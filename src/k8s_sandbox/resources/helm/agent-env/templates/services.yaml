@@ -28,7 +28,9 @@ spec:
       annotations:
         {{- toYaml $.Values.annotations | nindent 8 }}
     spec:
+      {{- if ne ($service.runtimeClassName | default "gvisor") "NONE" }}
       runtimeClassName: {{ $service.runtimeClassName | default "gvisor" }}
+      {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: 0
