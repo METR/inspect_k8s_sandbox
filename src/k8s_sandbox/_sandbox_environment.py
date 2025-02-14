@@ -10,6 +10,7 @@ from inspect_ai.util import (
     SandboxEnvironmentConfigType,
     sandboxenv,
 )
+from inspect_ai.util._sandbox import SandboxConnection
 from pydantic import BaseModel
 
 from k8s_sandbox._helm import Release
@@ -177,6 +178,9 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 return (
                     temp_file.read() if not text else temp_file.read().decode("utf-8")
                 )
+
+    async def connection(self) -> SandboxConnection:
+        return SandboxConnection(command="")
 
     @contextmanager
     def _log_op(
