@@ -180,7 +180,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 )
 
     async def connection(self) -> SandboxConnection:
-        return SandboxConnection(command="")
+        return SandboxConnection(type="k8s", command="")
 
     @contextmanager
     def _log_op(
