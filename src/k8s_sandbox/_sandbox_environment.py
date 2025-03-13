@@ -189,7 +189,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
     async def run_dropbear(self) -> None:
         with open(
-            Path(__file__).parent / "resources" / "dropbear.sh", "rb"
+            Path(__file__).parent / "resources" / "dropbear", "rb"
         ) as dropbear_script:
             await self.write_file("/usr/bin/dropbear", dropbear_script.read())
         await self.exec(["chmod", "+x", "/usr/bin/dropbear"])
