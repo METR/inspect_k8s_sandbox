@@ -187,13 +187,20 @@ class K8sSandboxEnvironment(SandboxEnvironment):
     async def connection(self) -> SandboxConnection:
         return SandboxConnection(type="k8s", command="")
 
-    async def install_dropbear(self) -> None:
+    async def run_dropbear(self) -> None:
         with open(
             Path(__file__).parent / "resources" / "dropbear.sh", "rb"
         ) as dropbear_script:
             await self.write_file("/usr/bin/dropbear", dropbear_script.read())
         await self.exec(["chmod", "+x", "/usr/bin/dropbear"])
         await self.exec(["mkdir", "-p", "/etc/dropbear"])
+        await self.exec(
+            [
+                "bash",
+                "-c",
+                "nohup dropbear -R -F -E -p 2222 > /dev/null 2>&1 &",
+            ]
+        )
 
     @contextmanager
     def _log_op(
