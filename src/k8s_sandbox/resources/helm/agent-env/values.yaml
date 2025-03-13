@@ -18,6 +18,11 @@ allowCIDR: []
 # allowed to access.
 # @default -- Empty list (no additional entities compared to default policies)
 allowEntities: []
+# -- A list of objects with port and protocol fields, specifying ports on the agent
+# environment that are open to the outside world. If no protocol is specified, the
+# default protocol is TCP.
+# @default -- Empty list (no additional ports compared to default policies)
+allowIngressPorts: []
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []
 # - name: "gcr-json-key"

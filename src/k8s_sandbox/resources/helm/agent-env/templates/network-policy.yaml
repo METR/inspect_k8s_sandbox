@@ -115,3 +115,25 @@ spec:
           io.kubernetes.pod.namespace: {{ .Release.Namespace }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
 {{- end }}
+{{- if .Values.allowIngressPorts }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ template "agentEnv.fullname" $ }}-sandbox-port-{{ .port }}-ingress
+  annotations:
+    {{- toYaml $.Values.annotations | nindent 4 }}
+spec:
+  description: Allow ingress traffic on port {{ .port }}.
+  endpointSelector:
+    matchLabels:
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+  ingress:
+    - toPorts:
+        - ports:
+        {{- range .Values.allowIngressPorts }}
+            - port: "{{ .port }}"
+              protocol: {{ .protocol | default "TCP" }}
+        {{- end }}
+{{- end }}
