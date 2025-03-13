@@ -91,7 +91,12 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
         release = _create_release(task_name, config)
         await HelmReleaseManager.get_instance().install(release)
-        return reorder_default_first(await get_sandboxes(release))
+        sandboxes = reorder_default_first(await get_sandboxes(release))
+
+        if "default" in sandboxes:
+            await sandboxes["default"].install_dropbear()
+
+        return sandboxes
 
     @classmethod
     async def sample_cleanup(
@@ -181,6 +186,14 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
     async def connection(self) -> SandboxConnection:
         return SandboxConnection(type="k8s", command="")
+
+    async def install_dropbear(self) -> None:
+        with open(
+            Path(__file__).parent / "resources" / "dropbear.sh", "rb"
+        ) as dropbear_script:
+            await self.write_file("/usr/bin/dropbear", dropbear_script.read())
+        await self.exec(["chmod", "+x", "/usr/bin/dropbear"])
+        await self.exec(["mkdir", "-p", "/etc/dropbear"])
 
     @contextmanager
     def _log_op(

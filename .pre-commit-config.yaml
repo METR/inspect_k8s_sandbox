@@ -13,6 +13,7 @@ repos:
     rev: v4.6.0
     hooks:
       - id: check-added-large-files
+        exclude: src/k8s_sandbox/resources/dropbear # Use Git LFS?
       - id: check-json
         exclude: 'devcontainer.json'
       - id: check-yaml
