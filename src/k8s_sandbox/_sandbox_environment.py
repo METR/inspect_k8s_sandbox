@@ -72,17 +72,17 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         config: SandboxEnvironmentConfigType | None,
         metadata: dict[str, str],
     ) -> dict[str, SandboxEnvironment]:
-        async def get_sandboxes(release: Release) -> dict[str, SandboxEnvironment]:
+        async def get_sandboxes(release: Release) -> dict[str, K8sSandboxEnvironment]:
             pods = await release.get_sandbox_pods()
-            sandbox_envs: dict[str, SandboxEnvironment] = {}
+            sandbox_envs: dict[str, K8sSandboxEnvironment] = {}
             for key, pod in pods.items():
                 sandbox_envs[key] = cls(release, pod)
             log_trace(f"Available sandboxes: {list(sandbox_envs.keys())}")
             return sandbox_envs
 
         def reorder_default_first(
-            sandboxes: dict[str, SandboxEnvironment],
-        ) -> dict[str, SandboxEnvironment]:
+            sandboxes: dict[str, K8sSandboxEnvironment],
+        ) -> dict[str, K8sSandboxEnvironment]:
             # Inspect expects the default sandbox to be the first sandbox in the dict.
             if "default" in sandboxes:
                 default = sandboxes.pop("default")
@@ -94,9 +94,9 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         sandboxes = reorder_default_first(await get_sandboxes(release))
 
         if "default" in sandboxes:
-            await sandboxes["default"].install_dropbear()
+            await sandboxes["default"].run_dropbear()
 
-        return sandboxes
+        return cast(dict[str, SandboxEnvironment], sandboxes)
 
     @classmethod
     async def sample_cleanup(
