@@ -10,7 +10,7 @@ from inspect_ai.util import (
     SandboxEnvironmentConfigType,
     sandboxenv,
 )
-from inspect_ai.util._sandbox import SandboxConnection
+from inspect_ai.util import SandboxConnection
 from pydantic import BaseModel
 
 from k8s_sandbox._helm import Release
