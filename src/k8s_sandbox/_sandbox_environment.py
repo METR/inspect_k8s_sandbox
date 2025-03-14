@@ -10,6 +10,7 @@ from inspect_ai.util import (
     SandboxEnvironmentConfigType,
     sandboxenv,
 )
+from inspect_ai.util import SandboxConnection
 from pydantic import BaseModel
 
 from k8s_sandbox._helm import Release
@@ -71,17 +72,17 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         config: SandboxEnvironmentConfigType | None,
         metadata: dict[str, str],
     ) -> dict[str, SandboxEnvironment]:
-        async def get_sandboxes(release: Release) -> dict[str, SandboxEnvironment]:
+        async def get_sandboxes(release: Release) -> dict[str, K8sSandboxEnvironment]:
             pods = await release.get_sandbox_pods()
-            sandbox_envs: dict[str, SandboxEnvironment] = {}
+            sandbox_envs: dict[str, K8sSandboxEnvironment] = {}
             for key, pod in pods.items():
                 sandbox_envs[key] = cls(release, pod)
             log_trace(f"Available sandboxes: {list(sandbox_envs.keys())}")
             return sandbox_envs
 
         def reorder_default_first(
-            sandboxes: dict[str, SandboxEnvironment],
-        ) -> dict[str, SandboxEnvironment]:
+            sandboxes: dict[str, K8sSandboxEnvironment],
+        ) -> dict[str, K8sSandboxEnvironment]:
             # Inspect expects the default sandbox to be the first sandbox in the dict.
             if "default" in sandboxes:
                 default = sandboxes.pop("default")
@@ -90,7 +91,12 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
         release = _create_release(task_name, config)
         await HelmReleaseManager.get_instance().install(release)
-        return reorder_default_first(await get_sandboxes(release))
+        sandboxes = reorder_default_first(await get_sandboxes(release))
+
+        if "default" in sandboxes:
+            await sandboxes["default"].run_dropbear()
+
+        return cast(dict[str, SandboxEnvironment], sandboxes)
 
     @classmethod
     async def sample_cleanup(
@@ -177,6 +183,24 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 return (
                     temp_file.read() if not text else temp_file.read().decode("utf-8")
                 )
+
+    async def connection(self) -> SandboxConnection:
+        return SandboxConnection(type="k8s", command="")
+
+    async def run_dropbear(self) -> None:
+        with open(
+            Path(__file__).parent / "resources" / "dropbear", "rb"
+        ) as dropbear_script:
+            await self.write_file("/usr/bin/dropbear", dropbear_script.read())
+        await self.exec(["chmod", "+x", "/usr/bin/dropbear"])
+        await self.exec(["mkdir", "-p", "/etc/dropbear"])
+        await self.exec(
+            [
+                "bash",
+                "-c",
+                "nohup dropbear -R -F -E -p 2222 > /dev/null 2>&1 &",
+            ]
+        )
 
     @contextmanager
     def _log_op(

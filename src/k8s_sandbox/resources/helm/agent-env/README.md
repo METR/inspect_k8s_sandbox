@@ -10,6 +10,7 @@
 | allowCIDR | list | Empty list (no additional CIDR ranges compared to default policies) | A list of CIDR ranges (e.g. 1.1.1.1/32) that pods within the agent environment are allowed to access. |
 | allowDomains | list | Empty list (no internet access) | A list of fully qualified domain names that pods within the agent environment are allowed to access. |
 | allowEntities | list | Empty list (no additional entities compared to default policies) | A list of Cilium entities (e.g. "world") that pods within the agent environment are allowed to access. |
+| allowIngressPorts | list | Empty list (no additional ports compared to default policies) | A list of objects with port and protocol fields, specifying ports on the agent environment that are open to the outside world. If no protocol is specified, the default protocol is TCP. |
 | annotations | object | `{}` | A dict of annotations to apply to resources within the agent environment. |
 | global | object | set by inspect | The name of the agent environment, only overwrite in cases where e.g. name lengths are causing failures. |
 | imagePullSecrets | list | `[]` | References to pre-existing secrets that contain registry credentials. |
