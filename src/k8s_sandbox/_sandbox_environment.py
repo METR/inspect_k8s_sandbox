@@ -6,11 +6,11 @@ from typing import Any, Generator, Literal, cast, overload
 from inspect_ai.util import (
     ExecResult,
     OutputLimitExceededError,
+    SandboxConnection,
     SandboxEnvironment,
     SandboxEnvironmentConfigType,
     sandboxenv,
 )
-from inspect_ai.util import SandboxConnection
 from pydantic import BaseModel
 
 from k8s_sandbox._helm import Release
