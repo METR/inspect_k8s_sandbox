@@ -23,24 +23,6 @@
         "type": "string"
       }
     },
-    "allowIngressPorts": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "port": {
-            "type": "string"
-          },
-          "protocol": {
-            "type": "string",
-            "enum": ["TCP", "UDP", "", "ANY"]
-          }
-        },
-        "required": [
-          "port"
-        ]
-      }
-    },
     "networks": {
       "type": "object"
     },
