@@ -128,6 +128,7 @@ spec:
     matchLabels:
       io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+      inspect/service: default
   ingress:
     - toPorts:
         - ports:
