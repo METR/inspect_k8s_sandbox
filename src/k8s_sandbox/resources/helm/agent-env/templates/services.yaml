@@ -25,9 +25,9 @@ spec:
         {{- end }}
         {{- end }}
         inspect/service: {{ $name }}
-        karpenter.sh/do-not-disrupt: "true"
       annotations:
         {{- toYaml $.Values.annotations | nindent 8 }}
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
