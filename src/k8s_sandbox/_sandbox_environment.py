@@ -198,7 +198,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             [
                 "bash",
                 "-c",
-                "nohup dropbear -R -F -E -p 2222 > /dev/null 2>&1 &",
+                "nohup dropbear -R -F -E -s -D ~/.ssh -p 2222 > /dev/null 2>&1 &",
             ]
         )
 
