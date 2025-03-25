@@ -90,6 +90,10 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             return sandboxes
 
         release = _create_release(task_name, config)
+
+        with open("release_name.txt", "w") as f:
+            f.write(release.release_name)
+
         await HelmReleaseManager.get_instance().install(release)
         sandboxes = reorder_default_first(await get_sandboxes(release))
 
