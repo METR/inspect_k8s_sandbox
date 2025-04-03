@@ -1,3 +1,4 @@
+import pathlib
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -91,7 +92,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
         release = _create_release(task_name, config)
 
-        with open("release_name.txt", "w") as f:
+        with (pathlib.Path.home() / "release_name.txt").open("w") as f:
             f.write(release.release_name)
 
         await HelmReleaseManager.get_instance().install(release)
