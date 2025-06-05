@@ -35,6 +35,10 @@ spec:
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: 0
+      {{- if $service.initContainers }}
+      initContainers:
+        {{- toYaml $service.initContainers | nindent 8 }}
+      {{- end }}
       containers:
       - name: {{ $name }}
         image: {{ $service.image }}

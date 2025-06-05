@@ -118,6 +118,9 @@
             "securityContext": {
               "type": "object"
             },
+            "initContainers": {
+              "type": "array"
+            },
             "volumeMounts": {
               "type": "array"
             },

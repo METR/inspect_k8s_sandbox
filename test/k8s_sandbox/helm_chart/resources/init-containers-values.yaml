@@ -1,0 +1,24 @@
+services:
+  default:
+    image: "python:3.12-bookworm"
+    initContainers:
+      - name: ssh-installer
+        image: human-cli-setup:latest
+        command: ['sh', '-c']
+        args:
+          - |
+            echo "Installing SSH components..."
+            mkdir -p /ssh-install/bin
+            echo "SSH installation complete"
+        volumeMounts:
+          - name: ssh-volume
+            mountPath: /ssh-install
+      - name: another-init
+        image: busybox:1.35
+        command: ['echo', 'Second init container']
+    volumeMounts:
+      - name: ssh-volume
+        mountPath: /ssh-install
+    volumes:
+      - name: ssh-volume
+        emptyDir: {}

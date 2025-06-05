@@ -75,6 +75,8 @@ services:
     imagePullPolicy: null
     # -- Privilege and access control settings for the container.
     securityContext: {}
+    # -- Init containers that run before the main container starts.
+    initContainers: []
     # -- Toleration settings for the Pod.
     tolerations: []
     # -- Node selector settings for the Pod.

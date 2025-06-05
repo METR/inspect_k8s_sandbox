@@ -212,6 +212,37 @@ def test_quotes_env_var_values(chart_dir: Path, test_resources_dir: Path) -> Non
     assert env[3] == {"name": "C", "value": "three"}
 
 
+def test_init_containers(chart_dir: Path, test_resources_dir: Path) -> None:
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "init-containers-values.yaml"
+    )
+
+    stateful_sets = _get_documents(documents, "StatefulSet")
+    assert len(stateful_sets) == 1
+
+    pod_spec = stateful_sets[0]["spec"]["template"]["spec"]
+
+    assert "initContainers" in pod_spec
+    init_containers = pod_spec["initContainers"]
+    assert len(init_containers) == 2
+
+    ssh_installer = init_containers[0]
+    assert ssh_installer["name"] == "ssh-installer"
+    assert ssh_installer["image"] == "human-cli-setup:latest"
+    assert ssh_installer["command"] == ['sh', '-c']
+    assert "Installing SSH components..." in ssh_installer["args"][0]
+    assert ssh_installer["volumeMounts"] == [{"name": "ssh-volume", "mountPath": "/ssh-install"}]
+
+    another_init = init_containers[1]
+    assert another_init["name"] == "another-init"
+    assert another_init["image"] == "busybox:1.35"
+    assert another_init["command"] == ['echo', 'Second init container']
+
+    assert len(pod_spec["containers"]) == 2  # main container + coredns
+    main_container = pod_spec["containers"][0]
+    assert main_container["image"] == "python:3.12-bookworm"
+
+
 def test_cluster_default_magic_string(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
