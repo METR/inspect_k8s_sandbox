@@ -4,8 +4,10 @@ kind: StatefulSet
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-{{ $name }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
     {{- include "agentEnv.labels" $ | nindent 4 }}
+    {{- if $.Values.labels }}
+    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- end }}
     inspect/service: {{ $name }}
   annotations:
     {{- toYaml $.Values.annotations | nindent 4 }}
@@ -19,8 +21,10 @@ spec:
   template:
     metadata:
       labels:
-        {{- toYaml $.Values.labels | nindent 8 }}
         {{- include "agentEnv.selectorLabels" $ | nindent 8 }}
+        {{- if $.Values.labels }}
+        {{- toYaml $.Values.labels | nindent 8 }}
+        {{- end }}
         {{- if $service.networks }}
         {{- range $service.networks }}
         aisi.gov.uk/network-{{ . }}: "true"
@@ -170,7 +174,10 @@ metadata:
   annotations:
     {{- toYaml $.Values.annotations | nindent 4 }}
   labels:
+    {{- include "agentEnv.labels" $ | nindent 4 }}
+    {{- if $.Values.labels }}
     {{- toYaml $.Values.labels | nindent 4 }}
+    {{- end }}
 spec:
   # Make this a headless service: other pods in this agent-env may connect directly to
   # the pod on all ports. This enables the use of tools like `nc` on any port or `ping`
