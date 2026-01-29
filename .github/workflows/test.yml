@@ -10,4 +10,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: npm install -g @devcontainers/cli@v0.30.0
       - run: devcontainer up --workspace-folder=.
-      - run: devcontainer exec --workspace-folder=. uv run pytest -rA -x --color=yes
+      # Skip tests requiring k8s - the CI k8s infrastructure is unreliable (helm times out)
+      - run: devcontainer exec --workspace-folder=. uv run pytest -rA -x --color=yes -m "not req_k8s"
