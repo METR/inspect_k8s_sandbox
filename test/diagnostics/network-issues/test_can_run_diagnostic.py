@@ -1,4 +1,7 @@
+import pytest
 from run import run_diagnostic_eval
+
+pytestmark = pytest.mark.req_k8s
 
 
 def test_can_run_diagnostic_network_issues() -> None:
