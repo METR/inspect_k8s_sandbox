@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 from abc import ABC
 from dataclasses import dataclass
@@ -119,6 +120,8 @@ class PodOperation(ABC):
         ws_client._all = _IgnoredIO()
 
     def _check_for_pod_restart(self):
+        if os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() == "false":
+            return
         check_for_pod_restart(self._pod)
 
 
