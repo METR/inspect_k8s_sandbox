@@ -1,4 +1,7 @@
 import logging
+import os
+import platform
+import socket
 from abc import ABC
 from dataclasses import dataclass
 from typing import Generator, Literal
@@ -65,6 +68,7 @@ class PodOperation(ABC):
         )
         try:
             self._discard_duplicate_channel(ws_client)
+            self._enable_tcp_keepalive(ws_client)
             yield ws_client
         finally:
             ws_client.close()
@@ -97,7 +101,54 @@ class PodOperation(ABC):
             return
         ws_client._all = _IgnoredIO()
 
+    def _enable_tcp_keepalive(self, ws_client: WSClient) -> None:
+        """
+        Enable TCP keepalive on the WebSocket connection.
+
+        This prevents connection drops during extended idle periods (e.g., when
+        waiting for model responses during extended thinking). Without keepalive,
+        intermediate network devices or the OS may close idle connections.
+
+        Settings:
+        - TCP_KEEPIDLE: Start probing after 30 seconds of idle
+        - TCP_KEEPINTVL: Send probes every 10 seconds
+        - TCP_KEEPCNT: 3 failed probes means connection is dead
+
+        Total timeout: 30 + 3*10 = 60 seconds of unresponsive state.
+        """
+        try:
+            # Access the underlying socket through the WebSocket client
+            # ws_client.sock is the WebSocket, ws_client.sock.sock is the TCP socket
+            sock = ws_client.sock.sock
+            if sock is None:
+                logger.warning("Could not enable TCP keepalive: socket is None")
+                return
+
+            # Enable TCP keepalive
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+            # Platform-specific keepalive settings
+            system = platform.system()
+            if system == "Linux":
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            elif system == "Darwin":  # macOS
+                # macOS uses TCP_KEEPALIVE instead of TCP_KEEPIDLE
+                TCP_KEEPALIVE = 0x10  # macOS-specific constant
+                sock.setsockopt(socket.IPPROTO_TCP, TCP_KEEPALIVE, 30)
+                # TCP_KEEPINTVL and TCP_KEEPCNT are not available on macOS
+            # Windows doesn't support fine-grained TCP keepalive settings via setsockopt
+
+            logger.debug(
+                f"TCP keepalive enabled on WebSocket connection (platform: {system})"
+            )
+        except (AttributeError, OSError) as e:
+            logger.warning(f"Failed to enable TCP keepalive: {e}")
+
     def _check_for_pod_restart(self):
+        if os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() == "false":
+            return
         client = k8s_client(self._pod.context_name)
         pod = client.read_namespaced_pod(
             name=self._pod.name, namespace=self._pod.namespace

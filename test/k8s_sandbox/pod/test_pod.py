@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 from k8s_sandbox._pod.execute import ExecuteOperation
 
@@ -92,3 +93,44 @@ def test_build_idempotent_shell_script_with_cwd_and_env():
     assert "cd /tmp" in script
     assert "export FOO=bar" in script
     assert f"/tmp/.k8s_exec_{exec_id}.marker" in script
+
+
+def test_pod_restart_check_disabled_skips_api_call():
+    """Test that INSPECT_POD_RESTART_CHECK=false skips the restart check."""
+    executor = ExecuteOperation(MagicMock())
+
+    # When env var is false, should not call k8s_client
+    with patch.dict(os.environ, {"INSPECT_POD_RESTART_CHECK": "false"}):
+        with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+            executor._check_for_pod_restart()  # pyright: ignore[reportPrivateUsage]
+            mock_client.assert_not_called()
+
+
+def test_pod_restart_check_disabled_case_insensitive():
+    """Test that INSPECT_POD_RESTART_CHECK=false is case insensitive."""
+    executor = ExecuteOperation(MagicMock())
+
+    for value in ["FALSE", "False", "false"]:
+        with patch.dict(os.environ, {"INSPECT_POD_RESTART_CHECK": value}):
+            with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+                executor._check_for_pod_restart()  # pyright: ignore[reportPrivateUsage]
+                mock_client.assert_not_called()
+
+
+def test_pod_restart_check_enabled_by_default():
+    """Test that restart check runs by default (env var not set)."""
+    executor = ExecuteOperation(MagicMock())
+
+    # Remove the env var if it exists
+    env = os.environ.copy()
+    _ = env.pop("INSPECT_POD_RESTART_CHECK", None)
+
+    with patch.dict(os.environ, env, clear=True):
+        with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+            # Will fail because mock isn't fully set up, but we just want to
+            # verify k8s_client was called
+            try:
+                executor._check_for_pod_restart()  # pyright: ignore[reportPrivateUsage]
+            except Exception:
+                pass
+            mock_client.assert_called_once()
