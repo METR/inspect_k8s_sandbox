@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator, Literal, cast, overload
 
-from inspect_ai.solver._task_state import sample_state
 from inspect_ai.util import (
     ExecResult,
     OutputLimitExceededError,
@@ -144,9 +143,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             return sandboxes
 
         resolved_config = _validate_and_resolve_k8s_sandbox_config(config)
-        state = sample_state()
-        sample_uuid = state.uuid if state else None
-        release = _create_release(task_name, resolved_config, sample_uuid=sample_uuid)
+        release = _create_release(task_name, resolved_config)
         await HelmReleaseManager.get_instance().install(release)
         return reorder_default_first(await get_sandboxes(release, resolved_config))
 
@@ -341,9 +338,7 @@ class K8sError(Exception):
         super().__init__(format_log_message(message, **kwargs))
 
 
-def _create_release(
-    task_name: str, config: _ResolvedConfig, sample_uuid: str | None = None
-) -> Release:
+def _create_release(task_name: str, config: _ResolvedConfig) -> Release:
     values_source = _create_values_source(config)
     return Release(
         task_name,
@@ -351,7 +346,6 @@ def _create_release(
         values_source,
         config.context,
         config.restarted_container_behavior,
-        sample_uuid=sample_uuid,
     )
 
 

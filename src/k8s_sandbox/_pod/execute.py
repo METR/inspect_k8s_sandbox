@@ -7,9 +7,7 @@ from typing import Generator
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import WSClient  # type: ignore
-from websocket import WebSocketConnectionClosedException
 
-from k8s_sandbox._logger import log_error
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecutableNotFoundError
 from k8s_sandbox._pod.get_returncode import get_returncode
@@ -123,55 +121,24 @@ class ExecuteOperation(PodOperation):
             stdout = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
             stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
             returncode: int | None = None
-
-            # Timing instrumentation for debugging connection drops (ENG-480)
-            connection_start_time = time.monotonic()
-            last_data_received_time = connection_start_time
-            total_bytes_received = 0
-            data_frames_received = 0
-
-            try:
-                while ws_client.is_open():
-                    # `timeout=None` means `update` will block indefinitely until there is
-                    # data to read from the socket.
-                    ws_client.update(timeout=None)
-                    # Note: `peek_*()` and `read_*()` may call `update(timeout=0)`.
-                    if ws_client.peek_stderr():
-                        data = ws_client.read_stderr()
-                        stderr.append(data)
-                        last_data_received_time = time.monotonic()
-                        total_bytes_received += len(data)
-                        data_frames_received += 1
-                    # Handle stdout _after_ stderr to guarantee that, if buffered, the
-                    # sentinel is actioned before the blocking `ws_client.update(None)`.
-                    if ws_client.peek_stdout():
-                        frame = ws_client.read_stdout()
-                        last_data_received_time = time.monotonic()
-                        total_bytes_received += len(frame)
-                        data_frames_received += 1
-                        # Assumption: The sentinel value is written to stdout in a single
-                        # frame and not split by other writes to stdout.
-                        filtered, returncode = self._filter_sentinel_and_returncode(frame)
-                        stdout.append(filtered)
-                        if returncode is not None:
-                            ws_client.close()
-                    self._verify_output_limit(stdout, stderr)
-            except WebSocketConnectionClosedException as e:
-                # Log detailed timing info on connection drop for debugging (ENG-480)
-                connection_duration = time.monotonic() - connection_start_time
-                idle_duration = time.monotonic() - last_data_received_time
-                log_error(
-                    "WebSocket connection dropped unexpectedly.",
-                    error_type=type(e).__name__,
-                    error_message=str(e),
-                    connection_duration_seconds=round(connection_duration, 2),
-                    idle_duration_seconds=round(idle_duration, 2),
-                    total_bytes_received=total_bytes_received,
-                    data_frames_received=data_frames_received,
-                    pod=self._pod.name,
-                )
-                raise
-
+            while ws_client.is_open():
+                # `timeout=None` means `update` will block indefinitely until there is
+                # data to read from the socket.
+                ws_client.update(timeout=None)
+                # Note: `peek_*()` and `read_*()` may call `update(timeout=0)`.
+                if ws_client.peek_stderr():
+                    stderr.append(ws_client.read_stderr())
+                # Handle stdout _after_ stderr to guarantee that, if buffered, the
+                # sentinel is actioned before the blocking `ws_client.update(None)`.
+                if ws_client.peek_stdout():
+                    frame = ws_client.read_stdout()
+                    # Assumption: The sentinel value is written to stdout in a single
+                    # frame and not split by other writes to stdout.
+                    filtered, returncode = self._filter_sentinel_and_returncode(frame)
+                    stdout.append(filtered)
+                    if returncode is not None:
+                        ws_client.close()
+                self._verify_output_limit(stdout, stderr)
             # returncode won't be set if setup commands e.g. `cd` failed.
             if returncode is None:
                 returncode = get_returncode(ws_client)
