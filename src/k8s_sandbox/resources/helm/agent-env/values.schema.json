@@ -139,6 +139,9 @@
             "nodeSelector": {
               "type": "object"
             },
+            "affinity": {
+              "type": "object"
+            },
             "networkIsolated": {
               "type": "boolean"
             },

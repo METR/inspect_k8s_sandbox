@@ -413,6 +413,37 @@ def test_coredns_container(
     assert corends_container["command"] == expected_coredns_command
 
 
+def test_affinity(chart_dir: Path, test_resources_dir: Path) -> None:
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "affinity-values.yaml"
+    )
+
+    stateful_sets = _get_documents(documents, "StatefulSet")
+    assert len(stateful_sets) == 2
+
+    default_set = next(
+        s for s in stateful_sets if s["metadata"]["name"].endswith("-default")
+    )
+    server_set = next(
+        s for s in stateful_sets if s["metadata"]["name"].endswith("-server")
+    )
+
+    # Default service should not have affinity (not set in values)
+    assert "affinity" not in default_set["spec"]["template"]["spec"]
+
+    # Server service should have the affinity from values
+    server_spec = server_set["spec"]["template"]["spec"]
+    assert "affinity" in server_spec
+    affinity = server_spec["affinity"]
+    rules = affinity["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    assert len(rules) == 1
+    assert rules[0]["topologyKey"] == "kubernetes.io/hostname"
+    assert rules[0]["labelSelector"]["matchLabels"] == {
+        "app.kubernetes.io/instance": "my-release",
+        "inspect/service": "default",
+    }
+
+
 def test_network_isolated_service(chart_dir: Path, test_resources_dir: Path) -> None:
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "network-isolated-values.yaml"

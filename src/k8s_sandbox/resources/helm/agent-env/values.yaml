@@ -93,6 +93,8 @@ services:
     tolerations: []
     # -- Node selector settings for the Pod.
     nodeSelector: {}
+    # -- Affinity settings for the Pod. See https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity
+    # affinity: {}
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"

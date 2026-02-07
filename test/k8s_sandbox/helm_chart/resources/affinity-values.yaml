@@ -1,0 +1,11 @@
+services:
+  server:
+    image: "nginx"
+    affinity:
+      podAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/instance: my-release
+              inspect/service: default
+          topologyKey: kubernetes.io/hostname
