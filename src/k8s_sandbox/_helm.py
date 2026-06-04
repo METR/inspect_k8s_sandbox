@@ -13,6 +13,7 @@ from inspect_ai.util import ExecResult, concurrency
 from kubernetes.client.rest import ApiException  # type: ignore
 from shortuuid import uuid
 
+from k8s_sandbox._diagnostics import describe_release_pods
 from k8s_sandbox._kubernetes_api import get_default_namespace, k8s_client
 from k8s_sandbox._logger import format_log_message, inspect_trace_action, log_trace
 from k8s_sandbox._pod import Pod
@@ -284,6 +285,13 @@ class Release:
                 error=result.stderr,
             )
             raise _ResourceQuotaModifiedError(result.stderr)
+        # Helm only reports the generic symptom (e.g. a pod not becoming ready). Read
+        # the pods' container states so the concrete cause (ImagePullBackOff, OOMKilled,
+        # FailedScheduling, ...) is surfaced. Best-effort: None if it can't be gathered.
+        diagnostics = describe_release_pods(
+            self._context_name, self._namespace, self.release_name
+        )
+        extra: dict[str, Any] = {"pod_diagnostics": diagnostics} if diagnostics else {}
         if re.search(r"context deadline exceeded", result.stderr):
             _raise_runtime_error(
                 f"Helm install timed out (context deadline exceeded). The configured "
@@ -293,9 +301,13 @@ class Release:
                 f"{INSPECT_HELM_TIMEOUT} environment variable.",
                 release=self.release_name,
                 result=result,
+                **extra,
             )
         _raise_runtime_error(
-            "Helm install failed.", release=self.release_name, result=result
+            "Helm install failed.",
+            release=self.release_name,
+            result=result,
+            **extra,
         )
 
 
