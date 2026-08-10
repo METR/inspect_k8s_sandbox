@@ -488,3 +488,37 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+@pytest.mark.parametrize(
+    ("values_file", "expected"),
+    [
+        pytest.param(None, False, id="default_withholds_token"),
+        pytest.param("automount-explicit-true-values.yaml", True, id="explicit_true"),
+        pytest.param("automount-with-sa-values.yaml", True, id="service_account_opts_in"),
+        # `default` in Helm treats false as empty, so an explicit false must not
+        # fall through to the serviceAccountName branch.
+        pytest.param(
+            "automount-sa-explicit-false-values.yaml",
+            False,
+            id="explicit_false_beats_service_account",
+        ),
+    ],
+)
+def test_automount_service_account_token(
+    chart_dir: Path,
+    test_resources_dir: Path,
+    values_file: str | None,
+    expected: bool,
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / values_file if values_file else None,
+    )
+
+    services = _get_documents(documents, "StatefulSet")
+
+    assert (
+        services[0]["spec"]["template"]["spec"]["automountServiceAccountToken"]
+        is expected
+    )

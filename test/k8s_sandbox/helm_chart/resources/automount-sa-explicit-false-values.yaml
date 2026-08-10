@@ -1,0 +1,2 @@
+serviceAccountName: my-sa
+automountServiceAccountToken: false

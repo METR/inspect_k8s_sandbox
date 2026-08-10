@@ -147,16 +147,41 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "name": {"type": "string"},
-                  "image": {"type": "string"},
-                  "command": { "type": "array", "items": { "type": "string" } },
-                  "args": { "type": "array", "items": { "type": "string" } },
-                  "imagePullPolicy": {"type": "string"},
-                  "workingDir": {"type": "string"},
-                  "resources": {"type": "object"},
-                  "securityContext": {"type": "object"}
+                  "name": {
+                    "type": "string"
+                  },
+                  "image": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "imagePullPolicy": {
+                    "type": "string"
+                  },
+                  "workingDir": {
+                    "type": "string"
+                  },
+                  "resources": {
+                    "type": "object"
+                  },
+                  "securityContext": {
+                    "type": "object"
+                  }
                 },
-                "required": ["name", "image"]
+                "required": [
+                  "name",
+                  "image"
+                ]
               }
             }
           },
@@ -205,7 +230,17 @@
       "type": "object"
     },
     "serviceAccountName": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "automountServiceAccountToken": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Mount the ServiceAccount token into agent pods. Defaults to false (true when serviceAccountName is set)."
     }
   },
   "required": [

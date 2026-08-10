@@ -36,6 +36,17 @@ spec:
       {{- if $.Values.serviceAccountName }}
       serviceAccountName: {{ $.Values.serviceAccountName }}
       {{- end }}
+      {{- /* Agent code has no reason to reach the Kubernetes API, so don't mount a
+             token for it. Unset means: false, unless serviceAccountName was given
+             (the operator asked for an identity, so preserve that behaviour).
+             kindIs, not `default`, because `default` treats false as empty. */}}
+      {{- if kindIs "bool" $.Values.automountServiceAccountToken }}
+      automountServiceAccountToken: {{ $.Values.automountServiceAccountToken }}
+      {{- else if $.Values.serviceAccountName }}
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: 0

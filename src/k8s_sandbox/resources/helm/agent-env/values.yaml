@@ -147,3 +147,9 @@ labels: {}
 # -- Service account name. When set, a ServiceAccount is created with this name
 # and pods will use it.
 serviceAccountName: null
+# -- Whether to mount the ServiceAccount token into agent pods. Agent code has no
+# reason to reach the Kubernetes API, so this defaults to false. Left unset it
+# resolves to false, or true when `serviceAccountName` is set (an explicitly
+# requested identity). Set it explicitly to override either way.
+# @default -- false (true when serviceAccountName is set)
+automountServiceAccountToken: null
