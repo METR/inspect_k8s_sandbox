@@ -145,7 +145,8 @@ annotations:
 # -- A dict of labels to apply to resources within the agent environment.
 labels: {}
 # -- Service account name. When set, a ServiceAccount is created with this name
-# and pods will use it.
+# and pods will use it. This must be a ServiceAccount name which doesn't already
+# exist.
 serviceAccountName: null
 # -- Whether to mount the ServiceAccount token into agent pods. Agent code has no
 # reason to reach the Kubernetes API, so this defaults to false. Left unset it

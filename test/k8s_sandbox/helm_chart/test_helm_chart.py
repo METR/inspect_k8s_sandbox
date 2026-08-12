@@ -495,7 +495,9 @@ def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str,
     [
         pytest.param(None, False, id="default_withholds_token"),
         pytest.param("automount-explicit-true-values.yaml", True, id="explicit_true"),
-        pytest.param("automount-with-sa-values.yaml", True, id="service_account_opts_in"),
+        pytest.param(
+            "automount-with-sa-values.yaml", True, id="service_account_opts_in"
+        ),
         # `default` in Helm treats false as empty, so an explicit false must not
         # fall through to the serviceAccountName branch.
         pytest.param(
