@@ -14,6 +14,23 @@
 - Raise an error when a conflicting `max_pod_ops` setting would otherwise be ignored.
 - Fix a service's `args` (compose `command:`) reaching the container as a single
   space-joined string instead of a list.
+- A sandbox waiting for cluster capacity no longer blocks other sandboxes from being
+  created. `INSPECT_HELM_TIMEOUT` still bounds the whole operation. Inspect's console
+  count of in-progress installs now reflects submissions in flight rather than
+  sandboxes still starting up.
+- A release which does not become ready now reports `Helm release did not become ready
+  within Ns` together with the state of its containers, rather than Helm's
+  `context deadline exceeded`.
+- Charts which render Pods directly, rather than via a StatefulSet or Deployment, are
+  now waited for. Charts using a `DaemonSet`, `Job` or `CronJob` are waited on for at
+  least one Pod rather than an exact count; `helm install --wait` waited for all of
+  them.
+- Add `INSPECT_HELM_UNINSTALL_TIMEOUT` (default 600s). Uninstalls previously used
+  `INSPECT_HELM_TIMEOUT`, which is now safe to set to hours.
+- A Helm release which fails to uninstall during sample cleanup no longer fails the
+  sample. It is retried and reported at the end of the eval as before.
+- Remove the `No GPU node is currently available` warning, which also fired for
+  releases that requested no GPU.
 
 ## 2026-08-12 0.13.0
 
