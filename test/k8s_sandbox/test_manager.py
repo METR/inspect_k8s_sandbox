@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import cast
 from unittest.mock import patch
@@ -191,6 +192,11 @@ async def test_cleanup_all_uninstalls_nothing_when_not_confirmed(
     assert "Cancelled." in capsys.readouterr().out
 
 
+_MANIFEST = json.dumps(
+    {"manifest": "kind: Pod\nmetadata:\n  labels: {inspect/service: default}\n"}
+)
+
+
 def _helm_results(
     monkeypatch: pytest.MonkeyPatch,
     install_ok: bool,
@@ -207,8 +213,17 @@ def _helm_results(
         subcommands.append(args[0])
         ok = install_ok if args[0] in ("install", "upgrade") else uninstall_ok
         stderr = "" if ok else "Error: context deadline exceeded\n"
-        return ExecResult(ok, 0 if ok else 1, "", stderr)
+        # A successful install reports the rendered manifest, which is how the
+        # readiness wait learns which sandboxes the chart declares.
+        stdout = _MANIFEST if ok and args[0] in ("install", "upgrade") else ""
+        return ExecResult(ok, 0 if ok else 1, stdout, stderr)
 
+    async def fake_wait_until_ready(self: Release, deadline: float) -> list[object]:
+        # These tests have no cluster; install() would otherwise poll one for
+        # readiness after the helm subprocess returns.
+        return []
+
+    monkeypatch.setattr(Release, "_wait_until_ready", fake_wait_until_ready)
     monkeypatch.setattr(helm_module, "get_default_namespace", lambda _: "default")
     monkeypatch.setattr(helm_module, "_run_subprocess", fake_run_subprocess)
     monkeypatch.setattr(helm_module, "describe_release_pods", lambda *_: None)
@@ -271,6 +286,8 @@ async def test_release_is_uninstalled_when_its_pods_cannot_be_read(
 
 async def _raise_no_pods(self: Release) -> dict[str, object]:
     raise RuntimeError("No pods found.")
+
+
 class _FakeSandbox:
     """Stands in for a K8sSandboxEnvironment; sample_cleanup only reads .release."""
 
