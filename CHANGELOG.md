@@ -38,6 +38,26 @@
   pods, none of which were removed until the eval ended. A chart with fixed-name
   `additionalResources` no longer fails the retry with `exists and cannot be imported
   into the current release`.
+- A sandbox waiting for cluster capacity no longer blocks other sandboxes from being
+  created. Inspect's console count of in-progress installs now reflects submissions in
+  flight rather than sandboxes still starting up.
+- A release which does not become ready now reports `Helm release did not become ready
+  within Ns` together with the state of its containers, rather than Helm's
+  `context deadline exceeded`.
+- A timeout now always reports, rather than hanging, when the Kubernetes API is slow to
+  answer the reads which gather the error's diagnostics.
+- Charts which render Pods directly, rather than via a StatefulSet or Deployment, are
+  now waited for. The eval no longer starts before every Pod labelled `inspect/service`
+  is Ready, even when the chart also creates Pods which are not sandboxes — a
+  `DaemonSet`, a hook, or anything added through `additionalResources`.
+- A chart which declares no Pod labelled `inspect/service` now fails the install,
+  rather than starting an eval with no sandbox.
+- Add `INSPECT_HELM_UNINSTALL_TIMEOUT` (default 600s). Uninstalls previously used
+  `INSPECT_HELM_TIMEOUT`, which is now safe to set to hours.
+- A Helm release which fails to uninstall during sample cleanup no longer fails the
+  sample. It is retried and reported at the end of the eval as before.
+- Remove the `No GPU node is currently available` warning, which also fired for
+  releases that requested no GPU.
 
 ## 2026-08-12 0.13.0
 

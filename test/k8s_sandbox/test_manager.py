@@ -3,7 +3,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
-from inspect_ai.util import ExecResult
+from inspect_ai.util import ExecResult, SandboxEnvironment
 from pytest import CaptureFixture, LogCaptureFixture
 
 import k8s_sandbox._manager as manager_module
@@ -271,3 +271,44 @@ async def test_release_is_uninstalled_when_its_pods_cannot_be_read(
 
 async def _raise_no_pods(self: Release) -> dict[str, object]:
     raise RuntimeError("No pods found.")
+class _FakeSandbox:
+    """Stands in for a K8sSandboxEnvironment; sample_cleanup only reads .release."""
+
+    def __init__(self, release: _FakeRelease) -> None:
+        self.release = release
+
+
+async def _sample_cleanup(manager: HelmReleaseManager, release: _FakeRelease) -> None:
+    environments = {"default": cast(SandboxEnvironment, _FakeSandbox(release))}
+    with patch.object(HelmReleaseManager, "get_instance", return_value=manager):
+        await K8sSandboxEnvironment.sample_cleanup(
+            "my-task", None, environments, interrupted=False
+        )
+
+
+async def test_sample_cleanup_uninstalls_and_untracks_the_release() -> None:
+    manager = HelmReleaseManager()
+    release = _FakeRelease("aaaaaaaa")
+    await _install(manager, release)
+
+    await _sample_cleanup(manager, release)
+
+    assert release.uninstall_attempted
+    assert manager._installed_releases == []
+
+
+async def test_sample_cleanup_does_not_fail_the_sample_when_uninstall_fails(
+    caplog: LogCaptureFixture,
+) -> None:
+    # Inspect turns an exception from sample_cleanup() into a sample error, which
+    # would discard a sample that had otherwise succeeded.
+    manager = HelmReleaseManager()
+    failing = _FakeRelease("bbbbbbbb", RuntimeError("Helm uninstall failed."))
+    await _install(manager, failing)
+
+    with caplog.at_level(logging.WARNING):
+        await _sample_cleanup(manager, failing)
+
+    assert "bbbbbbbb" in caplog.text
+    # Still tracked, so that uninstall_all() retries it at the end of the eval.
+    assert manager._installed_releases == [failing]
