@@ -38,16 +38,23 @@ class HelmReleaseManager:
             cls._context_var.set(manager)
             return manager
 
-    async def install(self, release: Release) -> None:
+    async def install(
+        self, release: Release, *, cleanup_on_cancel: bool = True
+    ) -> None:
         """
         Installs a release and tracks it for eventual cleanup.
 
         Args:
           release (Release): The release to install and track.
+          cleanup_on_cancel: Whether the release handles cancellation cleanup.
+            Set False when the caller owns cleanup, including failed installation.
         """
         # Track the release regardless of the install result.
         self._installed_releases.append(release)
-        await release.install()
+        if cleanup_on_cancel:
+            await release.install()
+        else:
+            await release.install(cleanup_on_cancel=False)
 
     async def uninstall(self, release: Release, quiet: bool) -> None:
         """

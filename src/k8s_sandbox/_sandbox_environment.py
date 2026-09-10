@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import math
 import re
 import shlex
 import sys
 import tempfile
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
-from typing import Any, Generator, Literal, cast, overload
+from typing import Any, AsyncIterator, Generator, Literal, cast, overload
 
+import anyio
 import websocket
 from inspect_ai.solver._task_state import sample_state
 from inspect_ai.util import (
@@ -107,6 +110,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
     _rlimit_adjusted = False
 
     def __init__(self, release: Release, pod: Pod, config: _ResolvedConfig):
+        super().__init__()
         self.release = release
         self._pod = pod
         self._config = config
@@ -194,41 +198,11 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         config: SandboxEnvironmentConfigType | None,
         metadata: dict[str, str],
     ) -> dict[str, SandboxEnvironment]:
-        async def get_sandboxes(
-            release: Release, config: _ResolvedConfig
-        ) -> dict[str, SandboxEnvironment]:
-            pods = await release.get_sandbox_pods()
-            sandbox_envs: dict[str, SandboxEnvironment] = {}
-            for key, pod in pods.items():
-                sandbox_envs[key] = cls(release, pod, config)
-            log_trace(f"Available sandboxes: {list(sandbox_envs.keys())}")
-            return sandbox_envs
-
-        def reorder_default_first(
-            sandboxes: dict[str, SandboxEnvironment],
-        ) -> dict[str, SandboxEnvironment]:
-            # Inspect expects the default sandbox to be the first sandbox in the dict.
-            if "default" in sandboxes:
-                default = sandboxes.pop("default")
-                return {"default": default, **sandboxes}
-            return sandboxes
-
-        resolved_config = _validate_and_resolve_k8s_sandbox_config(config)
-        state = sample_state()
-        sample_uuid = state.uuid if state else None
-        extra_values = _metadata_to_extra_values(
-            metadata, resolved_config.chart, resolved_config.values
-        )
-        release = _create_release(
-            task_name,
-            resolved_config,
-            sample_uuid=sample_uuid,
-            extra_values=extra_values,
-        )
+        release, resolved_config = _prepare_sample_release(task_name, config, metadata)
         manager = HelmReleaseManager.get_instance()
         try:
             await manager.install(release)
-            return reorder_default_first(await get_sandboxes(release, resolved_config))
+            return await cls._get_sandboxes(release, resolved_config)
         except Exception:
             # Inspect does not call sample_cleanup() when sample_init() raises, and
             # uninstall_all() does not run until the whole eval ends, so nothing else
@@ -240,6 +214,86 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             with suppress(Exception):
                 await manager.uninstall(release, quiet=True)
             raise
+
+    @classmethod
+    @asynccontextmanager
+    async def create(
+        cls,
+        task_name: str,
+        config: SandboxEnvironmentConfigType | None,
+        metadata: dict[str, str],
+        *,
+        cleanup_timeout: float = 60,
+    ) -> AsyncIterator[dict[str, SandboxEnvironment]]:
+        """Create temporary sandboxes and remove their release on context exit.
+
+        All services in the configuration are created in a new Helm release and
+        waited for before yielding. Existing sample sandboxes are left unchanged.
+        Use the returned handles directly: this does not register environments
+        with Inspect's ``sandbox()``, copy sample files, run sample setup, record
+        Inspect sandbox events, or acquire Inspect's sample sandbox limit.
+
+        Cleanup also runs after an installation failure or cancellation. A failed
+        cleanup raises if there is no earlier error; otherwise the earlier error
+        is preserved and cleanup failure is logged. The release remains tracked.
+        An enclosing Inspect eval retries removal during final cleanup only if
+        it already initialized the k8s provider and sandbox cleanup is enabled.
+        Otherwise, retry failed removal with ``inspect sandbox cleanup k8s``.
+
+        Args:
+            task_name: Task name attached to the release.
+            config: Helm or Compose configuration for the temporary sandboxes.
+            metadata: Sample metadata used for configuration interpolation.
+            cleanup_timeout: Positive, finite cleanup timeout in seconds. Expiry
+                may add up to 5 seconds each for subprocess termination and
+                output draining.
+
+        Yields:
+            Named sandbox handles, with the default environment first.
+        """
+        if not math.isfinite(cleanup_timeout) or cleanup_timeout <= 0:
+            raise ValueError("cleanup_timeout must be positive and finite")
+
+        await cls.task_init(task_name, config)
+        release, resolved_config = _prepare_sample_release(task_name, config, metadata)
+        manager = HelmReleaseManager.get_instance()
+        primary_error: BaseException | None = None
+        try:
+            # Retain the release before awaiting installation: it must be removed
+            # even if cancellation arrives before sandbox handles are available.
+            await manager.install(release, cleanup_on_cancel=False)
+            yield await cls._get_sandboxes(release, resolved_config)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                await _cleanup_created_release(manager, release, cleanup_timeout)
+            except BaseException as error:
+                if primary_error is None:
+                    raise
+                if not isinstance(error, asyncio.CancelledError):
+                    log_warn(
+                        "Failed to remove temporary sandbox release; manual "
+                        "cleanup may be required.",
+                        release=release.release_name,
+                        error=error,
+                    )
+
+    @classmethod
+    async def _get_sandboxes(
+        cls, release: Release, config: _ResolvedConfig
+    ) -> dict[str, SandboxEnvironment]:
+        pods = await release.get_sandbox_pods()
+        sandboxes: dict[str, SandboxEnvironment] = {
+            name: cls(release, pod, config) for name, pod in pods.items()
+        }
+        log_trace(f"Available sandboxes: {list(sandboxes.keys())}")
+        # Inspect expects the default sandbox to be first in the dictionary.
+        if "default" in sandboxes:
+            default = sandboxes.pop("default")
+            return {"default": default, **sandboxes}
+        return sandboxes
 
     @classmethod
     async def sample_cleanup(
@@ -441,6 +495,61 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 "namespace": self._pod.info.namespace,
             },
         ]
+
+
+async def _cleanup_created_release(
+    manager: HelmReleaseManager, release: Release, timeout: float
+) -> None:
+    async def uninstall() -> None:
+        await asyncio.wait_for(manager.uninstall(release, quiet=True), timeout=timeout)
+
+    # AnyIO shielding handles Inspect's enclosing cancel scopes. A separate
+    # asyncio task also protects deletion from direct Task.cancel() calls; wait
+    # for its bounded completion before propagating any new cancellation.
+    with anyio.CancelScope(shield=True):
+        cleanup = asyncio.create_task(uninstall())
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                cancellation = error
+            except Exception:
+                # Retrieve the failure below, after accounting for cancellation.
+                break
+        try:
+            cleanup.result()
+        except BaseException as error:
+            if cancellation is not None:
+                log_warn(
+                    "Failed to remove temporary sandbox release during cancellation; "
+                    "manual cleanup may be required.",
+                    release=release.release_name,
+                    error=error,
+                )
+                raise cancellation from error
+            raise
+        if cancellation is not None:
+            raise cancellation
+
+
+def _prepare_sample_release(
+    task_name: str,
+    config: SandboxEnvironmentConfigType | None,
+    metadata: dict[str, str],
+) -> tuple[Release, _ResolvedConfig]:
+    resolved_config = _validate_and_resolve_k8s_sandbox_config(config)
+    state = sample_state()
+    extra_values = _metadata_to_extra_values(
+        metadata, resolved_config.chart, resolved_config.values
+    )
+    release = _create_release(
+        task_name,
+        resolved_config,
+        sample_uuid=state.uuid if state else None,
+        extra_values=extra_values,
+    )
+    return release, resolved_config
 
 
 class K8sSandboxEnvironmentConfig(BaseModel, frozen=True):

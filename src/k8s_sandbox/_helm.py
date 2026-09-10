@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import (
     Any,
@@ -21,6 +21,7 @@ from typing import (
     Protocol,
 )
 
+import anyio
 import yaml
 from inspect_ai.util import ExecResult, concurrency
 from kubernetes.client.exceptions import ApiException  # type: ignore
@@ -44,6 +45,8 @@ _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
+_SUBPROCESS_TERMINATE_TIMEOUT = 5
+_SUBPROCESS_DRAIN_TIMEOUT = 5
 INSPECT_HELM_TIMEOUT = "INSPECT_HELM_TIMEOUT"
 INSPECT_HELM_UNINSTALL_TIMEOUT = "INSPECT_HELM_UNINSTALL_TIMEOUT"
 INSPECT_HELM_LABELS = "INSPECT_HELM_LABELS"
@@ -231,7 +234,7 @@ class Release:
     def _generate_release_name(self) -> str:
         return uuid().lower()[:8]
 
-    async def install(self) -> None:
+    async def install(self, *, cleanup_on_cancel: bool = True) -> None:
         try:
             with inspect_trace_action(
                 "K8s install Helm chart",
@@ -269,10 +272,12 @@ class Release:
             # uninstall operations can be interleaved with existing `helm install`
             # processes. Uninstall the release now that we know the install process has
             # terminated.
-            log_trace(
-                "Helm install was cancelled; uninstalling.", release=self.release_name
-            )
-            await self.uninstall(quiet=True)
+            if cleanup_on_cancel:
+                log_trace(
+                    "Helm install was cancelled; uninstalling.",
+                    release=self.release_name,
+                )
+                await self.uninstall(quiet=True)
             raise
 
     async def uninstall(self, quiet: bool) -> None:
@@ -596,26 +601,40 @@ def _helm_escape(value: str) -> str:
 async def _run_subprocess(
     cmd: str, args: list[str], capture_output: bool
 ) -> ExecResult[str]:
-    try:
-        proc = await asyncio.create_subprocess_exec(
+    # Retain the creation task so cancellation cannot lose a process which has
+    # started but whose handle has not yet been returned.
+    creation = asyncio.create_task(
+        asyncio.create_subprocess_exec(
             cmd,
             *args,
             stdout=asyncio.subprocess.PIPE if capture_output else None,
             stderr=asyncio.subprocess.PIPE if capture_output else None,
         )
-        stdout, stderr = await proc.communicate()
+    )
+    communication: asyncio.Task[tuple[bytes, bytes]] | None = None
+    try:
+        proc = await asyncio.shield(creation)
+        communication = asyncio.create_task(proc.communicate())
+        stdout, stderr = await asyncio.shield(communication)
     except asyncio.CancelledError:
-        try:
-            proc.terminate()
-            # Use communicate() over wait() to avoid potential deadlock
-            # https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.subprocess.Process.wait
-            await proc.communicate()
-        # Task may have been cancelled before proc was assigned.
-        except UnboundLocalError:
-            pass
-        # Process may have already naturally terminated.
-        except ProcessLookupError:
-            pass
+        # Protect termination from both AnyIO cancel scopes and repeated direct
+        # Task.cancel() calls. Always finish it before propagating the original
+        # cancellation so Helm cannot keep installing resources during cleanup.
+        with anyio.CancelScope(shield=True):
+            cleanup = asyncio.create_task(
+                _terminate_subprocess(creation, communication)
+            )
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    break
+            try:
+                cleanup.result()
+            except Exception:
+                logger.warning("Failed to stop cancelled subprocess.", exc_info=True)
         raise
     return ExecResult(
         success=proc.returncode == 0,
@@ -623,6 +642,39 @@ async def _run_subprocess(
         stdout=stdout.decode() if stdout else "",
         stderr=stderr.decode() if stderr else "",
     )
+
+
+async def _terminate_subprocess(
+    creation: asyncio.Task[asyncio.subprocess.Process],
+    communication: asyncio.Task[tuple[bytes, bytes]] | None,
+) -> None:
+    proc = await creation
+    if communication is None:
+        communication = asyncio.create_task(proc.communicate())
+    with suppress(ProcessLookupError):
+        proc.terminate()
+    try:
+        # Keep draining the original readers while the process exits: waiting
+        # for the process alone can deadlock when its output pipes fill up.
+        await asyncio.wait_for(
+            asyncio.shield(communication), timeout=_SUBPROCESS_TERMINATE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        try:
+            # A descendant can retain stdout/stderr after Helm dies. Bound the
+            # final drain too; wait_for cancels and retrieves its reader tasks.
+            await asyncio.wait_for(communication, timeout=_SUBPROCESS_DRAIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out draining output from cancelled subprocess %s after "
+                "killing it; closing its output pipes.",
+                proc.pid,
+            )
+            # asyncio.Process has no public close() method. Closing the
+            # transport releases pipes still held open by surviving descendants.
+            proc._transport.close()  # type: ignore[attr-defined]
 
 
 def _get_timeout() -> int:
