@@ -536,7 +536,7 @@ async def test_empty_priority_label_does_not_invoke_helm() -> None:
 async def test_priority_lookup_uses_remaining_install_deadline_without_asyncio_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delattr(asyncio, "timeout")
+    monkeypatch.delattr(asyncio, "timeout", raising=False)
     source = PrioritySourceJob(namespace="runner", name="eval-job")
     release = Release(
         __file__, None, ValuesSource.none(), None, priority_source_job=source
@@ -547,7 +547,7 @@ async def test_priority_lookup_uses_remaining_install_deadline_without_asyncio_t
         side_effect=lambda *_: time.sleep(0.05),
     ):
         with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-            with pytest.raises(TimeoutError):
+            with pytest.raises(asyncio.TimeoutError):
                 await release._install(None, time.monotonic() + 0.001, upgrade=False)
 
     mock_run.assert_not_called()
