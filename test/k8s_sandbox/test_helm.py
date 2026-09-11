@@ -533,7 +533,10 @@ async def test_empty_priority_label_does_not_invoke_helm() -> None:
     mock_run.assert_not_called()
 
 
-async def test_priority_lookup_uses_remaining_install_deadline() -> None:
+async def test_priority_lookup_uses_remaining_install_deadline_without_asyncio_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(asyncio, "timeout")
     source = PrioritySourceJob(namespace="runner", name="eval-job")
     release = Release(
         __file__, None, ValuesSource.none(), None, priority_source_job=source

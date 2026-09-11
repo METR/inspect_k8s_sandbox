@@ -312,12 +312,14 @@ class Release:
     ) -> None:
         priority_args: list[str] = []
         if self._priority_source_job is not None:
-            async with asyncio.timeout(max(deadline - time.monotonic(), 0.001)):
-                priority_class = await asyncio.to_thread(
+            priority_class = await asyncio.wait_for(
+                asyncio.to_thread(
                     read_priority_class,
                     self._priority_source_job,
                     self._context_name,
-                )
+                ),
+                timeout=max(deadline - time.monotonic(), 0.001),
+            )
             priority_args.append(
                 "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
                 + _helm_escape(priority_class)
