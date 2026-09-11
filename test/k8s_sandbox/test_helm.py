@@ -3,6 +3,7 @@ import contextlib
 import itertools
 import json
 import logging
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -13,11 +14,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 from inspect_ai.util import ExecResult
+from kubernetes.client.exceptions import ApiException
 from pytest import LogCaptureFixture
 
 from k8s_sandbox._helm import (
     _LIST_PODS_READ_TIMEOUT,
     _SERVICE_LABEL,
+    DEFAULT_CHART,
     DEFAULT_TIMEOUT,
     INSPECT_HELM_LABELS,
     INSPECT_HELM_TIMEOUT,
@@ -40,6 +43,7 @@ from k8s_sandbox._helm import (
 )
 from k8s_sandbox._kubernetes_api import get_default_namespace, k8s_client
 from k8s_sandbox._pod.snapshot import PodSnapshot
+from k8s_sandbox._priority import PRIORITY_LABEL, PrioritySourceJob
 from k8s_sandbox._sandbox_environment import _key_to_pascal, _metadata_to_extra_values
 
 
@@ -387,6 +391,185 @@ async def test_helm_install_no_extra_values() -> None:
     mock_run.assert_called_once()
     args = mock_run.call_args[0][1]
     assert not any(arg.startswith("--set-string=sampleMetadata") for arg in args)
+
+
+async def test_helm_install_without_priority_source_does_not_read_job() -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+
+    with patch("k8s_sandbox._helm.read_priority_class") as read_priority:
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            _helm_installed(mock_run)
+            await release.install()
+
+    read_priority.assert_not_called()
+
+
+async def test_helm_install_reads_priority_on_every_attempt() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    release = Release(
+        __file__, None, ValuesSource.none(), "dev-context", priority_source_job=source
+    )
+
+    with patch(
+        "k8s_sandbox._helm.read_priority_class", side_effect=["medium", "high"]
+    ) as read_priority:
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            _helm_installed(mock_run)
+            await release.install()
+            await release.install()
+
+    assert read_priority.call_args_list == [
+        ((source, "dev-context"),),
+        ((source, "dev-context"),),
+    ]
+    first_args = mock_run.call_args_list[0].args[1]
+    second_args = mock_run.call_args_list[1].args[1]
+    prefix = "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
+    assert f"{prefix}medium" in first_args
+    assert f"{prefix}high" in second_args
+
+
+async def test_priority_source_trusted_override_is_last(tmp_path: Path) -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    key = "labels.kueue.x-k8s.io/priority-class"
+    values = tmp_path / "values.yaml"
+    values.write_text(f'labels:\n  "{PRIORITY_LABEL}": from-values\n')
+    release = Release(
+        __file__,
+        None,
+        StaticValuesSource(values),
+        None,
+        extra_values={key: "low", "labels.other": "kept"},
+        priority_source_job=source,
+    )
+
+    with patch("k8s_sandbox._helm.read_priority_class", return_value="high"):
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            _helm_installed(mock_run)
+            await release.install()
+
+    args = mock_run.call_args.args[1]
+    user_override = "--set-string=labels\\.kueue\\.x-k8s\\.io/priority-class=low"
+    trusted_override = "--set-string=labels.kueue\\.x-k8s\\.io/priority-class=high"
+    assert args.index(trusted_override) > args.index(user_override)
+    assert trusted_override == args[-1]
+
+
+async def test_resource_quota_retry_reads_priority_again() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    release = Release(
+        __file__, None, ValuesSource.none(), None, priority_source_job=source
+    )
+    resource_quota_conflict = ExecResult(
+        False,
+        1,
+        "",
+        "Error: INSTALLATION FAILED: create: failed to create: Operation cannot be "
+        'fulfilled on resourcequotas "resource-quota": the object has been '
+        "modified; please apply your changes to the latest version and try again\n",
+    )
+    installed = ExecResult(True, 0, _manifest(_STATEFUL_SET), "")
+
+    with patch("k8s_sandbox._helm.INSTALL_RETRY_DELAY_SECONDS", 0):
+        with patch(
+            "k8s_sandbox._helm.read_priority_class", side_effect=["medium", "high"]
+        ) as read_priority:
+            with patch(
+                "k8s_sandbox._helm._run_subprocess",
+                autospec=True,
+                side_effect=[resource_quota_conflict, installed],
+            ) as mock_run:
+                await release.install()
+
+    assert read_priority.call_count == 2
+    priority_args = [
+        next(arg for arg in call.args[1] if "priority-class=" in arg)
+        for call in mock_run.call_args_list
+    ]
+    assert priority_args == [
+        "--set-string=labels.kueue\\.x-k8s\\.io/priority-class=medium",
+        "--set-string=labels.kueue\\.x-k8s\\.io/priority-class=high",
+    ]
+
+
+async def test_failed_priority_lookup_does_not_invoke_helm() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    release = Release(
+        __file__, None, ValuesSource.none(), None, priority_source_job=source
+    )
+    error = ApiException(status=403, reason="Forbidden")
+
+    with patch("k8s_sandbox._helm.read_priority_class", side_effect=error):
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            with pytest.raises(ApiException) as excinfo:
+                await release.install()
+
+    assert excinfo.value is error
+    mock_run.assert_not_called()
+
+
+async def test_priority_lookup_uses_remaining_install_deadline() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    release = Release(
+        __file__, None, ValuesSource.none(), None, priority_source_job=source
+    )
+
+    with patch(
+        "k8s_sandbox._helm.read_priority_class",
+        side_effect=lambda *_: time.sleep(0.05),
+    ):
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            with pytest.raises(TimeoutError):
+                await release._install(None, time.monotonic() + 0.001, upgrade=False)
+
+    mock_run.assert_not_called()
+
+
+def test_priority_label_renders_on_every_statefulset(tmp_path: Path) -> None:
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        "services:\n"
+        "  default:\n"
+        "    image: python:3.12\n"
+        "  helper:\n"
+        "    image: python:3.12\n"
+        "labels:\n"
+        "  existing-label: kept\n"
+    )
+    user_override = "labels.kueue\\.x-k8s\\.io/priority-class=low"
+    trusted_override = "labels.kueue\\.x-k8s\\.io/priority-class=high"
+
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "my-release",
+            str(DEFAULT_CHART),
+            "--values",
+            str(values),
+            f"--set-string={user_override}",
+            f"--set-string={trusted_override}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    statefulsets = [
+        document
+        for document in yaml.safe_load_all(result.stdout)
+        if document and document.get("kind") == "StatefulSet"
+    ]
+
+    assert len(statefulsets) == 2
+    for statefulset in statefulsets:
+        labels = statefulset["metadata"]["labels"]
+        pod_labels = statefulset["spec"]["template"]["metadata"]["labels"]
+        assert labels[PRIORITY_LABEL] == "high"
+        assert pod_labels[PRIORITY_LABEL] == "high"
+        assert labels["existing-label"] == "kept"
+        assert pod_labels["existing-label"] == "kept"
+        assert "kueue" not in labels
+        assert "kueue" not in pod_labels
 
 
 @pytest.mark.parametrize(
