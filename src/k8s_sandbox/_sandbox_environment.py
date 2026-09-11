@@ -53,6 +53,7 @@ from k8s_sandbox._pod.error import (
 )
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._prereqs import validate_prereqs
+from k8s_sandbox._priority import PrioritySourceJob
 from k8s_sandbox.compose._compose import (
     ComposeConfigValuesSource,
     ComposeValuesSource,
@@ -456,6 +457,8 @@ class K8sSandboxEnvironmentConfig(BaseModel, frozen=True):
     restarted_container_behavior: Literal["warn", "raise"] = "warn"
     max_pod_ops: int | None = None
     """Maximum number of concurrent pod operations. Defaults to cpu_count * 4."""
+    priority_source_job: PrioritySourceJob | None = None
+    """A Kubernetes Job whose Kueue admission priority should be inherited."""
 
 
 def _key_to_pascal(key: str) -> str:
@@ -562,6 +565,7 @@ def _create_release(
         config.restarted_container_behavior,
         sample_uuid=sample_uuid,
         extra_values=extra_values,
+        priority_source_job=config.priority_source_job,
     )
 
 
@@ -575,6 +579,7 @@ class _ResolvedConfig(BaseModel, frozen=True):
     restarted_container_behavior: Literal["warn", "raise"]
     compose_config: BaseModel | None = None
     max_pod_ops: int | None
+    priority_source_job: PrioritySourceJob | None = None
 
 
 def _create_values_source(config: _ResolvedConfig) -> ValuesSource:
@@ -627,6 +632,7 @@ def _validate_and_resolve_k8s_sandbox_config(
             default_user=None,
             restarted_container_behavior="warn",
             max_pod_ops=None,
+            priority_source_job=None,
         )
     if isinstance(config, K8sSandboxEnvironmentConfig):
         chart = Path(config.chart).resolve() if config.chart else None
@@ -641,6 +647,7 @@ def _validate_and_resolve_k8s_sandbox_config(
             default_user=config.default_user,
             restarted_container_behavior=config.restarted_container_behavior,
             max_pod_ops=config.max_pod_ops,
+            priority_source_job=config.priority_source_job,
         )
     if isinstance(config, ComposeConfig):
         return _ResolvedConfig(
@@ -651,6 +658,7 @@ def _validate_and_resolve_k8s_sandbox_config(
             restarted_container_behavior="warn",
             compose_config=config,
             max_pod_ops=None,
+            priority_source_job=None,
         )
     if isinstance(config, str):
         if is_compose_yaml(config) or is_dockerfile(config):
@@ -663,6 +671,7 @@ def _validate_and_resolve_k8s_sandbox_config(
                 restarted_container_behavior="warn",
                 compose_config=compose_config,
                 max_pod_ops=None,
+                priority_source_job=None,
             )
         values = Path(config).resolve()
         validate_values_file(values)
@@ -673,6 +682,7 @@ def _validate_and_resolve_k8s_sandbox_config(
             default_user=None,
             restarted_container_behavior="warn",
             max_pod_ops=None,
+            priority_source_job=None,
         )
     raise TypeError(
         f"Invalid 'SandboxEnvironmentConfigType | None' type: {type(config)}."

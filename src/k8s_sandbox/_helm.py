@@ -36,6 +36,7 @@ from k8s_sandbox._logger import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
+from k8s_sandbox._priority import PrioritySourceJob, read_priority_class
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
 DEFAULT_TIMEOUT = 600  # 10 minutes
@@ -203,6 +204,7 @@ class Release:
         restarted_container_behavior: Literal["warn", "raise"] = "warn",
         sample_uuid: str | None = None,
         extra_values: dict[str, str] | None = None,
+        priority_source_job: PrioritySourceJob | None = None,
     ) -> None:
         self.task_name = task_name
         self._chart_path = chart_path or DEFAULT_CHART
@@ -214,6 +216,7 @@ class Release:
         self.restarted_container_behavior = restarted_container_behavior
         self.sample_uuid = sample_uuid
         self._extra_values = dict(extra_values) if extra_values else {}
+        self._priority_source_job = priority_source_job
         # The sandboxes the rendered chart declares; set by _install().
         self._expected_services: frozenset[str] = frozenset()
         # The pods readiness confirmed; set by install() and consumed by
@@ -307,6 +310,21 @@ class Release:
     async def _install(
         self, values: Path | None, deadline: float, upgrade: bool
     ) -> None:
+        priority_args: list[str] = []
+        if self._priority_source_job is not None:
+            priority_class = await asyncio.wait_for(
+                asyncio.to_thread(
+                    read_priority_class,
+                    self._priority_source_job,
+                    self._context_name,
+                ),
+                timeout=max(deadline - time.monotonic(), 0.001),
+            )
+            priority_args.append(
+                "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
+                + _helm_escape(priority_class)
+            )
+
         # Whilst `upgrade --install` could always be used, prefer explicitly using
         # `install` for the first attempt.
         subcommand = ["upgrade", "--install"] if upgrade else ["install"]
@@ -346,7 +364,8 @@ class Release:
                 for k, v in self._extra_values.items()
             ]
             + _kubeconfig_context_args(self._context_name)
-            + values_args,
+            + values_args
+            + priority_args,
             capture_output=True,
         )
         if not result.success:
