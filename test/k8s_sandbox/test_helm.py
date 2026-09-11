@@ -508,6 +508,31 @@ async def test_failed_priority_lookup_does_not_invoke_helm() -> None:
     mock_run.assert_not_called()
 
 
+async def test_empty_priority_label_does_not_invoke_helm() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    release = Release(
+        __file__, None, ValuesSource.none(), None, priority_source_job=source
+    )
+    batch_client = MagicMock()
+    batch_client.read_namespaced_job.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(labels={PRIORITY_LABEL: ""})
+    )
+
+    with patch(
+        "k8s_sandbox._priority.k8s_client",
+        return_value=SimpleNamespace(api_client=object()),
+    ):
+        with patch(
+            "k8s_sandbox._priority.client.BatchV1Api", return_value=batch_client
+        ):
+            with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+                _helm_installed(mock_run)
+                with pytest.raises(ValueError, match=PRIORITY_LABEL):
+                    await release.install()
+
+    mock_run.assert_not_called()
+
+
 async def test_priority_lookup_uses_remaining_install_deadline() -> None:
     source = PrioritySourceJob(namespace="runner", name="eval-job")
     release = Release(

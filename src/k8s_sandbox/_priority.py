@@ -28,9 +28,10 @@ def read_priority_class(source: PrioritySourceJob, context: str | None) -> str:
         _request_timeout=_READ_JOB_REQUEST_TIMEOUT,  # type: ignore[call-arg]
     )
     labels = job.metadata.labels if job.metadata is not None else None
-    if labels is None or PRIORITY_LABEL not in labels:
+    priority = (labels or {}).get(PRIORITY_LABEL)
+    if not priority:
         raise ValueError(
             f"Priority source Job '{source.namespace}/{source.name}' does not have "
             f"the required '{PRIORITY_LABEL}' label."
         )
-    return labels[PRIORITY_LABEL]
+    return priority
