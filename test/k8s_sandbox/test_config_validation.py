@@ -1,11 +1,19 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from inspect_ai.util import ComposeBuild, ComposeConfig
 from pydantic import BaseModel
 
-from k8s_sandbox import K8sSandboxEnvironment, K8sSandboxEnvironmentConfig
-from k8s_sandbox._sandbox_environment import _validate_and_resolve_k8s_sandbox_config
+from k8s_sandbox import (
+    K8sSandboxEnvironment,
+    K8sSandboxEnvironmentConfig,
+    PrioritySourceJob,
+)
+from k8s_sandbox._sandbox_environment import (
+    _create_release,
+    _validate_and_resolve_k8s_sandbox_config,
+)
 
 VALID_VALUES = str(Path(__file__).parent / "resources" / "values.yaml")
 
@@ -47,13 +55,44 @@ async def test_invalid_config_type() -> None:
 
 def test_can_serialize_and_deserialize_config() -> None:
     original = K8sSandboxEnvironmentConfig(
-        chart="my-chart", values=Path("my-values.yaml"), context="my-context"
+        chart="my-chart",
+        values=Path("my-values.yaml"),
+        context="my-context",
+        priority_source_job=PrioritySourceJob(namespace="runner", name="eval-job"),
     )
 
     as_json = original.model_dump()
     recreated = K8sSandboxEnvironmentConfig.model_validate(as_json)
 
     assert recreated == original
+
+
+def test_config_deserializes_priority_source_job() -> None:
+    result = K8sSandboxEnvironment.config_deserialize(
+        {
+            "priority_source_job": {
+                "namespace": "runner",
+                "name": "eval-job",
+            }
+        }
+    )
+
+    assert isinstance(result, K8sSandboxEnvironmentConfig)
+    assert result.priority_source_job == PrioritySourceJob(
+        namespace="runner", name="eval-job"
+    )
+
+
+def test_priority_source_job_is_forwarded_to_release() -> None:
+    source = PrioritySourceJob(namespace="runner", name="eval-job")
+    resolved = _validate_and_resolve_k8s_sandbox_config(
+        K8sSandboxEnvironmentConfig(priority_source_job=source)
+    )
+
+    with patch("k8s_sandbox._helm.get_default_namespace", return_value="default"):
+        release = _create_release("task", resolved)
+
+    assert release._priority_source_job is source
 
 
 def test_is_docker_compatible() -> None:
@@ -89,6 +128,7 @@ def test_validate_compose_config() -> None:
     assert resolved.chart is None
     assert resolved.values is None
     assert resolved.compose_config is compose_config
+    assert resolved.priority_source_job is None
 
 
 def test_validate_dockerfile_str_config(tmp_path: Path) -> None:
@@ -100,6 +140,7 @@ def test_validate_dockerfile_str_config(tmp_path: Path) -> None:
     assert resolved.chart is None
     assert resolved.values is None
     assert resolved.compose_config is not None
+    assert resolved.priority_source_job is None
     compose_config = resolved.compose_config
     assert isinstance(compose_config, ComposeConfig)
     assert "default" in compose_config.services
@@ -128,3 +169,4 @@ def test_validate_helm_values_str_config_unchanged() -> None:
     resolved = _validate_and_resolve_k8s_sandbox_config(VALID_VALUES)
     assert resolved.values is not None
     assert resolved.compose_config is None
+    assert resolved.priority_source_job is None

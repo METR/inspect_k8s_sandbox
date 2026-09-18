@@ -33,9 +33,11 @@ from k8s_sandbox._logger import (
     inspect_trace_action,
     log_debug,
     log_trace,
+    log_warn,
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
+from k8s_sandbox._priority import PrioritySourceJob, read_priority_class
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
 DEFAULT_TIMEOUT = 600  # 10 minutes
@@ -43,6 +45,8 @@ MAX_INSTALL_ATTEMPTS = 3
 _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
+# Leave time for installation when the optional live priority read stalls.
+_PRIORITY_READ_TIMEOUT = 5  # seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
 INSPECT_HELM_TIMEOUT = "INSPECT_HELM_TIMEOUT"
 INSPECT_HELM_UNINSTALL_TIMEOUT = "INSPECT_HELM_UNINSTALL_TIMEOUT"
@@ -203,6 +207,7 @@ class Release:
         restarted_container_behavior: Literal["warn", "raise"] = "warn",
         sample_uuid: str | None = None,
         extra_values: dict[str, str] | None = None,
+        priority_source_job: PrioritySourceJob | None = None,
     ) -> None:
         self.task_name = task_name
         self._chart_path = chart_path or DEFAULT_CHART
@@ -214,6 +219,7 @@ class Release:
         self.restarted_container_behavior = restarted_container_behavior
         self.sample_uuid = sample_uuid
         self._extra_values = dict(extra_values) if extra_values else {}
+        self._priority_source_job = priority_source_job
         # The sandboxes the rendered chart declares; set by _install().
         self._expected_services: frozenset[str] = frozenset()
         # The pods readiness confirmed; set by install() and consumed by
@@ -307,6 +313,34 @@ class Release:
     async def _install(
         self, values: Path | None, deadline: float, upgrade: bool
     ) -> None:
+        priority_args: list[str] = []
+        source = self._priority_source_job
+        if source is not None:
+            try:
+                priority_class = await asyncio.wait_for(
+                    asyncio.to_thread(read_priority_class, source, self._context_name),
+                    timeout=min(
+                        _PRIORITY_READ_TIMEOUT,
+                        max(deadline - time.monotonic(), 0.001),
+                    ),
+                )
+            except Exception as e:
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError(
+                        "Helm install deadline expired while reading Job priority."
+                    ) from e
+                log_warn(
+                    "Failed to read Job priority; using configured priority.",
+                    release=self.release_name,
+                    priority_source_job=f"{source.namespace}/{source.name}",
+                    error=f"{type(e).__name__}: {e}",
+                )
+            else:
+                priority_args.append(
+                    "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
+                    + _helm_escape(priority_class)
+                )
+
         # Whilst `upgrade --install` could always be used, prefer explicitly using
         # `install` for the first attempt.
         subcommand = ["upgrade", "--install"] if upgrade else ["install"]
@@ -346,7 +380,8 @@ class Release:
                 for k, v in self._extra_values.items()
             ]
             + _kubeconfig_context_args(self._context_name)
-            + values_args,
+            + values_args
+            + priority_args,
             capture_output=True,
         )
         if not result.success:
