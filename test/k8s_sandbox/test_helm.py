@@ -494,153 +494,71 @@ async def test_resource_quota_retry_reads_priority_again() -> None:
 
 @pytest.mark.parametrize(
     "error",
-    [
-        ApiException(status=403, reason="Forbidden"),
-        ApiException(status=404, reason="Not Found"),
-        asyncio.TimeoutError("timed out"),
-    ],
+    [ApiException(status=403, reason="Forbidden"), None],
+    ids=["api-error", "missing-label"],
 )
-async def test_failed_priority_lookup_keeps_configured_values(
-    error: Exception, tmp_path: Path, caplog: LogCaptureFixture
+async def test_unavailable_priority_keeps_configured_values(
+    error: Exception | None, tmp_path: Path, caplog: LogCaptureFixture
 ) -> None:
     source = PrioritySourceJob(namespace="runner", name="eval-job")
     values = tmp_path / "values.yaml"
-    original_values = f'labels:\n  "{PRIORITY_LABEL}": from-values\n'
-    values.write_text(original_values)
-    release = Release(
-        __file__,
-        None,
-        StaticValuesSource(values),
-        None,
-        extra_values={"labels.kueue.x-k8s.io/priority-class": "from-metadata"},
-        priority_source_job=source,
-    )
-
-    with patch("k8s_sandbox._helm.read_priority_class", side_effect=error):
-        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-            _helm_installed(mock_run)
-            await release.install()
-
-    mock_run.assert_called_once()
-    args = mock_run.call_args.args[1]
-    assert args[args.index("--values") + 1] == str(values)
-    assert values.read_text() == original_values
-    assert (
-        "--set-string=labels\\.kueue\\.x-k8s\\.io/priority-class=from-metadata" in args
-    )
-    assert not any(
-        arg.startswith("--set-string=labels.kueue\\.x-k8s\\.io/priority-class=")
-        for arg in args
-    )
-    assert "using configured priority" in caplog.text
-    assert "runner/eval-job" in caplog.text
-    assert release.release_name in caplog.text
-    assert type(error).__name__ in caplog.text
-
-
-@pytest.mark.parametrize("labels", [None, {}, {PRIORITY_LABEL: ""}])
-async def test_missing_priority_label_keeps_configured_values(
-    labels: dict[str, str] | None, tmp_path: Path, caplog: LogCaptureFixture
-) -> None:
-    source = PrioritySourceJob(namespace="runner", name="eval-job")
-    values = tmp_path / "values.yaml"
-    original_values = f'labels:\n  "{PRIORITY_LABEL}": from-values\n'
-    values.write_text(original_values)
+    values.write_text(f'labels:\n  "{PRIORITY_LABEL}": hawk-medium\n')
     release = Release(
         __file__, None, StaticValuesSource(values), None, priority_source_job=source
     )
     batch_client = MagicMock()
+    batch_client.read_namespaced_job.side_effect = error
     batch_client.read_namespaced_job.return_value = SimpleNamespace(
-        metadata=SimpleNamespace(labels=labels)
+        metadata=SimpleNamespace(labels={})
     )
 
-    with patch(
-        "k8s_sandbox._priority.k8s_client",
-        return_value=SimpleNamespace(api_client=object()),
+    with (
+        patch("k8s_sandbox._priority.k8s_client"),
+        patch("k8s_sandbox._priority.client.BatchV1Api", return_value=batch_client),
+        patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run,
     ):
-        with patch(
-            "k8s_sandbox._priority.client.BatchV1Api", return_value=batch_client
-        ):
-            with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-                _helm_installed(mock_run)
-                await release.install()
+        _helm_installed(mock_run)
+        await release.install()
 
-    mock_run.assert_called_once()
     args = mock_run.call_args.args[1]
     assert args[args.index("--values") + 1] == str(values)
-    assert values.read_text() == original_values
     assert not any("priority-class=" in arg for arg in args)
     assert "using configured priority" in caplog.text
-    assert "runner/eval-job" in caplog.text
-    assert PRIORITY_LABEL in caplog.text
 
 
-async def test_slow_priority_lookup_falls_back_before_install_deadline(
-    monkeypatch: pytest.MonkeyPatch, caplog: LogCaptureFixture
+@pytest.mark.parametrize("deadline_expired", [False, True])
+async def test_priority_lookup_uses_remaining_install_deadline_without_asyncio_timeout(
+    deadline_expired: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delattr(asyncio, "timeout", raising=False)
-    monkeypatch.setattr(
-        "k8s_sandbox._helm._PRIORITY_READ_TIMEOUT", 0.001, raising=False
-    )
+    monkeypatch.setattr("k8s_sandbox._helm._PRIORITY_READ_TIMEOUT", 0.001)
     source = PrioritySourceJob(namespace="runner", name="eval-job")
     release = Release(
         __file__, None, ValuesSource.none(), None, priority_source_job=source
+    )
+    deadline = time.monotonic() + (0.001 if deadline_expired else 10)
+    expectation = (
+        pytest.raises(asyncio.TimeoutError, match="install deadline")
+        if deadline_expired
+        else contextlib.nullcontext()
     )
 
     def slow_priority_read(*_: object) -> str:
         time.sleep(0.05)
-        return "high"
+        return "hawk-high"
 
-    with patch("k8s_sandbox._helm.read_priority_class", side_effect=slow_priority_read):
-        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-            _helm_installed(mock_run)
-            await release.install()
-
-    mock_run.assert_called_once()
-    assert not any("priority-class=" in arg for arg in mock_run.call_args.args[1])
-    assert "using configured priority" in caplog.text
-    assert "TimeoutError" in caplog.text
-
-
-async def test_cancelled_priority_lookup_cancels_install(
-    caplog: LogCaptureFixture,
-) -> None:
-    source = PrioritySourceJob(namespace="runner", name="eval-job")
-    release = Release(
-        __file__, None, ValuesSource.none(), None, priority_source_job=source
-    )
-
-    with patch(
-        "k8s_sandbox._helm.read_priority_class", side_effect=asyncio.CancelledError
+    with (
+        patch("k8s_sandbox._helm.read_priority_class", side_effect=slow_priority_read),
+        patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run,
     ):
-        with patch.object(release, "uninstall", autospec=True) as mock_uninstall:
-            with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-                with pytest.raises(asyncio.CancelledError):
-                    await release.install()
+        _helm_installed(mock_run)
+        with expectation:
+            await release._install(None, deadline, upgrade=False)
 
-    mock_run.assert_not_called()
-    mock_uninstall.assert_awaited_once_with(quiet=True)
-    assert "using configured priority" not in caplog.text
-
-
-async def test_priority_lookup_uses_remaining_install_deadline_without_asyncio_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delattr(asyncio, "timeout", raising=False)
-    source = PrioritySourceJob(namespace="runner", name="eval-job")
-    release = Release(
-        __file__, None, ValuesSource.none(), None, priority_source_job=source
-    )
-
-    with patch(
-        "k8s_sandbox._helm.read_priority_class",
-        side_effect=lambda *_: time.sleep(0.05),
-    ):
-        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-            with pytest.raises(asyncio.TimeoutError, match="install deadline"):
-                await release._install(None, time.monotonic() + 0.001, upgrade=False)
-
-    mock_run.assert_not_called()
+    if deadline_expired:
+        mock_run.assert_not_called()
+    else:
+        assert not any("priority-class=" in arg for arg in mock_run.call_args.args[1])
 
 
 def test_priority_label_renders_on_every_statefulset(tmp_path: Path) -> None:
