@@ -4,6 +4,8 @@
 
 - Add optional `priority_source_job` sandbox configuration to inherit Kueue admission
   priority from a Kubernetes Job.
+- Warn and keep the configured Kueue priority if `priority_source_job` cannot be
+  read or has no priority label; stop waiting for the lookup after five seconds.
 - `network_mode: none` isolation is now enforced by omitting any ingress allow for the
   service rather than an unconditional ingress deny. Observable behaviour is unchanged
   for a chart used on its own, but a network policy layered on top of this chart (e.g.

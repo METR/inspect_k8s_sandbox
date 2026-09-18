@@ -33,6 +33,7 @@ from k8s_sandbox._logger import (
     inspect_trace_action,
     log_debug,
     log_trace,
+    log_warn,
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
@@ -44,6 +45,8 @@ MAX_INSTALL_ATTEMPTS = 3
 _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
+# Leave time for installation when the optional live priority read stalls.
+_PRIORITY_READ_TIMEOUT = 5  # seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
 INSPECT_HELM_TIMEOUT = "INSPECT_HELM_TIMEOUT"
 INSPECT_HELM_UNINSTALL_TIMEOUT = "INSPECT_HELM_UNINSTALL_TIMEOUT"
@@ -311,19 +314,32 @@ class Release:
         self, values: Path | None, deadline: float, upgrade: bool
     ) -> None:
         priority_args: list[str] = []
-        if self._priority_source_job is not None:
-            priority_class = await asyncio.wait_for(
-                asyncio.to_thread(
-                    read_priority_class,
-                    self._priority_source_job,
-                    self._context_name,
-                ),
-                timeout=max(deadline - time.monotonic(), 0.001),
-            )
-            priority_args.append(
-                "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
-                + _helm_escape(priority_class)
-            )
+        source = self._priority_source_job
+        if source is not None:
+            try:
+                priority_class = await asyncio.wait_for(
+                    asyncio.to_thread(read_priority_class, source, self._context_name),
+                    timeout=min(
+                        _PRIORITY_READ_TIMEOUT,
+                        max(deadline - time.monotonic(), 0.001),
+                    ),
+                )
+            except Exception as e:
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError(
+                        "Helm install deadline expired while reading Job priority."
+                    ) from e
+                log_warn(
+                    "Failed to read Job priority; using configured priority.",
+                    release=self.release_name,
+                    priority_source_job=f"{source.namespace}/{source.name}",
+                    error=f"{type(e).__name__}: {e}",
+                )
+            else:
+                priority_args.append(
+                    "--set-string=labels.kueue\\.x-k8s\\.io/priority-class="
+                    + _helm_escape(priority_class)
+                )
 
         # Whilst `upgrade --install` could always be used, prefer explicitly using
         # `install` for the first attempt.
