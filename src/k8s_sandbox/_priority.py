@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from k8s_sandbox._kubernetes_api import k8s_client
 
 PRIORITY_LABEL = "kueue.x-k8s.io/priority-class"
-_READ_JOB_REQUEST_TIMEOUT = (5, 30)
+_READ_JOB_REQUEST_TIMEOUT = (2, 3)
 
 
 class PrioritySourceJob(BaseModel):

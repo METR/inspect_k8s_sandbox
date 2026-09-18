@@ -33,7 +33,7 @@ def test_read_priority_class_from_job_label(priority_class: str) -> None:
     batch_client.read_namespaced_job.assert_called_once_with(
         name="eval-job",
         namespace="runner",
-        _request_timeout=(5, 30),
+        _request_timeout=(2, 3),
     )
 
 
