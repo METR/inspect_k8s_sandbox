@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix sandbox startup failing with `is not valid SemVer string` when Helm prints a
+  trailing newline and `semver` 3.1 or later is installed.
+
 - `network_mode: none` isolation is now enforced by omitting any ingress allow for the
   service rather than an unconditional ingress deny. Observable behaviour is unchanged
   for a chart used on its own, but a network policy layered on top of this chart (e.g.
