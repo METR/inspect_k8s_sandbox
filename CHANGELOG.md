@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The CoreDNS sidecar's `Corefile` is now mounted as a directory rather than with
+  `subPath`. A new `corednsUpstream` value (a list of DNS server IPs, e.g. the cluster
+  DNS Service IP) replaces the `/etc/resolv.conf` `subPath` mount with
+  `dnsPolicy: None`, for runtimes such as Kata Containers that do not support
+  `subPath`. Init containers cannot resolve names in that mode.
+
 - Fix sandbox startup failing with `is not valid SemVer string` when Helm prints a
   trailing newline and `semver` 3.1 or later is installed.
 
