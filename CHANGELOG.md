@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The CoreDNS sidecar's `Corefile` is now mounted as a directory rather than with
+  `subPath`. A new `corednsUpstream` value (a list of DNS server IPs, e.g. the cluster
+  DNS Service IP) replaces the `/etc/resolv.conf` `subPath` mount with
+  `dnsPolicy: None`, for runtimes such as Kata Containers that do not support
+  `subPath`. Init containers cannot resolve names in that mode.
+
 - **BREAKING CHANGE**: The CoreDNS sidecar now runs as UID/GID 65532 on a read-only root
   filesystem with only `NET_BIND_SERVICE`. A custom `corednsImage` must run under that
   context; set the new `corednsSecurityContext` if it cannot. The default image moves
