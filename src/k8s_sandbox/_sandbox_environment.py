@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import sys
@@ -347,6 +348,16 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 return (
                     temp_file.read() if not text else temp_file.read().decode("utf-8")
                 )
+
+    async def tools_network_host(self) -> str | None:
+        """SPIKE: the pod IP, so the sandbox-tools server is reached over the network.
+
+        Opt-in with `INSPECT_K8S_SANDBOX_TOOLS_NETWORK=1`. The deployment must allow
+        ingress from the Inspect process to the sandbox pod on the tools port.
+        """
+        if not os.environ.get("INSPECT_K8S_SANDBOX_TOOLS_NETWORK"):
+            return None
+        return await self._pod.pod_ip()
 
     async def connection(self, *, user: str | None = None) -> SandboxConnection:
         if user is None:

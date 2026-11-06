@@ -8,6 +8,7 @@ from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
+from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
@@ -210,6 +211,17 @@ class Pod:
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
         await self._run_async(lambda: reader.read_file(src, dst))
+
+    async def pod_ip(self) -> str | None:
+        """SPIKE: the pod's IP on the pod network (None until one is assigned)."""
+
+        def read() -> str | None:
+            pod = k8s_client(self._info.context_name).read_namespaced_pod(
+                name=self._info.name, namespace=self._info.namespace
+            )
+            return pod.status.pod_ip if pod.status else None
+
+        return await self._run_async(read)
 
     async def _run_async(self, callable: Callable[[], T]) -> T:
         """Run a synchronous function asynchronously."""
