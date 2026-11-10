@@ -36,7 +36,7 @@ _CLOSE_GROUP = "}\n"
 logger = logging.getLogger(__name__)
 
 
-def _shell_command(user: str | None, switch: bool | None = None) -> list[str]:
+def _shell_command(user: str | None, switch: bool = False) -> list[str]:
     """The command to open the interactive shell an exec() runs inside.
 
     When a user is requested, only reach for `runuser` if the container is not
@@ -48,12 +48,15 @@ def _shell_command(user: str | None, switch: bool | None = None) -> list[str]:
     inherits from the container instead.
 
     `switch` is whether a probe of the container (ExecuteOperation.probe_switch)
-    found that it needs `runuser` for this user. Until it has been probed, or if the
-    container has no `runuser`, the shell checks for itself, which costs two more
-    process starts per exec. `sh -c` takes its script from argv, so stdin reaches
-    whichever shell is exec'd unread, and the caller's protocol is unchanged.
+    found that it needs `runuser` for this user, and that `runuser` works. Otherwise
+    the shell checks for itself, which costs two more process starts per exec. It does
+    even where the probe found the container already running as the user: a pod
+    replaced under the same name since might not, and a plain shell would then run the
+    command as someone else, where `runuser` can only switch or fail. `sh -c` takes its
+    script from argv, so stdin reaches whichever shell is exec'd unread, and the
+    caller's protocol is unchanged.
     """
-    if user is None or switch is False:
+    if user is None:
         return ["/bin/sh"]
     if not user or switch:
         # An empty user matches nothing; leave runuser to reject it as it did before.
@@ -93,7 +96,7 @@ class ExecuteOperation(PodOperation):
         env: dict[str, str],
         user: str | None,
         timeout: int | None,
-        switch: bool | None = None,
+        switch: bool = False,
     ) -> ExecResult[str]:
         # The shell ends the command's output with this marker. It holds a random value
         # made up for this exec, so nothing the command prints can be taken for it.
@@ -117,16 +120,17 @@ class ExecuteOperation(PodOperation):
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
-    def probe_switch(self, user: str) -> bool | None:
-        """Whether this container needs `runuser` to run exec(user=...) as `user`.
+    def probe_switch(self, user: str) -> bool:
+        """Whether exec(user=...) can start `runuser` directly to run as `user`.
 
-        None if it would, but `runuser` can't switch to them here (it is missing, the
-        user doesn't exist, or the container may not switch users): the shell's own
-        check then reports that on each exec, as before. Starting `runuser` directly
-        only once it is known to work matters: one that fails at once ends the exec
-        before its script arrives, and the server then resets the connection, losing
-        the error. The answer is the exit status the exec's status channel reports,
-        so nothing the container prints can change it.
+        True if the container isn't running as `user` and `runuser` can switch to them.
+        Otherwise (it already runs as them, `runuser` is missing, the user doesn't
+        exist, or the container may not switch users) the shell's own check handles
+        each exec, as before. Starting `runuser` directly only once it is known to work
+        matters: one that fails at once ends the exec before its script arrives, and
+        the server then resets the connection, losing the error. The answer is the exit
+        status the exec's status channel reports, so nothing the container prints can
+        change it.
         """
         quoted = shlex.quote(user)
         probe = (
@@ -144,7 +148,7 @@ class ExecuteOperation(PodOperation):
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
             returncode = get_returncode(ws_client)
-        return {0: False, 1: True}.get(returncode)
+        return returncode == 1
 
     @contextmanager
     def _interactive_shell(self, command: list[str]) -> Generator[WSClient, None, None]:

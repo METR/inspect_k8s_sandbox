@@ -17,7 +17,7 @@
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).
 - `exec(user=...)` runs fewer programs per call after its first call as each user,
-  where the container runs as that user or can switch to them.
+  where the container switches to that user.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

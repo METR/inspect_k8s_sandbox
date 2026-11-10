@@ -982,9 +982,8 @@ class TestShellCommand:
         assert '[ "$(id -u 2>/dev/null)" = 1000 ]' in by_uid
         assert "id -un" not in by_uid
 
-    def test_a_probed_container_opens_the_shell_it_needs(self) -> None:
-        """No check, and so two fewer process starts, once a probe has answered."""
-        assert _shell_command("agent", switch=False) == ["/bin/sh"]
+    def test_runuser_is_started_directly_once_a_probe_found_it_works(self) -> None:
+        """No check, and so two fewer process starts."""
         assert _shell_command("agent", switch=True) == [
             "runuser",
             "-u",
@@ -992,6 +991,14 @@ class TestShellCommand:
             "--",
             "/bin/sh",
         ]
+
+    def test_otherwise_the_shell_checks_for_itself(self) -> None:
+        """Even if the container ran as the user when probed.
+
+        A plain shell in a pod replaced since would run as whoever the new one runs as.
+        """
+        assert _shell_command("agent", switch=False) == _shell_command("agent")
+        assert _shell_command("agent")[:2] == ["/bin/sh", "-c"]
 
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
@@ -1023,10 +1030,10 @@ def _probe_script(user: str) -> str:
 
 class TestProbeSwitch:
     @pytest.mark.parametrize(
-        ("returncode", "switch"), [(0, False), (1, True), (2, None)]
+        ("returncode", "switch"), [(0, False), (1, True), (2, False)]
     )
     def test_answer_comes_from_the_exit_status(
-        self, returncode: int, switch: bool | None
+        self, returncode: int, switch: bool
     ) -> None:
         op = ExecuteOperation(MagicMock())
 
