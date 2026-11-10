@@ -239,6 +239,26 @@ class TestScriptInAShell:
         assert result.stdout == b"out\n" + _marker(3)
         assert result.stderr == b"err\n" + _marker(3)
 
+    @pytest.mark.parametrize(
+        "stdin",
+        [
+            pytest.param(
+                bytes(range(256)) * 2 + b"'%s%%\\0\\n\x001\n7", id="every-byte"
+            ),
+            pytest.param("caf\u00e9 'quoted' \"double\" %d \\\n\u03bb", id="text"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_input_reaches_the_command_byte_for_byte(
+        self, shell: list[str], stdin: str | bytes
+    ) -> None:
+        script = _script(["cat"], stdin)
+
+        result = _run_script(shell, script)
+
+        expected = stdin if isinstance(stdin, bytes) else stdin.encode()
+        assert result.stdout == expected + _marker(0)
+
     def test_the_command_cannot_read_the_marker_from_stdin(
         self, shell: list[str]
     ) -> None:
@@ -418,7 +438,7 @@ class TestExecChunksStdin:
         sentinel = ExecResult(success=True, returncode=0, stdout="", stderr="")
         monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: sentinel)
 
-        # The assembled script (base64 input + pipeline) is several hundred bytes,
+        # The assembled script (input + pipeline) is several hundred bytes,
         # well above the 16-byte chunk size, so it splits into many frames.
         result = op.exec(
             ["cat"], stdin=b"x" * 100, cwd=None, env={}, user=None, timeout=None

@@ -1,4 +1,3 @@
-import base64
 import logging
 import re
 import secrets
@@ -27,6 +26,12 @@ COMPLETED_SENTINEL = "completed-sentinel-value"
 # a background process still holds the command's stdout or stderr open.
 STREAM_END_GRACE_SECONDS = 1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
+# Input bytes that can stand as themselves in the single-quoted printf format that
+# pipes input to a command: printable ASCII, less `\`, `%` and the quote.
+_PRINTF_LITERAL = frozenset(range(0x20, 0x7F)) - {ord("\\"), ord("%"), ord("'")}
+# Every other byte is written as a three-digit octal escape, which printf turns back
+# into that byte, null included.
+_PRINTF_ESCAPES = {b: f"\\{b:03o}" for b in range(256) if b not in _PRINTF_LITERAL}
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +137,6 @@ class ExecuteOperation(PodOperation):
             yield f"{self._prefix_timeout(timeout)}{shlex.join(command)}\n"
             # Store the returncode so that the `printf` below doesn't overwrite it.
             yield "returncode=$?\n"
-            # Ensure stdout and stderr are flushed before writing the sentinel value.
-            yield "sync\n"
             # End both streams with the marker and the returncode. The exec's status
             # channel reports the returncode when the shell exits; the markers are for
             # when a background process keeps stdout or stderr, and so the exec, open.
@@ -148,16 +151,13 @@ class ExecuteOperation(PodOperation):
         return "".join(generate())
 
     def _pipe_user_input(self, stdin: str | bytes) -> str:
-        # Encode the user-provided input as base64 for 2 reasons:
-        # 1. To avoid issues with special characters (e.g. new lines) in the input.
-        # 2. To support binary input (e.g. null byte).
-        stdin_b64 = base64.b64encode(
-            stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")
-        ).decode("ascii")
-        # Pipe user input. Simply writing it to the shell's stdin after a command e.g.
-        # `cat` results in `cat` blocking indefinitely as there is no way to close the
-        # stdin stream in v4.channel.k8s.io.
-        return f"echo '{stdin_b64}' | base64 -d | "
+        data = stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")
+        # Pipe user input from printf, a shell builtin, so no process starts for it.
+        # Simply writing it to the shell's stdin after a command e.g. `cat` results in
+        # `cat` blocking indefinitely as there is no way to close the stdin stream in
+        # v4.channel.k8s.io, and a shell reading its script from stdin may read ahead
+        # into the input.
+        return f"printf '{data.decode('latin-1').translate(_PRINTF_ESCAPES)}' | "
 
     def _prefix_timeout(self, timeout: int | None) -> str:
         if timeout is None:
