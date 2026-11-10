@@ -1,201 +1,329 @@
+import json
+import os
 import shlex
+import shutil
+import subprocess
+import sys
+import time
 from contextlib import contextmanager
 from typing import Generator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from inspect_ai.util import ExecResult
-from kubernetes.stream.ws_client import WSClient  # type: ignore
+from kubernetes.stream.ws_client import (  # type: ignore
+    ERROR_CHANNEL,
+    WSClient,
+)
+from kubernetes.stream.ws_client import (
+    STDERR_CHANNEL as STDERR,
+)
+from kubernetes.stream.ws_client import (
+    STDOUT_CHANNEL as STDOUT,
+)
 
+import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import PodError
 from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
 
+MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
 
-def _make_ws_client(
-    stdout_frames: list[bytes],
-    stderr_frames: list[bytes] | None = None,
-    error_after_close: Exception | None = None,
-) -> WSClient:
-    """Create a mock WSClient that delivers frames then optionally raises after close.
 
-    Simulates the real WSClient behavior where, after the sentinel triggers close(),
-    the next call to ws_client.update() (called internally by peek_stdout/peek_stderr)
-    raises BrokenPipeError or ConnectionResetError because the socket is gone.
+def _marker(returncode: int) -> bytes:
+    return f"{MARKER}{returncode}>".encode()
 
-    In the real code, peek_stdout()/peek_stderr() call update(timeout=0) internally,
-    which can raise these errors. We simulate this by having update() raise after
-    close() has been called.
+
+def _status(returncode: int) -> tuple[int, bytes]:
+    """The status channel frame the API server sends as the exec ends."""
+    if returncode == 0:
+        return ERROR_CHANNEL, b'{"metadata":{},"status":"Success"}'
+    cause = {"reason": "ExitCode", "message": str(returncode)}
+    status = {"status": "Failure", "details": {"causes": [cause]}}
+    return ERROR_CHANNEL, json.dumps(status).encode()
+
+
+class _FakeWSClient(WSClient):
+    """A WSClient whose frames come from a list rather than a socket.
+
+    Only update() is replaced, so peek_*() and read_*() behave as they do for real,
+    including peek_*() calling update(timeout=0) and so taking in the next frame.
+
+    Once the frames run out the exec ends (the server closes the connection), unless
+    `ends=False`, which is a background process holding stdout or stderr open: then
+    nothing more ever arrives.
     """
-    ws = MagicMock(spec=WSClient)
 
-    stdout_queue = list(stdout_frames)
-    stderr_queue = list(stderr_frames or [])
-    current_stdout: bytes | None = None
-    current_stderr: bytes | None = None
-    closed = False
+    def __init__(
+        self,
+        frames: list[tuple[int, bytes]],
+        ends: bool = True,
+        error: Exception | None = None,
+    ) -> None:
+        self._connected = True
+        self._channels: dict[int, bytes] = {}
+        self.binary = True
+        self.sock = None
+        self._frames = list(frames)
+        self._ends = ends
+        self._error = error
 
-    def close_ws(**kwargs: object) -> None:
-        nonlocal closed
-        closed = True
-
-    ws.close.side_effect = close_ws
-
-    # After close(), is_open still returns True for one more loop iteration.
-    # This is realistic: the while loop checks is_open(), which may briefly still
-    # return True before the socket state propagates. The error comes from update().
-    is_open_calls_after_close = 0
-
-    def is_open() -> bool:
-        nonlocal is_open_calls_after_close
-        if closed:
-            is_open_calls_after_close += 1
-            # Return True once after close so the loop re-enters
-            return is_open_calls_after_close <= 1
-        return True
-
-    ws.is_open.side_effect = is_open
-
-    def update(timeout: float | None = None) -> None:
-        nonlocal current_stdout, current_stderr
-        if closed and error_after_close is not None:
-            raise error_after_close
-        if closed:
+    def update(self, timeout: float | None = 0) -> None:
+        if not self.is_open():
             return
-        current_stderr = stderr_queue.pop(0) if stderr_queue else None
-        current_stdout = stdout_queue.pop(0) if stdout_queue else None
-
-    ws.update.side_effect = update
-
-    def peek_stderr(**kwargs: object) -> bytes:
-        return current_stderr or b""
-
-    def read_stderr(**kwargs: object) -> bytes:
-        nonlocal current_stderr
-        data = current_stderr or b""
-        current_stderr = None
-        return data
-
-    ws.peek_stderr.side_effect = peek_stderr
-    ws.read_stderr.side_effect = read_stderr
-
-    def peek_stdout(**kwargs: object) -> bytes:
-        return current_stdout or b""
-
-    def read_stdout(**kwargs: object) -> bytes:
-        nonlocal current_stdout
-        data = current_stdout or b""
-        current_stdout = None
-        return data
-
-    ws.peek_stdout.side_effect = peek_stdout
-    ws.read_stdout.side_effect = read_stdout
-
-    return ws
+        if self._frames:
+            channel, data = self._frames.pop(0)
+            self._channels[channel] = self._channels.get(channel, b"") + data
+        elif self._error is not None:
+            raise self._error
+        elif self._ends:
+            self._connected = False
+        elif timeout is None:
+            raise AssertionError("update(timeout=None) would block forever")
+        else:
+            time.sleep(timeout)
 
 
-class TestBrokenPipeAfterSentinel:
-    """Tests for BrokenPipeError/ConnectionResetError after the sentinel is received.
+def _handle(
+    ws: WSClient, user: str | None = None, timeout: int | None = None
+) -> ExecResult[str]:
+    return ExecuteOperation(MagicMock())._handle_shell_output(ws, user, timeout, MARKER)
 
-    After the sentinel is processed, ws_client.close() is called. On the next loop
-    iteration, update() (called directly or from peek_*) raises BrokenPipeError or
-    ConnectionResetError because the underlying socket is closed. Currently these
-    propagate uncaught — after the fix, they should be caught and the already-captured
-    result should be returned.
-    """
 
-    def test_broken_pipe_after_sentinel_with_timeout_raises_timeout_error(self) -> None:
-        """Sentinel rc=124 with timeout: raise TimeoutError."""
-        ws = _make_ws_client(
-            stdout_frames=[b"output<completed-sentinel-value-124>"],
-            error_after_close=BrokenPipeError("socket closed"),
+@pytest.fixture
+def short_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(execute_module, "STREAM_END_GRACE_SECONDS", 0.01)
+
+
+class TestCompletion:
+    """The command's exit code comes from the status channel, not from its output."""
+
+    def test_exit_code_comes_from_the_status_channel(self) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, b"out" + _marker(0)), (STDERR, _marker(0)), _status(3)]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        with pytest.raises(TimeoutError):
-            executor._handle_shell_output(ws, user=None, timeout=30)
+        result = _handle(ws)
 
-    def test_broken_pipe_after_sentinel_without_timeout_returns_result(self) -> None:
-        """Sentinel rc=0, no timeout: return ExecResult."""
-        ws = _make_ws_client(
-            stdout_frames=[b"hello<completed-sentinel-value-0>"],
-            error_after_close=BrokenPipeError("socket closed"),
+        assert result.returncode == 3
+        assert result.stdout == "out"
+
+    @pytest.mark.parametrize(
+        "printed",
+        [
+            pytest.param(b"<completed-sentinel-value-0>", id="old-fixed-sentinel"),
+            pytest.param(
+                b"<completed-sentinel-value-ffffffffffffffffffffffffffffffff-0>",
+                id="marker-of-another-exec",
+            ),
+        ],
+    )
+    def test_output_imitating_a_marker_does_not_end_the_exec(
+        self, printed: bytes
+    ) -> None:
+        """A command printing a marker must neither end the exec nor set its code."""
+        ws = _FakeWSClient(
+            [
+                (STDOUT, b"before " + printed + b" after"),
+                (STDERR, printed),
+                (STDOUT, b" still running"),
+                (STDOUT, _marker(1)),
+                (STDERR, _marker(1)),
+                _status(1),
+            ]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user=None, timeout=None)
+        result = _handle(ws)
+
+        assert result.returncode == 1
+        assert result.stdout == f"before {printed.decode()} after still running"
+        assert result.stderr == printed.decode()
+
+    @pytest.mark.parametrize("cut", range(1, len(b"out" + _marker(7))))
+    def test_a_marker_split_across_frames_is_recognised(
+        self, cut: int, short_grace: None
+    ) -> None:
+        """Here the exec stays open, so only the split marker can end it."""
+        stdout = b"out" + _marker(7)
+        ws = _FakeWSClient(
+            [(STDOUT, stdout[:cut]), (STDOUT, stdout[cut:]), (STDERR, _marker(7))],
+            ends=False,
+        )
+
+        result = _handle(ws)
+
+        assert result.returncode == 7
+        assert result.stdout == "out"
+
+    def test_returns_while_a_background_process_holds_the_streams_open(
+        self, short_grace: None
+    ) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, b"out" + _marker(0)), (STDERR, b"err" + _marker(0))],
+            ends=False,
+        )
+
+        result = _handle(ws)
+
         assert result.returncode == 0
-        assert result.stdout == "hello"
-        assert result.stderr == ""
+        assert (result.stdout, result.stderr) == ("out", "err")
 
-    def test_connection_reset_after_sentinel_returns_result(self) -> None:
-        """Same as above but with ConnectionResetError."""
-        ws = _make_ws_client(
-            stdout_frames=[b"hello<completed-sentinel-value-0>"],
-            error_after_close=ConnectionResetError("connection reset"),
+    def test_output_after_the_marker_is_dropped(self, short_grace: None) -> None:
+        """Only background processes can write after the shell's marker."""
+        ws = _FakeWSClient(
+            [
+                (STDOUT, b"out" + _marker(0) + b"bg"),
+                (STDERR, _marker(0)),
+                (STDOUT, b"longer than the bytes held back for a split marker " * 4),
+            ],
+            ends=False,
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user=None, timeout=None)
+        result = _handle(ws)
+
+        assert result.stdout == "out"
+
+    def test_waits_for_the_marker_on_both_streams(self, short_grace: None) -> None:
+        """Stderr's tail can arrive after stdout's marker (#23), so wait for both."""
+        ws = _FakeWSClient([(STDOUT, _marker(0))], ends=False)
+
+        with pytest.raises(AssertionError, match="would block forever"):
+            _handle(ws)
+
+    def test_a_stream_that_ends_without_a_marker_keeps_all_its_output(self) -> None:
+        """E.g. `cd` failed, so the shell exited before the command ran."""
+        ws = _FakeWSClient([(STDERR, b"sh: cd: can't cd to /nope"), _status(2)])
+
+        result = _handle(ws)
+
+        assert result.returncode == 2
+        assert result.stderr == "sh: cd: can't cd to /nope"
+
+
+_SHELLS = [
+    pytest.param(shell, id=shell[0])
+    for shell in (["sh"], ["bash"], ["dash"], ["busybox", "sh"])
+    if shutil.which(shell[0])
+]
+
+
+def _run_script(shell: list[str], script: str) -> subprocess.CompletedProcess[bytes]:
+    """Run an exec's script as the pod's shell gets it: stdin stays open after it."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, script.encode())
+    try:
+        return subprocess.run(shell, stdin=read_end, capture_output=True, timeout=10)
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
+def _script(cmd: list[str], stdin: str | bytes | None = None) -> str:
+    return ExecuteOperation(MagicMock())._build_shell_script(
+        cmd, stdin, None, {}, None, MARKER
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+class TestScriptInAShell:
+    def test_both_streams_end_with_the_marker(self, shell: list[str]) -> None:
+        script = _script(["sh", "-c", "echo out; echo err >&2; exit 3"])
+
+        result = _run_script(shell, script)
+
+        assert result.returncode == 3
+        assert result.stdout == b"out\n" + _marker(3)
+        assert result.stderr == b"err\n" + _marker(3)
+
+    def test_the_command_cannot_read_the_marker_from_stdin(
+        self, shell: list[str]
+    ) -> None:
+        """Bash reads its script a byte at a time, so it must still read all of it."""
+        echo_pending_stdin = (
+            "import os, select\n"
+            "if select.select([0], [], [], 0.5)[0]:\n"
+            "    os.write(1, os.read(0, 65536))"
+        )
+        script = _script([sys.executable, "-c", echo_pending_stdin])
+
+        result = _run_script(shell, script)
+
+        assert result.stdout == _marker(0)
+
+
+class TestBrokenPipeAfterMarkers:
+    """The connection can drop after both markers but before the status arrives."""
+
+    def test_broken_pipe_after_markers_with_timeout_raises_timeout_error(self) -> None:
+        """Marker rc=124 with timeout: raise TimeoutError."""
+        ws = _FakeWSClient(
+            [(STDOUT, b"output" + _marker(124)), (STDERR, _marker(124))],
+            error=BrokenPipeError("socket closed"),
+        )
+
+        with pytest.raises(TimeoutError):
+            _handle(ws, timeout=30)
+
+    @pytest.mark.parametrize(
+        "error",
+        [BrokenPipeError("socket closed"), ConnectionResetError("connection reset")],
+    )
+    def test_error_after_markers_returns_result(self, error: Exception) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, b"hello" + _marker(0)), (STDERR, _marker(0))], error=error
+        )
+
+        result = _handle(ws)
+
         assert result.returncode == 0
         assert result.stdout == "hello"
         assert result.stderr == ""
 
 
 class TestBrokenPipeWithoutSentinel:
-    """Tests for BrokenPipeError before the sentinel is received."""
-
-    def _make_dead_ws(
-        self,
-        error: Exception,
-    ) -> MagicMock:
-        ws = MagicMock(spec=WSClient)
-        ws.is_open.return_value = True
-        ws.update.side_effect = error
-        return ws
+    """Tests for BrokenPipeError before the markers are received."""
 
     def test_broken_pipe_without_sentinel_raises(self) -> None:
-        """BrokenPipe before sentinel → PodError."""
-        ws = self._make_dead_ws(BrokenPipeError("socket closed"))
+        """BrokenPipe before the markers → PodError."""
+        ws = _FakeWSClient([(STDOUT, b"partial")], error=BrokenPipeError("closed"))
 
-        executor = ExecuteOperation(MagicMock())
         with pytest.raises(PodError, match="WebSocket connection lost"):
-            executor._handle_shell_output(ws, user=None, timeout=None)
+            _handle(ws)
 
 
 class TestNonUtf8Output:
     """A command emitting non-UTF-8 bytes must not abort exec()."""
 
     def test_binary_byte_with_sentinel_in_same_frame(self) -> None:
-        ws = _make_ws_client(
-            stdout_frames=[b"before \xbb after<completed-sentinel-value-0>"],
+        ws = _FakeWSClient(
+            [(STDOUT, b"before \xbb after" + _marker(0)), (STDERR, _marker(0))]
+            + [_status(0)]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user=None, timeout=None)
+        result = _handle(ws)
 
         assert result.returncode == 0
         assert result.stdout == "before \ufffd after"
 
     def test_binary_byte_on_stderr(self) -> None:
-        ws = _make_ws_client(
-            stdout_frames=[b"<completed-sentinel-value-0>"],
-            stderr_frames=[b"warn \xbb done\n"],
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(0)), (STDERR, b"warn \xbb done\n" + _marker(0))]
+            + [_status(0)]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user=None, timeout=None)
+        result = _handle(ws)
 
         assert result.returncode == 0
         assert result.stderr == "warn \ufffd done\n"
 
     def test_binary_byte_in_earlier_frame_than_sentinel(self) -> None:
-        ws = _make_ws_client(
-            stdout_frames=[b"raw \xbb bytes", b"more<completed-sentinel-value-0>"],
+        ws = _FakeWSClient(
+            [(STDOUT, b"raw \xbb bytes"), (STDOUT, b"more" + _marker(0))]
+            + [(STDERR, _marker(0)), _status(0)]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user=None, timeout=None)
+        result = _handle(ws)
 
         assert result.returncode == 0
         assert result.stdout == "raw \ufffd bytesmore"
@@ -203,68 +331,41 @@ class TestNonUtf8Output:
 
 class TestRunuserErrors:
     def test_user_command_runuser_error_with_sentinel_returns_result(self) -> None:
-        ws = _make_ws_client(
-            stdout_frames=[b"<completed-sentinel-value-1>"],
-            stderr_frames=[b"runuser: user foo does not exist\n"],
+        ws = _FakeWSClient(
+            [
+                (STDERR, b"runuser: user foo does not exist\n" + _marker(1)),
+                (STDOUT, _marker(1)),
+                _status(1),
+            ]
         )
 
-        executor = ExecuteOperation(MagicMock())
-        result = executor._handle_shell_output(ws, user="nobody", timeout=None)
+        result = _handle(ws, user="nobody")
 
         assert result.returncode == 1
         assert result.stderr == "runuser: user foo does not exist\n"
 
     def test_wrapper_runuser_error_without_sentinel_raises(self) -> None:
-        ws = MagicMock(spec=WSClient)
-        current_stderr: bytes | None = None
+        stderr = b"runuser: user foo does not exist\n"
+        ws = _FakeWSClient([(STDERR, stderr), _status(1)])
 
-        ws.is_open.side_effect = [True, False]
-        ws.close.return_value = None
-
-        def update(timeout: float | None = None) -> None:
-            nonlocal current_stderr
-            current_stderr = b"runuser: user foo does not exist\n"
-
-        def peek_stderr(**kwargs: object) -> bytes:
-            return current_stderr or b""
-
-        def read_stderr(**kwargs: object) -> bytes:
-            nonlocal current_stderr
-            data = current_stderr or b""
-            current_stderr = None
-            return data
-
-        ws.update.side_effect = update
-        ws.peek_stderr.side_effect = peek_stderr
-        ws.read_stderr.side_effect = read_stderr
-        ws.peek_stdout.return_value = b""
-
-        with patch("k8s_sandbox._pod.execute.get_returncode", return_value=1):
-            executor = ExecuteOperation(MagicMock())
-            with pytest.raises(RuntimeError, match="does not appear to exist"):
-                executor._handle_shell_output(ws, user="foo", timeout=None)
+        with pytest.raises(RuntimeError, match="does not appear to exist"):
+            _handle(ws, user="foo")
 
     def test_non_runuser_error_without_sentinel_returns_result(self) -> None:
-        ws = MagicMock(spec=WSClient)
-        ws.is_open.return_value = False
+        ws = _FakeWSClient([_status(1)])
 
-        executor = ExecuteOperation(MagicMock())
-        with patch("k8s_sandbox._pod.execute.get_returncode", return_value=1):
-            result = executor._handle_shell_output(ws, user="foo", timeout=None)
+        result = _handle(ws, user="foo")
 
         assert result.returncode == 1
 
 
 class TestConnectionResetWithoutSentinel:
     def test_connection_reset_without_sentinel_raises(self) -> None:
-        """ConnectionReset before sentinel → PodError."""
-        ws = MagicMock(spec=WSClient)
-        ws.is_open.return_value = True
-        ws.update.side_effect = ConnectionResetError("connection reset")
+        """ConnectionReset before the markers → PodError."""
+        ws = _FakeWSClient([], error=ConnectionResetError("connection reset"))
 
-        executor = ExecuteOperation(MagicMock())
         with pytest.raises(PodError, match="WebSocket connection lost"):
-            executor._handle_shell_output(ws, user=None, timeout=None)
+            _handle(ws)
 
 
 class TestExecChunksStdin:
@@ -284,6 +385,9 @@ class TestExecChunksStdin:
 
         op = ExecuteOperation(MagicMock())
         monkeypatch.setattr(op, "_interactive_shell", fake_interactive_shell)
+        monkeypatch.setattr(
+            execute_module.secrets, "token_hex", lambda n: MARKER.split("-")[-2]
+        )
         sentinel = ExecResult(success=True, returncode=0, stdout="", stderr="")
         monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: sentinel)
 
@@ -293,7 +397,9 @@ class TestExecChunksStdin:
             ["cat"], stdin=b"x" * 100, cwd=None, env={}, user=None, timeout=None
         )
 
-        expected_script = op._build_shell_script(["cat"], b"x" * 100, None, {}, None)
+        expected_script = op._build_shell_script(
+            ["cat"], b"x" * 100, None, {}, None, MARKER
+        )
         written = "".join(call.args[0] for call in ws.write_stdin.call_args_list)
         assert written == expected_script
         assert ws.write_stdin.call_count > 1

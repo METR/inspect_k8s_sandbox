@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
+  before it finished, with exit code `N`. The exit code now comes from Kubernetes,
+  and `exec()` no longer leaves that marker at the end of stdout when it arrives in
+  two pieces. A command that leaves a background process holding its stdout or
+  stderr open now returns within about a second of exiting.
+
 ## 2026-10-09 0.14.0
 
 - `INSPECT_POD_RESTART_CHECK=false` skips the pre-operation pod read inside

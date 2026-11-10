@@ -128,12 +128,14 @@ class Pod:
         To support the required functionality, the supplied command is executed in a
         shell (/bin/sh).
 
-        To allow this method to return when the supplied command has completed, even if
-        backgrounded processes which inherit stdout or stderr are still running, a
-        sentinel value is written to stdout after the supplied command has completed.
-        When this sentinel value is detected, we close the websocket connection. This
-        sentinel value also includes the exit code of the supplied command, as we won't
-        have access to /bin/sh's return code if we manually close the websocket.
+        The exit code comes from the exec's status channel, which reports /bin/sh's own
+        exit status. To allow this method to return when the supplied command has
+        completed, even if backgrounded processes which inherit stdout or stderr are
+        still running, the shell writes a marker to both stdout and stderr once the
+        command exits. The marker holds a random value made up for this exec, so the
+        command's output cannot imitate it, and the command's exit code. If the
+        websocket connection is still open shortly after both markers arrive, we close
+        it and use the marker's exit code.
 
         Args:
           cmd (list[str]): The command and arguments to execute.
