@@ -144,7 +144,8 @@ class ExecuteOperation(PodOperation):
                 wait = deadline - time.monotonic()
                 if wait <= 0:
                     raise PodError(f"Probing exec(user={user!r}) timed out")
-                # Bounds a read that stalls partway through a frame, too.
+                # Also times out a read that stalls partway through a frame, within
+                # about twice the deadline (a frame still trickling in can take longer).
                 ws_client.sock.settimeout(wait)
                 try:
                     _update(ws_client, wait)
