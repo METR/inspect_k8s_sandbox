@@ -7,6 +7,10 @@
   and `exec()` no longer leaves that marker at the end of stdout when it arrives in
   two pieces. A command that leaves a background process holding its stdout or
   stderr open now returns within about a second of exiting.
+- `exec()` no longer runs a command a second time when its connection to the pod is
+  lost while the command runs. It raises `ExecResultUnknownError` (as the cause of a
+  `K8sError`) instead, since the command may have run. A connection lost before the
+  command was sent is still retried.
 
 ## 2026-10-09 0.14.0
 

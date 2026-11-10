@@ -9,6 +9,7 @@ from tenacity import wait_none
 
 from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._pod.error import (
+    ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
@@ -155,6 +156,11 @@ class TestExecRetryPermanent:
                 PermissionError("permission denied"),
                 PermissionError,
                 id="PermissionError",
+            ),
+            pytest.param(
+                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                K8sError,
+                id="ExecResultUnknownError",
             ),
         ],
     )

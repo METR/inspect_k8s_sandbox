@@ -2,14 +2,17 @@ import json
 import os
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator
 from unittest.mock import MagicMock
 
 import pytest
+import websocket
 from inspect_ai.util import ExecResult
 from kubernetes.stream.ws_client import (  # type: ignore
     ERROR_CHANNEL,
@@ -24,7 +27,7 @@ from kubernetes.stream.ws_client import (
 
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
-from k8s_sandbox._pod.error import PodError
+from k8s_sandbox._pod.error import ExecResultUnknownError
 from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
@@ -252,6 +255,25 @@ class TestScriptInAShell:
         assert result.stdout == _marker(0)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> None:
+    """A connection lost while sending the script leaves nothing run to repeat."""
+    ran = tmp_path / "ran"
+    script = ExecuteOperation(MagicMock())._build_shell_script(
+        ["touch", str(ran)], None, str(tmp_path), {"K": "V"}, None, MARKER
+    )
+    # Cut after each line but the last, as a dropped connection might: the shell then
+    # reads end of input.
+    cuts = [i + 1 for i, char in enumerate(script[:-1]) if char == "\n"]
+
+    for cut in cuts:
+        result = subprocess.run(shell, input=script[:cut].encode(), capture_output=True)
+
+        assert not ran.exists(), f"ran after a cut at {cut}: {script[:cut]!r}"
+        assert result.stdout == b""
+
+
 class TestBrokenPipeAfterMarkers:
     """The connection can drop after both markers but before the status arrives."""
 
@@ -281,14 +303,28 @@ class TestBrokenPipeAfterMarkers:
         assert result.stderr == ""
 
 
-class TestBrokenPipeWithoutSentinel:
-    """Tests for BrokenPipeError before the markers are received."""
+class TestResultLostAfterTheScriptWasSent:
+    """Once the script is sent the command may run, so a lost result isn't retried."""
 
-    def test_broken_pipe_without_sentinel_raises(self) -> None:
-        """BrokenPipe before the markers → PodError."""
-        ws = _FakeWSClient([(STDOUT, b"partial")], error=BrokenPipeError("closed"))
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BrokenPipeError("socket closed"),
+            ConnectionResetError("connection reset"),
+            websocket.WebSocketConnectionClosedException("gone"),
+            ssl.SSLEOFError("EOF occurred in violation of protocol"),
+        ],
+    )
+    def test_connection_lost_before_the_markers(self, error: Exception) -> None:
+        ws = _FakeWSClient([(STDOUT, b"partial")], error=error)
 
-        with pytest.raises(PodError, match="WebSocket connection lost"):
+        with pytest.raises(ExecResultUnknownError, match="WebSocket connection lost"):
+            _handle(ws)
+
+    def test_exec_ending_without_a_status(self) -> None:
+        ws = _FakeWSClient([(STDOUT, b"partial")])
+
+        with pytest.raises(ExecResultUnknownError, match="without the command's exit"):
             _handle(ws)
 
 
@@ -357,15 +393,6 @@ class TestRunuserErrors:
         result = _handle(ws, user="foo")
 
         assert result.returncode == 1
-
-
-class TestConnectionResetWithoutSentinel:
-    def test_connection_reset_without_sentinel_raises(self) -> None:
-        """ConnectionReset before the markers → PodError."""
-        ws = _FakeWSClient([], error=ConnectionResetError("connection reset"))
-
-        with pytest.raises(PodError, match="WebSocket connection lost"):
-            _handle(ws)
 
 
 class TestExecChunksStdin:

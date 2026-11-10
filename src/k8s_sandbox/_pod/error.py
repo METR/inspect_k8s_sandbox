@@ -15,6 +15,13 @@ class PodError(Exception):
         super().__init__(format_log_message(message, **kwargs))
 
 
+class ExecResultUnknownError(PodError):
+    """An exec's command was sent to the pod, but its result could not be read.
+
+    The command may have run, and may still be running, so it is not retried.
+    """
+
+
 class GetReturncodeError(Exception):
     """The return code of a Pod operation could not be retrieved."""
 

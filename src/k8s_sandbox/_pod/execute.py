@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from typing import Generator
 
+import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
@@ -16,7 +17,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import PodError
+from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import PodOperation
 
@@ -87,7 +88,9 @@ class ExecuteOperation(PodOperation):
         shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout, marker)
         with self._interactive_shell(user) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
-            # argument (-c) to better support potentially long commands.
+            # argument (-c) to better support potentially long commands. A failure
+            # here leaves the script's closing brace unsent, so nothing has run and
+            # the caller may retry. After it, the command may have run.
             self._write_stdin_chunked(ws_client, shell_script)
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
@@ -191,12 +194,12 @@ class ExecuteOperation(PodOperation):
                     stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
                     stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
                     self._verify_output_limit(stdout.buffer, stderr.buffer)
-                except (BrokenPipeError, ConnectionResetError) as e:
+                except (OSError, websocket.WebSocketException) as e:
                     if deadline is not None:
                         # Both markers already received — we have the result.
                         returncode = stdout.returncode
                         break
-                    raise PodError(
+                    raise ExecResultUnknownError(
                         "WebSocket connection lost during exec",
                         pod=self._pod.name,
                     ) from e
@@ -211,7 +214,13 @@ class ExecuteOperation(PodOperation):
                 stdout.flush()
                 stderr.flush()
                 self._verify_output_limit(stdout.buffer, stderr.buffer)
-                returncode = get_returncode(ws_client)
+                try:
+                    returncode = get_returncode(ws_client)
+                except GetReturncodeError as e:
+                    raise ExecResultUnknownError(
+                        "The exec ended without the command's exit code",
+                        pod=self._pod.name,
+                    ) from e
             return (
                 ExecResult(
                     success=returncode == 0,
