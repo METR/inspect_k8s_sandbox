@@ -693,6 +693,26 @@ class TestStatusReceivedBeforeTheConnectionWasLost:
 
         assert result.returncode == 3
 
+    def test_output_read_by_an_update_that_then_failed_is_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """As kubernetes 37's update() can: read every frame waiting, then fail."""
+        ws = _FakeWSClient(
+            [(STDOUT, b"out" + _marker(3)), (STDERR, _marker(3)), _status(3)],
+            error=ConnectionResetError("connection reset"),
+        )
+        read_one = ws.update
+
+        def read_all_then_fail(timeout: float | None = 0) -> None:
+            while True:
+                read_one(timeout)
+
+        monkeypatch.setattr(ws, "update", read_all_then_fail)
+
+        result = _handle(ws)
+
+        assert (result.returncode, result.stdout) == (3, "out")
+
 
 class TestResultLostAfterTheScriptWasSent:
     """Once the script is sent the command may run, so a lost result isn't retried."""
