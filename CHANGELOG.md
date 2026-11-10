@@ -11,7 +11,8 @@
   lost while the command runs, and no longer returns a successful result whose output
   lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
   `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
-  run. A connection lost before the command was sent is still retried.
+  run; or, if the container restarted or was replaced meanwhile, that error. A
+  connection lost before the command was sent is still retried.
 - `exec()` runs fewer programs in the container per call, which makes it faster
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).
