@@ -177,9 +177,10 @@ class ExecuteOperation(PodOperation):
                 yield f"cd {shlex.quote(cwd)} || exit $?\n"
             for key, value in env.items():
                 yield f"export {shlex.quote(key)}={shlex.quote(value)}\n"
-            if stdin is not None:
-                yield self._pipe_user_input(stdin)
-            yield f"{self._prefix_timeout(timeout)}{shlex.join(command)}\n"
+            # Run the command in a subshell, so that one which exits or execs this
+            # shell doesn't end it before it writes the markers.
+            pipe = "" if stdin is None else self._pipe_user_input(stdin)
+            yield f"({pipe}{self._prefix_timeout(timeout)}{shlex.join(command)})\n"
             # Store the returncode so that the `printf` below doesn't overwrite it.
             yield "returncode=$?\n"
             # End both streams with the marker and the returncode. The exec's status

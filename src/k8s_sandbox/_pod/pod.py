@@ -8,7 +8,11 @@ from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
-from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
+from k8s_sandbox._pod.error import (
+    ContainerRestartedError,
+    ExecResultUnknownError,
+    PodReplacedError,
+)
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
@@ -168,12 +172,23 @@ class Pod:
                 self._switch[key] = await self._run_async(
                     lambda: executor.probe_switch(user)
                 )
+            except TimeoutError:
+                # The shell's own check would wait on the same container, unbounded.
+                raise
             except Exception:
                 logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
-        switch = self._switch.get(key) if user else None
-        result = await self._run_async(
-            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
-        )
+        # A probe answers for the container it ran in: if this one was replaced or
+        # restarted meanwhile, let its shell check for itself this time.
+        switch = self._switch.get(key) if user and self._info == info else None
+        try:
+            result = await self._run_async(
+                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
+            )
+        except ExecResultUnknownError:
+            # A container restarted or replaced under the command explains the lost
+            # result better.
+            await self._diagnose_restart_after_failed_exec()
+            raise
         if not result.success:
             if warned_restart is not None:
                 raise warned_restart
