@@ -17,7 +17,7 @@
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).
 - `exec(user=...)` runs fewer programs per call after its first call as each user,
-  where the container runs as that user or can switch to them.
+  where the container switches to that user.
 
 ## 2026-10-09 0.14.0
 

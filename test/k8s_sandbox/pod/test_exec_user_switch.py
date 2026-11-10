@@ -21,7 +21,7 @@ async def _exec_as(pod: Pod, *users: str | None) -> None:
         await pod.exec(["true"], stdin=None, cwd=None, env={}, user=user, timeout=None)
 
 
-def _switches(op: MagicMock) -> list[bool | None]:
+def _switches(op: MagicMock) -> list[bool]:
     return [call.args[-1] for call in op.exec.call_args_list]
 
 
@@ -44,7 +44,7 @@ async def test_each_user_is_probed_once() -> None:
         ("agent",),
         ("root",),
     ]
-    assert _switches(op) == [True, True, False, None, True]
+    assert _switches(op) == [True, True, False, False, True]
 
 
 async def test_a_container_that_cannot_switch_is_probed_once() -> None:
@@ -58,13 +58,13 @@ async def test_a_container_that_cannot_switch_is_probed_once() -> None:
             uid="uid-OLD", container_name="default", restart_count=0
         )
         op = op_cls.return_value
-        op.probe_switch.return_value = None
+        op.probe_switch.return_value = False
         op.exec.return_value = OK
 
         await _exec_as(pod, "agent", "agent")
 
     assert op.probe_switch.call_count == 1
-    assert _switches(op) == [None, None]
+    assert _switches(op) == [False, False]
 
 
 async def test_a_failed_probe_leaves_the_check_to_the_shell_and_is_tried_again() -> (
@@ -85,7 +85,7 @@ async def test_a_failed_probe_leaves_the_check_to_the_shell_and_is_tried_again()
         await _exec_as(pod, "agent", "agent")
 
     assert op.probe_switch.call_count == 2
-    assert _switches(op) == [None, True]
+    assert _switches(op) == [False, True]
 
 
 async def test_a_restarted_container_is_probed_again() -> None:
@@ -155,7 +155,7 @@ async def test_a_container_changed_during_the_probe_checks_for_itself() -> None:
 
     def replaced_meanwhile(user: str) -> bool:
         pod._info = dataclasses.replace(pod._info, uid="uid-NEW")
-        return False
+        return True
 
     with (
         patch("k8s_sandbox._pod.op.k8s_client") as client,
@@ -170,7 +170,7 @@ async def test_a_container_changed_during_the_probe_checks_for_itself() -> None:
 
         await _exec_as(pod, "agent")
 
-    assert _switches(op) == [None]
+    assert _switches(op) == [False]
 
 
 @pytest.mark.parametrize(

@@ -54,9 +54,9 @@ class Pod:
             initial_restart_count,
             restarted_container_behavior,
         )
-        # Whether exec() must switch to a user with runuser, per pod, container start
-        # and user (see exec()).
-        self._switch: dict[tuple[str, int, str], bool | None] = {}
+        # Whether exec() can start runuser directly to run as a user, per pod,
+        # container start and user (see exec()).
+        self._switch: dict[tuple[str, int, str], bool] = {}
 
     @property
     def info(self) -> PodInfo:
@@ -166,7 +166,8 @@ class Pod:
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
-        # Finding this once per container spares every later exec two process starts.
+        # Probing once per container spares later execs that switch user two process
+        # starts each.
         key = (info.uid, info.initial_restart_count, user or "")
         if user and key not in self._switch:
             try:
@@ -181,7 +182,7 @@ class Pod:
                 logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
         # A probe answers for the container it ran in: if this one was replaced or
         # restarted meanwhile, let its shell check for itself this time.
-        switch = self._switch.get(key) if user and self._info == info else None
+        switch = self._switch.get(key, False) if user and self._info == info else False
         try:
             result = await self._run_async(
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
