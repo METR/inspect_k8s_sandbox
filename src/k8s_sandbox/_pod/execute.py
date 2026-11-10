@@ -139,7 +139,7 @@ class ExecuteOperation(PodOperation):
                 wait = deadline - time.monotonic()
                 if wait <= 0:
                     raise PodError(f"Probing exec(user={user!r}) timed out")
-                ws_client.update(timeout=wait)
+                _update(ws_client, wait)
                 # The probe prints nothing, so keep nothing a planted `id` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
@@ -231,11 +231,10 @@ class ExecuteOperation(PodOperation):
                 if wait is not None and wait <= 0:
                     break
                 try:
-                    # Until both markers are in, `wait` is None and `update` blocks
-                    # until there is data to read.
-                    ws_client.update(timeout=wait)
-                    _take_decrypted_frames(ws_client)
-                    # Take what update() read straight from the client's buffers. The
+                    # Until both markers are in, `wait` is None and this blocks until
+                    # there is data to read.
+                    _update(ws_client, wait)
+                    # Take what was read straight from the client's buffers. The
                     # peek_*() calls read another frame first, and one for the stream
                     # already read would wait unseen through the next blocking update().
                     stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
@@ -376,21 +375,25 @@ class ExecuteOperation(PodOperation):
             )
 
 
-def _take_decrypted_frames(ws_client: WSClient) -> None:
-    """Take in frames that TLS has already decrypted.
+def _update(ws_client: WSClient, timeout: float | None) -> None:
+    """ws_client.update(timeout), but first taking a frame TLS has already decrypted.
 
-    Before kubernetes 37, update() polls only the raw socket, which can't see them, so
-    a frame that arrived in the same TLS record as the last one would wait unseen for
-    more data: forever, while a background process holds the exec open.
+    Before kubernetes 37, update() reads one frame but polls only the raw socket, which
+    can't see a decrypted one: a frame that arrived in the same TLS record as the last
+    would wait unseen for more data, forever while a background process holds the exec
+    open. Take just the one, so that the caller checks its output limit and deadline
+    after each frame.
     """
     sock = ws_client.sock.sock
-    while ws_client.is_open() and isinstance(sock, ssl.SSLSocket) and sock.pending():
-        op_code, frame = ws_client.sock.recv_data_frame(True)
-        if op_code == ABNF.OPCODE_CLOSE:
-            ws_client._connected = False
-        elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
-            channel, data = frame.data[0], frame.data[1:]
-            ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
+    if not (isinstance(sock, ssl.SSLSocket) and sock.pending()):
+        ws_client.update(timeout=timeout)
+        return
+    op_code, frame = ws_client.sock.recv_data_frame(True)
+    if op_code == ABNF.OPCODE_CLOSE:
+        ws_client._connected = False
+    elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
+        channel, data = frame.data[0], frame.data[1:]
+        ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
 
 
 class _MarkedStream:

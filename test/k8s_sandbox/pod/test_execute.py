@@ -15,7 +15,7 @@ import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Generator, Sequence
+from typing import Callable, Generator, Iterable, Sequence
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -528,6 +528,51 @@ def _frame(channel: int, data: bytes) -> bytes:
     return websocket.ABNF(1, 0, 0, 0, opcode, 0, bytes([channel]) + data).format()
 
 
+def _close_frame() -> bytes:
+    """The server closing the connection (status 1000, normal closure)."""
+    opcode = websocket.ABNF.OPCODE_CLOSE
+    return websocket.ABNF(1, 0, 0, 0, opcode, 0, b"\x03\xe8").format()
+
+
+@contextmanager
+def _sending(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+    records: Iterable[bytes],
+    pause: float = 0,
+) -> Generator[None, None, None]:
+    """Send each of `records` as a TLS record of its own, from another thread."""
+    client, server = tls_sockets
+    stop = threading.Event()
+
+    def send() -> None:
+        try:
+            for record in records:
+                if stop.wait(pause):
+                    return
+                server.sendall(record)
+        except OSError:
+            pass  # The client stopped reading.
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        # Fails a read or a send still waiting, so that a failure can't hang the suite.
+        client.shutdown(socket.SHUT_RDWR)
+        client.close()
+        thread.join()
+
+
+def _straddling(first: bytes, frame: bytes, count: int) -> list[bytes]:
+    """TLS records holding `first`, then `count` copies of `frame`.
+
+    Each record ends one byte into the next frame, so TLS always holds part of one.
+    """
+    return [first + frame[:1]] + [frame[1:] + frame[:1]] * (count - 1) + [frame[1:]]
+
+
 def test_frames_tls_has_already_decrypted_are_read(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], short_grace: None
 ) -> None:
@@ -546,6 +591,87 @@ def test_frames_tls_has_already_decrypted_are_read(
         pool.shutdown()
 
     assert (result.returncode, result.stdout) == (0, "out")
+
+
+def test_a_flood_of_output_is_checked_against_the_limit_frame_by_frame(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output that never pauses, so TLS always holds more."""
+    monkeypatch.setattr(execute_module.limits, "MAX_EXEC_OUTPUT_SIZE", 10_000)
+    ws = _SocketWSClient(tls_sockets[0])
+    frames_read = 0
+    recv_data_frame = ws.sock.recv_data_frame
+
+    def counting(control_frame: bool = False) -> tuple[int, websocket.ABNF]:
+        nonlocal frames_read
+        frames_read += 1
+        return recv_data_frame(control_frame)
+
+    monkeypatch.setattr(ws.sock, "recv_data_frame", counting)
+    records = _straddling(b"", _frame(STDOUT, b"x" * 1000), 200)
+
+    with _sending(tls_sockets, records):
+        with pytest.raises(OutputLimitExceededError):
+            _handle(ws)
+
+    assert frames_read <= 12
+
+
+def test_output_after_the_markers_does_not_hold_the_exec_open(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], short_grace: None
+) -> None:
+    """A background process that keeps writing, so TLS always holds more."""
+    markers = _frame(STDOUT, b"out" + _marker(0)) + _frame(STDERR, _marker(0))
+    # For at least 3 seconds.
+    records = _straddling(markers, _frame(STDOUT, b"late"), 3000)
+    ws = _SocketWSClient(tls_sockets[0])
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+
+    with _sending(tls_sockets, records, pause=0.001):
+        start = time.monotonic()
+        result = pool.submit(_handle, ws).result(timeout=10)
+        elapsed = time.monotonic() - start
+    pool.shutdown()
+
+    assert (result.returncode, result.stdout) == (0, "out")
+    assert elapsed < 1
+
+
+def test_output_read_before_a_failed_close_reply_is_kept(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+) -> None:
+    """All of it in one TLS record, and the server gone before the client replies."""
+    client, server = tls_sockets
+    server.sendall(
+        _frame(STDOUT, b"out" + _marker(3))
+        + _frame(STDERR, _marker(3))
+        + _frame(*_status(3))
+        + _close_frame()
+    )
+    server.close()
+
+    result = _handle(_SocketWSClient(client))
+
+    assert (result.returncode, result.stdout) == (3, "out")
+
+
+def test_the_probe_reads_a_close_tls_has_already_decrypted(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The status and the close in one TLS record, and the server awaiting the reply."""
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
+    client, server = tls_sockets
+    server.sendall(_frame(*_status(1)) + _close_frame())
+    op = ExecuteOperation(MagicMock())
+
+    @contextmanager
+    def shell(command: list[str]) -> Generator[WSClient, None, None]:
+        yield _SocketWSClient(client)
+
+    with patch.object(op, "_interactive_shell", shell):
+        answer = op.probe_switch("agent")
+
+    assert answer is True
 
 
 class TestStatusReceivedBeforeTheConnectionWasLost:
