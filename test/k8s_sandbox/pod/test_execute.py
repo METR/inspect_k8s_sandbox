@@ -660,6 +660,29 @@ def test_output_read_before_a_failed_close_reply_is_kept(
     assert (result.returncode, result.stdout) == (3, "out")
 
 
+def test_the_socket_is_closed_after_the_server_closed_the_connection(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+) -> None:
+    """Rather than when the garbage collector gets to it."""
+    client, server = tls_sockets
+    server.sendall(
+        _frame(STDOUT, _marker(0))
+        + _frame(STDERR, _marker(0))
+        + _frame(*_status(0))
+        + _close_frame()
+    )
+    op = ExecuteOperation(MagicMock())
+
+    with (
+        patch.object(op_module, "k8s_client"),
+        patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
+    ):
+        with op._interactive_shell(["/bin/sh"]) as ws:
+            op._handle_shell_output(ws, None, None, MARKER)
+
+    assert client.fileno() == -1
+
+
 def test_the_probe_reads_a_close_tls_has_already_decrypted(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
