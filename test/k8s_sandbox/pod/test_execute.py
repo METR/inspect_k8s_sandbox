@@ -818,7 +818,7 @@ class TestResultLostAfterTheScriptWasSent:
             _handle(ws)
 
     def test_exec_ending_without_a_status(self) -> None:
-        """Still a GetReturncodeError, which callers (Hawk's VM-death report) match."""
+        """Still a GetReturncodeError, so callers that match one still do."""
         ws = _FakeWSClient([(STDOUT, b"partial")])
 
         with pytest.raises(GetReturncodeError) as raised:
