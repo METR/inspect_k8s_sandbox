@@ -1,13 +1,19 @@
 import base64
 import logging
 import re
+import secrets
 import shlex
+import time
 from contextlib import contextmanager
 from typing import Generator
 
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    STDERR_CHANNEL,
+    STDOUT_CHANNEL,
+    WSClient,
+)
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import PodError
@@ -15,7 +21,10 @@ from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
-COMPLETED_SENTINEL_PATTERN = re.compile(rf"<{COMPLETED_SENTINEL}-(\d+)>")
+# How long to wait, once both end markers have arrived, for the exec to end by itself
+# and report the shell's exit status (which takes milliseconds). It only runs out when
+# a background process still holds the command's stdout or stderr open.
+STREAM_END_GRACE_SECONDS = 1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 
 logger = logging.getLogger(__name__)
@@ -72,12 +81,15 @@ class ExecuteOperation(PodOperation):
         user: str | None,
         timeout: int | None,
     ) -> ExecResult[str]:
-        shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout)
+        # The shell ends the command's output with this marker. It holds a random value
+        # made up for this exec, so nothing the command prints can be taken for it.
+        marker = f"<{COMPLETED_SENTINEL}-{secrets.token_hex(16)}-"
+        shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout, marker)
         with self._interactive_shell(user) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands.
             self._write_stdin_chunked(ws_client, shell_script)
-            result = self._handle_shell_output(ws_client, user, timeout)
+            result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
     @contextmanager
@@ -102,8 +114,12 @@ class ExecuteOperation(PodOperation):
         cwd: str | None,
         env: dict[str, str],
         timeout: int | None,
+        marker: str,
     ) -> str:
         def generate() -> Generator[str, None, None]:
+            # A group is read in full before any of it runs, so the command cannot
+            # read the rest of the script, marker included, from the shell's stdin.
+            yield "{\n"
             if cwd is not None:
                 yield f"cd {shlex.quote(cwd)} || exit $?\n"
             for key, value in env.items():
@@ -111,18 +127,20 @@ class ExecuteOperation(PodOperation):
             if stdin is not None:
                 yield self._pipe_user_input(stdin)
             yield f"{self._prefix_timeout(timeout)}{shlex.join(command)}\n"
-            # Store the returncode so that the `echo` below doesn't overwrite it.
+            # Store the returncode so that the `printf` below doesn't overwrite it.
             yield "returncode=$?\n"
             # Ensure stdout and stderr are flushed before writing the sentinel value.
             yield "sync\n"
-            # Write a sentinel value to stdout to determine when the user command
-            # has completed. Also write the returncode as we won't have access to it if
-            # we manually close the websocket connection.
-            yield f'echo -n "<{COMPLETED_SENTINEL}-$returncode>"\n'
+            # End both streams with the marker and the returncode. The exec's status
+            # channel reports the returncode when the shell exits; the markers are for
+            # when a background process keeps stdout or stderr, and so the exec, open.
+            yield f"printf '{marker}%d>' \"$returncode\"\n"
+            yield f"printf '{marker}%d>' \"$returncode\" >&2\n"
             # Exit the shell. This won't actually close the websocket connection until
             # stdout and stderr (which have been inherited by the user command) are
-            # closed. But it will force the echo above to be flushed.
+            # closed.
             yield "exit $returncode\n"
+            yield "}\n"
 
         return "".join(generate())
 
@@ -148,55 +166,60 @@ class ExecuteOperation(PodOperation):
         return f"timeout -k 5s {timeout}s "
 
     def _handle_shell_output(
-        self, ws_client: WSClient, user: str | None, timeout: int | None
+        self, ws_client: WSClient, user: str | None, timeout: int | None, marker: str
     ) -> ExecResult[str]:
         def stream_output() -> tuple[ExecResult[str], bool]:
-            stdout = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-            stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
+            stdout = _MarkedStream(marker)
+            stderr = _MarkedStream(marker)
             returncode: int | None = None
+            # Set once both markers are in: the command has exited.
+            deadline: float | None = None
             while ws_client.is_open():
+                wait = None if deadline is None else deadline - time.monotonic()
+                if wait is not None and wait <= 0:
+                    # A background process is holding stdout or stderr open, so the
+                    # exec won't end by itself. Take the marker's returncode.
+                    returncode = stdout.returncode
+                    break
                 try:
-                    # `timeout=None` means `update` will block
-                    # indefinitely until there is data to read.
-                    ws_client.update(timeout=None)
-                    # Note: `peek_*()` and `read_*()` may call `update(timeout=0)`.
-                    if ws_client.peek_stderr():
-                        stderr.append(ws_client.read_stderr())
-                    # Handle stdout _after_ stderr to guarantee that, if buffered, the
-                    # sentinel is actioned before the blocking `ws_client.update(None)`.
-                    if ws_client.peek_stdout():
-                        frame = ws_client.read_stdout()
-                        # Assumption: The sentinel value is written to
-                        # stdout in a single frame, not split across frames.
-                        filtered, returncode = self._filter_sentinel_and_returncode(
-                            frame
-                        )
-                        stdout.append(filtered)
-                        if returncode is not None:
-                            ws_client.close()
-                    self._verify_output_limit(stdout, stderr)
+                    # Until both markers are in, `wait` is None and `update` blocks
+                    # until there is data to read.
+                    ws_client.update(timeout=wait)
+                    # Take what update() read straight from the client's buffers. The
+                    # peek_*() calls read another frame first, and one for the stream
+                    # already read would wait unseen through the next blocking update().
+                    stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
+                    stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
+                    self._verify_output_limit(stdout.buffer, stderr.buffer)
                 except (BrokenPipeError, ConnectionResetError) as e:
-                    if returncode is not None:
-                        # Sentinel already received — we have the result.
-                        # This commonly happens after ws_client.close() when
-                        # the next update() hits the closed socket.
+                    if deadline is not None:
+                        # Both markers already received — we have the result.
+                        returncode = stdout.returncode
                         break
                     raise PodError(
                         "WebSocket connection lost during exec",
                         pod=self._pod.name,
                     ) from e
-            saw_completed_sentinel = returncode is not None
-            # returncode won't be set if setup commands e.g. `cd` failed.
+                if deadline is None and None not in (
+                    stdout.returncode,
+                    stderr.returncode,
+                ):
+                    deadline = time.monotonic() + STREAM_END_GRACE_SECONDS
             if returncode is None:
+                # The exec ended by itself, so the status channel has the shell's exit
+                # status, also when the script stopped early (e.g. `cd` failed).
+                stdout.flush()
+                stderr.flush()
+                self._verify_output_limit(stdout.buffer, stderr.buffer)
                 returncode = get_returncode(ws_client)
             return (
                 ExecResult(
                     success=returncode == 0,
                     returncode=returncode,
-                    stdout=str(stdout),
-                    stderr=str(stderr),
+                    stdout=str(stdout.buffer),
+                    stderr=str(stderr.buffer),
                 ),
-                saw_completed_sentinel,
+                stdout.returncode is not None,
             )
 
         result, saw_completed_sentinel = stream_output()
@@ -261,17 +284,6 @@ class ExecuteOperation(PodOperation):
             )
             return
 
-    def _filter_sentinel_and_returncode(self, frame: bytes) -> tuple[bytes, int | None]:
-        # latin-1 maps each byte 1:1 to a codepoint, so it decodes arbitrary binary
-        # without raising and re-encodes losslessly. We use it only to locate and strip
-        # the ASCII sentinel; the surrounding bytes round-trip unchanged.
-        # Assumption: the sentinel is not split across frames.
-        decoded = frame.decode("latin-1")
-        split_frame = re.split(COMPLETED_SENTINEL_PATTERN, decoded)
-        if len(split_frame) == 1:
-            return frame, None
-        return (split_frame[0] + split_frame[2]).encode("latin-1"), int(split_frame[1])
-
     def _verify_output_limit(
         self, stdout: LimitedBuffer, stderr: LimitedBuffer
     ) -> None:
@@ -280,3 +292,38 @@ class ExecuteOperation(PodOperation):
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(stdout) + str(stderr),
             )
+
+
+class _MarkedStream:
+    """One of the command's output streams, up to the shell's end marker.
+
+    A frame can end partway through the marker, so the bytes at the end of each frame
+    that could be its start are held back until the next frame settles it.
+    """
+
+    def __init__(self, marker: str) -> None:
+        self.buffer = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
+        self.returncode: int | None = None
+        self._pattern = re.compile(re.escape(marker.encode()) + rb"(\d{1,3})>")
+        # The longest marker less one byte: a returncode has at most three digits.
+        self._hold = len(marker) + 3
+        self._pending = b""
+
+    def append(self, data: bytes) -> None:
+        if self.returncode is not None:
+            # Written after the command exited, by a background process.
+            return
+        data = self._pending + data
+        match = self._pattern.search(data)
+        if match:
+            self.buffer.append(data[: match.start()])
+            self.returncode = int(match[1])
+            self._pending = b""
+        else:
+            self.buffer.append(data[: -self._hold])
+            self._pending = data[-self._hold :]
+
+    def flush(self) -> None:
+        """Release the held-back bytes of a stream that ended without a marker."""
+        self.buffer.append(self._pending)
+        self._pending = b""

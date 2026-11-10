@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
+  before it finished, with exit code `N`. The exit code now comes from Kubernetes,
+  and `exec()` no longer leaves that marker at the end of stdout when it arrives in
+  two pieces. A command that leaves a background process holding its stdout or
+  stderr open now returns within about a second of exiting.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
