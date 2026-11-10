@@ -157,7 +157,8 @@ Transient network or infrastructure errors during `exec()`, `read_file()`, and `
 
 `exec()` is only retried when the error came before the command was sent to the Pod. Once
 the command may have run, a lost connection raises `ExecResultUnknownError` (the cause of
-the `K8sError` raised) rather than running the command again.
+the `K8sError` raised) rather than running the command again, or the container's restart or
+replacement error if that is what happened.
 
 ## Must run as root to use the `user` parameter in `exec()` { #exec-user }
 

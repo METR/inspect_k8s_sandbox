@@ -11,6 +11,7 @@ from inspect_ai.util import ExecResult
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
     ExecResultUnknownError,
+    PodError,
     PodReplacedError,
 )
 from k8s_sandbox._pod.execute import ExecuteOperation
@@ -172,8 +173,9 @@ class Pod:
                 self._switch[key] = await self._run_async(
                     lambda: executor.probe_switch(user)
                 )
-            except TimeoutError:
-                # The shell's own check would wait on the same container, unbounded.
+            except PodError:
+                # A probe that timed out: the shell's own check would wait on the same
+                # container, unbounded.
                 raise
             except Exception:
                 logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
@@ -187,6 +189,8 @@ class Pod:
         except ExecResultUnknownError:
             # A container restarted or replaced under the command explains the lost
             # result better.
+            if warned_restart is not None:
+                raise warned_restart
             await self._diagnose_restart_after_failed_exec()
             raise
         if not result.success:
