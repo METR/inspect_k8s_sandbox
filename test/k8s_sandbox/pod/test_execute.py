@@ -1,6 +1,7 @@
-import getpass
 import json
 import os
+import pwd
+import re
 import shlex
 import shutil
 import ssl
@@ -168,20 +169,20 @@ class TestCompletion:
         assert result.stdout == f"before {printed.decode()} after still running"
         assert result.stderr == printed.decode()
 
-    @pytest.mark.parametrize("cut", range(1, len(b"out" + _marker(7))))
+    @pytest.mark.parametrize("cut", range(1, len(b"out" + _marker(255))))
     def test_a_marker_split_across_frames_is_recognised(
         self, cut: int, short_grace: None
     ) -> None:
         """Here the exec stays open, so only the split marker can end it."""
-        stdout = b"out" + _marker(7)
+        stdout = b"out" + _marker(255)
         ws = _FakeWSClient(
-            [(STDOUT, stdout[:cut]), (STDOUT, stdout[cut:]), (STDERR, _marker(7))],
+            [(STDOUT, stdout[:cut]), (STDOUT, stdout[cut:]), (STDERR, _marker(255))],
             ends=False,
         )
 
         result = _handle(ws)
 
-        assert result.returncode == 7
+        assert result.returncode == 255
         assert result.stdout == "out"
 
     def test_returns_while_a_background_process_holds_the_streams_open(
@@ -262,6 +263,24 @@ class TestCompletion:
         ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(0)])
 
         with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
+            _handle(ws)
+
+    def test_held_back_bytes_are_kept_when_the_stream_ends_without_a_marker(
+        self,
+    ) -> None:
+        ws = _FakeWSClient([(STDOUT, b"out<completed-sen"), _status(1)])
+
+        result = _handle(ws)
+
+        assert result.stdout == "out<completed-sen"
+
+    def test_held_back_bytes_count_against_the_output_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(execute_module.limits, "MAX_EXEC_OUTPUT_SIZE", 8)
+        ws = _FakeWSClient([(STDOUT, b"12345678<"), _status(1)])
+
+        with pytest.raises(OutputLimitExceededError):
             _handle(ws)
 
     def test_a_stream_that_ends_without_a_marker_keeps_all_its_output(self) -> None:
@@ -445,6 +464,14 @@ class TestBrokenPipeAfterMarkers:
 
 
 class TestStatusReceivedBeforeTheConnectionWasLost:
+    def test_the_status_is_used_without_markers(self) -> None:
+        """E.g. `cd` failed, so the command never ran."""
+        ws = _FakeWSClient([_status(2)], error=ConnectionResetError("reset"))
+
+        result = _handle(ws)
+
+        assert result.returncode == 2
+
     def test_the_status_wins_over_the_markers(self) -> None:
         ws = _FakeWSClient(
             [(STDOUT, _marker(0)), (STDERR, _marker(0)), _status(3)],
@@ -472,6 +499,16 @@ class TestResultLostAfterTheScriptWasSent:
         ws = _FakeWSClient([(STDOUT, b"partial")], error=error)
 
         with pytest.raises(ExecResultUnknownError, match="WebSocket connection lost"):
+            _handle(ws)
+
+    def test_connection_lost_between_the_markers(self) -> None:
+        """Stderr may be missing its end, so stdout's marker alone isn't a result."""
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(0)), (STDERR, b"part of stderr")],
+            error=ConnectionResetError("connection reset"),
+        )
+
+        with pytest.raises(ExecResultUnknownError):
             _handle(ws)
 
     def test_exec_ending_without_a_status(self) -> None:
@@ -627,20 +664,18 @@ class TestClosingLine:
         assert writes[-1] == "}\n"
         assert "".join(writes).endswith('exit "$returncode"\n}\n')
 
-    def test_a_failure_before_it_is_left_to_the_caller_to_retry(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        "failing", [pytest.param("body", id="body"), pytest.param("}\n", id="close")]
+    )
+    def test_a_failure_writing_the_script_is_left_to_the_caller_to_retry(
+        self, monkeypatch: pytest.MonkeyPatch, failing: str
     ) -> None:
-        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data != "}\n")
+        """Nothing ran: a frame that failed to send never reached the shell."""
+        writes, op = _exec_writing_to(
+            monkeypatch, fails=lambda data: (data == "}\n") == (failing == "}\n")
+        )
 
         with pytest.raises(BrokenPipeError):
-            op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
-
-    def test_a_failure_sending_it_may_have_run_the_command(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data == "}\n")
-
-        with pytest.raises(ExecResultUnknownError):
             op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
 
 
@@ -672,6 +707,8 @@ class TestFreshMarker:
 
         scripts = "".join(c.args[0] for c in ws.write_stdin.call_args_list)
         assert handled[0] != handled[1]
+        for marker in handled:
+            assert re.fullmatch(r"<completed-sentinel-value-[0-9a-f]{32}-", marker)
         for marker in handled:
             assert scripts.count(f"printf '{marker}%d>'") == 2
 
@@ -768,7 +805,9 @@ class TestProbeSwitch:
     @pytest.mark.parametrize(
         ("user", "runuser", "expected"),
         [
-            pytest.param(getpass.getuser(), None, 0, id="already-that-user"),
+            pytest.param(
+                pwd.getpwuid(os.getuid()).pw_name, None, 0, id="already-that-user"
+            ),
             pytest.param(str(os.getuid()), None, 0, id="already-that-uid"),
             pytest.param("someone-else", "exit 0", 1, id="runuser-can-switch"),
             pytest.param("someone-else", "exit 1", 2, id="runuser-cannot-switch"),

@@ -43,6 +43,26 @@ async def test_each_user_is_probed_once() -> None:
     assert _switches(op) == [True, True, False, None, True]
 
 
+async def test_a_container_that_cannot_switch_is_probed_once() -> None:
+    """The shell checks for itself on every call then; probing again gains nothing."""
+    pod = _make_pod()
+    with (
+        patch("k8s_sandbox._pod.op.k8s_client") as client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as op_cls,
+    ):
+        client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=0
+        )
+        op = op_cls.return_value
+        op.probe_switch.return_value = None
+        op.exec.return_value = OK
+
+        await _exec_as(pod, "agent", "agent")
+
+    assert op.probe_switch.call_count == 1
+    assert _switches(op) == [None, None]
+
+
 async def test_a_failed_probe_leaves_the_check_to_the_shell_and_is_tried_again() -> (
     None
 ):

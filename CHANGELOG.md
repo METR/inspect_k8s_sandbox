@@ -5,15 +5,18 @@
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
-  background process holding its stdout or stderr open now returns about a second
-  after the command exits, rather than at once.
+  background process holding its stdout or stderr open now returns a tenth of a
+  second after the command exits, rather than at once.
 - `exec()` no longer runs a command a second time when its connection to the pod is
-  lost while the command runs. It raises `ExecResultUnknownError` (as the cause of a
-  `K8sError`) instead, since the command may have run. A connection lost before the
-  command was sent is still retried.
+  lost while the command runs, and no longer returns a successful result whose output
+  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
+  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
+  run. A connection lost before the command was sent is still retried.
 - `exec()` runs fewer programs in the container per call, which makes it faster
-  where starting one is slow. Images no longer need `sync`.
-- `exec(user=...)` runs fewer programs per call after its first call as each user.
+  where starting one is slow. Images no longer need `sync`, and need `printf` (a
+  shell builtin in dash, bash and busybox).
+- `exec(user=...)` runs fewer programs per call after its first call as each user,
+  where the container runs as that user or can switch to them.
 
 ## 2026-10-09 0.14.0
 
