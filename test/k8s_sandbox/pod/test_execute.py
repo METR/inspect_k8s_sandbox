@@ -82,7 +82,9 @@ class _FakeWSClient(WSClient):
         self.subprotocol = None
         self.binary = True
         # No socket: nothing for _update to read, nothing to close.
-        self.sock = types.SimpleNamespace(sock=None, close=lambda **kwargs: None)
+        self.sock = types.SimpleNamespace(
+            sock=None, close=lambda **kwargs: None, settimeout=lambda timeout: None
+        )
         self._frames = list(frames)
         self._ends = ends
         self._error = error
@@ -640,6 +642,26 @@ def test_output_after_the_markers_does_not_hold_the_exec_open(
 
     assert (result.returncode, result.stdout) == (0, "out")
     assert elapsed < 1
+
+
+def test_a_frame_cut_off_after_the_markers_does_not_hold_the_exec_open(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], short_grace: None
+) -> None:
+    """Part of a background process's frame, then the connection stalls."""
+    client, server = tls_sockets
+    markers = _frame(STDOUT, b"out" + _marker(0)) + _frame(STDERR, _marker(0))
+    server.sendall(markers + _frame(STDOUT, b"late")[:3])
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+
+    reading = pool.submit(_handle, _SocketWSClient(client))
+    try:
+        result = reading.result(timeout=5)
+    finally:
+        # Wakes a read still waiting, so that a failure can't hang the suite.
+        server.close()
+        pool.shutdown()
+
+    assert (result.returncode, result.stdout) == (0, "out")
 
 
 def test_output_read_before_a_failed_close_reply_is_kept(
