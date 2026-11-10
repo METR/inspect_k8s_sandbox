@@ -724,6 +724,31 @@ def test_the_probe_reads_a_status_tls_has_already_decrypted(
     assert answer is True
 
 
+def test_the_probe_gives_up_on_a_frame_cut_off(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Part of the status frame, then the connection stalls."""
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.5)
+    client, server = tls_sockets
+    server.sendall(_frame(*_status(1))[:5])
+    op = ExecuteOperation(MagicMock())
+
+    @contextmanager
+    def shell(command: list[str]) -> Generator[WSClient, None, None]:
+        yield _SocketWSClient(client)
+
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    with patch.object(op, "_interactive_shell", shell):
+        probing = pool.submit(op.probe_switch, "agent")
+        try:
+            with pytest.raises(PodError, match="timed out"):
+                probing.result(timeout=5)
+        finally:
+            # Wakes a read still waiting, so that a failure can't hang the suite.
+            server.close()
+            pool.shutdown()
+
+
 class TestStatusReceivedBeforeTheConnectionWasLost:
     def test_the_status_is_used_without_markers(self) -> None:
         """E.g. `cd` failed, so the command never ran."""
