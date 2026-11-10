@@ -143,7 +143,13 @@ class ExecuteOperation(PodOperation):
                 wait = deadline - time.monotonic()
                 if wait <= 0:
                     raise PodError(f"Probing exec(user={user!r}) timed out")
-                _update(ws_client, wait)
+                try:
+                    _update(ws_client, wait)
+                except (OSError, websocket.WebSocketException):
+                    # E.g. replying to the server's close after it has gone.
+                    if ERROR_CHANNEL not in ws_client._channels:
+                        raise
+                    ws_client.close()
                 # The probe prints nothing, so keep nothing a planted `id` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
@@ -385,7 +391,7 @@ class ExecuteOperation(PodOperation):
 
 
 def _update(ws_client: WSClient, timeout: float | None) -> None:
-    """ws_client.update(timeout), but first taking a frame TLS has already decrypted.
+    """ws_client.update(timeout), or a frame TLS has already decrypted if there is one.
 
     Before kubernetes 37, update() reads one frame but polls only the raw socket, which
     can't see a decrypted one: a frame that arrived in the same TLS record as the last

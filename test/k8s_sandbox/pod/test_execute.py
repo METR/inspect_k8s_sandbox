@@ -81,7 +81,7 @@ class _FakeWSClient(WSClient):
         self._closed_channels: set[int] = set()
         self.subprotocol = None
         self.binary = True
-        # No socket: nothing for _take_decrypted_frames to read, nothing to close.
+        # No socket: nothing for _update to read, nothing to close.
         self.sock = types.SimpleNamespace(sock=None, close=lambda **kwargs: None)
         self._frames = list(frames)
         self._ends = ends
@@ -1121,6 +1121,19 @@ class TestProbeBounds:
         with patch.object(op, "_interactive_shell", fake_shell):
             with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
+
+    def test_a_status_received_before_the_connection_was_lost_answers(self) -> None:
+        """E.g. replying to the server's close after it has gone."""
+        op = ExecuteOperation(MagicMock())
+
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            yield _FakeWSClient([_status(1)], error=BrokenPipeError("gone"))
+
+        with patch.object(op, "_interactive_shell", fake_shell):
+            answer = op.probe_switch("agent")
+
+        assert answer is True
 
     def test_keeps_none_of_the_containers_output(self) -> None:
         op = ExecuteOperation(MagicMock())
