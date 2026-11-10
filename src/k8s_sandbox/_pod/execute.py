@@ -20,7 +20,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 from websocket import ABNF
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
+from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import API_TIMEOUT, PodOperation
 
@@ -102,12 +102,18 @@ class ExecuteOperation(PodOperation):
         with self._interactive_shell(_shell_command(user, switch)) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands. Nothing runs
-            # until the group's closing line arrives, so a failure writing it may be
-            # retried. That line goes in a frame of its own, as a frame arrives whole or
-            # not at all: a shell that got the `}` but not the newline would still run
-            # the group when its input ended.
+            # until the group's closing `}` arrives, so a failure before then may be
+            # retried. A shell that got the `}` runs the group even without the
+            # newline after it, and over plain ws:// part of a frame cut off by a lost
+            # connection can still arrive: once that line is being sent, it may run.
             self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
-            ws_client.write_stdin(_CLOSE_GROUP)
+            try:
+                ws_client.write_stdin(_CLOSE_GROUP)
+            except (OSError, websocket.WebSocketException) as e:
+                raise ExecResultUnknownError(
+                    "WebSocket connection lost during exec",
+                    pod=self._pod.name,
+                ) from e
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
@@ -127,12 +133,12 @@ class ExecuteOperation(PodOperation):
             f"if {_runs_as(user)}; then exit 0; fi; "
             f"if runuser -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
         )
-        deadline = time.monotonic() + API_TIMEOUT
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
+            deadline = time.monotonic() + API_TIMEOUT
             while ws_client.is_open():
                 wait = deadline - time.monotonic()
                 if wait <= 0:
-                    raise TimeoutError(f"Probing exec(user={user!r}) timed out")
+                    raise PodError(f"Probing exec(user={user!r}) timed out")
                 ws_client.update(timeout=wait)
                 # The probe prints nothing, so keep nothing a planted `id` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)

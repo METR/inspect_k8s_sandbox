@@ -34,7 +34,11 @@ from kubernetes.stream.ws_client import (
 
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
-from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
+from k8s_sandbox._pod.error import (
+    ExecResultUnknownError,
+    GetReturncodeError,
+    PodError,
+)
 from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
@@ -745,18 +749,21 @@ class TestClosingLine:
         assert writes[-1] == "}\n"
         assert "".join(writes).endswith('exit "$returncode"\n}\n')
 
-    @pytest.mark.parametrize(
-        "failing", [pytest.param("body", id="body"), pytest.param("}\n", id="close")]
-    )
-    def test_a_failure_writing_the_script_is_left_to_the_caller_to_retry(
-        self, monkeypatch: pytest.MonkeyPatch, failing: str
+    def test_a_failure_before_it_is_left_to_the_caller_to_retry(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Nothing ran: a frame that failed to send never reached the shell."""
-        writes, op = _exec_writing_to(
-            monkeypatch, fails=lambda data: (data == "}\n") == (failing == "}\n")
-        )
+        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data != "}\n")
 
         with pytest.raises(BrokenPipeError):
+            op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
+
+    def test_a_failure_sending_it_may_have_run_the_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Over plain ws://, the `}` alone can arrive from a frame cut off."""
+        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data == "}\n")
+
+        with pytest.raises(ExecResultUnknownError):
             op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
 
 
@@ -931,7 +938,7 @@ class TestProbeBounds:
             yield _FakeWSClient([(STDOUT, b"x")], ends=False)
 
         with patch.object(op, "_interactive_shell", fake_shell):
-            with pytest.raises(TimeoutError):
+            with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
 
     def test_keeps_none_of_the_containers_output(self) -> None:
