@@ -705,13 +705,13 @@ def test_the_socket_is_closed_after_the_server_closed_the_connection(
     assert client.fileno() == -1
 
 
-def test_the_probe_reads_a_close_tls_has_already_decrypted(
+def test_the_probe_reads_a_status_tls_has_already_decrypted(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The status and the close in one TLS record, and the server awaiting the reply."""
+    """Output, the status and the close in one TLS record; the server awaits a reply."""
     monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
     client, server = tls_sockets
-    server.sendall(_frame(*_status(1)) + _close_frame())
+    server.sendall(_frame(STDOUT, b"x") + _frame(*_status(1)) + _close_frame())
     op = ExecuteOperation(MagicMock())
 
     @contextmanager
@@ -1144,13 +1144,41 @@ class TestProbeBounds:
             with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
 
-    def test_a_status_received_before_the_connection_was_lost_answers(self) -> None:
-        """E.g. replying to the server's close after it has gone."""
+    def test_a_status_received_before_the_connection_was_lost_answers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """As kubernetes 37's update() can: read the status, then fail.
+
+        E.g. replying to the server's close after it has gone.
+        """
+        op = ExecuteOperation(MagicMock())
+        ws = _FakeWSClient([_status(1)], error=BrokenPipeError("gone"))
+        read_one = ws.update
+
+        def read_all_then_fail(timeout: float | None = 0) -> None:
+            while True:
+                read_one(timeout)
+
+        monkeypatch.setattr(ws, "update", read_all_then_fail)
+
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            yield ws
+
+        with patch.object(op, "_interactive_shell", fake_shell):
+            answer = op.probe_switch("agent")
+
+        assert answer is True
+
+    def test_answers_without_waiting_for_the_server_to_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.5)
         op = ExecuteOperation(MagicMock())
 
         @contextmanager
         def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
-            yield _FakeWSClient([_status(1)], error=BrokenPipeError("gone"))
+            yield _FakeWSClient([_status(1)], ends=False)
 
         with patch.object(op, "_interactive_shell", fake_shell):
             answer = op.probe_switch("agent")

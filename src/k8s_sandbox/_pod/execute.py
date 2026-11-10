@@ -139,20 +139,20 @@ class ExecuteOperation(PodOperation):
         )
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
             deadline = time.monotonic() + API_TIMEOUT
-            while ws_client.is_open():
+            # The answer is in with the status; the server's close needn't follow.
+            while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
                 wait = deadline - time.monotonic()
                 if wait <= 0:
                     raise PodError(f"Probing exec(user={user!r}) timed out")
                 try:
                     _update(ws_client, wait)
                 except (OSError, websocket.WebSocketException):
-                    # E.g. replying to the server's close after it has gone.
                     if ERROR_CHANNEL not in ws_client._channels:
                         raise
-                    ws_client.close()
                 # The probe prints nothing, so keep nothing a planted `id` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
+            ws_client.close()
             returncode = get_returncode(ws_client)
         return returncode == 1
 
