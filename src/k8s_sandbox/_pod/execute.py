@@ -1,3 +1,4 @@
+import base64
 import logging
 import re
 import secrets
@@ -10,6 +11,7 @@ import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
     STDERR_CHANNEL,
     STDOUT_CHANNEL,
     WSClient,
@@ -18,7 +20,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
 from k8s_sandbox._pod.get_returncode import get_returncode
-from k8s_sandbox._pod.op import PodOperation
+from k8s_sandbox._pod.op import API_TIMEOUT, PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
@@ -26,12 +28,8 @@ COMPLETED_SENTINEL = "completed-sentinel-value"
 # a background process still holds the command's stdout or stderr open.
 STREAM_END_GRACE_SECONDS = 1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
-# Input bytes that can stand as themselves in the single-quoted printf format that
-# pipes input to a command: printable ASCII, less `\`, `%` and the quote.
-_PRINTF_LITERAL = frozenset(range(0x20, 0x7F)) - {ord("\\"), ord("%"), ord("'")}
-# Every other byte is written as a three-digit octal escape, which printf turns back
-# into that byte, null included.
-_PRINTF_ESCAPES = {b: f"\\{b:03o}" for b in range(256) if b not in _PRINTF_LITERAL}
+# The last line of every exec script, which closes its { } group: see exec().
+_CLOSE_GROUP = "}\n"
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +99,20 @@ class ExecuteOperation(PodOperation):
         shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout, marker)
         with self._interactive_shell(_shell_command(user, switch)) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
-            # argument (-c) to better support potentially long commands. A failure
-            # here leaves the script's closing brace unsent, so nothing has run and
-            # the caller may retry. After it, the command may have run.
-            self._write_stdin_chunked(ws_client, shell_script)
+            # argument (-c) to better support potentially long commands. Nothing runs
+            # until the group's closing line arrives, so a failure before then may be
+            # retried.
+            self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
+            # Send that line whole, in a frame of its own: a shell that got the `}` but
+            # not the newline would still run the group when its input ended. From here
+            # on the command may run.
+            try:
+                ws_client.write_stdin(_CLOSE_GROUP)
+            except (OSError, websocket.WebSocketException) as e:
+                raise ExecResultUnknownError(
+                    "WebSocket connection lost during exec",
+                    pod=self._pod.name,
+                ) from e
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
@@ -124,8 +132,16 @@ class ExecuteOperation(PodOperation):
             f"if {_runs_as(user)}; then exit 0; fi; "
             f"if runuser -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
         )
+        deadline = time.monotonic() + API_TIMEOUT
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
-            ws_client.run_forever()
+            while ws_client.is_open():
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    raise TimeoutError(f"Probing exec(user={user!r}) timed out")
+                ws_client.update(timeout=wait)
+                # The probe prints nothing, so keep nothing a planted `id` might.
+                ws_client._channels.pop(STDOUT_CHANNEL, None)
+                ws_client._channels.pop(STDERR_CHANNEL, None)
             returncode = get_returncode(ws_client)
         return {0: False, 1: True}.get(returncode)
 
@@ -174,19 +190,22 @@ class ExecuteOperation(PodOperation):
             # Exit the shell. This won't actually close the websocket connection until
             # stdout and stderr (which have been inherited by the user command) are
             # closed.
-            yield "exit $returncode\n"
-            yield "}\n"
+            yield 'exit "$returncode"\n'
+            yield _CLOSE_GROUP
 
         return "".join(generate())
 
     def _pipe_user_input(self, stdin: str | bytes) -> str:
-        data = stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")
-        # Pipe user input from printf, a shell builtin, so no process starts for it.
-        # Simply writing it to the shell's stdin after a command e.g. `cat` results in
-        # `cat` blocking indefinitely as there is no way to close the stdin stream in
-        # v4.channel.k8s.io, and a shell reading its script from stdin may read ahead
-        # into the input.
-        return f"printf '{data.decode('latin-1').translate(_PRINTF_ESCAPES)}' | "
+        # Encode the user-provided input as base64 for 2 reasons:
+        # 1. To avoid issues with special characters (e.g. new lines) in the input.
+        # 2. To support binary input (e.g. null byte).
+        stdin_b64 = base64.b64encode(
+            stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")
+        ).decode("ascii")
+        # Pipe user input. Simply writing it to the shell's stdin after a command e.g.
+        # `cat` results in `cat` blocking indefinitely as there is no way to close the
+        # stdin stream in v4.channel.k8s.io.
+        return f"echo '{stdin_b64}' | base64 -d | "
 
     def _prefix_timeout(self, timeout: int | None) -> str:
         if timeout is None:
@@ -203,15 +222,11 @@ class ExecuteOperation(PodOperation):
         def stream_output() -> tuple[ExecResult[str], bool]:
             stdout = _MarkedStream(marker)
             stderr = _MarkedStream(marker)
-            returncode: int | None = None
             # Set once both markers are in: the command has exited.
             deadline: float | None = None
             while ws_client.is_open():
                 wait = None if deadline is None else deadline - time.monotonic()
                 if wait is not None and wait <= 0:
-                    # A background process is holding stdout or stderr open, so the
-                    # exec won't end by itself. Take the marker's returncode.
-                    returncode = stdout.returncode
                     break
                 try:
                     # Until both markers are in, `wait` is None and `update` blocks
@@ -224,32 +239,46 @@ class ExecuteOperation(PodOperation):
                     stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
                     self._verify_output_limit(stdout.buffer, stderr.buffer)
                 except (OSError, websocket.WebSocketException) as e:
-                    if deadline is not None:
-                        # Both markers already received — we have the result.
-                        returncode = stdout.returncode
-                        break
-                    raise ExecResultUnknownError(
-                        "WebSocket connection lost during exec",
-                        pod=self._pod.name,
-                    ) from e
+                    if deadline is None:
+                        raise ExecResultUnknownError(
+                            "WebSocket connection lost during exec",
+                            pod=self._pod.name,
+                        ) from e
+                    break
                 if deadline is None and None not in (
                     stdout.returncode,
                     stderr.returncode,
                 ):
                     deadline = time.monotonic() + STREAM_END_GRACE_SECONDS
-            if returncode is None:
-                # The exec ended by itself, so the status channel has the shell's exit
-                # status, also when the script stopped early (e.g. `cd` failed).
+            if deadline is None or ERROR_CHANNEL in ws_client._channels:
+                # The exec reported the shell's exit status, or ended before the
+                # markers (e.g. `cd` failed, so the command never ran).
+                if ws_client.is_open():
+                    ws_client.close()
                 stdout.flush()
                 stderr.flush()
                 self._verify_output_limit(stdout.buffer, stderr.buffer)
                 try:
                     returncode = get_returncode(ws_client)
                 except GetReturncodeError as e:
+                    if deadline is None:
+                        raise ExecResultUnknownError(
+                            "The exec ended without the command's exit code",
+                            pod=self._pod.name,
+                        ) from e
+                    returncode = self._marked_returncode(stdout, stderr)
+                # The shell can only exit 0 once it has written both markers, so a
+                # missing one means the end of the output was lost on the way.
+                if returncode == 0 and None in (stdout.returncode, stderr.returncode):
                     raise ExecResultUnknownError(
-                        "The exec ended without the command's exit code",
+                        "The exec ended without the end of the command's output",
                         pod=self._pod.name,
-                    ) from e
+                    )
+            else:
+                # Both markers are in but no exit status: a background process is
+                # holding stdout or stderr open, or the connection was lost after the
+                # command exited.
+                returncode = self._marked_returncode(stdout, stderr)
             return (
                 ExecResult(
                     success=returncode == 0,
@@ -322,6 +351,18 @@ class ExecuteOperation(PodOperation):
             )
             return
 
+    def _marked_returncode(
+        self, stdout: "_MarkedStream", stderr: "_MarkedStream"
+    ) -> int:
+        # The markers disagree only if something besides the shell wrote one: code the
+        # command runs can read its own stdout back through /proc and so learn it.
+        if stdout.returncode is None or stdout.returncode != stderr.returncode:
+            raise ExecResultUnknownError(
+                "The command's end markers disagree, so its exit code is unknown",
+                pod=self._pod.name,
+            )
+        return stdout.returncode
+
     def _verify_output_limit(
         self, stdout: LimitedBuffer, stderr: LimitedBuffer
     ) -> None:
@@ -342,7 +383,8 @@ class _MarkedStream:
     def __init__(self, marker: str) -> None:
         self.buffer = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
         self.returncode: int | None = None
-        self._pattern = re.compile(re.escape(marker.encode()) + rb"(\d{1,3})>")
+        self._prefix = marker.encode()
+        self._pattern = re.compile(re.escape(self._prefix) + rb"(\d{1,3})>")
         # The longest marker less one byte: a returncode has at most three digits.
         self._hold = len(marker) + 3
         self._pending = b""
@@ -358,8 +400,17 @@ class _MarkedStream:
             self.returncode = int(match[1])
             self._pending = b""
         else:
-            self.buffer.append(data[: -self._hold])
-            self._pending = data[-self._hold :]
+            # Hold back only a tail that could still become the marker, which starts at
+            # its only `<`.
+            start = data.rfind(b"<", max(0, len(data) - self._hold))
+            if start == -1 or not self._could_become_marker(data[start:]):
+                start = len(data)
+            self.buffer.append(data[:start])
+            self._pending = data[start:]
+
+    def _could_become_marker(self, tail: bytes) -> bool:
+        head, digits = tail[: len(self._prefix)], tail[len(self._prefix) :]
+        return self._prefix.startswith(head) and (digits.isdigit() or not digits)
 
     def flush(self) -> None:
         """Release the held-back bytes of a stream that ended without a marker."""

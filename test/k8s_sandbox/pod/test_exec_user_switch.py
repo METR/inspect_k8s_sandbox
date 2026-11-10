@@ -61,6 +61,26 @@ async def test_a_failed_probe_leaves_the_check_to_the_shell_and_is_tried_again()
     assert _switches(op) == [None, True]
 
 
+async def test_a_restarted_container_is_probed_again() -> None:
+    pod = _make_pod(restarted_container_behavior="warn")
+    with (
+        patch("k8s_sandbox._pod.op.k8s_client") as client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as op_cls,
+    ):
+        client.return_value.read_namespaced_pod.side_effect = [
+            _k8s_pod(uid="uid-OLD", container_name="default", restart_count=0),
+            _k8s_pod(uid="uid-OLD", container_name="default", restart_count=1),
+        ]
+        op = op_cls.return_value
+        op.probe_switch.side_effect = [False, True]
+        op.exec.return_value = OK
+
+        await _exec_as(pod, "agent", "agent")
+
+    assert op.probe_switch.call_count == 2
+    assert _switches(op) == [False, True]
+
+
 async def test_a_replaced_pod_is_probed_again() -> None:
     pod = _make_pod(restarted_container_behavior="warn")
     with (

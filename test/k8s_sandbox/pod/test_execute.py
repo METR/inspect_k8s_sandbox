@@ -9,12 +9,12 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Callable, Generator, Sequence
 from unittest.mock import MagicMock, patch
 
 import pytest
 import websocket
-from inspect_ai.util import ExecResult
+from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.stream.ws_client import (  # type: ignore
     ERROR_CHANNEL,
     WSClient,
@@ -28,7 +28,7 @@ from kubernetes.stream.ws_client import (
 
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
-from k8s_sandbox._pod.error import ExecResultUnknownError
+from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
 from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
@@ -53,19 +53,22 @@ class _FakeWSClient(WSClient):
     Only update() is replaced, so peek_*() and read_*() behave as they do for real,
     including peek_*() calling update(timeout=0) and so taking in the next frame.
 
-    Once the frames run out the exec ends (the server closes the connection), unless
+    A number in place of a frame is a pause, in seconds, before the next one. Once the
+    frames run out the exec ends (the server closes the connection), unless
     `ends=False`, which is a background process holding stdout or stderr open: then
     nothing more ever arrives.
     """
 
     def __init__(
         self,
-        frames: list[tuple[int, bytes]],
+        frames: Sequence[tuple[int, bytes] | float],
         ends: bool = True,
         error: Exception | None = None,
     ) -> None:
         self._connected = True
         self._channels: dict[int, bytes] = {}
+        self._closed_channels: set[int] = set()
+        self.subprotocol = None
         self.binary = True
         self.sock = None
         self._frames = list(frames)
@@ -75,8 +78,18 @@ class _FakeWSClient(WSClient):
     def update(self, timeout: float | None = 0) -> None:
         if not self.is_open():
             return
+        if self._frames and isinstance(self._frames[0], float):
+            pause = self._frames[0]
+            if timeout is not None and timeout < pause:
+                time.sleep(timeout)
+                self._frames[0] = pause - timeout
+                return
+            time.sleep(pause)
+            self._frames.pop(0)
         if self._frames:
-            channel, data = self._frames.pop(0)
+            frame = self._frames.pop(0)
+            assert not isinstance(frame, float)
+            channel, data = frame
             self._channels[channel] = self._channels.get(channel, b"") + data
         elif self._error is not None:
             raise self._error
@@ -109,8 +122,20 @@ class TestCompletion:
 
         result = _handle(ws)
 
-        assert result.returncode == 3
+        assert (result.returncode, result.success) == (3, False)
         assert result.stdout == "out"
+
+    def test_a_status_that_arrives_wins_over_the_markers(
+        self, short_grace: None
+    ) -> None:
+        """Even if the connection then stays open past the grace period."""
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(0)), (STDERR, _marker(0)), _status(3)], ends=False
+        )
+
+        result = _handle(ws)
+
+        assert (result.returncode, result.success) == (3, False)
 
     @pytest.mark.parametrize(
         "printed",
@@ -169,8 +194,33 @@ class TestCompletion:
 
         result = _handle(ws)
 
-        assert result.returncode == 0
+        assert (result.returncode, result.success) == (0, True)
         assert (result.stdout, result.stderr) == ("out", "err")
+
+    def test_markers_that_disagree_are_not_trusted(self, short_grace: None) -> None:
+        """Code the command runs can read stdout's marker back and forge it."""
+        ws = _FakeWSClient([(STDOUT, _marker(0)), (STDERR, _marker(1))], ends=False)
+
+        with pytest.raises(ExecResultUnknownError, match="disagree"):
+            _handle(ws)
+
+    def test_a_status_without_an_exit_code_leaves_it_to_the_markers(self) -> None:
+        status = {
+            "status": "Failure",
+            "message": "error executing command in container",
+            "details": {"causes": [{"message": "failed while waiting for exec"}]},
+        }
+        ws = _FakeWSClient(
+            [
+                (STDOUT, _marker(5)),
+                (STDERR, _marker(5)),
+                (ERROR_CHANNEL, json.dumps(status).encode()),
+            ]
+        )
+
+        result = _handle(ws)
+
+        assert result.returncode == 5
 
     def test_output_after_the_marker_is_dropped(self, short_grace: None) -> None:
         """Only background processes can write after the shell's marker."""
@@ -189,9 +239,29 @@ class TestCompletion:
 
     def test_waits_for_the_marker_on_both_streams(self, short_grace: None) -> None:
         """Stderr's tail can arrive after stdout's marker (#23), so wait for both."""
-        ws = _FakeWSClient([(STDOUT, _marker(0))], ends=False)
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(0)), 0.1, (STDERR, b"late" + _marker(0))], ends=False
+        )
 
-        with pytest.raises(AssertionError, match="would block forever"):
+        result = _handle(ws)
+
+        assert result.stderr == "late"
+
+    def test_output_over_the_limit_fails_without_waiting_for_more(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only output that could still turn out to be the marker is held back."""
+        monkeypatch.setattr(execute_module.limits, "MAX_EXEC_OUTPUT_SIZE", 8)
+        ws = _FakeWSClient([(STDOUT, b"x" * 9)], ends=False)
+
+        with pytest.raises(OutputLimitExceededError):
+            _handle(ws)
+
+    def test_success_without_the_markers_means_output_was_lost(self) -> None:
+        """The shell writes both markers before it can exit 0."""
+        ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(0)])
+
+        with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
             _handle(ws)
 
     def test_a_stream_that_ends_without_a_marker_keeps_all_its_output(self) -> None:
@@ -248,6 +318,9 @@ class TestScriptInAShell:
             ),
             pytest.param("caf\u00e9 'quoted' \"double\" %d \\\n\u03bb", id="text"),
             pytest.param("", id="empty"),
+            pytest.param("-hello", id="leading-hyphen"),
+            pytest.param("--", id="double-hyphen"),
+            pytest.param("-n", id="option-like"),
         ],
     )
     def test_input_reaches_the_command_byte_for_byte(
@@ -259,6 +332,40 @@ class TestScriptInAShell:
 
         expected = stdin if isinstance(stdin, bytes) else stdin.encode()
         assert result.stdout == expected + _marker(0)
+
+    def test_a_callers_ifs_does_not_change_the_exit_code(
+        self, shell: list[str]
+    ) -> None:
+        script = ExecuteOperation(MagicMock())._build_shell_script(
+            ["sh", "-c", "exit 13"], None, None, {"IFS": "3"}, None, MARKER
+        )
+
+        result = _run_script(shell, script)
+
+        assert result.returncode == 13
+
+    def test_needs_no_sync(self, shell: list[str], tmp_path: Path) -> None:
+        """Images no longer need `sync` (prerequisites.md)."""
+        (tmp_path / "cat").symlink_to(shutil.which("cat") or "/bin/cat")
+        (tmp_path / "file").write_text("output")
+        script = _script(["cat", str(tmp_path / "file")])
+        read_end, write_end = os.pipe()
+        os.write(write_end, script.encode())
+
+        try:
+            result = subprocess.run(
+                [shutil.which(shell[0]) or shell[0], *shell[1:]],
+                stdin=read_end,
+                capture_output=True,
+                timeout=10,
+                env={"PATH": str(tmp_path)},
+            )
+        finally:
+            os.close(read_end)
+            os.close(write_end)
+
+        assert result.stdout == b"output" + _marker(0)
+        assert result.stderr == _marker(0)
 
     def test_the_command_cannot_read_the_marker_from_stdin(
         self, shell: list[str]
@@ -324,6 +431,18 @@ class TestBrokenPipeAfterMarkers:
         assert result.stderr == ""
 
 
+class TestStatusReceivedBeforeTheConnectionWasLost:
+    def test_the_status_wins_over_the_markers(self) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(0)), (STDERR, _marker(0)), _status(3)],
+            error=ConnectionResetError("connection reset"),
+        )
+
+        result = _handle(ws)
+
+        assert result.returncode == 3
+
+
 class TestResultLostAfterTheScriptWasSent:
     """Once the script is sent the command may run, so a lost result isn't retried."""
 
@@ -343,10 +462,13 @@ class TestResultLostAfterTheScriptWasSent:
             _handle(ws)
 
     def test_exec_ending_without_a_status(self) -> None:
+        """Still a GetReturncodeError, which callers (Hawk's VM-death report) match."""
         ws = _FakeWSClient([(STDOUT, b"partial")])
 
-        with pytest.raises(ExecResultUnknownError, match="without the command's exit"):
+        with pytest.raises(GetReturncodeError) as raised:
             _handle(ws)
+
+        assert isinstance(raised.value, ExecResultUnknownError)
 
 
 class TestNonUtf8Output:
@@ -455,6 +577,92 @@ class TestExecChunksStdin:
         assert result is sentinel
 
 
+def _exec_writing_to(
+    monkeypatch: pytest.MonkeyPatch, fails: Callable[[str], bool] = lambda data: False
+) -> tuple[list[str], ExecuteOperation]:
+    """An ExecuteOperation recording its stdin writes, which fail where `fails` says."""
+    monkeypatch.setattr(op_module, "_STDIN_CHUNK_SIZE", 16)
+    writes: list[str] = []
+    ws = MagicMock(spec=WSClient)
+
+    def write_stdin(data: str) -> None:
+        writes.append(data)
+        if fails(data):
+            raise BrokenPipeError("socket closed")
+
+    ws.write_stdin.side_effect = write_stdin
+
+    @contextmanager
+    def fake_interactive_shell(command: list[str]) -> Generator[MagicMock, None, None]:
+        yield ws
+
+    op = ExecuteOperation(MagicMock())
+    monkeypatch.setattr(op, "_interactive_shell", fake_interactive_shell)
+    done = ExecResult(success=True, returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: done)
+    return writes, op
+
+
+class TestClosingLine:
+    """A shell runs a { } group once it has the `}`, even if the newline never came."""
+
+    def test_is_sent_whole_and_last(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        writes, op = _exec_writing_to(monkeypatch)
+
+        op.exec(["cat"], stdin=b"x" * 100, cwd=None, env={}, user=None, timeout=None)
+
+        assert writes[-1] == "}\n"
+        assert "".join(writes).endswith('exit "$returncode"\n}\n')
+
+    def test_a_failure_before_it_is_left_to_the_caller_to_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data != "}\n")
+
+        with pytest.raises(BrokenPipeError):
+            op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
+
+    def test_a_failure_sending_it_may_have_run_the_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data == "}\n")
+
+        with pytest.raises(ExecResultUnknownError):
+            op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
+
+
+class TestFreshMarker:
+    def test_each_exec_ends_its_output_with_a_new_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws = MagicMock(spec=WSClient)
+
+        @contextmanager
+        def fake_interactive_shell(
+            command: list[str],
+        ) -> Generator[MagicMock, None, None]:
+            yield ws
+
+        op = ExecuteOperation(MagicMock())
+        monkeypatch.setattr(op, "_interactive_shell", fake_interactive_shell)
+        handled: list[str] = []
+        done = ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+        def handle(ws: WSClient, user: object, timeout: object, marker: str) -> object:
+            handled.append(marker)
+            return done
+
+        monkeypatch.setattr(op, "_handle_shell_output", handle)
+
+        for _ in range(2):
+            op.exec(["true"], stdin=None, cwd=None, env={}, user=None, timeout=None)
+
+        scripts = "".join(c.args[0] for c in ws.write_stdin.call_args_list)
+        assert handled[0] != handled[1]
+        for marker in handled:
+            assert scripts.count(f"printf '{marker}%d>'") == 2
+
+
 class TestShellCommand:
     """`runuser` is only reached for when the container is not already that user."""
 
@@ -509,6 +717,21 @@ class TestShellCommand:
         assert user not in script.replace(shlex.quote(user), "")
 
 
+def _probe_script(user: str) -> str:
+    op = ExecuteOperation(MagicMock())
+    commands: list[list[str]] = []
+
+    @contextmanager
+    def capture(command: list[str]) -> Generator[WSClient, None, None]:
+        commands.append(command)
+        yield _FakeWSClient([_status(0)])
+
+    with patch.object(op, "_interactive_shell", capture):
+        op.probe_switch(user)
+    assert commands[0][:2] == ["/bin/sh", "-c"]
+    return commands[0][2]
+
+
 class TestProbeSwitch:
     @pytest.mark.parametrize(
         ("returncode", "switch"), [(0, False), (1, True), (2, None)]
@@ -517,43 +740,80 @@ class TestProbeSwitch:
         self, returncode: int, switch: bool | None
     ) -> None:
         op = ExecuteOperation(MagicMock())
-        commands = []
 
         @contextmanager
         def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
-            commands.append(command)
             yield _FakeWSClient([(STDOUT, b"0"), _status(returncode)])
 
         with patch.object(op, "_interactive_shell", fake_shell):
-            assert op.probe_switch("agent") is switch
-        assert commands[0][:2] == ["/bin/sh", "-c"]
+            answer = op.probe_switch("agent")
+
+        assert answer is switch
 
     @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
     @pytest.mark.parametrize("shell", _SHELLS)
-    def test_probe_in_a_shell(self, shell: list[str]) -> None:
+    @pytest.mark.parametrize(
+        ("user", "runuser", "expected"),
+        [
+            pytest.param(getpass.getuser(), None, 0, id="already-that-user"),
+            pytest.param(str(os.getuid()), None, 0, id="already-that-uid"),
+            pytest.param("someone-else", "exit 0", 1, id="runuser-can-switch"),
+            pytest.param("someone-else", "exit 1", 2, id="runuser-cannot-switch"),
+            # A real runuser can't switch to a user that doesn't exist either.
+            pytest.param("no-such-user-k8s-sandbox", None, 2, id="no-such-user"),
+        ],
+    )
+    def test_probe_in_a_shell(
+        self,
+        shell: list[str],
+        user: str,
+        runuser: str | None,
+        expected: int,
+        tmp_path: Path,
+    ) -> None:
+        if runuser is not None:
+            stub = tmp_path / "runuser"
+            stub.write_text(f"#!/bin/sh\n{runuser}\n")
+            stub.chmod(0o755)
+        path = f"{tmp_path}:{os.environ['PATH']}"
+
+        result = subprocess.run(
+            [*shell, "-c", _probe_script(user)], env={**os.environ, "PATH": path}
+        )
+
+        assert result.returncode == expected
+
+
+class TestProbeBounds:
+    """A planted `id` or `runuser` can hold the probe's output open or flood it."""
+
+    def test_gives_up_on_a_probe_that_never_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.05)
         op = ExecuteOperation(MagicMock())
-        scripts = {}
 
-        def probe_script(user: str) -> str:
-            @contextmanager
-            def capture(command: list[str]) -> Generator[WSClient, None, None]:
-                scripts[user] = command[2]
-                yield _FakeWSClient([_status(0)])
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            yield _FakeWSClient([(STDOUT, b"x")], ends=False)
 
-            with patch.object(op, "_interactive_shell", capture):
-                op.probe_switch(user)
-            return scripts[user]
+        with patch.object(op, "_interactive_shell", fake_shell):
+            with pytest.raises(TimeoutError):
+                op.probe_switch("agent")
 
-        me = getpass.getuser()
-        other = "no-such-user-k8s-sandbox"
+    def test_keeps_none_of_the_containers_output(self) -> None:
+        op = ExecuteOperation(MagicMock())
+        ws = _FakeWSClient([(STDOUT, b"x" * 100), (STDERR, b"y" * 100), _status(1)])
 
-        def run(user: str) -> int:
-            return subprocess.run([*shell, "-c", probe_script(user)]).returncode
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            yield ws
 
-        assert run(me) == 0
-        assert run(str(os.getuid())) == 0
-        # runuser can't switch to a user that doesn't exist: don't start it directly.
-        assert run(other) == 2
+        with patch.object(op, "_interactive_shell", fake_shell):
+            answer = op.probe_switch("agent")
+
+        assert answer is True
+        assert STDOUT not in ws._channels and STDERR not in ws._channels
 
 
 class TestRunuserErrorMessages:
