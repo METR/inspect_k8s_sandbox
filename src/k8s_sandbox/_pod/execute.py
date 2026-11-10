@@ -230,28 +230,33 @@ class ExecuteOperation(PodOperation):
                 wait = None if deadline is None else deadline - time.monotonic()
                 if wait is not None and wait <= 0:
                     break
+                lost = None
                 try:
                     # Until both markers are in, `wait` is None and this blocks until
                     # there is data to read.
                     _update(ws_client, wait)
-                    # Take what was read straight from the client's buffers. The
-                    # peek_*() calls read another frame first, and one for the stream
-                    # already read would wait unseen through the next blocking update().
-                    stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
-                    stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
-                    self._verify_output_limit(stdout.buffer, stderr.buffer)
                 except (OSError, websocket.WebSocketException) as e:
-                    if deadline is None and ERROR_CHANNEL not in ws_client._channels:
-                        raise ExecResultUnknownError(
-                            "WebSocket connection lost during exec",
-                            pod=self._pod.name,
-                        ) from e
-                    break
+                    lost = e
+                # Take what was read straight from the client's buffers, also by an
+                # update() that then failed (from kubernetes 37 it reads every frame
+                # waiting). The peek_*() calls read another frame first, and one for
+                # the stream already read would wait unseen through the next blocking
+                # update().
+                stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
+                stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
+                self._verify_output_limit(stdout.buffer, stderr.buffer)
                 if deadline is None and None not in (
                     stdout.returncode,
                     stderr.returncode,
                 ):
                     deadline = time.monotonic() + STREAM_END_GRACE_SECONDS
+                if lost is not None:
+                    if deadline is None and ERROR_CHANNEL not in ws_client._channels:
+                        raise ExecResultUnknownError(
+                            "WebSocket connection lost during exec",
+                            pod=self._pod.name,
+                        ) from lost
+                    break
             if deadline is None or ERROR_CHANNEL in ws_client._channels:
                 # The exec reported the shell's exit status, or ended before the
                 # markers (e.g. `cd` failed, so the command never ran).
