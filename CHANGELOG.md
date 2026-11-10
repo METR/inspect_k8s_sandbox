@@ -14,6 +14,8 @@
 - `exec()` starts one or two fewer processes in the container per call: it no
   longer runs `sync`, and passes `input` without `base64`. Images no longer need
   `sync`, `echo` or `base64`.
+- `exec(user=...)` starts two fewer processes per call: whether the container
+  already runs as that user is now checked once per sandbox, not on every call.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

@@ -49,6 +49,8 @@ class Pod:
             initial_restart_count,
             restarted_container_behavior,
         )
+        # Per user: whether exec() must switch to them with runuser (see exec()).
+        self._switch: dict[str, bool | None] = {}
 
     @property
     def info(self) -> PodInfo:
@@ -80,6 +82,7 @@ class Pod:
         try:
             check_for_pod_restart(self._info)
         except PodReplacedError as e:
+            self._switch.clear()
             self._info = dataclasses.replace(
                 self._info,
                 uid=e.new_uid,
@@ -157,8 +160,17 @@ class Pod:
         """
         warned_restart = await self.check_for_pod_restart()
         executor = ExecuteOperation(self._info)
+        if user and user not in self._switch:
+            # Finding this once spares every later exec two process starts.
+            try:
+                self._switch[user] = await self._run_async(
+                    lambda: executor.probe_switch(user)
+                )
+            except Exception:
+                logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
+        switch = self._switch.get(user) if user else None
         result = await self._run_async(
-            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout)
+            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
         )
         if not result.success:
             if warned_restart is not None:
