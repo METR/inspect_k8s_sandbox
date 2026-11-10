@@ -14,6 +14,7 @@ import threading
 import time
 import types
 from contextlib import contextmanager
+from importlib.metadata import version
 from pathlib import Path
 from typing import Callable, Generator, Iterable, Sequence
 from unittest.mock import MagicMock, patch
@@ -593,6 +594,10 @@ def test_frames_tls_has_already_decrypted_are_read(
     assert (result.returncode, result.stdout) == (0, "out")
 
 
+@pytest.mark.skipif(
+    int(version("kubernetes").split(".")[0]) >= 37,
+    reason="kubernetes 37's update() reads every frame already waiting (#278)",
+)
 def test_a_flood_of_output_is_checked_against_the_limit_frame_by_frame(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
