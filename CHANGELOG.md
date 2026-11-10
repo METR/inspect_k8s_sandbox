@@ -5,8 +5,8 @@
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
-  background process holding its stdout or stderr open now returns about a second
-  after the command exits, rather than at once.
+  background process holding its stdout or stderr open now returns a tenth of a
+  second after the command exits, rather than at once.
 - `exec()` no longer runs a command a second time when its connection to the pod is
   lost while the command runs, and no longer returns a successful result whose output
   lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a

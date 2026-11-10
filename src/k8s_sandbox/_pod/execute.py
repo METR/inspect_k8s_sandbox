@@ -3,6 +3,7 @@ import logging
 import re
 import secrets
 import shlex
+import ssl
 import time
 from contextlib import contextmanager
 from typing import Generator
@@ -16,6 +17,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     STDOUT_CHANNEL,
     WSClient,
 )
+from websocket import ABNF
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError
@@ -26,7 +28,7 @@ COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
 # and report the shell's exit status (which takes milliseconds). It only runs out when
 # a background process still holds the command's stdout or stderr open.
-STREAM_END_GRACE_SECONDS = 1
+STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 # The last line of every exec script, which closes its { } group: see exec().
 _CLOSE_GROUP = "}\n"
@@ -226,6 +228,7 @@ class ExecuteOperation(PodOperation):
                     # Until both markers are in, `wait` is None and `update` blocks
                     # until there is data to read.
                     ws_client.update(timeout=wait)
+                    _take_decrypted_frames(ws_client)
                     # Take what update() read straight from the client's buffers. The
                     # peek_*() calls read another frame first, and one for the stream
                     # already read would wait unseen through the next blocking update().
@@ -365,6 +368,23 @@ class ExecuteOperation(PodOperation):
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(stdout) + str(stderr),
             )
+
+
+def _take_decrypted_frames(ws_client: WSClient) -> None:
+    """Take in frames that TLS has already decrypted.
+
+    Before kubernetes 37, update() polls only the raw socket, which can't see them, so
+    a frame that arrived in the same TLS record as the last one would wait unseen for
+    more data: forever, while a background process holds the exec open.
+    """
+    sock = ws_client.sock.sock
+    while ws_client.is_open() and isinstance(sock, ssl.SSLSocket) and sock.pending():
+        op_code, frame = ws_client.sock.recv_data_frame(True)
+        if op_code == ABNF.OPCODE_CLOSE:
+            ws_client._connected = False
+        elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
+            channel, data = frame.data[0], frame.data[1:]
+            ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
 
 
 class _MarkedStream:

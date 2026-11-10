@@ -1,13 +1,18 @@
+import concurrent.futures
+import io
 import json
 import os
 import pwd
 import re
 import shlex
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
+import types
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Generator, Sequence
@@ -71,7 +76,8 @@ class _FakeWSClient(WSClient):
         self._closed_channels: set[int] = set()
         self.subprotocol = None
         self.binary = True
-        self.sock = None
+        # No socket: nothing for _take_decrypted_frames to read, nothing to close.
+        self.sock = types.SimpleNamespace(sock=None, close=lambda **kwargs: None)
         self._frames = list(frames)
         self._ends = ends
         self._error = error
@@ -461,6 +467,81 @@ class TestBrokenPipeAfterMarkers:
         assert result.returncode == 0
         assert result.stdout == "hello"
         assert result.stderr == ""
+
+
+@pytest.fixture
+def tls_sockets(
+    tmp_path: Path,
+) -> Generator[tuple[ssl.SSLSocket, ssl.SSLSocket], None, None]:
+    """A client and a server socket with TLS between them."""
+    if shutil.which("openssl") is None:
+        pytest.skip("Needs openssl to make a certificate")
+    key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt"]
+        + ["ec_paramgen_curve:prime256v1", "-nodes", "-days", "1", "-subj", "/CN=x"]
+        + ["-keyout", str(key), "-out", str(cert)],
+        check=True,
+        capture_output=True,
+    )
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    a, b = socket.socketpair()
+    server = server_context.wrap_socket(
+        a, server_side=True, do_handshake_on_connect=False
+    )
+    client = client_context.wrap_socket(b, do_handshake_on_connect=False)
+    handshake = threading.Thread(target=server.do_handshake)
+    handshake.start()
+    client.do_handshake()
+    handshake.join()
+    yield client, server
+    server.close()
+    client.close()
+
+
+class _SocketWSClient(WSClient):
+    """A WSClient on a real socket, with the client's own update() and its poll."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._connected = True
+        self._channels: dict[int, bytes] = {}
+        self._closed_channels: set[int] = set()
+        self._all = io.BytesIO()
+        self.subprotocol = None
+        self.binary = True
+        self.sock = websocket.WebSocket()
+        self.sock.sock = sock
+        self.sock.connected = True
+
+
+def _frame(channel: int, data: bytes) -> bytes:
+    """A server's (unmasked) exec frame."""
+    opcode = websocket.ABNF.OPCODE_BINARY
+    return websocket.ABNF(1, 0, 0, 0, opcode, 0, bytes([channel]) + data).format()
+
+
+def test_frames_tls_has_already_decrypted_are_read(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], short_grace: None
+) -> None:
+    """Both markers in one TLS record, then nothing: as a background process does."""
+    client, server = tls_sockets
+    server.sendall(_frame(STDOUT, b"out" + _marker(0)) + _frame(STDERR, _marker(0)))
+    ws = _SocketWSClient(client)
+
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    reading = pool.submit(_handle, ws)
+    try:
+        result = reading.result(timeout=5)
+    finally:
+        # Wakes a read still waiting, so that a failure can't hang the suite.
+        server.close()
+        pool.shutdown()
+
+    assert (result.returncode, result.stdout) == (0, "out")
 
 
 class TestStatusReceivedBeforeTheConnectionWasLost:
