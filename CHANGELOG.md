@@ -8,12 +8,15 @@
   background process holding its stdout or stderr open now returns about a second
   after the command exits, rather than at once.
 - `exec()` no longer runs a command a second time when its connection to the pod is
-  lost while the command runs. It raises `ExecResultUnknownError` (as the cause of a
-  `K8sError`) instead, since the command may have run. A connection lost before the
-  command was sent is still retried.
+  lost while the command runs, and no longer returns a successful result whose output
+  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
+  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
+  run. A connection lost before the command was sent is still retried.
 - `exec()` runs fewer programs in the container per call, which makes it faster
-  where starting one is slow. Images no longer need `sync`.
-- `exec(user=...)` runs fewer programs per call after its first call as each user.
+  where starting one is slow. Images no longer need `sync`, and need `printf` (a
+  shell builtin in dash, bash and busybox).
+- `exec(user=...)` runs fewer programs per call after its first call as each user,
+  where the container runs as that user or can switch to them.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

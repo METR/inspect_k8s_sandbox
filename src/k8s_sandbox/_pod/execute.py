@@ -100,19 +100,12 @@ class ExecuteOperation(PodOperation):
         with self._interactive_shell(_shell_command(user, switch)) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands. Nothing runs
-            # until the group's closing line arrives, so a failure before then may be
-            # retried.
+            # until the group's closing line arrives, so a failure writing it may be
+            # retried. That line goes in a frame of its own, as a frame arrives whole or
+            # not at all: a shell that got the `}` but not the newline would still run
+            # the group when its input ended.
             self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
-            # Send that line whole, in a frame of its own: a shell that got the `}` but
-            # not the newline would still run the group when its input ended. From here
-            # on the command may run.
-            try:
-                ws_client.write_stdin(_CLOSE_GROUP)
-            except (OSError, websocket.WebSocketException) as e:
-                raise ExecResultUnknownError(
-                    "WebSocket connection lost during exec",
-                    pod=self._pod.name,
-                ) from e
+            ws_client.write_stdin(_CLOSE_GROUP)
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
@@ -240,7 +233,7 @@ class ExecuteOperation(PodOperation):
                     stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
                     self._verify_output_limit(stdout.buffer, stderr.buffer)
                 except (OSError, websocket.WebSocketException) as e:
-                    if deadline is None:
+                    if deadline is None and ERROR_CHANNEL not in ws_client._channels:
                         raise ExecResultUnknownError(
                             "WebSocket connection lost during exec",
                             pod=self._pod.name,

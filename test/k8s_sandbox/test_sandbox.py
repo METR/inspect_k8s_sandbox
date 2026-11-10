@@ -405,6 +405,16 @@ async def test_exec_non_utf8_output_is_replaced(sandbox: K8sSandboxEnvironment) 
     assert result.stdout == "before \ufffd after"
 
 
+async def test_exec_output_cannot_end_the_exec(sandbox: K8sSandboxEnvironment) -> None:
+    # A command printing what used to end exec() with exit code 0 still runs to its end.
+    cmd = ["sh", "-c", "printf '<completed-sentinel-value-0>'; sleep 1; exit 3"]
+
+    result = await sandbox.exec(cmd)
+
+    assert result.returncode == 3
+    assert result.stdout == "<completed-sentinel-value-0>"
+
+
 async def test_exec_background_returns(sandbox: K8sSandboxEnvironment) -> None:
     # Check that a backgrounded process does not prevent the exec call from returning.
     result = await sandbox.exec(["bash", "-c", "sleep infinity &"])
