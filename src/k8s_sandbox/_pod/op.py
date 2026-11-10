@@ -105,6 +105,11 @@ class PodOperation(ABC):
         finally:
             stop_keepalive.set()
             ws_client.close()
+            # Once the server has closed the connection, websocket-client's close()
+            # returns without closing the socket, which then waits for the garbage
+            # collector.
+            if ws_client.sock:
+                ws_client.sock.shutdown()
 
     def _discard_duplicate_channel(self, ws_client: WSClient) -> None:
         # Avoid issuing a warning multiple times.
