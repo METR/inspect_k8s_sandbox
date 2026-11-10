@@ -333,6 +333,19 @@ class TestScriptInAShell:
         expected = stdin if isinstance(stdin, bytes) else stdin.encode()
         assert result.stdout == expected + _marker(0)
 
+    @pytest.mark.parametrize(
+        ("cmd", "returncode"),
+        [(["exit", "0"], 0), (["exit", "3"], 3), (["exec", "true"], 0)],
+    )
+    def test_a_command_that_ends_its_shell_still_gets_the_markers(
+        self, shell: list[str], cmd: list[str], returncode: int
+    ) -> None:
+        result = _run_script(shell, _script(cmd))
+
+        assert result.returncode == returncode
+        assert result.stdout == _marker(returncode)
+        assert result.stderr == _marker(returncode)
+
     def test_a_callers_ifs_does_not_change_the_exit_code(
         self, shell: list[str]
     ) -> None:
