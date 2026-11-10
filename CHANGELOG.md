@@ -14,6 +14,8 @@
 - `exec()` starts one or two fewer processes in the container per call: it no
   longer runs `sync`, and passes `input` without `base64`. Images no longer need
   `sync`, `echo` or `base64`.
+- `exec(user=...)` starts two fewer processes per call: whether the container
+  already runs as that user is now checked once per sandbox, not on every call.
 
 ## 2026-10-09 0.14.0
 

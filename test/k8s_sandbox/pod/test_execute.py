@@ -1,3 +1,4 @@
+import getpass
 import json
 import os
 import shlex
@@ -9,7 +10,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import websocket
@@ -426,7 +427,7 @@ class TestExecChunksStdin:
 
         @contextmanager
         def fake_interactive_shell(
-            user: str | None,
+            command: list[str],
         ) -> Generator[MagicMock, None, None]:
             yield ws
 
@@ -484,6 +485,17 @@ class TestShellCommand:
         assert '[ "$(id -u 2>/dev/null)" = 1000 ]' in by_uid
         assert "id -un" not in by_uid
 
+    def test_a_probed_container_opens_the_shell_it_needs(self) -> None:
+        """No check, and so two fewer process starts, once a probe has answered."""
+        assert _shell_command("agent", switch=False) == ["/bin/sh"]
+        assert _shell_command("agent", switch=True) == [
+            "runuser",
+            "-u",
+            "agent",
+            "--",
+            "/bin/sh",
+        ]
+
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
         assert _shell_command("") == ["runuser", "-u", "", "--", "/bin/sh"]
@@ -495,6 +507,53 @@ class TestShellCommand:
 
         assert script.count(shlex.quote(user)) == 2
         assert user not in script.replace(shlex.quote(user), "")
+
+
+class TestProbeSwitch:
+    @pytest.mark.parametrize(
+        ("returncode", "switch"), [(0, False), (1, True), (2, None)]
+    )
+    def test_answer_comes_from_the_exit_status(
+        self, returncode: int, switch: bool | None
+    ) -> None:
+        op = ExecuteOperation(MagicMock())
+        commands = []
+
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            commands.append(command)
+            yield _FakeWSClient([(STDOUT, b"0"), _status(returncode)])
+
+        with patch.object(op, "_interactive_shell", fake_shell):
+            assert op.probe_switch("agent") is switch
+        assert commands[0][:2] == ["/bin/sh", "-c"]
+
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    @pytest.mark.parametrize("shell", _SHELLS)
+    def test_probe_in_a_shell(self, shell: list[str]) -> None:
+        op = ExecuteOperation(MagicMock())
+        scripts = {}
+
+        def probe_script(user: str) -> str:
+            @contextmanager
+            def capture(command: list[str]) -> Generator[WSClient, None, None]:
+                scripts[user] = command[2]
+                yield _FakeWSClient([_status(0)])
+
+            with patch.object(op, "_interactive_shell", capture):
+                op.probe_switch(user)
+            return scripts[user]
+
+        me = getpass.getuser()
+        other = "no-such-user-k8s-sandbox"
+
+        def run(user: str) -> int:
+            return subprocess.run([*shell, "-c", probe_script(user)]).returncode
+
+        assert run(me) == 0
+        assert run(str(os.getuid())) == 0
+        # runuser can't switch to a user that doesn't exist: don't start it directly.
+        assert run(other) == 2
 
 
 class TestRunuserErrorMessages:

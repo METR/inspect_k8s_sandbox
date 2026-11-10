@@ -36,7 +36,7 @@ _PRINTF_ESCAPES = {b: f"\\{b:03o}" for b in range(256) if b not in _PRINTF_LITER
 logger = logging.getLogger(__name__)
 
 
-def _shell_command(user: str | None) -> list[str]:
+def _shell_command(user: str | None, switch: bool | None = None) -> list[str]:
     """The command to open the interactive shell an exec() runs inside.
 
     When a user is requested, only reach for `runuser` if the container is not
@@ -47,9 +47,27 @@ def _shell_command(user: str | None) -> list[str]:
     normalizes HOME, SHELL, USER, LOGNAME and PATH, which the skip path
     inherits from the container instead.
 
-    The check runs in the container rather than here so that it costs no extra
-    round trip. `sh -c` takes its script from argv, so stdin reaches whichever
-    shell is exec'd unread, and the caller's protocol is unchanged.
+    `switch` is whether a probe of the container (ExecuteOperation.probe_switch)
+    found that it needs `runuser` for this user. Until it has been probed, or if the
+    container has no `runuser`, the shell checks for itself, which costs two more
+    process starts per exec. `sh -c` takes its script from argv, so stdin reaches
+    whichever shell is exec'd unread, and the caller's protocol is unchanged.
+    """
+    if user is None or switch is False:
+        return ["/bin/sh"]
+    if not user or switch:
+        # An empty user matches nothing; leave runuser to reject it as it did before.
+        return ["runuser", "-u", user, "--", "/bin/sh"]
+    return [
+        "/bin/sh",
+        "-c",
+        f"if {_runs_as(user)}; then exec /bin/sh; fi; "
+        f"exec runuser -u {shlex.quote(user)} -- /bin/sh",
+    ]
+
+
+def _runs_as(user: str) -> str:
+    """A shell test of whether the container runs as `user`.
 
     `user` may be a name or a uid, and the two must be compared against
     different things: testing a uid against `id -un` (or a name against `id -u`)
@@ -58,23 +76,12 @@ def _shell_command(user: str | None) -> list[str]:
 
     `id -un` reports only the first passwd name for a uid, so a second name for
     the same uid (root/toor) is not recognised and falls through to `runuser` --
-    i.e. the previous behaviour, which is the safe direction.
+    i.e. the previous behaviour, which is the safe direction. A missing or failing
+    `id` leaves the substitution empty, which cannot equal a non-empty user, so
+    that also falls through to `runuser`.
     """
-    if user is None:
-        return ["/bin/sh"]
-    if not user:
-        # Matches nothing; leave runuser to reject it as it did before.
-        return ["runuser", "-u", user, "--", "/bin/sh"]
-    quoted = shlex.quote(user)
-    # A missing or failing `id` leaves the substitution empty, which cannot
-    # equal a non-empty user, so that also falls through to `runuser`.
     current = "id -u" if user.isdigit() else "id -un"
-    return [
-        "/bin/sh",
-        "-c",
-        f'if [ "$({current} 2>/dev/null)" = {quoted} ]; then exec /bin/sh; fi; '
-        f"exec runuser -u {quoted} -- /bin/sh",
-    ]
+    return f'[ "$({current} 2>/dev/null)" = {shlex.quote(user)} ]'
 
 
 class ExecuteOperation(PodOperation):
@@ -86,12 +93,13 @@ class ExecuteOperation(PodOperation):
         env: dict[str, str],
         user: str | None,
         timeout: int | None,
+        switch: bool | None = None,
     ) -> ExecResult[str]:
         # The shell ends the command's output with this marker. It holds a random value
         # made up for this exec, so nothing the command prints can be taken for it.
         marker = f"<{COMPLETED_SENTINEL}-{secrets.token_hex(16)}-"
         shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout, marker)
-        with self._interactive_shell(user) as ws_client:
+        with self._interactive_shell(_shell_command(user, switch)) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands. A failure
             # here leaves the script's closing brace unsent, so nothing has run and
@@ -100,14 +108,35 @@ class ExecuteOperation(PodOperation):
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
+    def probe_switch(self, user: str) -> bool | None:
+        """Whether this container needs `runuser` to run exec(user=...) as `user`.
+
+        None if it would, but `runuser` can't switch to them here (it is missing, the
+        user doesn't exist, or the container may not switch users): the shell's own
+        check then reports that on each exec, as before. Starting `runuser` directly
+        only once it is known to work matters: one that fails at once ends the exec
+        before its script arrives, and the server then resets the connection, losing
+        the error. The answer is the exit status the exec's status channel reports,
+        so nothing the container prints can change it.
+        """
+        quoted = shlex.quote(user)
+        probe = (
+            f"if {_runs_as(user)}; then exit 0; fi; "
+            f"if runuser -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
+        )
+        with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
+            ws_client.run_forever()
+            returncode = get_returncode(ws_client)
+        return {0: False, 1: True}.get(returncode)
+
     @contextmanager
-    def _interactive_shell(self, user: str | None) -> Generator[WSClient, None, None]:
-        # ExecutableNotFoundError from here now only means /bin/sh is missing. A
-        # missing `runuser` is exec'd by the shell rather than by the API server,
-        # so it surfaces as a 127 on stderr and is handled by
-        # _check_for_runuser_error instead.
+    def _interactive_shell(self, command: list[str]) -> Generator[WSClient, None, None]:
+        # ExecutableNotFoundError from here only means /bin/sh, or runuser once a
+        # probe has found it, is missing. A missing `runuser` is otherwise exec'd by
+        # the shell rather than by the API server, so it surfaces as a 127 on stderr
+        # and is handled by _check_for_runuser_error instead.
         yield from self.create_websocket_client_for_exec(
-            command=_shell_command(user),
+            command=command,
             stderr=True,
             stdin=True,
             stdout=True,
