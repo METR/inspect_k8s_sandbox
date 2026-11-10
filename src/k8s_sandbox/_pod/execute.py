@@ -144,8 +144,12 @@ class ExecuteOperation(PodOperation):
                 wait = deadline - time.monotonic()
                 if wait <= 0:
                     raise PodError(f"Probing exec(user={user!r}) timed out")
+                # Bounds a read that stalls partway through a frame, too.
+                ws_client.sock.settimeout(wait)
                 try:
                     _update(ws_client, wait)
+                except websocket.WebSocketTimeoutException:
+                    continue  # The deadline has passed.
                 except (OSError, websocket.WebSocketException):
                     if ERROR_CHANNEL not in ws_client._channels:
                         raise
