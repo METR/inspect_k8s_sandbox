@@ -260,6 +260,8 @@ class ExecuteOperation(PodOperation):
                     stderr.returncode,
                 ):
                     deadline = time.monotonic() + STREAM_END_GRACE_SECONDS
+                    # Nor wait past it for the rest of a frame already started.
+                    ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
                 if lost is not None:
                     if deadline is None and ERROR_CHANNEL not in ws_client._channels:
                         raise ExecResultUnknownError(
