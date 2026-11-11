@@ -214,14 +214,31 @@ class Pod:
 
         Closing the stream ends the command's stdin and stdout. Until then the stream
         holds the exec's connection, so callers must close it.
+
+        In "raise" mode a restart found already, or one Kubernetes shows, raises here
+        as for exec(), rather than starting the command in the replacement. A stream
+        that ends with 255 after the command wrote stdout, Kata's status for a command
+        whose VM stopped, keeps a restart for every later operation: so the command must
+        not exit 255 itself once it has written. A stream open when a restart is found
+        drops, as one whose connection was lost.
         """
+        await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
-        stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
+        stack, ws_client = await self._run_async(
             lambda: operation.open_stdio(cmd, user),
-            # The websocket opened for a caller that stopped waiting.
+            # The websocket opened for a caller that won't get it.
             discard=lambda opened: opened[0].close(),
         )
-        return PodStdio(stack, ws_client)
+        return PodStdio(
+            stack,
+            ws_client,
+            stopped=self._stdio_stopped,
+            restarted=lambda: self._restart_error,
+        )
+
+    def _stdio_stopped(self) -> None:
+        if self._info.restarted_container_behavior == "raise":
+            self._keep_stopped()
 
     async def _diagnose_restart_after_failure(self) -> None:
         try:
@@ -289,13 +306,17 @@ class Pod:
                 await self._diagnose_restart_after_failure()
             raise
 
-    async def _run_async(self, callable: Callable[[], T]) -> T:
+    async def _run_async(
+        self, callable: Callable[[], T], discard: Callable[[T], object] | None = None
+    ) -> T:
         """Run a synchronous function asynchronously.
 
         Once a check in "raise" mode has detected a restart, raise it instead: before
         running the function, and after, if it was detected meanwhile, whether the
         function returned or failed. In "raise" mode a container that stopped under
-        the function counts as restarted.
+        the function counts as restarted. DISCARD closes a result the caller won't
+        get, such as an open connection: one a restart was found in, or one that came
+        once the caller stopped waiting.
         """
 
         def run() -> T:
@@ -303,24 +324,20 @@ class Pod:
             try:
                 result = callable()
             except ContainerStoppedError as e:
-                info = self._info
-                if info.restarted_container_behavior == "raise":
-                    # Gone, though Kubernetes may not show it stopped yet.
-                    error = self._keep(
-                        ContainerRestartedError(
-                            pod_name=info.name,
-                            container_name=info.default_container_name,
-                            restart_count=info.initial_restart_count + 1,
-                            last_reason="stopped under an operation",
-                        )
-                    )
+                if self._info.restarted_container_behavior == "raise":
+                    error = self._keep_stopped()
                     raise type(error)(**vars(error)) from e
                 raise
             except Exception:
                 # A restart found while it ran explains its failure better.
                 self._raise_restart()
                 raise
-            self._raise_restart()
+            try:
+                self._raise_restart()
+            except (PodReplacedError, ContainerRestartedError):
+                if discard is not None:
+                    discard(result)
+                raise
             return result
 
         # Not queued behind other operations if it was found already, but suspended
@@ -331,15 +348,34 @@ class Pod:
             self._raise_restart()
         executor = PodOpExecutor.get_instance()
         try:
-            result = await executor.queue_operation(run)
+            result = await executor.queue_operation(run, discard=discard)
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
             # Also if it was found before this resumed.
             self._raise_restart()
             raise
-        self._raise_restart()
+        try:
+            self._raise_restart()
+        except (PodReplacedError, ContainerRestartedError):
+            if discard is not None:
+                # Not on the event loop: closing a connection can wait on the server.
+                threading.Thread(target=discard, args=(result,), daemon=True).start()
+            raise
         return result
+
+    def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
+        """Keep the restart of a container that stopped under an operation."""
+        info = self._info
+        # Gone, though Kubernetes may not show it stopped yet.
+        return self._keep(
+            ContainerRestartedError(
+                pod_name=info.name,
+                container_name=info.default_container_name,
+                restart_count=info.initial_restart_count + 1,
+                last_reason="stopped under an operation",
+            )
+        )
 
     def _keep(
         self, error: PodReplacedError | ContainerRestartedError

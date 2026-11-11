@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 from typing import AsyncIterator, Callable, Generator, Iterable, Sequence
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
@@ -1513,7 +1513,11 @@ class TestRunuserErrorMessages:
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
 
 
-def _stdio(client: ssl.SSLSocket) -> PodStdio:
+def _stdio(
+    client: ssl.SSLSocket,
+    stopped: Callable[[], None] | None = None,
+    restarted: Callable[[], Exception | None] | None = None,
+) -> PodStdio:
     """A stream on `client`, opened as Pod.exec_stdio() opens one."""
     op = ExecuteOperation(MagicMock())
     with (
@@ -1523,7 +1527,7 @@ def _stdio(client: ssl.SSLSocket) -> PodStdio:
         ),
     ):
         stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
-    return PodStdio(stack, ws)
+    return PodStdio(stack, ws, stopped=stopped, restarted=restarted)
 
 
 def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
@@ -1551,6 +1555,125 @@ async def _wait_for(condition: Callable[[], bool]) -> None:
 
 
 class TestExecStdio:
+    async def test_a_restart_found_since_it_opened_drops_a_reply_already_read(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Its command may run in the replacement."""
+        client, server = tls_sockets
+        restart = RuntimeError("restarted")
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+        # One frame, so that the reply is read along with the ready line.
+        server.sendall(_frame(STDOUT, b"ready\na reply\n"))
+
+        with anyio.fail_after(30):
+            assert await stream.receive(6) == b"ready\n"
+            found.append(restart)
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
+                await stream.receive()
+
+        assert dropped.value.__cause__ is restart
+
+    async def test_a_restart_found_while_a_receive_waits_drops_the_reply(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Where Inspect's reader usually is, while a request waits for its reply."""
+        client, server = tls_sockets
+        restart = RuntimeError("restarted")
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+
+        with anyio.fail_after(30):
+            receiving = asyncio.create_task(stream.receive())
+            for _ in range(10):  # Until it waits on the socket.
+                await asyncio.sleep(0)
+            assert not receiving.done()
+            found.append(restart)
+            server.sendall(_frame(STDOUT, b"a reply\n"))
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
+                await receiving
+
+        assert dropped.value.__cause__ is restart
+
+    async def test_a_restart_found_before_a_receive_raises_with_nothing_to_read(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        stream = _stdio(client, restarted=lambda: RuntimeError("restarted"))
+
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            await stream.receive()
+
+    async def test_a_send_that_finds_a_restart_ends_a_waiting_receive_too(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        restart = RuntimeError("restarted")
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+
+        with anyio.fail_after(30):
+            receiving = asyncio.create_task(stream.receive())
+            for _ in range(10):  # Until it waits on the socket.
+                await asyncio.sleep(0)
+            found.append(restart)
+            with pytest.raises(anyio.BrokenResourceError):
+                await stream.send(b"a request\n")
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
+                await receiving
+
+        assert dropped.value.__cause__ is restart
+
+    async def test_a_restart_found_since_it_opened_fails_a_send(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        stream = _stdio(client, restarted=lambda: RuntimeError("restarted"))
+
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            await stream.send(b"a request\n")
+
+    @pytest.mark.parametrize(
+        ("frames", "stopped"),
+        [
+            pytest.param(
+                [_frame(STDOUT, b"ready\n"), _frame(*_status(255))],
+                True,
+                id="255-after-stdout",
+            ),
+            # As a PyInstaller program that failed to start.
+            pytest.param([_frame(*_status(255))], False, id="255-before-stdout"),
+            pytest.param(
+                [_frame(STDOUT, b"ready\n"), _frame(*_status(1))], False, id="1"
+            ),
+            pytest.param(
+                [
+                    _frame(STDOUT, b"ready\n"),
+                    _frame(ERROR_CHANNEL, b'{"status":"Failure","reason":"Internal"}'),
+                ],
+                False,
+                id="no-exit-code",
+            ),
+        ],
+    )
+    async def test_a_255_after_stdout_says_the_container_stopped(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        frames: list[bytes],
+        stopped: bool,
+    ) -> None:
+        """Kata's status for a command whose VM stopped under it."""
+        client, server = tls_sockets
+        told: list[bool] = []
+        stream = _stdio(client, stopped=lambda: told.append(True))
+        server.sendall(b"".join(frames) + _close_frame())
+
+        with anyio.fail_after(30):
+            async for _ in _receiving(stream, max_bytes=4):
+                pass
+
+        assert told == ([True] if stopped else [])
+
     async def test_the_command_runs_as_the_user_with_stdin_unread(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -2126,8 +2249,12 @@ class TestExecStdio:
 
         monkeypatch.setattr(PodOpExecutor, "_instance", None)  # A pool of its own.
         pod = Pod("pod", "ns", None, "default", "uid", 0, "raise")
-        with patch.object(
-            ExecuteOperation, "_interactive_shell", lambda *_, **__: Shell()
+        with (
+            patch.object(
+                ExecuteOperation, "_interactive_shell", lambda *_, **__: Shell()
+            ),
+            # A healthy pod.
+            patch.object(pod, "check_for_pod_restart", AsyncMock(return_value=None)),
         ):
             starting = asyncio.create_task(pod.exec_stdio(["cat"], None))
             await _wait_for(opening.is_set)

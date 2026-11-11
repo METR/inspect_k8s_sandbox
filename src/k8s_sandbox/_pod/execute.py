@@ -31,7 +31,7 @@ from k8s_sandbox._pod.error import (
     GetReturncodeError,
     PodError,
 )
-from k8s_sandbox._pod.get_returncode import get_returncode
+from k8s_sandbox._pod.get_returncode import get_returncode, returncode_from_status
 from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
@@ -514,9 +514,23 @@ class PodStdio(ByteStream):
     stream is closed.
     """
 
-    def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
+    def __init__(
+        self,
+        stack: ExitStack,
+        ws_client: WSClient,
+        stopped: Callable[[], None] | None = None,
+        restarted: Callable[[], Exception | None] | None = None,
+    ) -> None:
         self._stack = stack
         self._ws = ws_client
+        # Called if the exec's status is 255 once the command has written stdout: Kata's
+        # status for a command whose VM stopped, for a command that never exits 255
+        # itself after its first output. Inspect's tools bridge writes its ready line
+        # first, then exits only with 0 (its stdin closed) or 1 (an uncaught exception,
+        # under PyInstaller 4.3 or later); PyInstaller's own 255 precedes any output.
+        self._stopped = stopped
+        # The restart found since the stream opened, if any.
+        self._restarted = restarted
         sock = ws_client.sock.sock
         self._fd = sock.fileno()  # websocket-client closes the socket at its end.
         sock.setblocking(False)
@@ -536,6 +550,7 @@ class PodStdio(ByteStream):
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
         await _land_pending_cancel()
+        self._drop_if_restarted()
         await self._turn()
         while not self._stdout or self._closed:
             if self._closed:
@@ -556,9 +571,23 @@ class PodStdio(ByteStream):
                 self._end(e)
             else:
                 await self._turn()
+        # Also for a reply that came while this waited.
+        self._drop_if_restarted()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
+
+    def _drop_if_restarted(self) -> None:
+        """End the stream if a restart was found since it opened, as if it was lost.
+
+        Its command may run in the replacement, so not even replies already read are
+        given out.
+        """
+        if self._closed or self._restarted is None:
+            return
+        if (error := self._restarted()) is not None:
+            self._end(error)
+            raise anyio.BrokenResourceError(repr(error)) from error
 
     async def _turn(self) -> None:
         """Count a call or a frame read, and let other tasks run every so many.
@@ -597,11 +626,14 @@ class PodStdio(ByteStream):
             self._stderr = (self._stderr + data)[-_STDERR_TAIL_BYTES:]
         elif channel == ERROR_CHANNEL:
             self._status = bytes(data)
+            if self._stopped is not None and self._wrote and _is_255(self._status):
+                self._stopped()
             self._end(None)
 
     async def send(self, item: bytes) -> None:
         async with self._send_lock:
             await _land_pending_cancel()  # also one that came as it waited for the lock
+            self._drop_if_restarted()
             try:
                 for i in range(0, len(item), STDIN_CHUNK_SIZE):
                     chunk = b"\0" + item[i : i + STDIN_CHUNK_SIZE]  # Stdin's channel.
@@ -665,6 +697,13 @@ class PodStdio(ByteStream):
             )
         elif self._stderr:
             log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
+
+
+def _is_255(status: bytes) -> bool:
+    try:
+        return returncode_from_status(status) == 255
+    except Exception:  # A status without an exit code.
+        return False
 
 
 async def _land_pending_cancel() -> None:

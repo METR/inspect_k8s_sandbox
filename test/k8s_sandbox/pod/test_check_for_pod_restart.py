@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import io
 import json
 import pathlib
+import threading
 import traceback
 from unittest.mock import MagicMock, patch
 
@@ -172,7 +174,7 @@ def _inline_executor():
     """Run the pod's operations inline, without the executor's threads."""
     executor = MagicMock()
 
-    async def queue(callable):
+    async def queue(callable, **_kwargs):
         return callable()
 
     executor.queue_operation = queue
@@ -290,7 +292,7 @@ def test_env_var_skips_file_op_check_but_not_exec(monkeypatch):
     ) as mock_get_instance:
         executor = MagicMock()
 
-        async def queue(callable):
+        async def queue(callable, discard=None):
             return callable()
 
         executor.queue_operation = queue
@@ -330,7 +332,7 @@ def test_env_var_default_keeps_file_op_check(monkeypatch):
     ) as mock_get_instance:
         executor = MagicMock()
 
-        async def queue(callable):
+        async def queue(callable, discard=None):
             return callable()
 
         executor.queue_operation = queue
@@ -632,7 +634,7 @@ def test_a_result_got_before_a_restart_was_found_but_returned_after_it_is_droppe
     )
     executor = MagicMock()
 
-    async def queue(callable):
+    async def queue(callable, discard=None):
         result = callable()
         # Another operation finds the restart before this one resumes.
         pod._restart_error = restart
@@ -659,7 +661,7 @@ def test_a_failure_got_before_a_restart_was_found_but_raised_after_it_raises_it(
     pod = _make_pod()
     executor = MagicMock()
 
-    async def queue(callable):
+    async def queue(callable, discard=None):
         try:
             return callable()
         finally:
@@ -840,3 +842,200 @@ def test_a_later_detection_does_not_replace_the_first_kept():
         with pytest.raises(ContainerRestartedError):
             pod._check_for_pod_restart_sync()
     assert isinstance(pod._restart_error, PodReplacedError)
+
+
+def test_exec_stdio_after_a_restart_was_found_raises_it_without_starting():
+    pod = _make_pod()
+    pod._restart_error = _restart()
+    with _inline_executor(), patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op:
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+    exec_op.return_value.open_stdio.assert_not_called()
+
+
+def test_exec_stdio_raises_a_restart_kubernetes_shows_without_starting():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(
+                _make_pod().exec_stdio(["inspect-sandbox-tools", "bridge"], None)
+            )
+    exec_op.return_value.open_stdio.assert_not_called()
+
+
+def test_exec_stdio_closes_a_stream_opened_as_a_restart_was_found():
+    pod = _make_pod()
+    stack = MagicMock()
+
+    def open_stdio(*_args):
+        # Another operation finds the restart meanwhile.
+        pod._restart_error = _restart()
+        return stack, MagicMock()
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=0
+        )
+        exec_op.return_value.open_stdio.side_effect = open_stdio
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+    stack.close.assert_called_once()
+
+
+@pytest.mark.parametrize(("mode", "kept"), [("raise", True), ("warn", False)])
+def test_exec_stdio_keeps_a_restart_when_its_stream_says_the_container_stopped(
+    mode: str, kept: bool
+):
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+        patch("k8s_sandbox._pod.pod.PodStdio") as stdio,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=0
+        )
+        exec_op.return_value.open_stdio.return_value = (MagicMock(), MagicMock())
+        pod = _make_pod(mode)
+        asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+        # The stream ended with 255 after the command wrote stdout.
+        stdio.call_args.kwargs["stopped"]()
+
+    assert isinstance(pod._restart_error, ContainerRestartedError) is kept
+
+
+@contextlib.contextmanager
+def _opening_stdio(after_queued=None):
+    """Pod.exec_stdio on a healthy pod, with its operations run inline.
+
+    Yields the mock ExecuteOperation. AFTER_QUEUED(n, before) runs before and after
+    the nth operation.
+    """
+    calls = 0
+
+    async def queue(callable, discard=None):
+        nonlocal calls
+        calls += 1
+        if after_queued is not None:
+            after_queued(calls, True)
+        result = callable()
+        if after_queued is not None:
+            after_queued(calls, False)
+        return result
+
+    executor = MagicMock()
+    executor.queue_operation = queue
+    with (
+        patch(
+            "k8s_sandbox._pod.executor.PodOpExecutor.get_instance",
+            return_value=executor,
+        ),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=0
+        )
+        yield exec_op
+
+
+def test_exec_stdio_whose_turn_comes_after_a_restart_was_found_does_not_start():
+    pod = _make_pod()
+
+    def found(call, before):
+        # By another operation, while this one's open waited its turn.
+        if call == 2 and before:
+            pod._restart_error = _restart()
+
+    with _opening_stdio(found) as exec_op:
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+    exec_op.return_value.open_stdio.assert_not_called()
+
+
+def test_exec_stdio_whose_open_fails_as_a_restart_is_found_raises_the_restart():
+    pod = _make_pod()
+
+    def open_stdio(*_args):
+        pod._restart_error = _restart()
+        raise TimeoutError("the open timed out")
+
+    with _opening_stdio() as exec_op:
+        exec_op.return_value.open_stdio.side_effect = open_stdio
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+
+
+def test_exec_stdio_closes_a_stream_off_the_event_loop_if_a_restart_came_with_it():
+    # Closing waits for the server's answer, which the event loop must not.
+    pod = _make_pod()
+    closed = threading.Event()
+    closed_on: list[threading.Thread] = []
+
+    def close():
+        closed_on.append(threading.current_thread())
+        closed.set()
+
+    stack = MagicMock()
+    stack.close.side_effect = close
+
+    def found(call, before):
+        # By another operation, after the open returned but before this resumed.
+        if call == 2 and not before:
+            pod._restart_error = _restart()
+
+    with _opening_stdio(found) as exec_op:
+        exec_op.return_value.open_stdio.return_value = (stack, MagicMock())
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+
+    assert closed.wait(30)
+    assert closed_on[0] is not threading.main_thread()
+
+
+@pytest.mark.parametrize(
+    "found_on", [2, 3], ids=["in-the-worker", "after-the-worker-returned"]
+)
+def test_a_result_rejected_at_its_last_check_is_discarded(found_on: int):
+    pod = _make_pod()
+    discarded = threading.Event()
+    checks = 0
+    raise_restart = pod._raise_restart
+
+    def checking():
+        nonlocal checks
+        checks += 1
+        if checks == found_on:
+            # Recorded by another operation right before this check.
+            pod._restart_error = _restart()
+        raise_restart()
+
+    with _inline_executor(), patch.object(pod, "_raise_restart", checking):
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(
+                pod._run_async(lambda: "a stream", discard=lambda _: discarded.set())
+            )
+
+    assert discarded.wait(10)
+
+
+def test_exec_stdio_streams_see_a_restart_kept_after_they_opened():
+    pod = _make_pod()
+    with _opening_stdio() as exec_op, patch("k8s_sandbox._pod.pod.PodStdio") as stdio:
+        exec_op.return_value.open_stdio.return_value = (MagicMock(), MagicMock())
+        asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+    restarted = stdio.call_args.kwargs["restarted"]
+
+    assert restarted() is None
+    pod._restart_error = _restart()
+    assert restarted() is pod._restart_error

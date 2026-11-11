@@ -57,7 +57,14 @@
   later.
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
-  taking one each. Needs anyio 4.14 or later.
+  taking one each. Needs anyio 4.14 or later. With
+  `restarted_container_behavior="raise"`, `exec_stdio()` raises a detected restart
+  before starting its command, as `exec()` does, and a stream already open raises
+  `anyio.BrokenResourceError` at its next `receive()` or `send()` once a restart is
+  found. In that mode, when its stream ends with exit code 255 after the
+  command wrote stdout (Kata's status for a command whose VM stopped), the stream ends
+  as usual and every later operation fails as after a detected restart. The command
+  must not exit 255 itself once it has written.
 - `exec(user="root")` no longer needs `id` or `runuser` in the image, and is faster
   where starting a program is slow. In a container that is not root,
   `exec(user="0")` now fails as `exec(user="root")` does, with a warning, rather
