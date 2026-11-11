@@ -1484,7 +1484,7 @@ class TestExecStdio:
 
         assert client.fileno() == -1
 
-    @pytest.mark.parametrize("cmd", [[], ["--"], ["-a", "x"]])
+    @pytest.mark.parametrize("cmd", [[], ["--"], ["-a", "x"], ["\0--"]])
     def test_a_missing_command_is_refused(self, cmd: list[str]) -> None:
         """`exec` alone, or with only its options, leaves the shell reading on."""
         with (
@@ -1595,9 +1595,8 @@ class TestExecStdio:
         deadline = time.monotonic() + 30
 
         # The event loop is held until both pieces are in (or the budget runs out).
-        for line in (b"one\n", b"two\n"):
+        for count, line in enumerate((b"one\n", b"two\n"), start=1):
             server.sendall(_frame(STDOUT, line))
-            count = len(stream._pieces) + 1
             while len(stream._pieces) < count and time.monotonic() < deadline:
                 threading.Event().wait(0.01)
         pieces = list(stream._pieces)
