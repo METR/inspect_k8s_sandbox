@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import collections
 import contextlib
 import logging
 import re
@@ -42,8 +43,9 @@ _CLOSE_GROUP = "}\n"
 # Kept from an exec_stdio command's stderr, to explain one that failed to start.
 _STDERR_TAIL_BYTES = 4096
 # The most stdout an exec_stdio stream's reader gathers from frames already waiting
-# before it hands them on: each hand-off waits for the event loop.
+# into one piece, and the most pieces it holds for the stream's reader (4 MiB).
 _STDIO_PIECE_BYTES = 256 * 1024
+_STDIO_PIECES = 16
 
 logger = logging.getLogger(__name__)
 
@@ -461,19 +463,21 @@ class PodStdio(ByteStream):
     """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio()).
 
     A thread reads the websocket into a bounded buffer, so a slow reader of the
-    stream stops it, and then TCP. It owns the websocket: once the exec ends or the
-    stream is closed, it closes the websocket.
+    stream stops it, and then TCP. It hands pieces on without waiting for the event
+    loop, which a busy runner keeps slow, and waits only for room. It owns the
+    websocket: once the exec ends or the stream is closed, it closes the websocket.
     """
 
     def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
         self._ws = ws_client
         self._loop = asyncio.get_running_loop()
-        self._stdout_in, self._stdout = anyio.create_memory_object_stream[bytes](16)
-        # Set when a piece of stdout, or its end, arrives. receive() waits on this
-        # rather than in the memory stream, which hands a piece straight to a waiting
-        # receiver: one cancelled by Task.cancel() before it resumed would lose it.
+        self._pieces: collections.deque[bytes] = collections.deque()
+        self._room = threading.Condition()  # Guards the pieces and _closed.
+        # Set when a piece of stdout, or its end, arrives. receive() takes a piece
+        # only once awake, so one cancelled meanwhile loses nothing.
         self._arrived = asyncio.Event()
         self._unread = b""
+        self._ended = False
         self._error: Exception | None = None
         self._closed = False
         # Writes take no tokens from anyio's shared limiter, so a wedged one can't
@@ -505,16 +509,15 @@ class PodStdio(ByteStream):
                     stderr = stderr[-_STDERR_TAIL_BYTES:]
                     if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
                         wrote = True
-                        put = self._put(stdout)
-                        asyncio.run_coroutine_threadsafe(put, self._loop).result()
+                        self._put(stdout)
         except Exception as e:
             # A failed read, or the stream closed under the reader.
             if ERROR_CHANNEL not in self._ws._channels:
                 self._error = e
         finally:
             _shutdown(self._ws)
-            with contextlib.suppress(RuntimeError):  # The event loop is closed.
-                self._loop.call_soon_threadsafe(self._end)
+            self._ended = True
+            self._wake()
             stack.close()
             if not (wrote or self._closed):
                 # It failed to start (a missing user, runuser or executable): the
@@ -528,10 +531,7 @@ class PodStdio(ByteStream):
                 log_trace("An exec_stdio command wrote to stderr.", stderr=stderr)
 
     def _read_waiting(self) -> None:
-        """Read on while stdout's frames are already waiting, up to a piece.
-
-        So that a busy event loop paces pieces rather than frames.
-        """
+        """Read on while stdout's frames are already waiting, up to a piece."""
         channels = self._ws._channels
         read = len(channels.get(STDOUT_CHANNEL, b""))
         while 0 < read < _STDIO_PIECE_BYTES:
@@ -540,25 +540,35 @@ class PodStdio(ByteStream):
             if read == before:
                 return
 
-    async def _put(self, stdout: bytes) -> None:
-        await self._stdout_in.send(stdout)
-        self._arrived.set()
+    def _put(self, stdout: bytes) -> None:
+        with self._room:
+            while len(self._pieces) >= _STDIO_PIECES and not self._closed:
+                self._room.wait()
+            if self._closed:
+                raise anyio.ClosedResourceError
+            self._pieces.append(stdout)
+        self._wake()
 
-    def _end(self) -> None:
-        self._stdout_in.close()
-        self._arrived.set()
+    def _wake(self) -> None:
+        with contextlib.suppress(RuntimeError):  # The event loop is closed.
+            self._loop.call_soon_threadsafe(self._arrived.set)
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
         while not self._unread:
             self._arrived.clear()
-            try:
-                self._unread = self._stdout.receive_nowait()
-            except anyio.WouldBlock:
-                await self._arrived.wait()
-            except anyio.EndOfStream:
+            ended = self._ended  # Before the pieces: the last is in by the time it is.
+            with self._room:
+                if self._closed:
+                    raise anyio.ClosedResourceError
+                if self._pieces:
+                    self._unread = self._pieces.popleft()
+                    self._room.notify()
+                    continue
+            if ended:
                 if self._error is not None:
                     raise anyio.BrokenResourceError(repr(self._error)) from self._error
-                raise
+                raise anyio.EndOfStream
+            await self._arrived.wait()
         data, self._unread = self._unread[:max_bytes], self._unread[max_bytes:]
         return data
 
@@ -584,9 +594,11 @@ class PodStdio(ByteStream):
 
     async def aclose(self) -> None:
         # Awaits nothing, so that it cannot be cancelled halfway. The reader, woken by
-        # either, then closes the websocket and ends a pending receive().
-        self._closed = True
-        self._stdout.close()
+        # either, then closes the websocket.
+        with self._room:
+            self._closed = True
+            self._room.notify()
+        self._arrived.set()  # Ends a pending receive() at once.
         _shutdown(self._ws)
 
 

@@ -1477,9 +1477,8 @@ class TestExecStdio:
             def start(self) -> None:
                 raise RuntimeError("can't start new thread")
 
-        monkeypatch.setattr(
-            execute_module, "threading", types.SimpleNamespace(Thread=Thread)
-        )
+        fake = types.SimpleNamespace(Thread=Thread, Condition=threading.Condition)
+        monkeypatch.setattr(execute_module, "threading", fake)
         with pytest.raises(RuntimeError):
             PodStdio(stack, ws)
 
@@ -1500,7 +1499,7 @@ class TestExecStdio:
         receiving = asyncio.create_task(stream.receive())
         await asyncio.sleep(0)  # It now waits for stdout.
 
-        await stream._put(b"a reply\n")  # As the reader thread does.
+        stream._put(b"a reply\n")  # As the reader thread does.
         receiving.cancel()
         with pytest.raises(asyncio.CancelledError):
             await receiving
@@ -1559,9 +1558,7 @@ class TestExecStdio:
         sender = threading.Thread(target=send)
         sender.start()
         try:
-            await _wait_for(
-                lambda: stream._stdout.statistics().current_buffer_used == 16
-            )
+            await _wait_for(lambda: len(stream._pieces) == execute_module._STDIO_PIECES)
 
             await stream.aclose()
 
@@ -1570,6 +1567,25 @@ class TestExecStdio:
             with contextlib.suppress(OSError):  # Fails a send still waiting.
                 server.shutdown(socket.SHUT_RDWR)
             sender.join()
+
+    async def test_pieces_are_handed_on_while_the_event_loop_is_held(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """A busy runner holds its event loop: the reader must not wait for it."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        deadline = time.monotonic() + 30
+
+        # The event loop is held until both pieces are in (or the budget runs out).
+        for line in (b"one\n", b"two\n"):
+            server.sendall(_frame(STDOUT, line))
+            count = len(stream._pieces) + 1
+            while len(stream._pieces) < count and time.monotonic() < deadline:
+                threading.Event().wait(0.01)
+        pieces = list(stream._pieces)
+        await stream.aclose()
+
+        assert pieces == [b"one\n", b"two\n"]
 
     async def test_frames_already_waiting_reach_the_stream_as_one_piece(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
