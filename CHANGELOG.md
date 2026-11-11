@@ -31,6 +31,12 @@
 - Add a per-service `podAnnotations` value: annotations for that service's Pod
   alone, over the top-level `annotations`, for a runtime that reads per-pod
   settings from annotations.
+- Fix an exec's input (such as a large `write_file()`, which streams over the exec's
+  stdin) going unread after about a minute with the `kubernetes` Python client 36 or
+  later.
+- Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
+  `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
+  taking one each. Needs anyio 4.14 or later.
 
 ## 2026-10-09 0.14.0
 

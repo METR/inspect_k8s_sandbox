@@ -13,7 +13,7 @@ from k8s_sandbox._pod.write import WriteFileOperation
 def test_write_file_writes_data_via_chunked_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(op_module, "_STDIN_CHUNK_SIZE", 4)
+    monkeypatch.setattr(op_module, "STDIN_CHUNK_SIZE", 4)
     op = WriteFileOperation(MagicMock())
     ws = MagicMock(spec=WSClient)
     captured: dict[str, int] = {}

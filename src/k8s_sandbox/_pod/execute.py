@@ -1,14 +1,18 @@
 import base64
+import contextlib
 import logging
 import re
 import secrets
 import shlex
 import ssl
 import time
-from contextlib import contextmanager
-from typing import Generator
+from contextlib import ExitStack, contextmanager
+from typing import Awaitable, Callable, Generator, Sequence, cast
 
+import anyio
+import anyio.lowlevel
 import websocket
+from anyio.abc import ByteStream
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
@@ -19,10 +23,11 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import ABNF
 
+from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
-from k8s_sandbox._pod.op import API_TIMEOUT, PodOperation
+from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
@@ -32,12 +37,22 @@ STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 # The last line of every exec script, which closes its { } group: see exec().
 _CLOSE_GROUP = "}\n"
+# Kept from an exec_stdio command's stderr, to explain one that failed to start.
+_STDERR_TAIL_BYTES = 4096
+# How often an exec_stdio stream retries TLS that must write to read, or read to write.
+_TLS_RETRY_SECONDS = 0.01
+# The most receive() calls and frames read an exec_stdio stream takes, while they keep
+# coming, before it lets other tasks run: a few per reply, so a large one rarely waits
+# for a busy event loop.
+_STEPS_PER_TURN = 32
 
 logger = logging.getLogger(__name__)
 
 
-def _shell_command(user: str | None, switch: bool = False) -> list[str]:
-    """The command to open the interactive shell an exec() runs inside.
+def _shell_command(
+    user: str | None, switch: bool = False, command: Sequence[str] = ("/bin/sh",)
+) -> list[str]:
+    """The command that runs `command` (by default, exec()'s shell) as `user`.
 
     When a user is requested, only reach for `runuser` if the container is not
     already running as that user. `runuser` calls setgroups(2), which needs
@@ -53,19 +68,20 @@ def _shell_command(user: str | None, switch: bool = False) -> list[str]:
     even where the probe found the container already running as the user: a pod
     replaced under the same name since might not, and a plain shell would then run the
     command as someone else, where `runuser` can only switch or fail. `sh -c` takes its
-    script from argv, so stdin reaches whichever shell is exec'd unread, and the
-    caller's protocol is unchanged.
+    script from argv, so stdin reaches the command it execs unread, and the caller's
+    protocol is unchanged.
     """
     if user is None:
-        return ["/bin/sh"]
+        return list(command)
     if not user or switch:
         # An empty user matches nothing; leave runuser to reject it as it did before.
-        return ["runuser", "-u", user, "--", "/bin/sh"]
+        return ["runuser", "-u", user, "--", *command]
+    run = shlex.join(command)
     return [
         "/bin/sh",
         "-c",
-        f"if {_runs_as(user)}; then exec /bin/sh; fi; "
-        f"exec runuser -u {shlex.quote(user)} -- /bin/sh",
+        f"if {_runs_as(user)}; then exec {run}; fi; "
+        f"exec runuser -u {shlex.quote(user)} -- {run}",
     ]
 
 
@@ -120,6 +136,27 @@ class ExecuteOperation(PodOperation):
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
 
+    def open_stdio(
+        self, cmd: list[str], user: str | None
+    ) -> tuple[ExitStack, WSClient]:
+        """Start `cmd` as `user`, switched to as exec() does, joined to the websocket.
+
+        Returns the websocket and the stack that closes it. The command is the exec's
+        argv (through `sh -c` to switch users), so stdin reaches it unread.
+        """
+        stack = ExitStack()
+        # No resize keepalive: resize events for an exec without a TTY stall its stdin
+        # where they go unread (CRI-O, and any runtime over v5.channel.k8s.io: see
+        # _send_keepalive). TCP keepalives keep the connection alive; a stream idle past
+        # the runtime's stream idle timeout (4 h by default) closes, and Inspect opens
+        # another.
+        ws_client = stack.enter_context(
+            self._interactive_shell(
+                _shell_command(user, command=cmd), send_keepalive=False
+            )
+        )
+        return stack, ws_client
+
     def probe_switch(self, user: str) -> bool:
         """Whether exec(user=...) can start `runuser` directly to run as `user`.
 
@@ -162,12 +199,15 @@ class ExecuteOperation(PodOperation):
         return returncode == 1
 
     @contextmanager
-    def _interactive_shell(self, command: list[str]) -> Generator[WSClient, None, None]:
+    def _interactive_shell(
+        self, command: list[str], send_keepalive: bool = True
+    ) -> Generator[WSClient, None, None]:
         # ExecutableNotFoundError from here only means /bin/sh, or runuser once a
         # probe has found it, is missing. A missing `runuser` is otherwise exec'd by
         # the shell rather than by the API server, so it surfaces as a 127 on stderr
         # and is handled by _check_for_runuser_error instead.
         yield from self.create_websocket_client_for_exec(
+            send_keepalive,
             command=command,
             stderr=True,
             stdin=True,
@@ -416,6 +456,194 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
     elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
         channel, data = frame.data[0], frame.data[1:]
         ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
+
+
+class PodStdio(ByteStream):
+    """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio()).
+
+    receive() and send() read and write the websocket's socket, made non-blocking,
+    in the task that calls them: no thread has to win the GIL from a busy event loop
+    to pass a reply on. Nothing is read while no one receives, so a slow reader stops
+    the command through TCP. The websocket closes at the exec's status, or once the
+    stream is closed.
+    """
+
+    def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
+        self._stack = stack
+        self._ws = ws_client
+        sock = ws_client.sock.sock
+        self._fd = sock.fileno()  # websocket-client closes the socket at its end.
+        sock.setblocking(False)
+        self._sock = sock
+        self._stdout = bytearray()
+        self._message = b""  # A message's frames so far, until its last.
+        self._stderr = b""
+        self._status: bytes | None = None
+        self._wrote = False
+        self._ended = False
+        self._error: Exception | None = None
+        self._closed = False
+        self._unyielded = 0  # Steps since the stream last let other tasks run.
+        self._send_lock = anyio.Lock(fast_acquire=True)  # Free: no turn of the loop.
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1")
+        await _land_pending_cancel()
+        await self._turn()
+        while not self._stdout or self._closed:
+            if self._closed:
+                raise anyio.ClosedResourceError
+            if self._ended:
+                if self._error is not None:
+                    raise anyio.BrokenResourceError(repr(self._error)) from self._error
+                raise anyio.EndOfStream
+            try:
+                # websocket-client keeps a frame read in part for the next call.
+                self._take(self._ws.sock.recv_frame())
+            except (ssl.SSLWantReadError, BlockingIOError):
+                await self._wait(anyio.wait_readable)
+                self._unyielded = 0
+            except ssl.SSLWantWriteError:
+                await anyio.sleep(_TLS_RETRY_SECONDS)  # See send().
+            except (OSError, websocket.WebSocketException) as e:
+                self._end(e)
+            else:
+                await self._turn()
+        data = bytes(self._stdout[:max_bytes])
+        del self._stdout[:max_bytes]
+        return data
+
+    async def _turn(self) -> None:
+        """Count a call or a frame read, and let other tasks run every so many.
+
+        So that frames or calls that keep coming (a flood of stdout or stderr, or many
+        small reads) do not hold the event loop. What was read stays read, so a cancel
+        here loses nothing.
+        """
+        self._unyielded += 1
+        if self._unyielded >= _STEPS_PER_TURN:
+            self._unyielded = 0
+            await anyio.lowlevel.checkpoint()
+
+    def _take(self, frame: ABNF) -> None:
+        """Take a frame of the exec's output, up to its status."""
+        if frame.opcode == ABNF.OPCODE_CLOSE:
+            self._end(None)
+            return
+        payload = cast(bytes, frame.data)  # recv_frame() reads bytes.
+        if frame.opcode == ABNF.OPCODE_CONT:
+            message = self._message + payload
+        elif frame.opcode in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
+            message = payload
+        else:
+            # A ping goes unanswered: the API server sends none, and a pong could
+            # land inside a frame a send() has begun.
+            return
+        self._message = b"" if frame.fin else message
+        if not frame.fin or len(message) < 2:
+            return
+        channel, data = message[0], memoryview(message)[1:]
+        if channel == STDOUT_CHANNEL:
+            self._stdout += data
+            self._wrote = True
+        elif channel == STDERR_CHANNEL:
+            self._stderr = (self._stderr + data)[-_STDERR_TAIL_BYTES:]
+        elif channel == ERROR_CHANNEL:
+            self._status = bytes(data)
+            self._end(None)
+
+    async def send(self, item: bytes) -> None:
+        async with self._send_lock:
+            await _land_pending_cancel()  # also one that came as it waited for the lock
+            try:
+                for i in range(0, len(item), STDIN_CHUNK_SIZE):
+                    chunk = b"\0" + item[i : i + STDIN_CHUNK_SIZE]  # Stdin's channel.
+                    frame = ABNF.create_frame(chunk, ABNF.OPCODE_BINARY).format()
+                    await self._write(memoryview(frame))
+            except OSError as e:
+                self._end(e)
+                raise anyio.BrokenResourceError(repr(e)) from e
+            except anyio.get_cancelled_exc_class():
+                # A frame cut short would corrupt any later one.
+                self._close()
+                raise
+
+    async def _write(self, data: memoryview) -> None:
+        while data:
+            if self._closed:
+                raise anyio.ClosedResourceError
+            if self._ended:
+                raise anyio.BrokenResourceError("the exec has ended") from self._error
+            try:
+                data = data[self._sock.send(data) :]
+            except (ssl.SSLWantWriteError, BlockingIOError):
+                await self._wait(anyio.wait_writable)
+            except ssl.SSLWantReadError:
+                # TLS 1.3 never reads to write (1.2 could, to renegotiate), and the
+                # read and write directions may not both wait on the socket at once.
+                await anyio.sleep(_TLS_RETRY_SECONDS)
+
+    async def _wait(self, wait: Callable[[int], Awaitable[None]]) -> None:
+        """Wait for the socket; the stream ending or closing meanwhile ends the wait."""
+        with contextlib.suppress(anyio.ClosedResourceError):
+            await wait(self._fd)
+
+    async def send_eof(self) -> None:
+        raise NotImplementedError("v4.channel.k8s.io cannot close stdin alone")
+
+    async def aclose(self) -> None:
+        self._close()  # Awaits nothing, so that it cannot be cancelled halfway.
+
+    def _close(self) -> None:
+        self._closed = True
+        self._end(None)
+
+    def _end(self, error: Exception | None) -> None:
+        """Close the websocket, ending a receive() or send() waiting on its socket."""
+        if self._ended:
+            return
+        _clear_tls_errors()  # It may follow a failed read or write.
+        self._ended = True
+        self._error = error
+        anyio.notify_closing(self._fd)
+        self._ws.sock.shutdown()  # Closes the socket: the close then awaits no answer.
+        self._stack.close()
+        if not (self._wrote or self._closed):
+            # It failed to start (a missing user, runuser or executable): the caller
+            # only sees the stream end.
+            log_warn(
+                "An exec_stdio command ended before writing to stdout.",
+                status=self._status,
+                stderr=self._stderr,
+            )
+        elif self._stderr:
+            log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
+
+
+async def _land_pending_cancel() -> None:
+    """Let a cancellation already due in this task land before the stream acts.
+
+    A cancel scope's, or a bare Task.cancel() requested while the task ran, which
+    anyio's checkpoint_if_cancelled() misses. Otherwise none lands while the stream
+    reads or writes without waiting.
+    """
+    if anyio.get_current_task().has_pending_cancellation():
+        await anyio.lowlevel.checkpoint()
+
+
+# For _clear_tls_errors: making a TLS object clears the thread's OpenSSL error queue.
+_TLS_ERROR_CLEARER = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+
+def _clear_tls_errors() -> None:
+    """Clear OpenSSL's error queue for this thread: on an event loop, everyone's.
+
+    CPython raises a TLS read or write's system error (EPIPE, say) as OSError without
+    clearing the queue, and OpenSSL then reports any later TLS call on the thread that
+    would wait as that error, ending the loop's other TLS connections.
+    """
+    _TLS_ERROR_CLEARER.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO(), server_side=True)
 
 
 class _MarkedStream:

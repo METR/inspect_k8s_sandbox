@@ -30,7 +30,7 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # Maximum size of a single WebSocket stdin frame. Larger single writes (tens of
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
-_STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
+STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +67,17 @@ class PodOperation(ABC):
         self._pod = pod
 
     def _write_stdin_chunked(self, ws_client: WSClient, data: str | bytes) -> None:
-        """Write ``data`` to the stdin channel in ``_STDIN_CHUNK_SIZE`` frames.
+        """Write ``data`` to the stdin channel in ``STDIN_CHUNK_SIZE`` frames.
 
-        Used by both exec and write_file (see ``_STDIN_CHUNK_SIZE`` for why we
+        Used by both exec and write_file (see ``STDIN_CHUNK_SIZE`` for why we
         chunk). The slice type is preserved: ``str`` -> text frames, ``bytes``
         -> binary frames.
         """
-        for i in range(0, len(data), _STDIN_CHUNK_SIZE):
-            ws_client.write_stdin(data[i : i + _STDIN_CHUNK_SIZE])
+        for i in range(0, len(data), STDIN_CHUNK_SIZE):
+            ws_client.write_stdin(data[i : i + STDIN_CHUNK_SIZE])
 
     def create_websocket_client_for_exec(
-        self, **kwargs
+        self, send_keepalive: bool = True, **kwargs
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
         # Note: ApiException is intentionally not caught; it should fail the eval.
@@ -100,7 +100,8 @@ class PodOperation(ABC):
         )
         try:
             self._discard_duplicate_channel(ws_client)
-            keepalive.start()
+            if send_keepalive:
+                keepalive.start()
             yield ws_client
         finally:
             stop_keepalive.set()
@@ -206,7 +207,12 @@ def _send_keepalive(ws_client: WSClient, stop: threading.Event) -> None:
     [2] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/websocket.go#L339-L349
     [3] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/hybi.go#L290-L302
     [4] https://github.com/kubernetes/kubernetes/blob/77b02b7ad40d36cd803856de5ba5922c947cb0aa/staging/src/k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go#L348-L356
+
+    Nothing is sent on v5.channel.k8s.io, which kubernetes>=36 negotiates first: there,
+    resize frames on an exec without a TTY stop the server reading the exec's stdin.
     """
+    if getattr(ws_client, "subprotocol", None) == "v5.channel.k8s.io":
+        return
     payload = json.dumps({"Width": 80, "Height": 24}).encode()  # Size is arbitrary
     while not stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
         try:

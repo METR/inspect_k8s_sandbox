@@ -14,7 +14,7 @@ from k8s_sandbox._pod.error import (
     PodError,
     PodReplacedError,
 )
-from k8s_sandbox._pod.execute import ExecuteOperation
+from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
@@ -199,6 +199,20 @@ class Pod:
                 raise warned_restart
             await self._diagnose_restart_after_failed_exec()
         return result
+
+    async def exec_stdio(self, cmd: list[str], user: str | None) -> PodStdio:
+        """Start a command as exec() would, and join a stream to its stdin and stdout.
+
+        Closing the stream ends the command's stdin and stdout. Until then the stream
+        holds the exec's connection, so callers must close it.
+        """
+        operation = ExecuteOperation(self._info)
+        stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
+            lambda: operation.open_stdio(cmd, user),
+            # The websocket opened for a caller that stopped waiting.
+            discard=lambda opened: opened[0].close(),
+        )
+        return PodStdio(stack, ws_client)
 
     async def _diagnose_restart_after_failed_exec(self) -> None:
         try:

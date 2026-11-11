@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -8,8 +9,10 @@ from textwrap import dedent
 from typing import AsyncGenerator, Generator
 from unittest.mock import patch
 
+import anyio
 import pytest
 import pytest_asyncio
+from anyio.streams.buffered import BufferedByteStream
 from inspect_ai.util import OutputLimitExceededError, SandboxEnvironmentLimits
 from kubernetes.stream.ws_client import ApiException, WSClient  # type: ignore
 from pytest import LogCaptureFixture
@@ -1031,3 +1034,51 @@ async def test_can_get_sandbox_connection_with_default_user(
     # The attachToK8sContainer command does not support passing in a user name, so
     # we don't return any VS Code command.
     assert result.vscode_command is None
+
+
+async def test_exec_stdio_carries_requests_and_replies(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo ready; exec cat"])
+    )
+    try:
+        with anyio.fail_after(60):
+            ready = await stream.receive_until(b"\n", 100)
+            await stream.send(b"echoed\n")
+            echoed = await stream.receive_until(b"\n", 100)
+    finally:
+        await stream.aclose()
+
+    assert (ready, echoed) == (b"ready", b"echoed")
+
+
+async def test_closing_exec_stdio_ends_the_command(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    """Its stdin closes with the stream, so a command reading it (the bridge) exits."""
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo $$; exec cat"])
+    )
+    with anyio.fail_after(60):
+        pid = (await stream.receive_until(b"\n", 100)).decode()
+    await stream.aclose()
+
+    with anyio.fail_after(60):
+        while (await sandbox_busybox.exec(["kill", "-0", pid])).success:
+            await anyio.sleep(0.5)
+
+
+async def test_exec_stdio_runs_as_the_default_user(
+    sandbox_with_default_user: K8sSandboxEnvironment,
+) -> None:
+    stream = await sandbox_with_default_user.exec_stdio(["id", "-un"])
+    output = b""
+    try:
+        with anyio.fail_after(60), contextlib.suppress(anyio.EndOfStream):
+            while True:
+                output += await stream.receive()
+    finally:
+        await stream.aclose()
+
+    assert output == b"ubuntu\n"
