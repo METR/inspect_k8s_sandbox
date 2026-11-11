@@ -1513,7 +1513,9 @@ class TestExecStdio:
 
         assert client.fileno() == -1
 
-    @pytest.mark.parametrize("cmd", [[], ["--"], ["-a", "x"], ["\0--"]])
+    @pytest.mark.parametrize(
+        "cmd", [[], ["--"], ["-a", "x"], ["\0--"], ["printf", "x\0y"]]
+    )
     def test_a_missing_command_is_refused(self, cmd: list[str]) -> None:
         """`exec` alone, or with only its options, leaves the shell reading on."""
         with (
