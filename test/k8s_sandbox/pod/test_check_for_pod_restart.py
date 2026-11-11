@@ -689,6 +689,21 @@ def test_an_operation_after_a_restart_was_found_is_not_queued():
     executor.queue_operation.assert_not_called()
 
 
+def test_an_operation_after_a_restart_was_found_lets_other_tasks_run_first():
+    # A caller retrying in a loop must not hold the event loop.
+    pod = _make_pod()
+    pod._restart_error = _restart()
+    ran: list[bool] = []
+
+    async def operation() -> list[bool]:
+        asyncio.get_running_loop().call_soon(ran.append, True)
+        with pytest.raises(ContainerRestartedError):
+            await pod._run_async(lambda: None)
+        return list(ran)
+
+    assert asyncio.run(operation()) == [True]
+
+
 def test_the_first_restart_kept_stays():
     pod = _make_pod()
     first, second = _restart(1), _restart(2)

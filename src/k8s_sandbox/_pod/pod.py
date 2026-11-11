@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import os
@@ -308,8 +309,12 @@ class Pod:
             self._raise_restart()
             return result
 
-        # Not queued behind other operations if it was found already.
-        self._raise_restart()
+        # Not queued behind other operations if it was found already, but suspended
+        # first, as queueing would have: a caller retrying in a loop must not hold the
+        # event loop.
+        if self._restart_error is not None:
+            await asyncio.sleep(0)
+            self._raise_restart()
         executor = PodOpExecutor.get_instance()
         try:
             result = await executor.queue_operation(run)
