@@ -36,10 +36,10 @@ class ContainerStatus:
     name: str
     restart_count: int
     last_terminated_reason: str | None
-    running: bool = True
+    running: bool
     """False while the container is stopped (``state.terminated``) or waiting to
     start (``state.waiting``)."""
-    terminated_reason: str | None = None
+    terminated_reason: str | None
     """``state.terminated.reason``, while the container is stopped."""
 
 

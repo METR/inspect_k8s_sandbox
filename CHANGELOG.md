@@ -3,19 +3,15 @@
 ## Unreleased
 
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
-  replacement or container restart now raises the same `PodReplacedError` or
-  `ContainerRestartedError`, `read_file()` and `write_file()` included (also when
-  `INSPECT_POD_RESTART_CHECK=false`), and so does one that was running when the restart
-  was detected, whatever it returned. Before, only the first one raised, and a solver
-  that caught it carried on in the new container.
-- A container that Kubernetes shows stopped, or waiting to start again, now counts as
-  restarted, so an operation cannot reach its replacement before the new restart count
-  is published (seconds later when the restart replaces a Kata VM).
-- `exec()` raises `ContainerStoppedError`, an `ExecResultUnknownError`, when the exec
-  ends with status 255 before the command's end, which is how Kata reports a command
-  whose VM stopped under it, instead of returning 255 as the command's exit code. With
-  `restarted_container_behavior="raise"` it raises `ContainerRestartedError` instead, as
-  every later operation does, before Kubernetes shows the container stopped.
+  replacement or container restart fails with the same `PodReplacedError` or
+  `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
+  it was detected. `read_file()` and `write_file()` do too when
+  `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
+  waiting to start again, counts as restarted.
+- `exec()` raises `ContainerStoppedError`, an `ExecResultUnknownError`, instead of
+  returning exit code 255 when the command's container stopped under it, as Kata reports
+  a command whose VM stopped. With `restarted_container_behavior="raise"` it raises
+  `ContainerRestartedError` instead.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a

@@ -151,7 +151,8 @@ def check_for_pod_restart(pod: PodInfo) -> None:
     Raises:
         PodReplacedError: the pod's UID has changed since ``pod.uid``.
         ContainerRestartedError: the default container's restart count has
-            increased since ``pod.initial_restart_count``, or it is not running.
+            increased since ``pod.initial_restart_count``, or, in ``"raise"``
+            mode, it is not running.
         RuntimeError: the named container is no longer present on the pod
             (treated as a permanent misconfiguration).
     """
@@ -184,10 +185,10 @@ def check_for_pod_restart(pod: PodInfo) -> None:
             restart_count=status.restart_count,
             last_reason=status.last_terminated_reason or "unknown",
         )
-    if not status.running and status.restart_count + 1 > pod.initial_restart_count:
+    if not status.running and pod.restarted_container_behavior == "raise":
         # The container stopped, and the kubelet is starting another, which an
         # operation can reach before its restart count is published (seconds later
-        # when the restart replaces a Kata VM). Unless "warn" counted it already.
+        # when the restart replaces a Kata VM). "warn" reports it when the count moves.
         raise ContainerRestartedError(
             pod_name=pod.name,
             container_name=status.name,

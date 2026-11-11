@@ -22,7 +22,6 @@ from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 
 T = TypeVar("T")
-E = TypeVar("E", bound=BaseException)
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +33,6 @@ def _file_op_restart_check_enabled() -> bool:
     # check is the high-signal way we learn a sandbox pod was replaced and
     # stays unconditional, while file-op API errors are self-revealing.
     return os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() != "false"
-
-
-def _copy(error: E) -> E:
-    """Return ERROR without its traceback and chain, to keep or to raise again.
-
-    One exception raised again collects each raise's frames, and concurrent raises
-    would share them.
-    """
-    copy = type(error).__new__(type(error))
-    copy.args, copy.__dict__ = error.args, dict(vars(error))
-    return copy
 
 
 class Pod:
@@ -106,7 +94,8 @@ class Pod:
             check_for_pod_restart(self._info)
         except (PodReplacedError, ContainerRestartedError) as e:
             if self._info.restarted_container_behavior == "raise":
-                self._restart_error = _copy(e)
+                # A copy, without the frames of the operations it passes through.
+                self._restart_error = type(e)(**vars(e))
                 raise
             if isinstance(e, PodReplacedError):
                 self._info = dataclasses.replace(
@@ -213,13 +202,13 @@ class Pod:
                 and info.restarted_container_behavior == "raise"
             ):
                 # Gone, though Kubernetes may not show it stopped yet.
-                self._restart_error = ContainerRestartedError(
+                error = self._restart_error = ContainerRestartedError(
                     pod_name=info.name,
                     container_name=info.default_container_name,
                     restart_count=info.initial_restart_count + 1,
                     last_reason="stopped under a command",
                 )
-                raise _copy(self._restart_error) from e
+                raise type(error)(**vars(error)) from e
             raise
         if not result.success:
             if warned_restart is not None:
@@ -291,5 +280,7 @@ class Pod:
         return await executor.queue_operation(run)
 
     def _raise_restart(self) -> None:
-        if self._restart_error is not None:
-            raise _copy(self._restart_error)
+        if (error := self._restart_error) is not None:
+            # A copy: one exception raised again collects each raise's frames, and
+            # concurrent raises would share them.
+            raise type(error)(**vars(error))

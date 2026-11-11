@@ -468,7 +468,7 @@ def test_raise_mode_drops_a_result_got_while_a_restart_was_found():
             asyncio.run(pod.exec(["true"], None, None, {}, None, None))
 
 
-def test_warn_mode_reports_a_stopped_container_once():
+def test_warn_mode_reports_a_stopped_container_when_its_count_moves():
     stopped = _raw_pod_response(
         {
             "metadata": {"uid": "uid-OLD", "name": "agent-env-abc-default-0"},
@@ -486,5 +486,5 @@ def test_warn_mode_reports_a_stopped_container_once():
     pod = _make_pod(restarted_container_behavior="warn")
     with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
         mock_client.return_value.read_namespaced_pod.return_value = stopped
-        assert isinstance(pod._check_for_pod_restart_sync(), ContainerRestartedError)
         assert pod._check_for_pod_restart_sync() is None
+        assert pod.info.initial_restart_count == 0
