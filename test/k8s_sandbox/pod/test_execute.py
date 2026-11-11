@@ -1501,7 +1501,8 @@ class TestExecStdio:
         client, server = tls_sockets
         stream = _stdio(client)
         server.sendall(
-            _frame(STDERR, b"sh: 1: exec: inspect-sandbox-tools: not found\n")
+            _frame(STDOUT, b"")  # Every exec opens with one.
+            + _frame(STDERR, b"sh: 1: exec: inspect-sandbox-tools: not found\n")
             + _frame(*_status(127))
             + _close_frame()
         )
@@ -1535,6 +1536,46 @@ class TestExecStdio:
         await _wait_for(lambda: client.fileno() == -1)
 
         assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+    async def test_a_receive_cancelled_once_it_has_run_loses_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """A Task.cancel() can land after the stdout it took, as well as before."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+        await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
+        receiving = asyncio.create_task(stream.receive())
+        await asyncio.sleep(0)  # It runs one step.
+
+        receiving.cancel()
+        received = b""
+        with contextlib.suppress(asyncio.CancelledError):
+            received = await receiving
+        with anyio.fail_after(30):
+            while received != b"a reply\n":
+                received += await stream.receive()
+        await stream.aclose()
+
+    async def test_stdout_read_before_the_stream_broke_is_kept(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+        with anyio.fail_after(30):
+            first = await stream.receive(2)  # The rest of the frame stays read.
+        server.close()
+
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            while True:
+                await stream.send(b"a request\n")
+        with anyio.fail_after(30):
+            rest = await stream.receive()
+            with pytest.raises(anyio.BrokenResourceError):
+                await stream.receive()
+
+        assert first + rest == b"a reply\n"
 
     async def test_a_closed_stream_gives_nothing_it_had_read(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1648,7 +1689,7 @@ class TestExecStdio:
         client, server = socket.socketpair()
         stream = PodStdio(contextlib.ExitStack(), _SocketWSClient(client))
         receiving = asyncio.create_task(stream.receive())
-        await asyncio.sleep(0)  # It now waits for stdout.
+        await anyio.wait_all_tasks_blocked()  # It now waits for stdout.
 
         server.sendall(_frame(STDOUT, b"a reply\n"))
         with anyio.fail_after(30):
@@ -1761,7 +1802,7 @@ class TestExecStdio:
         stream = _stdio(client)
         reader = _reader(server)
         receiving = asyncio.create_task(stream.receive())
-        await asyncio.sleep(0)  # It now waits for stdout.
+        await anyio.wait_all_tasks_blocked()  # It now waits for stdout.
 
         await stream.aclose()
 
@@ -1799,9 +1840,11 @@ class TestExecStdio:
         try:
             stream = _stdio(client)
             reader = _reader(server)
+            receiving = asyncio.create_task(stream.receive())
+            await anyio.wait_all_tasks_blocked()  # It now waits for stdout.
             server.sendall(_frame(STDOUT, b"ready\n"))
             with anyio.fail_after(30):
-                ready = await stream.receive()
+                ready = await receiving
                 await stream.send(b"a request\n")
             _, request = reader.recv_data_frame(True)
         finally:

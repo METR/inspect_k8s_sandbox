@@ -141,10 +141,11 @@ class ExecuteOperation(PodOperation):
         argv (through `sh -c` to switch users), so stdin reaches it unread.
         """
         stack = ExitStack()
-        # No resize keepalive: CRI-O does not drain resize events for an exec
-        # without a TTY, so they would stall the stream's stdin. TCP keepalives
-        # keep the connection alive; a stream idle past the kubelet's stream idle
-        # timeout (4 h by default) closes, and Inspect opens another.
+        # No resize keepalive: resize events for an exec without a TTY stall its stdin
+        # where they go unread (CRI-O, and any runtime over v5.channel.k8s.io: see
+        # _send_keepalive). TCP keepalives keep the connection alive; a stream idle past
+        # the runtime's stream idle timeout (4 h by default) closes, and Inspect opens
+        # another.
         ws_client = stack.enter_context(
             self._interactive_shell(
                 _shell_command(user, command=cmd), send_keepalive=False

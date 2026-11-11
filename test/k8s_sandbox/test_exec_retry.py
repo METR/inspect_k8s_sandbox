@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
@@ -387,9 +388,10 @@ class TestExecStdioRetry:
             side_effect=[ApiException(status=503, reason="Unavailable"), stream]
         )
 
-        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
         assert mock_pod.exec_stdio.call_count == 2
+        assert opened is stream
 
     async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
         """Nothing checks the pod again while the stream lasts."""
@@ -406,6 +408,19 @@ class TestExecStdioRetry:
             await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
         assert isinstance(error.value.__cause__, PodReplacedError)
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = AsyncMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(side_effect=anyio.Event().wait)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools", "bridge"])
+            await anyio.wait_all_tasks_blocked()
+            tasks.cancel_scope.cancel()
+
         stream.aclose.assert_awaited_once()
 
     async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
