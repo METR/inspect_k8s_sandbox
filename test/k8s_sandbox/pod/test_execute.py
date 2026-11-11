@@ -471,8 +471,8 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 ) -> None:
     """As `runuser -u root` would, also in a container replaced by one not root.
 
-    The check needs no program: only the command is on the PATH here, and an `id`
-    that records being run, so one that starts `id` from the PATH fails too (busybox
+    The check needs no program from the PATH: only the command is on it here, and an
+    `id` that records being run, so one that starts `id` from it fails too (busybox
     runs its own `id` applet instead).
     """
     bin_dir = tmp_path / "bin"
