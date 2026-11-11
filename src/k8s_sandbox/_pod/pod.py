@@ -223,15 +223,11 @@ class Pod:
         """
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
-        stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
+        stack, ws_client = await self._run_async(
             lambda: operation.open_stdio(cmd, user),
-            # The websocket opened for a caller that stopped waiting.
+            # The websocket opened for a caller that won't get it.
             discard=lambda opened: opened[0].close(),
         )
-        if self._restart_error is not None:
-            # Found while it opened, so the command may run in the replacement.
-            stack.close()
-            self._raise_restart()
         return PodStdio(stack, ws_client, stopped=self._stdio_stopped)
 
     def _stdio_stopped(self) -> None:
@@ -304,13 +300,17 @@ class Pod:
                 await self._diagnose_restart_after_failure()
             raise
 
-    async def _run_async(self, callable: Callable[[], T]) -> T:
+    async def _run_async(
+        self, callable: Callable[[], T], discard: Callable[[T], object] | None = None
+    ) -> T:
         """Run a synchronous function asynchronously.
 
         Once a check in "raise" mode has detected a restart, raise it instead: before
         running the function, and after, if it was detected meanwhile, whether the
         function returned or failed. In "raise" mode a container that stopped under
-        the function counts as restarted.
+        the function counts as restarted. DISCARD closes a result the caller won't
+        get, such as an open connection: one a restart was found in, or one that came
+        once the caller stopped waiting.
         """
 
         def run() -> T:
@@ -326,6 +326,8 @@ class Pod:
                 # A restart found while it ran explains its failure better.
                 self._raise_restart()
                 raise
+            if self._restart_error is not None and discard is not None:
+                discard(result)
             self._raise_restart()
             return result
 
@@ -337,13 +339,16 @@ class Pod:
             self._raise_restart()
         executor = PodOpExecutor.get_instance()
         try:
-            result = await executor.queue_operation(run)
+            result = await executor.queue_operation(run, discard=discard)
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
             # Also if it was found before this resumed.
             self._raise_restart()
             raise
+        if self._restart_error is not None and discard is not None:
+            # Not on the event loop: closing a connection can wait on the server.
+            threading.Thread(target=discard, args=(result,), daemon=True).start()
         self._raise_restart()
         return result
 
