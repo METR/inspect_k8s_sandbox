@@ -38,6 +38,7 @@
 | services.default.initContainers | list | `[]` | Init containers to run before the main container starts. Useful for waiting for dependencies to become ready (e.g., database connectivity checks). Each init container supports: `name` (required), `image` (required), `command`, `args`, `imagePullPolicy`, `workingDir`, `resources`, and `securityContext`. The `$AGENT_ENV` environment variable is automatically injected. Note: init containers cannot reliably access external domains from `allowDomains` due to CoreDNS starting after init containers complete. |
 | services.default.livenessProbe | object | `{}` | A probe which is used to determine when to restart a container. |
 | services.default.nodeSelector | object | `{}` | Node selector settings for the Pod. |
+| services.default.podAnnotations | object | `{}` | Annotations for this service's Pod alone, over the top-level `annotations`. |
 | services.default.ports | list | `[]` | Deprecated. All ports of services with a DNS record are accessible (though not necessarily open) to other services within the agent environment. If one or more ports are provided, `dnsRecord` is automatically set to true. |
 | services.default.readinessProbe | object | `{}` | A probe which is used to determine when the container is ready to accept. traffic. |
 | services.default.resources | object | see [templates/services.yaml](./templates/services.yaml) | Resource requests and limits for the container. |

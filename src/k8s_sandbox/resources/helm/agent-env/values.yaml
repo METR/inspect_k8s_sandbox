@@ -148,6 +148,8 @@ services:
     tolerations: []
     # -- Node selector settings for the Pod.
     nodeSelector: {}
+    # -- Annotations for this service's Pod alone, over the top-level `annotations`.
+    podAnnotations: {}
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"

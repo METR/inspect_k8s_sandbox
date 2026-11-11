@@ -171,6 +171,37 @@ def test_annotations(chart_dir: Path, test_resources_dir: Path) -> None:
         assert deployment["metadata"]["annotations"]["myValue"] == attr_value
 
 
+def test_pod_annotations_reach_only_their_service_pod(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "annotations.shared=release,annotations.both=release,"
+        "services.default.podAnnotations.both=default,"
+        "services.default.podAnnotations.mine=default,"
+        "services.server.podAnnotations.mine=server",
+    )
+
+    release = {"shared": "release", "both": "release"}
+    pods = {}
+    for stateful_set in _get_documents(documents, "StatefulSet"):
+        # The StatefulSet itself keeps the top-level annotations alone.
+        assert stateful_set["metadata"]["annotations"] == release
+        pods[stateful_set["metadata"]["name"]] = stateful_set["spec"]["template"]
+    for service in _get_documents(documents, "Service"):
+        assert service["metadata"]["annotations"] == release
+    assert pods["agent-env-my-release-default"]["metadata"]["annotations"] == {
+        "shared": "release",
+        "both": "default",
+        "mine": "default",
+    }
+    assert pods["agent-env-my-release-server"]["metadata"]["annotations"] == {
+        **release,
+        "mine": "server",
+    }
+
+
 @pytest.mark.parametrize(
     "labels",
     [
