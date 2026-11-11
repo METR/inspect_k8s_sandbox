@@ -5,10 +5,14 @@ from typing import IO, Generator
 from inspect_ai.util import OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from websocket import WebSocketException
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
-from k8s_sandbox._pod.get_returncode import get_returncode
+from k8s_sandbox._pod.get_returncode import (
+    get_returncode,
+    raise_if_stopped_before_lost,
+)
 from k8s_sandbox._pod.op import (
     PodOperation,
     raise_for_known_read_write_errors,
@@ -43,15 +47,19 @@ class ReadFileOperation(PodOperation):
         start_position = dst.tell()
         # Stream the response, writing it to dst as we go to avoid holding the whole
         # response in memory.
-        while ws_client.is_open():
-            # `timeout=None` means `update` will block indefinitely until there is
-            # data to read.
-            ws_client.update(timeout=None)
-            if ws_client.peek_stdout():
-                dst.write(ws_client.read_stdout())
-                self._verify_output_limit(dst.tell() - start_position)
-            if ws_client.peek_stderr():
-                stderr.append(ws_client.read_stderr())
+        try:
+            while ws_client.is_open():
+                # `timeout=None` means `update` will block indefinitely until there is
+                # data to read.
+                ws_client.update(timeout=None)
+                if ws_client.peek_stdout():
+                    dst.write(ws_client.read_stdout())
+                    self._verify_output_limit(dst.tell() - start_position)
+                if ws_client.peek_stderr():
+                    stderr.append(ws_client.read_stderr())
+        except (OSError, WebSocketException) as e:
+            raise_if_stopped_before_lost(ws_client, e, self._pod.name)
+            raise
         returncode = get_returncode(ws_client)
         # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
         if returncode == 255:

@@ -5,11 +5,13 @@ from unittest.mock import MagicMock
 
 import pytest
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
 import k8s_sandbox._pod.write as writefile_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.write import WriteFileOperation
+from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
 
 
 def test_write_file_writes_data_via_chunked_helper(
@@ -59,3 +61,24 @@ def test_a_255_is_a_stopped_container(
         op._handle_stream_output(ws)
 
     assert type(raised.value) is error
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [ConnectionResetError(), WebSocketConnectionClosedException()],
+    ids=["reset", "closed"],
+)
+@pytest.mark.parametrize(
+    ("frames", "stopped"),
+    [([_status(255)], True), ([_status(2)], False), ([], False)],
+    ids=["255", "another-status", "no-status"],
+)
+def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
+    frames: list[tuple[int, bytes]], stopped: bool, lost: Exception
+) -> None:
+    ws = _FakeWSClient(frames, error=lost)
+
+    with pytest.raises(Exception) as raised:
+        WriteFileOperation(MagicMock())._handle_stream_output(ws)
+
+    assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))

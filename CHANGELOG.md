@@ -17,7 +17,8 @@
   fails, instead of waiting on a stalled API server without end. A server that keeps
   sending, however slowly, is still waited on.
 - An operation whose container stopped under it, which Kata reports with exit code 255
-  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`.
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`, also
+  when the connection is lost after that status arrived.
   Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
   `write_file()` were retried, reaching the container that replaced it. With
   `restarted_container_behavior="raise"`, or for an `exec()` whose check after it sees
