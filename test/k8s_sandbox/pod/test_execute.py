@@ -1285,8 +1285,10 @@ def _stdio(client: ssl.SSLSocket) -> PodStdio:
     """A stream on `client`, opened as Pod.exec_stdio() opens one."""
     op = ExecuteOperation(MagicMock())
     with (
-        patch.object(op_module, "k8s_client"),
-        patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
+        patch.object(op_module, "k8s_client", autospec=True),
+        patch.object(
+            op_module, "stream", autospec=True, return_value=_SocketWSClient(client)
+        ),
     ):
         stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
     return PodStdio(stack, ws)
@@ -1324,9 +1326,9 @@ class TestExecStdio:
         op = ExecuteOperation(MagicMock())
 
         with (
-            patch.object(op_module, "k8s_client"),
+            patch.object(op_module, "k8s_client", autospec=True),
             patch.object(
-                op_module, "stream", return_value=_SocketWSClient(client)
+                op_module, "stream", autospec=True, return_value=_SocketWSClient(client)
             ) as stream,
         ):
             stack, _ = op.open_stdio(["printf", "%s\n", "a b"], "agent")
@@ -1463,8 +1465,10 @@ class TestExecStdio:
         client, _ = tls_sockets
         op = ExecuteOperation(MagicMock())
         with (
-            patch.object(op_module, "k8s_client"),
-            patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
+            patch.object(op_module, "k8s_client", autospec=True),
+            patch.object(
+                op_module, "stream", autospec=True, return_value=_SocketWSClient(client)
+            ),
         ):
             stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
 

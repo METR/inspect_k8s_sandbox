@@ -18,9 +18,8 @@
   shell builtin in dash, bash and busybox).
 - `exec(user=...)` runs fewer programs per call after its first call as each user,
   where the container switches to that user.
-- With kubernetes 36 or later, which uses the `v5.channel.k8s.io` exec protocol, no
-  longer send the connection keepalive, which there stops the pod reading an exec's
-  input after about a minute.
+- Fix an exec's input going unread after about a minute with kubernetes 36 or later
+  (the `v5.channel.k8s.io` exec protocol).
 - Add `exec_stdio()`, which Inspect's persistent exec channel uses to send many
   sandbox tools requests over one exec per sandbox.
 
