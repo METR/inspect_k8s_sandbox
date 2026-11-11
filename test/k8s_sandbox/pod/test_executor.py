@@ -122,3 +122,33 @@ async def test_queue_operation_propagates_caller_context(
 def _synchronous_operation(value: int) -> tuple[int, str]:
     sleep(1)
     return value, threading.current_thread().name
+
+
+async def test_a_result_in_as_its_caller_stops_waiting_is_discarded_off_the_loop() -> (
+    None
+):
+    """Discarding closes a connection, which can block for seconds."""
+    executor = PodOpExecutor.get_instance(max_pod_ops=1)
+    started, discarded = threading.Event(), threading.Event()
+    discarded_on: list[threading.Thread] = []
+
+    def operation() -> str:
+        started.set()
+        return "an open connection"
+
+    def discard(result: str) -> None:
+        discarded_on.append(threading.current_thread())
+        discarded.set()
+
+    task = asyncio.create_task(executor.queue_operation(operation, discard))
+    while not started.is_set():
+        await asyncio.sleep(0)
+    # The pool's one thread takes this only once the operation's result is in, which
+    # the caller cannot see before the event loop runs again.
+    executor._executor.submit(lambda: None).result(timeout=30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert discarded.wait(timeout=30)
+    assert discarded_on[0] is not threading.current_thread()

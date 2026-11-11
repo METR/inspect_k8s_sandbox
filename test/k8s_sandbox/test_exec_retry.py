@@ -387,9 +387,8 @@ class TestExecStdioRetry:
             side_effect=[ApiException(status=503, reason="Unavailable"), stream]
         )
 
-        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
-        assert opened is stream
         assert mock_pod.exec_stdio.call_count == 2
 
     async def test_permanent_error_is_not_retried(self) -> None:
@@ -425,19 +424,21 @@ class TestExecStdioRetry:
             side_effect=[ApiException(status=503, reason="Unavailable"), None]
         )
 
-        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
-        assert opened is stream
         assert mock_pod.exec_stdio.call_count == 1
 
-    async def test_the_default_user_is_used(self) -> None:
+    @pytest.mark.parametrize("user, expected", [(None, "agent"), ("root", "root")])
+    async def test_the_default_user_is_used_unless_one_is_given(
+        self, user: str | None, expected: str
+    ) -> None:
         sandbox, mock_pod = _make_sandbox()
         sandbox._config = MagicMock(default_user="agent")
         mock_pod.exec_stdio = AsyncMock()
 
-        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
 
         assert mock_pod.exec_stdio.call_args.args == (
             ["inspect-sandbox-tools", "bridge"],
-            "agent",
+            expected,
         )

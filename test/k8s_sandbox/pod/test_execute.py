@@ -39,13 +39,13 @@ from kubernetes.stream.ws_client import (
 
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
-import k8s_sandbox._pod.pod as pod_module
 from k8s_sandbox._pod.error import (
     ExecResultUnknownError,
     GetReturncodeError,
     PodError,
 )
 from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio, _shell_command
+from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.pod import Pod
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
@@ -1356,6 +1356,7 @@ class TestExecStdio:
         await _wait_for(lambda: client.fileno() == -1)
 
         assert b"".join(received) == b"ready\na reply\n"
+        assert max(len(piece) for piece in received) == 4
 
     async def test_a_lost_connection_breaks_the_stream(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1367,10 +1368,53 @@ class TestExecStdio:
 
         with anyio.fail_after(30):
             reply = await stream.receive()
-            with pytest.raises(anyio.BrokenResourceError):
+            with pytest.raises(anyio.BrokenResourceError) as broken:
                 await stream.receive()
 
         assert reply == b"a reply\n"
+        assert str(broken.value)  # Names what broke it, for the host's log.
+
+    async def test_sent_bytes_reach_the_command_s_stdin(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        reader.recv_data_frame(True)  # The line open_stdio() wrote.
+        request = bytes(range(256)) + b"\n"
+
+        with anyio.fail_after(30):
+            await stream.send(request)
+        _, frame = reader.recv_data_frame(True)
+        await stream.aclose()
+
+        assert frame.data == b"\x00" + request
+
+    async def test_sends_take_no_tokens_of_anyio_s_shared_limiter(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A wedged write must not hold up the other threads Inspect starts."""
+        client, _ = tls_sockets
+        stream = _stdio(client)
+        shared = anyio.to_thread.current_default_thread_limiter()
+        monkeypatch.setattr(shared, "total_tokens", 1)
+
+        async with shared:  # All its tokens are taken.
+            with anyio.fail_after(30):
+                await stream.send(b"a request\n")
+        await stream.aclose()
+
+    async def test_the_stream_cannot_end_stdin_alone(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """v4.channel.k8s.io has no way to, so a caller must not think it did."""
+        stream = _stdio(tls_sockets[0])
+
+        with pytest.raises(NotImplementedError):
+            await stream.send_eof()
+        await stream.aclose()
 
     async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1449,7 +1493,9 @@ class TestExecStdio:
         assert len(first) == 32 * 4096
 
     async def test_an_open_whose_caller_stopped_waiting_is_closed(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """By the open's own close, not the garbage collector's.
 
@@ -1470,11 +1516,9 @@ class TestExecStdio:
             def __exit__(self, *exc_info: object) -> None:
                 closed.set()
 
+        monkeypatch.setattr(PodOpExecutor, "_instance", None)  # A pool of its own.
         pod = Pod("pod", "ns", None, "default", "uid", 0, "raise")
-        with (
-            patch.object(ExecuteOperation, "_interactive_shell", lambda *_: Shell()),
-            patch.object(pod_module, "check_for_pod_restart"),
-        ):
+        with patch.object(ExecuteOperation, "_interactive_shell", lambda *_: Shell()):
             starting = asyncio.create_task(pod.exec_stdio(["cat"], None))
             await _wait_for(opening.is_set)
             starting.cancel()
@@ -1511,7 +1555,7 @@ class TestExecStdio:
         sending = await _send_in_progress(stream, server)
 
         sending.cancel()  # As Task.cancel() can, which no shield stops.
-        with pytest.raises(asyncio.CancelledError):
+        with anyio.fail_after(30), pytest.raises(asyncio.CancelledError):
             await sending
 
         with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
