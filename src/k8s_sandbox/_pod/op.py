@@ -44,11 +44,14 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
 STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
-# AWS Nitro Sandboxes (EKS's `isolated-sandbox` runtime) can reorder an exec's stdin
-# that arrives faster than the runtime forwards it, silently (staging, 2026-11: 0 of
-# 2,500 payloads of 64 KiB corrupted, 4 of 500 at 128 KiB, every one at 16 MiB). So a
-# bigger payload goes one piece of at most this size per exec, each piece checked
-# against the sha256 the container computes (PodOperation._stage).
+# AWS Nitro Sandboxes (EKS's `isolated-sandbox` runtime) forward an exec's stdin in
+# 32 KiB chunks that can arrive swapped, silently (staging, 2026-11: 4 of 500 payloads
+# of 128 KiB, every one at 16 MiB, and, with execs running at once, about 1 in 2,500
+# of 64 KiB). A payload of one chunk cannot be swapped, so stdin up to this size goes
+# as it is; a bigger payload is staged (PodOperation._stage).
+STDIN_UNCHECKED_SIZE = 32 * 1024
+# A staged payload goes one piece of at most this size per exec, each piece checked
+# against the sha256 the container computes, and sent again if it differs.
 STDIN_PIECE_SIZE = 64 * 1024
 # How many times a piece is sent before its corruption is an error.
 _PIECE_ATTEMPTS = 3

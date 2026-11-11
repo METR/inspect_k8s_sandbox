@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Fix `write_file()` and `exec()` silently corrupting stdin over 64 KiB on AWS Nitro
-  Sandboxes (EKS's `isolated-sandbox` runtime). On every runtime, stdin over 64 KiB now
-  goes in hash-checked pieces of 64 KiB, one exec each, and needs `mktemp`,
+- Fix `write_file()` and `exec()` silently corrupting stdin over 32 KiB on AWS Nitro
+  Sandboxes (EKS's `isolated-sandbox` runtime). On every runtime, stdin over 32 KiB now
+  goes in hash-checked pieces of up to 64 KiB, one exec each, and needs `mktemp`,
   `sha256sum` and a writable temporary directory in the container. A piece that
   arrives corrupted three times raises `PodError`.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume

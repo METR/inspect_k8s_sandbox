@@ -12,7 +12,7 @@ from k8s_sandbox._pod.get_returncode import (
     raise_if_stopped_before_lost,
 )
 from k8s_sandbox._pod.op import (
-    STDIN_PIECE_SIZE,
+    STDIN_UNCHECKED_SIZE,
     SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
@@ -21,7 +21,7 @@ from k8s_sandbox._pod.op import (
 
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
-        if len(data) > STDIN_PIECE_SIZE:
+        if len(data) > STDIN_UNCHECKED_SIZE:
             directory = self._stage(
                 data, lambda command: command, raise_for_known_read_write_errors
             )

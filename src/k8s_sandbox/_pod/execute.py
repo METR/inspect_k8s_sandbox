@@ -35,7 +35,7 @@ from k8s_sandbox._pod.get_returncode import get_returncode, returncode_from_stat
 from k8s_sandbox._pod.op import (
     API_TIMEOUT,
     STDIN_CHUNK_SIZE,
-    STDIN_PIECE_SIZE,
+    STDIN_UNCHECKED_SIZE,
     SYSTEM_PATH,
     PodOperation,
 )
@@ -153,8 +153,8 @@ class ExecuteOperation(PodOperation):
             cmd, stdin, cwd, env, timeout, marker, root=root
         )
         shell = ["/bin/sh"] if root else _shell_command(user, switch)
-        if len(shell_script.encode()) > STDIN_PIECE_SIZE:
-            # A script this big could reach the shell reordered (see STDIN_PIECE_SIZE),
+        if len(shell_script.encode()) > STDIN_UNCHECKED_SIZE:
+            # A script this big could reach the shell reordered (STDIN_UNCHECKED_SIZE),
             # so it is staged in pieces, as the shell's user, and a loader runs it.
             directory = self._stage(
                 shell_script.encode(),

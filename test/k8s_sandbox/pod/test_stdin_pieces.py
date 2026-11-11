@@ -1,6 +1,6 @@
-"""Stdin over 64 KiB goes in hash-checked pieces of at most 64 KiB, one exec each.
+"""Stdin over 32 KiB is staged in hash-checked pieces of at most 64 KiB, one exec each.
 
-AWS Nitro Sandboxes can reorder an exec's stdin above 64 KiB; see STDIN_PIECE_SIZE.
+AWS Nitro Sandboxes can swap an exec's stdin in 32 KiB chunks; see STDIN_UNCHECKED_SIZE.
 These tests pin the hazard's boundary as the literal 64 KiB, not the module constant, so
 raising the constant fails them.
 """
@@ -29,7 +29,10 @@ from k8s_sandbox._pod.op import raise_for_known_read_write_errors
 from k8s_sandbox._pod.write import WriteFileOperation
 from test.k8s_sandbox.pod.test_execute import _SHELLS, MARKER
 
-HAZARD = 64 * 1024  # The largest exec stdin payload that arrived intact on Nitro.
+UNCHECKED = (
+    32 * 1024
+)  # The most stdin sent unstaged: one chunk, which cannot be swapped.
+PIECE = 64 * 1024  # The most stdin one staging exec sends.
 
 
 class _FakeContainer:
@@ -102,20 +105,20 @@ def _stage(data: bytes, container: _FakeContainer) -> str:
 class TestStage:
     def test_every_piece_is_one_exec_of_at_most_64_kib(self) -> None:
         # Eleven pieces or more, so a glob over unpadded names would join out of order.
-        data = os.urandom(11 * HAZARD + 123)
+        data = os.urandom(11 * PIECE + 123)
         container = _FakeContainer()
 
         directory = _stage(data, container)
 
         assert container.files[directory] == {"data": data}
-        assert max(container.frames) <= HAZARD
+        assert max(container.frames) <= PIECE
         assert sum(container.frames) == len(data)
         # One exec per piece, plus the join (which sends no stdin).
         assert len(container.commands) == 12 + 1
         assert container.frames[-1] == 0
 
     def test_a_corrupted_piece_is_sent_again(self) -> None:
-        data = os.urandom(3 * HAZARD)
+        data = os.urandom(3 * PIECE)
         container = _FakeContainer(
             corrupt=lambda name, n: name == "00000001" and n == 1
         )
@@ -129,20 +132,20 @@ class TestStage:
         container = _FakeContainer(corrupt=lambda name, n: name == "00000001")
 
         with pytest.raises(PodError, match="corrupted 3 times"):
-            _stage(os.urandom(2 * HAZARD + 1), container)
+            _stage(os.urandom(2 * PIECE + 1), container)
 
         assert container.attempts["00000001"] == 3
 
     def test_a_join_that_comes_back_different_is_an_error(self) -> None:
         with pytest.raises(PodError, match="joined corrupted"):
-            _stage(os.urandom(2 * HAZARD + 1), _FakeContainer(corrupt_join=True))
+            _stage(os.urandom(2 * PIECE + 1), _FakeContainer(corrupt_join=True))
 
     @pytest.mark.skipif(
         shutil.which("sha256sum") is None or shutil.which("mktemp") is None,
         reason="Needs the container's helpers (Linux)",
     )
     def test_the_scripts_run_in_a_real_shell(self) -> None:
-        data = os.urandom(3 * HAZARD + 7)
+        data = os.urandom(3 * PIECE + 7)
         sent: list[int] = []
 
         def run_piece(
@@ -163,7 +166,7 @@ class TestStage:
         try:
             assert Path(directory, "data").read_bytes() == data
             assert sorted(p.name for p in Path(directory).iterdir()) == ["data"]
-            assert max(sent) <= HAZARD
+            assert max(sent) <= PIECE
         finally:
             shutil.rmtree(directory)
 
@@ -182,7 +185,7 @@ class TestRunPiece:
         monkeypatch.setattr(op_module, "get_returncode", lambda ws: 0)
         ws = MagicMock(spec=WSClient)
         ws.read_stdout.return_value = "/tmp/tmp.x\n" + "ab" * 32 + "  -\n"
-        piece = os.urandom(HAZARD)
+        piece = os.urandom(PIECE)
 
         result = self._op_with_ws(ws)._run_piece(
             lambda c: c, "true", piece, lambda stderr: None
@@ -218,8 +221,8 @@ class TestRunPiece:
 
 
 class TestWriteFile:
-    @pytest.mark.parametrize("size", [0, 1, HAZARD])
-    def test_up_to_64_kib_is_one_exec_as_before(
+    @pytest.mark.parametrize("size", [0, 1, UNCHECKED])
+    def test_up_to_32_kib_is_one_exec_as_before(
         self, monkeypatch: pytest.MonkeyPatch, size: int
     ) -> None:
         op = WriteFileOperation(MagicMock())
@@ -240,10 +243,10 @@ class TestWriteFile:
 
         assert b"".join(c.args[0] for c in ws.write_stdin.call_args_list) == b"x" * size
 
-    def test_over_64_kib_is_staged_then_joined_into_the_file(
+    def test_over_32_kib_is_staged_then_joined_into_the_file(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        data = os.urandom(HAZARD + 1)
+        data = os.urandom(UNCHECKED + 1)
         container = _FakeContainer()
         op = WriteFileOperation(MagicMock())
         op._run_piece = container.run_piece  # type: ignore[method-assign]
@@ -266,7 +269,7 @@ class TestWriteFile:
         [(directory, dst)] = joined
         assert dst == Path("/home/agent/dst")
         assert container.files[directory] == {"data": data}
-        assert max(container.frames) <= HAZARD
+        assert max(container.frames) <= PIECE
 
     def test_a_failed_stage_raises_the_file_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -282,7 +285,7 @@ class TestWriteFile:
         monkeypatch.setattr(op, "create_websocket_client_for_exec", create)
 
         with pytest.raises(PermissionError):
-            op.write_file(os.urandom(HAZARD + 1), Path("/tmp/dst"))
+            op.write_file(os.urandom(UNCHECKED + 1), Path("/tmp/dst"))
 
     def test_the_join_command_writes_dst_and_removes_the_stage(self) -> None:
         op = WriteFileOperation(MagicMock())
@@ -350,18 +353,18 @@ class TestExec:
         assert stages == []
         assert "base64 -d" in written
 
-    def test_a_script_over_64_kib_is_staged_and_the_shell_gets_a_loader(
+    def test_a_script_over_32_kib_is_staged_and_the_shell_gets_a_loader(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # 48 KiB of input is 64 KiB in base64, so the script passes 64 KiB.
-        stdin = os.urandom(48 * 1024)
+        # 24 KiB of input is 32 KiB in base64, so the script passes 32 KiB.
+        stdin = os.urandom(24 * 1024)
         written, _, stages = self._exec(monkeypatch, stdin)
 
         script = ExecuteOperation(MagicMock())._build_shell_script(
             ["cat"], stdin, None, {}, None, MARKER
         )
         assert stages == [script.encode()]
-        assert len(written.encode()) <= HAZARD
+        assert len(written.encode()) <= UNCHECKED
         assert written == '{\ntrap "rm -rf -- /tmp/tmp.x" EXIT\n. /tmp/tmp.x/data\n}\n'
 
     @pytest.mark.parametrize(
@@ -376,7 +379,7 @@ class TestExec:
     def test_the_stage_is_written_as_the_execs_user(
         self, monkeypatch: pytest.MonkeyPatch, user: str | None, wrap: list[str]
     ) -> None:
-        _, wrapped, _ = self._exec(monkeypatch, os.urandom(HAZARD), user=user)
+        _, wrapped, _ = self._exec(monkeypatch, os.urandom(UNCHECKED), user=user)
 
         assert wrapped == [wrap]
 
@@ -413,7 +416,12 @@ class TestExec:
 
         with pytest.raises(error) as raised:
             op.exec(
-                ["cat"], os.urandom(HAZARD), cwd=None, env={}, user=user, timeout=None
+                ["cat"],
+                os.urandom(UNCHECKED),
+                cwd=None,
+                env={},
+                user=user,
+                timeout=None,
             )
         assert type(raised.value) is error
 
