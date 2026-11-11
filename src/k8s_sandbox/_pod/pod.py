@@ -219,7 +219,8 @@ class Pod:
         as for exec(), rather than starting the command in the replacement. A stream
         that ends with 255 after the command wrote stdout, Kata's status for a command
         whose VM stopped, keeps a restart for every later operation: so the command must
-        not exit 255 itself once it has written.
+        not exit 255 itself once it has written. A stream open when a restart is found
+        drops, as one whose connection was lost.
         """
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
@@ -228,7 +229,12 @@ class Pod:
             # The websocket opened for a caller that won't get it.
             discard=lambda opened: opened[0].close(),
         )
-        return PodStdio(stack, ws_client, stopped=self._stdio_stopped)
+        return PodStdio(
+            stack,
+            ws_client,
+            stopped=self._stdio_stopped,
+            restarted=lambda: self._restart_error,
+        )
 
     def _stdio_stopped(self) -> None:
         if self._info.restarted_container_behavior == "raise":

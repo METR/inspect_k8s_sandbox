@@ -1514,7 +1514,9 @@ class TestRunuserErrorMessages:
 
 
 def _stdio(
-    client: ssl.SSLSocket, stopped: Callable[[], None] | None = None
+    client: ssl.SSLSocket,
+    stopped: Callable[[], None] | None = None,
+    restarted: Callable[[], Exception | None] | None = None,
 ) -> PodStdio:
     """A stream on `client`, opened as Pod.exec_stdio() opens one."""
     op = ExecuteOperation(MagicMock())
@@ -1525,7 +1527,7 @@ def _stdio(
         ),
     ):
         stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
-    return PodStdio(stack, ws, stopped=stopped)
+    return PodStdio(stack, ws, stopped=stopped, restarted=restarted)
 
 
 def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
@@ -1553,6 +1555,30 @@ async def _wait_for(condition: Callable[[], bool]) -> None:
 
 
 class TestExecStdio:
+    async def test_a_restart_found_since_it_opened_drops_a_reply_already_read(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Its command may run in the replacement."""
+        client, server = tls_sockets
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+        server.sendall(_frame(STDOUT, b"ready\n") + _frame(STDOUT, b"a reply\n"))
+
+        with anyio.fail_after(30):
+            assert await stream.receive(6) == b"ready\n"
+            found.append(RuntimeError("restarted"))
+            with pytest.raises(anyio.BrokenResourceError):
+                await stream.receive()
+
+    async def test_a_restart_found_since_it_opened_fails_a_send(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        stream = _stdio(client, restarted=lambda: RuntimeError("restarted"))
+
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            await stream.send(b"a request\n")
+
     @pytest.mark.parametrize(
         ("frames", "stopped"),
         [

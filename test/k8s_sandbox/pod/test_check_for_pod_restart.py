@@ -1027,3 +1027,15 @@ def test_a_result_rejected_at_its_last_check_is_discarded(found_on: int):
             )
 
     assert discarded.wait(10)
+
+
+def test_exec_stdio_streams_see_a_restart_kept_after_they_opened():
+    pod = _make_pod()
+    with _opening_stdio() as exec_op, patch("k8s_sandbox._pod.pod.PodStdio") as stdio:
+        exec_op.return_value.open_stdio.return_value = (MagicMock(), MagicMock())
+        asyncio.run(pod.exec_stdio(["inspect-sandbox-tools", "bridge"], None))
+    restarted = stdio.call_args.kwargs["restarted"]
+
+    assert restarted() is None
+    pod._restart_error = _restart()
+    assert restarted() is pod._restart_error
