@@ -31,7 +31,7 @@ from k8s_sandbox._pod.error import (
     GetReturncodeError,
     PodError,
 )
-from k8s_sandbox._pod.get_returncode import get_returncode
+from k8s_sandbox._pod.get_returncode import get_returncode, returncode_from_status
 from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
@@ -514,9 +514,18 @@ class PodStdio(ByteStream):
     stream is closed.
     """
 
-    def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
+    def __init__(
+        self,
+        stack: ExitStack,
+        ws_client: WSClient,
+        stopped: Callable[[], None] | None = None,
+    ) -> None:
         self._stack = stack
         self._ws = ws_client
+        # Called if the exec's status is 255 once the command has written stdout: Kata's
+        # status for a command whose VM stopped, for a command that never exits 255
+        # itself after its first output.
+        self._stopped = stopped
         sock = ws_client.sock.sock
         self._fd = sock.fileno()  # websocket-client closes the socket at its end.
         sock.setblocking(False)
@@ -597,6 +606,8 @@ class PodStdio(ByteStream):
             self._stderr = (self._stderr + data)[-_STDERR_TAIL_BYTES:]
         elif channel == ERROR_CHANNEL:
             self._status = bytes(data)
+            if self._stopped is not None and self._wrote and _is_255(self._status):
+                self._stopped()
             self._end(None)
 
     async def send(self, item: bytes) -> None:
@@ -665,6 +676,13 @@ class PodStdio(ByteStream):
             )
         elif self._stderr:
             log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
+
+
+def _is_255(status: bytes) -> bool:
+    try:
+        return returncode_from_status(status) == 255
+    except Exception:  # A status without an exit code.
+        return False
 
 
 async def _land_pending_cancel() -> None:

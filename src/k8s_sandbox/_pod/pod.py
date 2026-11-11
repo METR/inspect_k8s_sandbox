@@ -214,14 +214,29 @@ class Pod:
 
         Closing the stream ends the command's stdin and stdout. Until then the stream
         holds the exec's connection, so callers must close it.
+
+        In "raise" mode a restart found already, or one Kubernetes shows, raises here
+        as for exec(), rather than starting the command in the replacement. A stream
+        that ends with 255 after the command wrote stdout, Kata's status for a command
+        whose VM stopped, keeps a restart for every later operation: so the command must
+        not exit 255 itself once it has written.
         """
+        await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
         stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
             lambda: operation.open_stdio(cmd, user),
             # The websocket opened for a caller that stopped waiting.
             discard=lambda opened: opened[0].close(),
         )
-        return PodStdio(stack, ws_client)
+        if self._restart_error is not None:
+            # Found while it opened, so the command may run in the replacement.
+            stack.close()
+            self._raise_restart()
+        return PodStdio(stack, ws_client, stopped=self._stdio_stopped)
+
+    def _stdio_stopped(self) -> None:
+        if self._info.restarted_container_behavior == "raise":
+            self._keep_stopped()
 
     async def _diagnose_restart_after_failure(self) -> None:
         try:
@@ -303,17 +318,8 @@ class Pod:
             try:
                 result = callable()
             except ContainerStoppedError as e:
-                info = self._info
-                if info.restarted_container_behavior == "raise":
-                    # Gone, though Kubernetes may not show it stopped yet.
-                    error = self._keep(
-                        ContainerRestartedError(
-                            pod_name=info.name,
-                            container_name=info.default_container_name,
-                            restart_count=info.initial_restart_count + 1,
-                            last_reason="stopped under an operation",
-                        )
-                    )
+                if self._info.restarted_container_behavior == "raise":
+                    error = self._keep_stopped()
                     raise type(error)(**vars(error)) from e
                 raise
             except Exception:
@@ -340,6 +346,19 @@ class Pod:
             raise
         self._raise_restart()
         return result
+
+    def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
+        """Keep the restart of a container that stopped under an operation."""
+        info = self._info
+        # Gone, though Kubernetes may not show it stopped yet.
+        return self._keep(
+            ContainerRestartedError(
+                pod_name=info.name,
+                container_name=info.default_container_name,
+                restart_count=info.initial_restart_count + 1,
+                last_reason="stopped under an operation",
+            )
+        )
 
     def _keep(
         self, error: PodReplacedError | ContainerRestartedError

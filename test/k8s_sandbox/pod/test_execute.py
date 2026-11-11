@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 from typing import AsyncIterator, Callable, Generator, Iterable, Sequence
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
 import pytest
@@ -1513,7 +1513,9 @@ class TestRunuserErrorMessages:
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
 
 
-def _stdio(client: ssl.SSLSocket) -> PodStdio:
+def _stdio(
+    client: ssl.SSLSocket, stopped: Callable[[], None] | None = None
+) -> PodStdio:
     """A stream on `client`, opened as Pod.exec_stdio() opens one."""
     op = ExecuteOperation(MagicMock())
     with (
@@ -1523,7 +1525,7 @@ def _stdio(client: ssl.SSLSocket) -> PodStdio:
         ),
     ):
         stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
-    return PodStdio(stack, ws)
+    return PodStdio(stack, ws, stopped=stopped)
 
 
 def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
@@ -1551,6 +1553,47 @@ async def _wait_for(condition: Callable[[], bool]) -> None:
 
 
 class TestExecStdio:
+    @pytest.mark.parametrize(
+        ("frames", "stopped"),
+        [
+            pytest.param(
+                [_frame(STDOUT, b"ready\n"), _frame(*_status(255))],
+                True,
+                id="255-after-stdout",
+            ),
+            # As a PyInstaller program that failed to start.
+            pytest.param([_frame(*_status(255))], False, id="255-before-stdout"),
+            pytest.param(
+                [_frame(STDOUT, b"ready\n"), _frame(*_status(1))], False, id="1"
+            ),
+            pytest.param(
+                [
+                    _frame(STDOUT, b"ready\n"),
+                    _frame(ERROR_CHANNEL, b'{"status":"Failure","reason":"Internal"}'),
+                ],
+                False,
+                id="no-exit-code",
+            ),
+        ],
+    )
+    async def test_a_255_after_stdout_says_the_container_stopped(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        frames: list[bytes],
+        stopped: bool,
+    ) -> None:
+        """Kata's status for a command whose VM stopped under it."""
+        client, server = tls_sockets
+        told: list[bool] = []
+        stream = _stdio(client, stopped=lambda: told.append(True))
+        server.sendall(b"".join(frames) + _close_frame())
+
+        with anyio.fail_after(30):
+            async for _ in _receiving(stream, max_bytes=4):
+                pass
+
+        assert told == ([True] if stopped else [])
+
     async def test_the_command_runs_as_the_user_with_stdin_unread(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -2126,8 +2169,12 @@ class TestExecStdio:
 
         monkeypatch.setattr(PodOpExecutor, "_instance", None)  # A pool of its own.
         pod = Pod("pod", "ns", None, "default", "uid", 0, "raise")
-        with patch.object(
-            ExecuteOperation, "_interactive_shell", lambda *_, **__: Shell()
+        with (
+            patch.object(
+                ExecuteOperation, "_interactive_shell", lambda *_, **__: Shell()
+            ),
+            # A healthy pod.
+            patch.object(pod, "check_for_pod_restart", AsyncMock(return_value=None)),
         ):
             starting = asyncio.create_task(pod.exec_stdio(["cat"], None))
             await _wait_for(opening.is_set)
