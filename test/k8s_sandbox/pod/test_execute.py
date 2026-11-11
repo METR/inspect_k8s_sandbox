@@ -1771,11 +1771,14 @@ class TestExecStdio:
                 frames.append(reader.recv_data_frame(True)[1].data)
 
         reading = threading.Thread(target=read)
-        reading.start()
         with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
                 for request in requests:
                     tasks.start_soon(stream.send, request)
+                # Nothing is read until both sends are under way: the first stops
+                # partway, and the second either waits its turn or writes too.
+                await anyio.wait_all_tasks_blocked()
+                reading.start()
         reading.join(30)
         await stream.aclose()
 
