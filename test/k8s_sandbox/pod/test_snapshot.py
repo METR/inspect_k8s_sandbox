@@ -65,7 +65,6 @@ def test_parse_pod_extracts_key_fields():
                 restart_count=2,
                 last_terminated_reason="OOMKilled",
                 running=True,
-                terminated_reason=None,
             ),
         ),
     )

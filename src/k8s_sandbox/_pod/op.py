@@ -193,9 +193,7 @@ def check_for_pod_restart(pod: PodInfo) -> None:
             pod_name=pod.name,
             container_name=status.name,
             restart_count=status.restart_count + 1,
-            last_reason=status.terminated_reason
-            or status.last_terminated_reason
-            or "unknown",
+            last_reason=status.last_terminated_reason or "unknown",
         )
 
 

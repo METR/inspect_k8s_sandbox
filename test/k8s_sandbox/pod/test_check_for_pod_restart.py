@@ -33,6 +33,7 @@ def _k8s_pod(uid: str, container_name: str, restart_count: int) -> MagicMock:
                     {
                         "name": container_name,
                         "restartCount": restart_count,
+                        "state": {"running": {}},
                         "lastState": {"terminated": {"reason": "OOMKilled"}},
                     }
                 ]
@@ -162,24 +163,17 @@ def test_container_not_running_raises_before_its_restart_count_moves(
     assert excinfo.value.last_reason == reason
 
 
-def test_running_container_does_not_raise():
-    pod = _raw_pod_response(
-        {
-            "metadata": {"uid": "uid-1", "name": "agent-env-abc-default-0"},
-            "status": {
-                "containerStatuses": [
-                    {
-                        "name": "default",
-                        "restartCount": 0,
-                        "state": {"running": {"startedAt": "2026-11-11T00:00:00Z"}},
-                    }
-                ]
-            },
-        }
+def _inline_executor():
+    """Run the pod's operations inline, without the executor's threads."""
+    executor = MagicMock()
+
+    async def queue(callable):
+        return callable()
+
+    executor.queue_operation = queue
+    return patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
     )
-    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
-        mock_client.return_value.read_namespaced_pod.return_value = pod
-        check_for_pod_restart(_pod_info(uid="uid-1", restart_count=0))
 
 
 def _make_pod(restarted_container_behavior: str = "raise") -> Pod:
@@ -219,16 +213,7 @@ def test_raise_mode_raises_again_without_reading_the_pod(
     uid: str, restart_count: int, error_type: type[Exception]
 ):
     pod = _make_pod()
-    with patch(
-        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance"
-    ) as mock_get_instance:
-        executor = MagicMock()
-
-        async def queue(callable):
-            return callable()
-
-        executor.queue_operation = queue
-        mock_get_instance.return_value = executor
+    with _inline_executor():
         with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
             mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
                 uid=uid, container_name="default", restart_count=restart_count
@@ -371,16 +356,7 @@ def test_raise_mode_fails_every_later_operation_with_the_check_off(
     # through a file operation either, when INSPECT_POD_RESTART_CHECK=false skips
     # their pod reads.
     monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
-    with patch(
-        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance"
-    ) as mock_get_instance:
-        executor = MagicMock()
-
-        async def queue(callable):
-            return callable()
-
-        executor.queue_operation = queue
-        mock_get_instance.return_value = executor
+    with _inline_executor():
         with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
             mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
                 uid=uid, container_name="default", restart_count=restart_count
@@ -403,19 +379,6 @@ def test_raise_mode_fails_every_later_operation_with_the_check_off(
                 exec_op.return_value.exec.assert_not_called()
                 read_op.return_value.read_file.assert_not_called()
                 write_op.return_value.write_file.assert_not_called()
-
-
-def _inline_executor():
-    """Run the pod's operations inline, without the executor's threads."""
-    executor = MagicMock()
-
-    async def queue(callable):
-        return callable()
-
-    executor.queue_operation = queue
-    return patch(
-        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
-    )
 
 
 def _healthy_pod_response() -> MagicMock:

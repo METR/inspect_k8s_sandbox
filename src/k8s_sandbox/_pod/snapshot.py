@@ -36,11 +36,10 @@ class ContainerStatus:
     name: str
     restart_count: int
     last_terminated_reason: str | None
+    """Why its last instance stopped: the one stopped now, else the previous one."""
     running: bool
     """False while the container is stopped (``state.terminated``) or waiting to
     start (``state.waiting``)."""
-    terminated_reason: str | None
-    """``state.terminated.reason``, while the container is stopped."""
 
 
 @dataclass(frozen=True)
@@ -149,12 +148,13 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
 
 
 def _parse_container_status(cs: dict[str, Any]) -> ContainerStatus:
-    terminated = (cs.get("lastState") or {}).get("terminated") or {}
     state = cs.get("state") or {}
+    terminated = (
+        state.get("terminated") or (cs.get("lastState") or {}).get("terminated") or {}
+    )
     return ContainerStatus(
         name=cs["name"],
         restart_count=cs.get("restartCount", 0),
         last_terminated_reason=terminated.get("reason"),
         running="terminated" not in state and "waiting" not in state,
-        terminated_reason=(state.get("terminated") or {}).get("reason"),
     )
