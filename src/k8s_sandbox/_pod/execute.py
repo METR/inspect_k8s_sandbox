@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import contextlib
 import logging
@@ -490,11 +489,7 @@ class PodStdio(ByteStream):
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
-        # A cancellation already due (by a cancel scope, or a bare Task.cancel(), which
-        # anyio's check misses) lands before the stream takes anything.
-        await anyio.lowlevel.checkpoint_if_cancelled()
-        if _cancel_pending():
-            await anyio.lowlevel.checkpoint()
+        await _land_pending_cancel()
         await self._turn()
         while not self._stdout or self._closed:
             if self._closed:
@@ -559,6 +554,7 @@ class PodStdio(ByteStream):
             self._end(None)
 
     async def send(self, item: bytes) -> None:
+        await _land_pending_cancel()
         async with self._send_lock:
             try:
                 for i in range(0, len(item), STDIN_CHUNK_SIZE):
@@ -625,13 +621,15 @@ class PodStdio(ByteStream):
             log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
 
 
-def _cancel_pending() -> bool:
-    """Whether a Task.cancel() is due in this task: anyio's check sees only scopes.
+async def _land_pending_cancel() -> None:
+    """Let a cancellation already due in this task land before the stream acts.
 
-    asyncio's own flag for a cancel requested while the task ran, not yet thrown into
-    it (anyio reads it too); one requested while it waited was thrown at that wait.
+    A cancel scope's, or a bare Task.cancel() requested while the task ran, which
+    anyio's checkpoint_if_cancelled() misses. Otherwise none lands while the stream
+    reads or writes without waiting.
     """
-    return bool(getattr(asyncio.current_task(), "_must_cancel", False))
+    if anyio.get_current_task().has_pending_cancellation():
+        await anyio.lowlevel.checkpoint()
 
 
 # For _clear_tls_errors: making a TLS object clears the thread's OpenSSL error queue.

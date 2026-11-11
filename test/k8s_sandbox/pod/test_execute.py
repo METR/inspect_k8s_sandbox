@@ -1708,6 +1708,61 @@ class TestExecStdio:
 
         assert reply == b"a reply\n"
 
+    async def test_a_send_in_a_task_already_cancelled_sends_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """By a bare Task.cancel(): a frame cut short would have closed the stream."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+
+        async def cancelled_send() -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await stream.send(b"x" * 64 * 1024**2)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(cancelled_send())
+        await stream.send(b"a request\n")
+        first = _reader(server).recv_data_frame(True)[1].data
+        await stream.aclose()
+
+        assert first == b"\0a request\n"
+
+    async def test_receives_in_a_cancelled_tasks_shielded_cleanup_take_few_turns(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """As exec_remote's kill of a cancelled command reads its reply."""
+        client, server = tls_sockets
+        server.sendall(_frame(STDOUT, b"x" * 64 * 64))
+        stream = _stdio(client)
+        turns = 0
+        received = b""
+
+        async def other_task() -> None:
+            nonlocal turns
+            while True:
+                turns += 1
+                await anyio.lowlevel.checkpoint()
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                with anyio.CancelScope() as cancelled:
+                    cancelled.cancel()
+                    try:
+                        await anyio.sleep_forever()
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            before = turns
+                            while len(received) < 64 * 64:
+                                received += await stream.receive(64)
+                            during = turns - before
+                tasks.cancel_scope.cancel()
+        await stream.aclose()
+
+        assert during < 16
+
     @pytest.mark.parametrize("max_bytes", [0, -1])
     async def test_receiving_nothing_is_refused(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], max_bytes: int
