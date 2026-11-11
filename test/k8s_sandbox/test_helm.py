@@ -3,6 +3,7 @@ import contextlib
 import itertools
 import json
 import logging
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -401,6 +402,7 @@ async def test_helm_install_no_extra_values() -> None:
         ("has=equals", "has\\=equals"),
         ("back\\slash", "back\\\\slash"),
         ("a,b.c=d\\e", "a\\,b\\.c\\=d\\\\e"),
+        ("{list}", "\\{list}"),
     ],
 )
 def test_helm_escape(value: str, expected: str) -> None:
@@ -417,6 +419,48 @@ async def test_helm_install_extra_values_escaped() -> None:
 
     args = mock_run.call_args[0][1]
     assert "--set-string=sampleMetadataKey=val\\,with\\.special\\=chars" in args
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["task,allowDomains={*},runtimeClassName=other.a=b\\c", "{a}", "123", "true"],
+)
+async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
+    tmp_path: Path, name: str
+) -> None:
+    """Helm's --set syntax in either ends up in its value, not as values of its own.
+
+    Nor does Helm read a name as a list, number or boolean.
+    """
+    chart = tmp_path / "chart"
+    (chart / "templates").mkdir(parents=True)
+    (chart / "Chart.yaml").write_text("apiVersion: v2\nname: values\nversion: 0.1.0\n")
+    (chart / "templates" / "values.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: values\n"
+        "data:\n  values: {{ toJson .Values | quote }}\n"
+    )
+    uuid = "uuid,allowEntities={world}"
+    release = Release(name, chart, ValuesSource.none(), None, sample_uuid=uuid)
+
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run)
+        await release.install()
+
+    args = mock_run.call_args[0][1]
+    sets = [
+        arg for arg in args if any(key in arg for key in ("TaskName", "SampleUUID"))
+    ]
+    rendered = subprocess.run(
+        ["helm", "template", "release", str(chart), *sets],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    values = json.loads(yaml.safe_load(rendered.stdout)["data"]["values"])
+    assert values == {
+        "annotations": {"inspectTaskName": name},
+        "labels": {"inspectSampleUUID": uuid},
+    }
 
 
 def test_metadata_to_extra_values_skips_invalid_keys(tmp_path: Path) -> None:

@@ -356,14 +356,18 @@ class Release:
                 # Returns the rendered manifest, which is where the pod count for the
                 # readiness wait comes from.
                 "--output=json",
-                # Annotation do not have strict length reqs. Quoting/escaping
-                # handled by asyncio.create_subprocess_exec.
-                f"--set=annotations.inspectTaskName={self.task_name}",
+                # Annotations have no strict length limit. Escaped as a string, so
+                # the name is the annotation's value and sets nothing else.
+                "--set-string=annotations.inspectTaskName="
+                + _helm_escape(self.task_name),
                 # Include a label to identify releases created by Inspect.
                 _labels_arg(),
             ]
             + (
-                [f"--set=labels.inspectSampleUUID={self.sample_uuid}"]
+                [
+                    "--set-string=labels.inspectSampleUUID="
+                    + _helm_escape(self.sample_uuid)
+                ]
                 if self.sample_uuid
                 else []
             )
@@ -618,14 +622,16 @@ def _helm_escape(value: str) -> str:
     r"""Escape special characters for Helm's strvals parser.
 
     Helm's ``--set`` / ``--set-string`` flags use a custom parser that treats
-    ``\\``, ``,``, ``.`` and ``=`` as metacharacters.  Each must be escaped
-    with a leading backslash so the value is passed through literally.
+    ``\\``, ``,``, ``.`` and ``=`` as metacharacters, and a value starting with
+    ``{`` as a list.  Each must be escaped with a leading backslash so the value
+    is passed through literally.
     """
     # Order matters: escape backslashes first to avoid double-escaping.
     value = value.replace("\\", "\\\\")
     value = value.replace(",", "\\,")
     value = value.replace(".", "\\.")
     value = value.replace("=", "\\=")
+    value = value.replace("{", "\\{")
     return value
 
 

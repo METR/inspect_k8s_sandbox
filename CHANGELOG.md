@@ -75,6 +75,8 @@
   `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
   them there. The caller's command still
   runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.
+- The task name and sample UUID reach the chart verbatim, as strings, whatever
+  characters they contain (a comma, `=`, a leading `{`, or a name such as `123`).
 
 ## 2026-10-09 0.14.0
 
