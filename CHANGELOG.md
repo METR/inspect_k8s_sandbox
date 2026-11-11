@@ -10,6 +10,9 @@
 - A container that Kubernetes shows stopped, or waiting to start again, now counts as
   restarted, so an operation cannot reach its replacement before the new restart count
   is published (seconds later when the restart replaces a Kata VM).
+- `exec()` raises `ExecResultUnknownError` (as the cause of a `K8sError`) when the exec
+  ends with status 255 before the command's end, which is how Kata reports a command
+  whose VM stopped under it, instead of returning 255 as the command's exit code.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a

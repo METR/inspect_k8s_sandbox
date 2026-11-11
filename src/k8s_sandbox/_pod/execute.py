@@ -292,8 +292,13 @@ class ExecuteOperation(PodOperation):
                         ) from e
                     returncode = self._marked_returncode(stdout, stderr)
                 # The shell can only exit 0 once it has written both markers, so a
-                # missing one means the end of the output was lost on the way.
-                if returncode == 0 and None in (stdout.returncode, stderr.returncode):
+                # missing one means the end of the output was lost on the way. 255
+                # before them is Kata's status for a command whose VM stopped under
+                # it, which did not exit 255 itself.
+                if returncode in (0, 255) and None in (
+                    stdout.returncode,
+                    stderr.returncode,
+                ):
                     raise ExecResultUnknownError(
                         "The exec ended without the end of the command's output",
                         pod=self._pod.name,

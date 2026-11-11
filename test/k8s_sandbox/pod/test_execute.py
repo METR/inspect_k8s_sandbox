@@ -278,6 +278,20 @@ class TestCompletion:
         with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
             _handle(ws)
 
+    def test_255_without_the_markers_is_not_the_commands_exit_code(self) -> None:
+        """Kata's status for a command whose VM stopped under it."""
+        ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(255)])
+
+        with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
+            _handle(ws)
+
+    def test_the_commands_own_255_is_returned(self, short_grace: None) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(255)), (STDERR, _marker(255)), _status(255)]
+        )
+
+        assert _handle(ws).returncode == 255
+
     def test_held_back_bytes_are_kept_when_the_stream_ends_without_a_marker(
         self,
     ) -> None:
