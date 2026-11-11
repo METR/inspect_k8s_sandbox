@@ -203,7 +203,8 @@ class Pod:
     async def exec_stdio(self, cmd: list[str], user: str | None) -> PodStdio:
         """Start a command as exec() would, and join a stream to its stdin and stdout.
 
-        Closing the stream ends the command's stdin and stdout.
+        Closing the stream ends the command's stdin and stdout. Until then the stream
+        holds a thread and the exec, so callers must close it.
         """
         operation = ExecuteOperation(self._info)
         stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
