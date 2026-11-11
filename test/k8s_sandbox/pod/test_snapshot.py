@@ -188,3 +188,40 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     pod = list_pods(api, "ns", label_selector="app=x")[0]
 
     assert (pod.ready, pod.phase) == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "running"),
+    [
+        pytest.param({"running": {}}, True, id="running"),
+        pytest.param({"terminated": {"exitCode": 255}}, False, id="stopped"),
+        pytest.param({"waiting": {"reason": "ContainerCreating"}}, False, id="waiting"),
+        pytest.param({}, True, id="not-published"),
+    ],
+)
+def test_parse_pod_reads_whether_a_container_runs(state: dict, running: bool):
+    snapshot = _parse_pod(
+        _pod_body(container_statuses=[{"name": "default", "state": state}])
+    )
+
+    status = snapshot.status_for("default")
+    assert status is not None
+    assert status.running is running
+
+
+def test_parse_pod_takes_the_current_stops_reason_first():
+    snapshot = _parse_pod(
+        _pod_body(
+            container_statuses=[
+                {
+                    "name": "default",
+                    "state": {"terminated": {"reason": "Error"}},
+                    "lastState": {"terminated": {"reason": "OOMKilled"}},
+                }
+            ]
+        )
+    )
+
+    status = snapshot.status_for("default")
+    assert status is not None
+    assert status.last_terminated_reason == "Error"

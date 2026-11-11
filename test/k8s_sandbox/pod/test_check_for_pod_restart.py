@@ -496,3 +496,42 @@ def test_raise_mode_keeps_a_container_that_stopped_under_a_file_operation(monkey
             asyncio.run(pod.exec(["true"], None, None, {}, None, None))
         mock_client.return_value.read_namespaced_pod.assert_not_called()
         exec_op.return_value.exec.assert_not_called()
+
+
+def test_a_stopped_sidecar_is_not_a_restart_of_the_sample():
+    pod = _raw_pod_response(
+        {
+            "metadata": {"uid": "uid-1", "name": "agent-env-abc-default-0"},
+            "status": {
+                "containerStatuses": [
+                    {"name": "default", "restartCount": 0, "state": {"running": {}}},
+                    {
+                        "name": "coredns",
+                        "restartCount": 0,
+                        "state": {"terminated": {"reason": "Error"}},
+                    },
+                ]
+            },
+        }
+    )
+    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+        mock_client.return_value.read_namespaced_pod.return_value = pod
+        check_for_pod_restart(_pod_info(uid="uid-1", restart_count=0))
+
+
+def test_warn_mode_carries_on_after_a_restart():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        exec_op.return_value.exec.return_value = ExecResult(
+            success=True, returncode=0, stdout="", stderr=""
+        )
+        pod = _make_pod(restarted_container_behavior="warn")
+        for _ in range(2):
+            assert asyncio.run(pod.exec(["true"], None, None, {}, None, None)).success
+        assert exec_op.return_value.exec.call_count == 2

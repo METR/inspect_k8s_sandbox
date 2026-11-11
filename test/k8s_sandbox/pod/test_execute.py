@@ -296,12 +296,14 @@ class TestCompletion:
         with pytest.raises(ContainerStoppedError, match='"returncode": "255"'):
             _handle(ws)
 
-    def test_the_commands_own_255_is_returned(self, short_grace: None) -> None:
+    def test_the_commands_own_255_is_returned(self) -> None:
         ws = _FakeWSClient(
             [(STDOUT, _marker(255)), (STDERR, _marker(255)), _status(255)]
         )
 
-        assert _handle(ws).returncode == 255
+        result = _handle(ws)
+
+        assert result.returncode == 255
 
     def test_held_back_bytes_are_kept_when_the_stream_ends_without_a_marker(
         self,
