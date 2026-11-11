@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Generator, Literal, cast, overload
 
 import websocket
+from anyio.abc import ByteStream
 from inspect_ai.solver._task_state import sample_state
 from inspect_ai.util import (
     ComposeConfig,
@@ -313,6 +314,15 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                     )
             log_trace(f"Completed: {op}.", **(log_kwargs | {"result": result}))
             return result
+
+    async def exec_stdio(self, cmd: list[str], user: str | None = None) -> ByteStream:
+        if user is None:
+            user = self._config.default_user
+        with self._log_op("K8s open exec stdio in Pod", (), cmd=cmd):
+            async for attempt in _retry():
+                with attempt:
+                    stream = await self._pod.exec_stdio(cmd, user)
+            return stream
 
     async def write_file(self, file: str, contents: str | bytes) -> None:
         data = contents.encode("utf-8") if isinstance(contents, str) else contents

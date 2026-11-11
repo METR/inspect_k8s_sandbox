@@ -21,6 +21,8 @@
 - With kubernetes 36 or later, which uses the `v5.channel.k8s.io` exec protocol, no
   longer send the connection keepalive, which there stops the pod reading an exec's
   input after about a minute.
+- Add `exec_stdio()`, which Inspect's persistent exec channel uses to send many
+  sandbox tools requests over one exec per sandbox.
 
 ## 2026-10-09 0.14.0
 

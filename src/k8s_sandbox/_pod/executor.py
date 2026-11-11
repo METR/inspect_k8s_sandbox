@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import os
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, TypeVar
 
 from inspect_ai.util import concurrency
@@ -74,7 +75,11 @@ class PodOpExecutor:
             )
         return cls._instance
 
-    async def queue_operation(self, callable: Callable[[], T]) -> T:
+    async def queue_operation(
+        self,
+        callable: Callable[[], T],
+        discard: Callable[[T], object] | None = None,
+    ) -> T:
         """
         Queue a synchronous pod operation to run asynchronously and return the result.
 
@@ -84,13 +89,28 @@ class PodOpExecutor:
         of the number of ongoing operations. Other than the user display, the
         use of the semaphore is redundant.
 
+        A cancelled caller cannot stop the operation's thread. If the caller stops
+        waiting and the operation still returns a result, `discard` is called with it
+        on a new thread, so that a result holding an open connection is closed rather
+        than left to the garbage collector.
+
         This method is async-safe but not thread-safe.
         """
         async with concurrency("pod-op", self._max_workers):
-            # run_in_executor does not propagate the caller's context into the
+            # The executor does not propagate the caller's context into the
             # worker thread, so pass it directly to preserve Inspect
             # sandbox config overrides
             context = contextvars.copy_context()
-            return await asyncio.get_event_loop().run_in_executor(
-                self._executor, lambda: context.run(callable)
-            )
+            future = self._executor.submit(context.run, callable)
+            try:
+                return await asyncio.wrap_future(future)
+            except BaseException:
+                if discard is not None:
+                    # Runs once: now if the result is already in, else when it is.
+                    future.add_done_callback(lambda done: _discard(done, discard))
+                raise
+
+
+def _discard(future: Future[T], discard: Callable[[T], object]) -> None:
+    if not future.cancelled() and future.exception() is None:
+        threading.Thread(target=discard, args=(future.result(),), daemon=True).start()

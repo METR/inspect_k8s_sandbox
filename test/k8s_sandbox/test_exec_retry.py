@@ -371,3 +371,43 @@ class TestWriteFileRetryExhausted:
             await sandbox.write_file("/tmp/test.txt", "hello")
 
         assert mock_write.call_count == 5
+
+
+# -- exec_stdio retry tests --
+
+
+class TestExecStdioRetry:
+    """Opening is retried as exec() is, and runs as the default user unless told."""
+
+    async def test_transient_error_is_retried(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = MagicMock()
+        mock_pod.exec_stdio = AsyncMock(
+            side_effect=[ApiException(status=503, reason="Unavailable"), stream]
+        )
+
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert opened is stream
+        assert mock_pod.exec_stdio.call_count == 2
+
+    async def test_permanent_error_is_not_retried(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        mock_pod.exec_stdio = AsyncMock(side_effect=RuntimeError("no such user"))
+
+        with pytest.raises(K8sError):
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 1
+
+    async def test_the_default_user_is_used(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        sandbox._config = MagicMock(default_user="agent")
+        mock_pod.exec_stdio = AsyncMock()
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_args.args == (
+            ["inspect-sandbox-tools", "bridge"],
+            "agent",
+        )

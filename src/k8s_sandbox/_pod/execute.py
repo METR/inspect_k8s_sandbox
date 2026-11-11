@@ -1,14 +1,20 @@
+import asyncio
 import base64
+import contextlib
 import logging
 import re
 import secrets
 import shlex
+import socket
 import ssl
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Generator
 
+import anyio
 import websocket
+from anyio.abc import ByteStream
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
@@ -19,6 +25,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import ABNF
 
+from k8s_sandbox._logger import log_trace
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
@@ -32,6 +39,8 @@ STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 # The last line of every exec script, which closes its { } group: see exec().
 _CLOSE_GROUP = "}\n"
+# Kept from an exec_stdio command's stderr, to explain one that failed to start.
+_STDERR_TAIL_BYTES = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +128,22 @@ class ExecuteOperation(PodOperation):
                 ) from e
             result = self._handle_shell_output(ws_client, user, timeout, marker)
         return result
+
+    def open_stdio(
+        self, cmd: list[str], user: str | None
+    ) -> tuple[ExitStack, WSClient]:
+        """Start `cmd` as exec() would for `user`, joined to the websocket's stdio.
+
+        Returns the websocket and the stack that closes it. The shell reads one line
+        and execs the command, which inherits the rest of stdin. The caller must write
+        nothing more until the command has answered: dash and busybox sh read ahead.
+        """
+        with ExitStack() as stack:
+            ws_client = stack.enter_context(
+                self._interactive_shell(_shell_command(user))
+            )
+            ws_client.write_stdin(f"exec {shlex.join(cmd)}\n")
+            return stack.pop_all(), ws_client
 
     def probe_switch(self, user: str) -> bool:
         """Whether exec(user=...) can start `runuser` directly to run as `user`.
@@ -416,6 +441,112 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
     elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
         channel, data = frame.data[0], frame.data[1:]
         ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
+
+
+class PodStdio(ByteStream):
+    """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio()).
+
+    A thread reads the websocket into a bounded buffer, so a slow reader of the
+    stream stops it, and then TCP. It owns the websocket: once the exec ends or the
+    stream is closed, it closes the websocket.
+    """
+
+    def __init__(
+        self, operation: PodOperation, stack: ExitStack, ws_client: WSClient
+    ) -> None:
+        self._operation = operation
+        self._ws = ws_client
+        self._loop = asyncio.get_running_loop()
+        self._stdout_in, self._stdout = anyio.create_memory_object_stream[bytes](16)
+        # Set when a piece of stdout, or its end, arrives. receive() waits on this
+        # rather than in the memory stream, which hands a piece straight to a waiting
+        # receiver: one cancelled by Task.cancel() before it resumed would lose it.
+        self._arrived = asyncio.Event()
+        self._unread = b""
+        self._error: Exception | None = None
+        # Writes take no tokens from anyio's shared limiter, so a wedged one can't
+        # hold up other threads.
+        self._limiter = anyio.CapacityLimiter(1)
+        threading.Thread(
+            target=self._read, args=(stack,), daemon=True, name="pod-stdio"
+        ).start()
+
+    def _read(self, stack: ExitStack) -> None:
+        stderr = b""
+        try:
+            while self._ws.is_open():
+                _update(self._ws, None)
+                stderr += self._ws._channels.pop(STDERR_CHANNEL, b"")
+                stderr = stderr[-_STDERR_TAIL_BYTES:]
+                if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
+                    put = self._put(stdout)
+                    asyncio.run_coroutine_threadsafe(put, self._loop).result()
+        except Exception as e:
+            # A failed read, or the stream closed under the reader.
+            if ERROR_CHANNEL not in self._ws._channels:
+                self._error = e
+        finally:
+            _shutdown(self._ws)
+            with contextlib.suppress(RuntimeError):  # The event loop is closed.
+                self._loop.call_soon_threadsafe(self._end)
+            stack.close()
+            if stderr:
+                log_trace("An exec_stdio command wrote to stderr.", stderr=stderr)
+
+    async def _put(self, stdout: bytes) -> None:
+        await self._stdout_in.send(stdout)
+        self._arrived.set()
+
+    def _end(self) -> None:
+        self._stdout_in.close()
+        self._arrived.set()
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        while not self._unread:
+            self._arrived.clear()
+            try:
+                self._unread = self._stdout.receive_nowait()
+            except anyio.WouldBlock:
+                await self._arrived.wait()
+            except anyio.EndOfStream:
+                if self._error is not None:
+                    raise anyio.BrokenResourceError from self._error
+                raise
+        data, self._unread = self._unread[:max_bytes], self._unread[max_bytes:]
+        return data
+
+    async def send(self, item: bytes) -> None:
+        try:
+            await anyio.to_thread.run_sync(
+                self._operation._write_stdin_chunked,
+                self._ws,
+                item,
+                abandon_on_cancel=True,
+                limiter=self._limiter,
+            )
+        except (OSError, websocket.WebSocketException) as e:
+            raise anyio.BrokenResourceError from e
+
+    async def send_eof(self) -> None:
+        raise NotImplementedError("v4.channel.k8s.io cannot close stdin alone")
+
+    async def aclose(self) -> None:
+        # Awaits nothing, so that it cannot be cancelled halfway. The reader, woken by
+        # either, then closes the websocket and ends a pending receive().
+        self._stdout.close()
+        _shutdown(self._ws)
+
+
+def _shutdown(ws_client: WSClient) -> None:
+    """Fail a read or write waiting on the websocket's socket, at once.
+
+    The plain socket's shutdown: SSLSocket.shutdown (and WebSocket.abort(), which
+    calls it) drops TLS first, so a write racing it could go out unencrypted.
+    """
+    sock = getattr(ws_client.sock, "sock", None)
+    if sock is not None:
+        with contextlib.suppress(OSError):
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
 
 
 class _MarkedStream:
