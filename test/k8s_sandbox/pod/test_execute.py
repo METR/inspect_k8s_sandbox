@@ -1289,7 +1289,7 @@ def _stdio(client: ssl.SSLSocket) -> PodStdio:
         patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
     ):
         stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
-    return PodStdio(op, stack, ws)
+    return PodStdio(stack, ws)
 
 
 def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
@@ -1476,7 +1476,7 @@ class TestExecStdio:
             execute_module, "threading", types.SimpleNamespace(Thread=Thread)
         )
         with pytest.raises(RuntimeError):
-            PodStdio(op, stack, ws)
+            PodStdio(stack, ws)
 
         assert client.fileno() == -1
 
@@ -1516,6 +1516,26 @@ class TestExecStdio:
         with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
             await sending
         await _wait_for(lambda: client.fileno() == -1)
+
+    async def test_the_stream_ends_with_the_exec_while_a_send_is_stuck(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """The pod no longer reads stdin, so the send holds the websocket's send lock.
+
+        Answering the server's close would need that lock.
+        """
+        client, server = tls_sockets
+        stream = _stdio(client)
+        sending = await _send_in_progress(stream, server)
+        await _wait_for(stream._ws.sock.lock.locked)
+
+        server.sendall(_frame(*_status(1)) + _close_frame())
+
+        with anyio.fail_after(30):
+            with pytest.raises(anyio.EndOfStream):
+                await stream.receive()
+            with pytest.raises(anyio.BrokenResourceError):
+                await sending
 
     async def test_closing_a_stream_nobody_reads_closes_its_socket(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1608,7 +1628,7 @@ class TestExecStdio:
         ws = _SocketWSClient(client)
         server.sendall(_frame(STDOUT, b"a reply\n"))
         server.close()
-        stream = PodStdio(ExecuteOperation(MagicMock()), contextlib.ExitStack(), ws)
+        stream = PodStdio(contextlib.ExitStack(), ws)
 
         with anyio.fail_after(30):
             reply = await stream.receive()

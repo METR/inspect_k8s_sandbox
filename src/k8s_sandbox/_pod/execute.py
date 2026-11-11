@@ -464,10 +464,7 @@ class PodStdio(ByteStream):
     stream is closed, it closes the websocket.
     """
 
-    def __init__(
-        self, operation: PodOperation, stack: ExitStack, ws_client: WSClient
-    ) -> None:
-        self._operation = operation
+    def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
         self._ws = ws_client
         self._loop = asyncio.get_running_loop()
         self._stdout_in, self._stdout = anyio.create_memory_object_stream[bytes](16)
@@ -494,7 +491,9 @@ class PodStdio(ByteStream):
         stderr = b""
         wrote = False
         try:
-            while self._ws.is_open():
+            # Up to the exec's status, not its close: answering the server's close
+            # needs the send lock, which a send() the pod no longer reads holds.
+            while self._ws.is_open() and ERROR_CHANNEL not in self._ws._channels:
                 try:
                     _update(self._ws, None)
                     self._read_waiting()
@@ -534,7 +533,7 @@ class PodStdio(ByteStream):
         """
         channels = self._ws._channels
         read = len(channels.get(STDOUT_CHANNEL, b""))
-        while 0 < read < _STDIO_PIECE_BYTES and self._ws.is_open():
+        while 0 < read < _STDIO_PIECE_BYTES:
             _update(self._ws, 0)
             read, before = len(channels.get(STDOUT_CHANNEL, b"")), read
             if read == before:
@@ -565,7 +564,7 @@ class PodStdio(ByteStream):
     async def send(self, item: bytes) -> None:
         try:
             await anyio.to_thread.run_sync(
-                self._operation._write_stdin_chunked,
+                PodOperation._write_stdin_chunked,
                 self._ws,
                 item,
                 abandon_on_cancel=True,
@@ -596,7 +595,7 @@ def _shutdown(ws_client: WSClient) -> None:
     The plain socket's shutdown: SSLSocket.shutdown (and WebSocket.abort(), which
     calls it) drops TLS first, so a write racing it could go out unencrypted.
     """
-    sock = getattr(ws_client.sock, "sock", None)
+    sock = ws_client.sock.sock
     if sock is not None:
         with contextlib.suppress(OSError):
             socket.socket.shutdown(sock, socket.SHUT_RDWR)

@@ -66,10 +66,11 @@ class PodOperation(ABC):
     def __init__(self, pod: PodInfo):
         self._pod = pod
 
-    def _write_stdin_chunked(self, ws_client: WSClient, data: str | bytes) -> None:
+    @staticmethod
+    def _write_stdin_chunked(ws_client: WSClient, data: str | bytes) -> None:
         """Write ``data`` to the stdin channel in ``_STDIN_CHUNK_SIZE`` frames.
 
-        Used by both exec and write_file (see ``_STDIN_CHUNK_SIZE`` for why we
+        Used by exec, exec_stdio and write_file (see ``_STDIN_CHUNK_SIZE`` for why we
         chunk). The slice type is preserved: ``str`` -> text frames, ``bytes``
         -> binary frames.
         """

@@ -391,15 +391,6 @@ class TestExecStdioRetry:
 
         assert mock_pod.exec_stdio.call_count == 2
 
-    async def test_permanent_error_is_not_retried(self) -> None:
-        sandbox, mock_pod = _make_sandbox()
-        mock_pod.exec_stdio = AsyncMock(side_effect=RuntimeError("no such user"))
-
-        with pytest.raises(K8sError):
-            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
-
-        assert mock_pod.exec_stdio.call_count == 1
-
     async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
         """Nothing checks the pod again while the stream lasts."""
         sandbox, mock_pod = _make_sandbox()

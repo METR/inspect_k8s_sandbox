@@ -211,7 +211,7 @@ class Pod:
             # The websocket opened for a caller that stopped waiting.
             discard=lambda opened: opened[0].close(),
         )
-        return PodStdio(operation, stack, ws_client)
+        return PodStdio(stack, ws_client)
 
     async def _diagnose_restart_after_failed_exec(self) -> None:
         try:
