@@ -313,12 +313,20 @@ _SHELLS = [
 ]
 
 
-def _run_script(shell: list[str], script: str) -> subprocess.CompletedProcess[bytes]:
+def _run_script(
+    shell: list[str], script: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
     """Run an exec's script as the pod's shell gets it: stdin stays open after it."""
     read_end, write_end = os.pipe()
     os.write(write_end, script.encode())
     try:
-        return subprocess.run(shell, stdin=read_end, capture_output=True, timeout=10)
+        return subprocess.run(
+            [shutil.which(shell[0]) or shell[0], *shell[1:]],
+            stdin=read_end,
+            capture_output=True,
+            timeout=10,
+            env=env,
+        )
     finally:
         os.close(read_end)
         os.close(write_end)
@@ -428,38 +436,78 @@ class TestScriptInAShell:
         assert result.stdout == _marker(0)
 
 
-def _as_uid_0() -> list[str]:
-    """A prefix that runs a shell as uid 0, as a root container's shell is."""
-    if os.geteuid() == 0:
-        return []
-    probe = subprocess.run(["unshare", "-r", "true"], capture_output=True)
-    if probe.returncode != 0:
-        pytest.skip("this runner can map itself to uid 0 in no user namespace")
-    return ["unshare", "-r"]
+def _proc_status(uids: str, gids: str = "1000\t1000\t1000\t1000") -> str:
+    """A /proc/self/status giving these real, effective, saved and filesystem ids."""
+    return f"Name:\tsh\nPid:\t7\nUid:\t{uids}\nGid:\t{gids}\nGroups:\t\n"
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Reads the uid from Linux's /proc")
-@pytest.mark.parametrize("shell", _SHELLS)
-@pytest.mark.parametrize("uid_0", [True, False], ids=["uid-0", "other-uid"])
-def test_a_root_exec_runs_its_command_only_as_uid_0(
-    shell: list[str], tmp_path: Path, uid_0: bool
-) -> None:
-    """As `runuser -u root` would, also in a container replaced by one not root."""
-    ran = tmp_path / "ran"
+def _root_script(cmd: list[str], status: Path) -> str:
+    """A root exec's script, whose uid check reads `status` in place of /proc."""
     script = ExecuteOperation(MagicMock())._build_shell_script(
-        ["touch", str(ran)], None, None, {}, None, MARKER, root=True
+        cmd, None, None, {}, None, MARKER, root=True
     )
-    if not uid_0 and os.geteuid() == 0:
-        pytest.skip("this runner is root")
+    assert " </proc/self/status\n" in script
+    return script.replace(" </proc/self/status\n", f" <{shlex.quote(str(status))}\n")
 
-    result = _run_script([*_as_uid_0(), *shell] if uid_0 else shell, script)
 
-    assert ran.exists() is uid_0
-    if uid_0:
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+@pytest.mark.parametrize(
+    ("status", "runs"),
+    [
+        pytest.param(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"), True, id="root"),
+        pytest.param(_proc_status("1000\t1000\t1000\t1000"), False, id="uid-1000"),
+        pytest.param(_proc_status("0\t1000\t0\t0"), False, id="effective-uid-1000"),
+        pytest.param(
+            _proc_status("1000\t1000\t1000\t1000", "0\t0\t0\t0"), False, id="gid-0"
+        ),
+        pytest.param("Name:\tsh\nGid:\t0\t0\t0\t0\n", False, id="no-uid"),
+        pytest.param("", False, id="empty"),
+        pytest.param(None, False, id="missing"),
+    ],
+)
+def test_a_root_exec_runs_its_command_only_as_uid_0(
+    shell: list[str], tmp_path: Path, status: str | None, runs: bool
+) -> None:
+    """As `runuser -u root` would, also in a container replaced by one not root.
+
+    The check starts no program: only the command is on the PATH here.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "touch").symlink_to(shutil.which("touch") or "/usr/bin/touch")
+    status_file = tmp_path / "status"
+    if status is not None:
+        status_file.write_text(status)
+    ran = tmp_path / "ran"
+    script = _root_script(["touch", str(ran)], status_file)
+
+    result = _run_script(shell, script, {"PATH": str(bin_dir)})
+
+    assert ran.exists() is runs
+    if runs:
         assert result.returncode == 0
     else:
         assert result.returncode == 1
-        assert result.stderr == b"runuser: may not be used by non-root users\n"
+        assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_a_root_exec_keeps_the_containers_environment(
+    shell: list[str], tmp_path: Path
+) -> None:
+    """Whatever the container sets, the uid check leaves for the command."""
+    status_file = tmp_path / "status"
+    status_file.write_text(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"))
+    script = _root_script(
+        ["sh", "-c", 'printf %s, "$u" "$k" "$r" "$e" "$x"'], status_file
+    )
+    env = {**os.environ, **dict.fromkeys(["u", "k", "r", "e", "x"], "keep")}
+
+    result = _run_script(shell, script, env)
+
+    assert result.stdout == b"keep," * 5 + _marker(0)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
@@ -975,6 +1023,7 @@ class TestExecChunksStdin:
         (None, ["/bin/sh"], False),
         ("agent", _shell_command("agent"), False),
     ],
+    ids=["root", "0", "default", "agent"],
 )
 def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
     monkeypatch: pytest.MonkeyPatch,
@@ -982,25 +1031,15 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
     shell: list[str],
     checked: bool,
 ) -> None:
-    """One program start, not `id` and a second shell; the check runs in it instead."""
-    ws = MagicMock(spec=WSClient)
-    shells: list[list[str]] = []
+    """One program start, not `id` and a second shell; the check runs in it first."""
+    writes, op = _exec_writing_to(monkeypatch)
+    opened = MagicMock(wraps=op._interactive_shell)
+    monkeypatch.setattr(op, "_interactive_shell", opened)
 
-    @contextmanager
-    def fake_interactive_shell(command: list[str]) -> Generator[MagicMock, None, None]:
-        shells.append(command)
-        yield ws
+    op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
 
-    op = ExecuteOperation(MagicMock())
-    monkeypatch.setattr(op, "_interactive_shell", fake_interactive_shell)
-    done = ExecResult(success=True, returncode=0, stdout="", stderr="")
-    monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: done)
-
-    op.exec(["true"], stdin=None, cwd=None, env={}, user=user, timeout=None)
-
-    written = "".join(call.args[0] for call in ws.write_stdin.call_args_list)
-    assert shells == [shell]
-    assert written.startswith("{\n" + execute_module._ROOT_CHECK) is checked
+    opened.assert_called_once_with(shell)
+    assert "".join(writes).startswith("{\n" + execute_module._ROOT_CHECK) is checked
 
 
 def _exec_writing_to(
