@@ -13,6 +13,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -489,6 +490,15 @@ def tls_sockets(
     tmp_path: Path,
 ) -> Generator[tuple[ssl.SSLSocket, ssl.SSLSocket], None, None]:
     """A client and a server socket with TLS between them."""
+    client, server = _tls(tmp_path, *socket.socketpair())
+    yield client, server
+    server.close()
+    client.close()
+
+
+def _tls(
+    tmp_path: Path, server_socket: socket.socket, client_socket: socket.socket
+) -> tuple[ssl.SSLSocket, ssl.SSLSocket]:
     if shutil.which("openssl") is None:
         pytest.skip("Needs openssl to make a certificate")
     key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
@@ -504,18 +514,42 @@ def tls_sockets(
     client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client_context.check_hostname = False
     client_context.verify_mode = ssl.CERT_NONE
-    a, b = socket.socketpair()
     server = server_context.wrap_socket(
-        a, server_side=True, do_handshake_on_connect=False
+        server_socket, server_side=True, do_handshake_on_connect=False
     )
-    client = client_context.wrap_socket(b, do_handshake_on_connect=False)
+    client = client_context.wrap_socket(client_socket, do_handshake_on_connect=False)
     handshake = threading.Thread(target=server.do_handshake)
     handshake.start()
     client.do_handshake()
     handshake.join()
-    yield client, server
-    server.close()
-    client.close()
+    return client, server
+
+
+def _keep_a_tls_error(tmp_path: Path, other: ssl.SSLSocket) -> bool:
+    """Whether `other`, waiting for nothing, reports a system error left in the queue.
+
+    OpenSSL keeps a reset connection's write error in its queue for this thread.
+    """
+    for _ in range(5):  # A write can find the reset still on its way.
+        with socket.create_server(("127.0.0.1", 0)) as listener:
+            client_socket = socket.create_connection(listener.getsockname())
+            server_socket, _ = listener.accept()
+        client, server = _tls(tmp_path, server_socket, client_socket)
+        reset = socket.socket(fileno=server.detach())
+        reset.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        reset.close()
+        with contextlib.suppress(OSError):
+            client.recv(10)
+        with contextlib.suppress(OSError):
+            client.send(b"x")
+        client.close()
+        try:
+            other.recv(10)
+        except ssl.SSLWantReadError:
+            continue
+        except OSError:
+            return True
+    return False
 
 
 class _SocketWSClient(WSClient):
@@ -908,7 +942,7 @@ class TestExecChunksStdin:
     ) -> None:
         # Tiny chunk size (patched in op.py, where _write_stdin_chunked reads it)
         # plus stubbed shell creation + output handling, so only the write path runs.
-        monkeypatch.setattr(op_module, "_STDIN_CHUNK_SIZE", 16)
+        monkeypatch.setattr(op_module, "STDIN_CHUNK_SIZE", 16)
         ws = MagicMock(spec=WSClient)
 
         @contextmanager
@@ -945,7 +979,7 @@ def _exec_writing_to(
     monkeypatch: pytest.MonkeyPatch, fails: Callable[[str], bool] = lambda data: False
 ) -> tuple[list[str], ExecuteOperation]:
     """An ExecuteOperation recording its stdin writes, which fail where `fails` says."""
-    monkeypatch.setattr(op_module, "_STDIN_CHUNK_SIZE", 16)
+    monkeypatch.setattr(op_module, "STDIN_CHUNK_SIZE", 16)
     writes: list[str] = []
     ws = MagicMock(spec=WSClient)
 
@@ -1309,7 +1343,6 @@ async def _send_in_progress(
     stream: PodStdio, server: ssl.SSLSocket
 ) -> asyncio.Task[None]:
     """A send more than the socket buffers hold, once its first bytes are out."""
-    _reader(server).recv_data_frame(True)  # The line open_stdio() wrote.
     sending = asyncio.create_task(stream.send(b"x" * 64 * 1024**2))
     await _wait_for(lambda: bool(select.select([server], [], [], 0)[0]))
     return sending
@@ -1322,25 +1355,33 @@ async def _wait_for(condition: Callable[[], bool]) -> None:
 
 
 class TestExecStdio:
-    async def test_the_command_replaces_the_shell_exec_runs(
+    async def test_the_command_runs_as_the_user_with_stdin_unread(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
+        """From argv, through the user switch exec() uses: nothing reads stdin first."""
         client, server = tls_sockets
         op = ExecuteOperation(MagicMock())
-
         with (
             patch.object(op_module, "k8s_client", autospec=True),
             patch.object(
                 op_module, "stream", autospec=True, return_value=_SocketWSClient(client)
             ) as stream,
         ):
-            stack, _ = op.open_stdio(["printf", "%s\n", "a b"], "agent")
-        _, frame = _reader(server).recv_data_frame(True)
-        server.close()
-        stack.close()
+            stack, ws = op.open_stdio(["printf", "%s\n", "a b"], "agent")
+        stdio = PodStdio(stack, ws)
+        with anyio.fail_after(30):
+            await stdio.send(b"a request\n")
+        _, first = _reader(server).recv_data_frame(True)
+        await stdio.aclose()
 
-        assert stream.call_args.kwargs["command"] == _shell_command("agent")
-        assert frame.data == b"\x00exec printf '%s\n' 'a b'\n"
+        assert stream.call_args.kwargs["command"] == [
+            "/bin/sh",
+            "-c",
+            'if [ "$(id -un 2>/dev/null)" = agent ]; '
+            "then exec printf '%s\n' 'a b'; fi; "
+            "exec runuser -u agent -- printf '%s\n' 'a b'",
+        ]
+        assert first.data == b"\x00a request\n"
 
     async def test_the_stream_is_stdout_until_the_exec_ends(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1385,7 +1426,6 @@ class TestExecStdio:
         client, server = tls_sockets
         stream = _stdio(client)
         reader = _reader(server)
-        reader.recv_data_frame(True)  # The line open_stdio() wrote.
         request = bytes(range(256)) + b"\n"
 
         with anyio.fail_after(30):
@@ -1395,15 +1435,33 @@ class TestExecStdio:
 
         assert frame.data == b"\x00" + request
 
-    async def test_the_stream_cannot_end_stdin_alone(
+    async def test_a_large_send_goes_out_in_frames_the_api_server_takes(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """v4.channel.k8s.io has no way to, so a caller must not think it did."""
-        stream = _stdio(tls_sockets[0])
+        """Single frames of tens of MiB make the API server reset the connection."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        request = os.urandom(op_module.STDIN_CHUNK_SIZE * 2 + 1)
+        frames: list[bytes] = []
 
-        with pytest.raises(NotImplementedError):
-            await stream.send_eof()
+        def read() -> None:
+            while sum(len(frame) - 1 for frame in frames) < len(request):
+                frames.append(reader.recv_data_frame(True)[1].data)
+
+        reading = threading.Thread(target=read)
+        reading.start()
+        with anyio.fail_after(30):
+            await stream.send(request)
+        reading.join(30)
         await stream.aclose()
+
+        assert b"".join(frame[1:] for frame in frames) == request
+        assert [len(frame) - 1 for frame in frames] == [
+            op_module.STDIN_CHUNK_SIZE,
+            op_module.STDIN_CHUNK_SIZE,
+            1,
+        ]
 
     async def test_the_stream_sends_no_resize_keepalive(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1435,11 +1493,11 @@ class TestExecStdio:
         sample = contextvars.ContextVar[str | None]("sample", default=None)
         sample.set("this sample")
 
-        def note_sample(record: logging.LogRecord) -> bool:
-            record.sample = sample.get()
-            return True
+        class NoteSample(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                record.sample = sample.get()
+                return True
 
-        caplog.handler.addFilter(note_sample)
         client, server = tls_sockets
         stream = _stdio(client)
         server.sendall(
@@ -1448,7 +1506,11 @@ class TestExecStdio:
             + _close_frame()
         )
 
-        with anyio.fail_after(30), pytest.raises(anyio.EndOfStream):
+        with (
+            caplog.filtering(NoteSample()),
+            anyio.fail_after(30),
+            pytest.raises(anyio.EndOfStream),
+        ):
             await stream.receive()
         await stream.aclose()
 
@@ -1457,17 +1519,8 @@ class TestExecStdio:
             "WARNING",
             "this sample",
         )
-
-    @pytest.mark.parametrize(
-        "cmd", [[], ["--"], ["-a", "x"], ["\0--"], ["printf", "x\0y"]]
-    )
-    def test_a_missing_command_is_refused(self, cmd: list[str]) -> None:
-        """`exec` alone, or with only its options, leaves the shell reading on."""
-        with (
-            patch.object(op_module, "k8s_client", autospec=True),
-            pytest.raises(ValueError),
-        ):
-            ExecuteOperation(MagicMock()).open_stdio(cmd, None)
+        assert "127" in warning.getMessage()  # The exec's status.
+        assert "inspect-sandbox-tools: not found" in warning.getMessage()
 
     async def test_a_stream_closed_before_any_output_logs_no_failure(
         self,
@@ -1483,25 +1536,45 @@ class TestExecStdio:
 
         assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
-    async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
+    async def test_a_closed_stream_gives_nothing_it_had_read(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """By Task.cancel(), which a memory stream's own receive() loses data to."""
         client, server = tls_sockets
         stream = _stdio(client)
-        receiving = asyncio.create_task(stream.receive())
-        await asyncio.sleep(0)  # It now waits for stdout.
         server.sendall(_frame(STDOUT, b"a reply\n"))
-        select.select([client], [], [], 30)  # Its wait is over, but it has not run.
-
-        receiving.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await receiving
         with anyio.fail_after(30):
-            reply = await stream.receive()
+            first = await stream.receive(2)  # The rest of the frame stays read.
+
         await stream.aclose()
 
-        assert reply == b"a reply\n"
+        assert first == b"a "
+        with pytest.raises(anyio.ClosedResourceError):
+            await stream.receive()
+
+    async def test_sends_at_once_go_out_one_after_the_other(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Frames larger than the socket buffers, so that each send waits partway."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        requests = [b"a" * 3 * 1024**2, b"b" * 3 * 1024**2]
+        frames: list[bytes] = []
+
+        def read() -> None:
+            while sum(len(frame) - 1 for frame in frames) < 6 * 1024**2:
+                frames.append(reader.recv_data_frame(True)[1].data)
+
+        reading = threading.Thread(target=read)
+        reading.start()
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                for request in requests:
+                    tasks.start_soon(stream.send, request)
+        reading.join(30)
+        await stream.aclose()
+
+        assert sorted(set(frame[1:]) for frame in frames) == [{97}] * 3 + [{98}] * 3
 
     async def test_closing_fails_a_send_the_server_is_not_reading(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1570,18 +1643,19 @@ class TestExecStdio:
 
             await _wait_for(closed.is_set)
 
-    async def test_output_read_before_a_failed_read_is_kept(self) -> None:
-        """Over a plain socket, which a lost connection ends without TLS's alert."""
+    async def test_a_plain_socket_s_reads_wait_like_tls_ones(self) -> None:
+        """For an API server without TLS, whose socket says so with BlockingIOError."""
         client, server = socket.socketpair()
-        ws = _SocketWSClient(client)
-        server.sendall(_frame(STDOUT, b"a reply\n"))
-        server.close()
-        stream = PodStdio(contextlib.ExitStack(), ws)
+        stream = PodStdio(contextlib.ExitStack(), _SocketWSClient(client))
+        receiving = asyncio.create_task(stream.receive())
+        await asyncio.sleep(0)  # It now waits for stdout.
 
+        server.sendall(_frame(STDOUT, b"a reply\n"))
         with anyio.fail_after(30):
-            reply = await stream.receive()
-            with pytest.raises(anyio.BrokenResourceError):
-                await stream.receive()
+            reply = await receiving
+        server.close()
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            await stream.receive()
 
         assert reply == b"a reply\n"
 
@@ -1615,6 +1689,70 @@ class TestExecStdio:
         assert received == [b"a reply\n"]
         assert client.fileno() == -1
 
+    async def test_a_stream_s_end_leaves_other_tls_connections_working(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], tmp_path: Path
+    ) -> None:
+        """On the event loop, which a runner's other TLS connections share.
+
+        CPython raises a TLS read or write's system error (EPIPE, say) without clearing
+        it from OpenSSL's queue for the thread, and OpenSSL 3.5 then reports it for the
+        thread's next TLS call that would wait. A stream's read left one on staging.
+        """
+        client, _ = tls_sockets
+        stream = _stdio(client)
+        other, _peer = _tls(tmp_path, *socket.socketpair())
+        other.setblocking(False)
+        if not _keep_a_tls_error(tmp_path, other):
+            pytest.skip("This OpenSSL keeps no system error for the thread")
+
+        await stream.aclose()
+
+        with pytest.raises(ssl.SSLWantReadError):
+            other.recv(10)
+
+    async def test_a_flood_of_stderr_does_not_hold_the_event_loop(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Other tasks run, and can cancel the read, while it lasts: losing nothing."""
+        client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
+        flood = b"".join(_frame(STDERR, b"x") for _ in range(10_000))
+        server.sendall(flood + _frame(STDOUT, b"a reply\n"))
+        stream = _stdio(client)
+        first = None
+
+        async def cancel(scope: anyio.CancelScope) -> None:
+            scope.cancel()
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel, tasks.cancel_scope)
+                first = await stream.receive()
+        assert first is None  # Cancelled by the other task, mid-flood.
+        with anyio.fail_after(30):
+            reply = await stream.receive()
+        await stream.aclose()
+
+        assert reply == b"a reply\n"
+
+    async def test_a_receive_whose_caller_was_cancelled_takes_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.receive()
+        assert scope.cancelled_caught
+        with anyio.fail_after(30):
+            reply = await stream.receive()
+        await stream.aclose()
+
+        assert reply == b"a reply\n"
+
     async def test_closing_ends_a_pending_receive_without_a_close_handshake(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -1622,7 +1760,6 @@ class TestExecStdio:
         client, server = tls_sockets
         stream = _stdio(client)
         reader = _reader(server)
-        reader.recv_data_frame(True)  # The line open_stdio() wrote.
         receiving = asyncio.create_task(stream.receive())
         await asyncio.sleep(0)  # It now waits for stdout.
 
@@ -1652,7 +1789,7 @@ class TestExecStdio:
             run = thread.run
 
             def run_once_released() -> None:
-                released.wait(30)
+                released.wait()  # Set when the test ends, passed or not.
                 run()
 
             thread.run = run_once_released  # type: ignore[method-assign]
@@ -1662,7 +1799,6 @@ class TestExecStdio:
         try:
             stream = _stdio(client)
             reader = _reader(server)
-            reader.recv_data_frame(True)  # The line open_stdio() wrote.
             server.sendall(_frame(STDOUT, b"ready\n"))
             with anyio.fail_after(30):
                 ready = await stream.receive()

@@ -1035,10 +1035,9 @@ async def test_can_get_sandbox_connection_with_default_user(
     assert result.vscode_command is None
 
 
-async def test_exec_stdio_through_a_shell_that_reads_ahead(
+async def test_exec_stdio_carries_requests_and_replies(
     sandbox_busybox: K8sSandboxEnvironment,
 ) -> None:
-    """The shell (busybox sh) reads ahead of the line it runs."""
     stream = BufferedByteStream(
         await sandbox_busybox.exec_stdio(["sh", "-c", "echo ready; exec cat"])
     )
@@ -1051,6 +1050,22 @@ async def test_exec_stdio_through_a_shell_that_reads_ahead(
         await stream.aclose()
 
     assert (ready, echoed) == (b"ready", b"echoed")
+
+
+async def test_closing_exec_stdio_ends_the_command(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    """Its stdin closes with the stream, so a command reading it (the bridge) exits."""
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo $$; exec cat"])
+    )
+    with anyio.fail_after(60):
+        pid = (await stream.receive_until(b"\n", 100)).decode()
+    await stream.aclose()
+
+    with anyio.fail_after(60):
+        while (await sandbox_busybox.exec(["kill", "-0", pid])).success:
+            await anyio.sleep(0.5)
 
 
 async def test_exec_stdio_runs_as_the_default_user(
