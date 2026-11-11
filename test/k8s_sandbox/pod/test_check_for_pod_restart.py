@@ -13,7 +13,7 @@ from k8s_sandbox._pod.error import (
     ContainerStoppedError,
     PodReplacedError,
 )
-from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.pod import Pod
 
 
@@ -61,6 +61,9 @@ def test_no_change_does_not_raise():
         )
         # Should not raise
         check_for_pod_restart(_pod_info())
+    # A stalled read gives up rather than hold its thread.
+    read = mock_client.return_value.read_namespaced_pod.call_args
+    assert read.kwargs["_request_timeout"] == API_TIMEOUT
 
 
 def test_missing_container_statuses_skips_restart_check():
@@ -676,3 +679,85 @@ def test_a_result_got_before_a_restart_was_found_but_returned_after_it_is_droppe
     ):
         with pytest.raises(ContainerRestartedError):
             asyncio.run(pod._run_async(lambda: "replacement's output"))
+
+
+def _restart(restart_count: int = 1) -> ContainerRestartedError:
+    return ContainerRestartedError(
+        pod_name="p",
+        container_name="default",
+        restart_count=restart_count,
+        last_reason="Error",
+    )
+
+
+def test_a_failure_got_before_a_restart_was_found_but_raised_after_it_raises_it():
+    pod = _make_pod()
+    executor = MagicMock()
+
+    async def queue(callable):
+        try:
+            return callable()
+        finally:
+            # Another operation finds the restart before this one resumes.
+            pod._restart_error = _restart()
+
+    def times_out():
+        raise TimeoutError("Command timed out")
+
+    executor.queue_operation = queue
+    with patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
+    ):
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod._run_async(times_out))
+
+
+def test_an_operation_after_a_restart_was_found_is_not_queued():
+    pod = _make_pod()
+    pod._restart_error = _restart()
+    executor = MagicMock()
+    with patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
+    ):
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod._run_async(lambda: None))
+    executor.queue_operation.assert_not_called()
+
+
+def test_the_first_restart_kept_stays():
+    pod = _make_pod()
+    first, second = _restart(1), _restart(2)
+
+    assert pod._keep(first) is first
+    assert pod._keep(second) is first
+
+
+def test_warn_mode_leaves_a_failed_file_operations_connection_error_to_be_retried():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        read_op.return_value.read_file.side_effect = ConnectionResetError()
+        pod = _make_pod(restarted_container_behavior="warn")
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+
+
+def test_warn_mode_raises_the_restart_a_user_probe_was_warned_of_when_it_stops():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        exec_op.return_value.probe_switch.side_effect = ContainerStoppedError("stopped")
+        pod = _make_pod(restarted_container_behavior="warn")
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec(["true"], None, None, {}, "agent", None))
+        exec_op.return_value.exec.assert_not_called()

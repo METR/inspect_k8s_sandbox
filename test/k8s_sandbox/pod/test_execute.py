@@ -285,6 +285,10 @@ class TestCompletion:
             pytest.param([(STDOUT, b"the start of the output")], id="no-marker"),
             pytest.param([(STDOUT, _marker(255))], id="stdout-marker-only"),
             pytest.param([(STDERR, _marker(255))], id="stderr-marker-only"),
+            # The command exited 0, then the VM stopped before its shell did.
+            pytest.param(
+                [(STDOUT, _marker(0)), (STDERR, _marker(0))], id="markers-say-0"
+            ),
         ],
     )
     def test_255_without_both_markers_is_not_the_commands_exit_code(

@@ -4,10 +4,13 @@ import asyncio
 import dataclasses
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
+from kubernetes.client.exceptions import ApiException  # type: ignore
+from websocket import WebSocketException
 
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
@@ -61,6 +64,7 @@ class Pod:
         self._switch: dict[tuple[str, int, str], bool] = {}
         # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
+        self._restart_lock = threading.Lock()
 
     @property
     def info(self) -> PodInfo:
@@ -95,10 +99,8 @@ class Pod:
             check_for_pod_restart(self._info)
         except (PodReplacedError, ContainerRestartedError) as e:
             if self._info.restarted_container_behavior == "raise":
-                # A copy, without the frames of the operations it passes through. The
-                # first detection stays, if concurrent ones made two.
-                if self._restart_error is None:
-                    self._restart_error = type(e)(**vars(e))
+                # A copy, without the frames of the operations it passes through.
+                self._keep(type(e)(**vars(e)))
                 raise
             if isinstance(e, PodReplacedError):
                 self._info = dataclasses.replace(
@@ -176,21 +178,23 @@ class Pod:
         # Probing once per container spares later execs that switch user two process
         # starts each.
         key = (info.uid, info.initial_restart_count, user or "")
-        if user and key not in self._switch:
-            try:
-                self._switch[key] = await self._run_async(
-                    lambda: executor.probe_switch(user)
-                )
-            except PodError:
-                # A probe that timed out: the shell's own check would wait on the same
-                # container, unbounded.
-                raise
-            except Exception:
-                logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
-        # A probe answers for the container it ran in: if this one was replaced or
-        # restarted meanwhile, let its shell check for itself this time.
-        switch = self._switch.get(key, False) if user and self._info == info else False
         try:
+            if user and key not in self._switch:
+                try:
+                    self._switch[key] = await self._run_async(
+                        lambda: executor.probe_switch(user)
+                    )
+                except (PodError, PodReplacedError, ContainerRestartedError):
+                    # A probe that timed out: the shell's own check would wait on the
+                    # same container, unbounded. Or a container that stopped under it.
+                    raise
+                except Exception:
+                    logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
+            # A probe answers for the container it ran in: if this one was replaced or
+            # restarted meanwhile, let its shell check for itself this time.
+            switch = (
+                self._switch.get(key, False) if user and self._info == info else False
+            )
             result = await self._run_async(
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
             )
@@ -274,7 +278,14 @@ class Pod:
         """
         try:
             await self._run_async(callable)
-        except (PodReplacedError, ContainerRestartedError):
+        except (
+            PodReplacedError,
+            ContainerRestartedError,
+            # Left to the provider's retries, as for exec.
+            ApiException,
+            WebSocketException,
+            ConnectionError,
+        ):
             raise
         except Exception:
             if warned is not None:
@@ -287,8 +298,8 @@ class Pod:
 
         Once a check in "raise" mode has detected a restart, raise it instead: before
         running the function, and after, if it was detected meanwhile, whether the
-        function returned or failed. In "raise"
-        mode a container that stopped under the function counts as restarted.
+        function returned or failed. In "raise" mode a container that stopped under
+        the function counts as restarted.
         """
 
         def run() -> T:
@@ -299,14 +310,14 @@ class Pod:
                 info = self._info
                 if info.restarted_container_behavior == "raise":
                     # Gone, though Kubernetes may not show it stopped yet.
-                    if self._restart_error is None:
-                        self._restart_error = ContainerRestartedError(
+                    error = self._keep(
+                        ContainerRestartedError(
                             pod_name=info.name,
                             container_name=info.default_container_name,
                             restart_count=info.initial_restart_count + 1,
                             last_reason="stopped under an operation",
                         )
-                    error = self._restart_error
+                    )
                     raise type(error)(**vars(error)) from e
                 raise
             except Exception:
@@ -316,11 +327,28 @@ class Pod:
             self._raise_restart()
             return result
 
+        # Not queued behind other operations if it was found already.
+        self._raise_restart()
         executor = PodOpExecutor.get_instance()
-        result = await executor.queue_operation(run)
-        # Also if it was found before this resumed.
+        try:
+            result = await executor.queue_operation(run)
+        except (PodReplacedError, ContainerRestartedError):
+            raise
+        except Exception:
+            # Also if it was found before this resumed.
+            self._raise_restart()
+            raise
         self._raise_restart()
         return result
+
+    def _keep(
+        self, error: PodReplacedError | ContainerRestartedError
+    ) -> PodReplacedError | ContainerRestartedError:
+        """Keep ERROR unless a restart was kept already, and return the one kept."""
+        with self._restart_lock:
+            if self._restart_error is None:
+                self._restart_error = error
+            return self._restart_error
 
     def _raise_restart(self) -> None:
         if (error := self._restart_error) is not None:

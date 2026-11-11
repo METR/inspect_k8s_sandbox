@@ -310,9 +310,12 @@ class ExecuteOperation(PodOperation):
                         "The exec ended without the end of the command's output",
                         pod=self._pod.name,
                     )
-                # 255 before them is Kata's status for a command whose VM stopped
-                # under it, which did not exit 255 itself.
-                if returncode == 255 and None in (stdout.returncode, stderr.returncode):
+                # 255 unless both say so is Kata's status for a command whose VM
+                # stopped under its shell.
+                if returncode == 255 and (stdout.returncode, stderr.returncode) != (
+                    255,
+                    255,
+                ):
                     raise ContainerStoppedError(
                         "The exec's container stopped under the command",
                         pod=self._pod.name,
