@@ -1454,6 +1454,37 @@ class TestExecStdio:
 
         assert caplog.records[-1].levelname == "WARNING"
 
+    async def test_a_stream_whose_reader_cannot_start_closes_its_socket(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """As when the runner has run out of threads."""
+        client, _ = tls_sockets
+        op = ExecuteOperation(MagicMock())
+        with (
+            patch.object(op_module, "k8s_client"),
+            patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
+        ):
+            stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
+
+        class Thread(threading.Thread):
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(
+            execute_module, "threading", types.SimpleNamespace(Thread=Thread)
+        )
+        with pytest.raises(RuntimeError):
+            PodStdio(op, stack, ws)
+
+        assert client.fileno() == -1
+
+    def test_an_empty_command_is_refused(self) -> None:
+        """`exec` alone would leave a shell reading the stream as commands."""
+        with pytest.raises(ValueError):
+            ExecuteOperation(MagicMock()).open_stdio([], None)
+
     async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:

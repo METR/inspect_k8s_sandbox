@@ -141,6 +141,9 @@ class ExecuteOperation(PodOperation):
         and execs the command, which inherits the rest of stdin. The caller must write
         nothing more until the command has answered: dash and busybox sh read ahead.
         """
+        if not cmd:
+            # `exec` alone would leave the shell reading the stream as commands.
+            raise ValueError("exec_stdio needs a command")
         with ExitStack() as stack:
             # No resize keepalive: CRI-O does not drain resize events for an exec
             # without a TTY, so they would stall the stream's stdin. TCP keepalives
@@ -478,9 +481,14 @@ class PodStdio(ByteStream):
         # Writes take no tokens from anyio's shared limiter, so a wedged one can't
         # hold up other threads.
         self._limiter = anyio.CapacityLimiter(1)
-        threading.Thread(
-            target=self._read, args=(stack,), daemon=True, name="pod-stdio"
-        ).start()
+        try:
+            threading.Thread(
+                target=self._read, args=(stack,), daemon=True, name="pod-stdio"
+            ).start()
+        except BaseException:
+            _shutdown(ws_client)  # So that the close does not wait for the server.
+            stack.close()
+            raise
 
     def _read(self, stack: ExitStack) -> None:
         stderr = b""
