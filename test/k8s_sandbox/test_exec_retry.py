@@ -402,9 +402,10 @@ class TestExecStdioRetry:
             )
         )
 
-        with pytest.raises(K8sError):
+        with pytest.raises(K8sError) as error:
             await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
+        assert isinstance(error.value.__cause__, PodReplacedError)
         stream.aclose.assert_awaited_once()
 
     async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:

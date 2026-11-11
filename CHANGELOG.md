@@ -21,8 +21,9 @@
 - Fix an exec's input (such as a large `write_file()`, which streams over the exec's
   stdin) going unread after about a minute with kubernetes 36 or later, which uses the
   `v5.channel.k8s.io` exec protocol.
-- Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork), sandbox
-  tools requests share one exec per sandbox and user.
+- Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
+  `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
+  taking one each.
 
 ## 2026-10-09 0.14.0
 

@@ -5,6 +5,7 @@ from time import sleep
 from typing import Generator
 from unittest.mock import patch
 
+import anyio
 import pytest
 from pytest import MonkeyPatch
 
@@ -146,8 +147,9 @@ async def test_a_result_in_as_its_caller_stops_waiting_is_discarded_off_the_loop
         discarded.set()
 
     task = asyncio.create_task(executor.queue_operation(operation, discard))
-    while not started.is_set():
-        await asyncio.sleep(0)
+    with anyio.fail_after(30):
+        while not started.is_set():
+            await asyncio.sleep(0)
     # The event loop is held from here until the cancel, so the result comes in where
     # the caller cannot see it: the pool's one thread takes the next only after.
     release.set()

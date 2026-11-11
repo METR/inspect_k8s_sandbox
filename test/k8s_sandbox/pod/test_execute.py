@@ -1487,8 +1487,26 @@ class TestExecStdio:
     @pytest.mark.parametrize("cmd", [[], ["--"], ["-a", "x"]])
     def test_a_missing_command_is_refused(self, cmd: list[str]) -> None:
         """`exec` alone, or with only its options, leaves the shell reading on."""
-        with pytest.raises(ValueError):
+        with (
+            patch.object(op_module, "k8s_client", autospec=True),
+            patch.object(op_module, "stream", autospec=True),
+            pytest.raises(ValueError),
+        ):
             ExecuteOperation(MagicMock()).open_stdio(cmd, None)
+
+    async def test_a_stream_closed_before_any_output_logs_no_failure(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """As when the pod check after the open fails, or the host stops waiting."""
+        client, _ = tls_sockets
+        stream = _stdio(client)
+
+        await stream.aclose()
+        await _wait_for(lambda: client.fileno() == -1)
+
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
     async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
