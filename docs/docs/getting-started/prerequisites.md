@@ -22,8 +22,8 @@ containers which you'd like `K8sSandboxEnvironment` to directly interact with (i
 `exec()`, `read_file()`, `write_file()`):
 
 * `sh`
-* `sync`
 * `echo`
+* `printf`
 * `head`
 * `cat`
 * `mkdir`

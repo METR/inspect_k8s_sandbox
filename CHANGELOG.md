@@ -12,6 +12,22 @@
 - A warning is logged when Compose `init: true` is ignored on non-default services
   or on the default service with an explicit `command` or `entrypoint`.
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
+- Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
+  before it finished, with exit code `N`, and that marker being left at the end of
+  stdout when it arrived in two pieces. `exec()` of a command that leaves a
+  background process holding its stdout or stderr open now returns a tenth of a
+  second after the command exits, rather than at once.
+- `exec()` no longer runs a command a second time when its connection to the pod is
+  lost while the command runs, and no longer returns a successful result whose output
+  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
+  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
+  run; or, if the container restarted or was replaced meanwhile, that error. A
+  connection lost before the command was sent is still retried.
+- `exec()` runs fewer programs in the container per call, which makes it faster
+  where starting one is slow. Images no longer need `sync`, and need `printf` (a
+  shell builtin in dash, bash and busybox).
+- `exec(user=...)` runs fewer programs per call after its first call as each user,
+  where the container switches to that user.
 
 ## 2026-10-09 0.14.0
 

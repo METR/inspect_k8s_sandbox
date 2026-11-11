@@ -1,59 +1,27 @@
-from unittest.mock import MagicMock
+import pytest
 
-from k8s_sandbox._pod.execute import ExecuteOperation
+from k8s_sandbox._pod.execute import _MarkedStream
 
-
-def test_filter_sentinel_and_returncode():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"before<completed-sentinel-value-42>after"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"beforeafter", 42)
+MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
 
 
-def test_filter_sentinel_and_returncode_new_lines():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"a\nb<completed-sentinel-value-42>\nc\nd"
+@pytest.mark.parametrize(
+    ("frame", "output", "returncode"),
+    [
+        pytest.param(b"before{m}42>after", "before", 42, id="output-after-dropped"),
+        pytest.param(b"a\nb{m}42>\nc\nd", "a\nb", 42, id="new-lines"),
+        pytest.param(b"stdout", "stdout", None, id="not-present"),
+        pytest.param(b"", "", None, id="empty"),
+        pytest.param(b"{m}42>after", "", 42, id="nothing-preceding"),
+        pytest.param(b"before{m}42>", "before", 42, id="nothing-following"),
+        pytest.param(b"{m}0>", "", 0, id="0"),
+        pytest.param(b"{m}255>", "", 255, id="255"),
+    ],
+)
+def test_marked_stream(frame: bytes, output: str, returncode: int | None) -> None:
+    stream = _MarkedStream(MARKER)
 
-    assert executor._filter_sentinel_and_returncode(frame) == (b"a\nb\nc\nd", 42)
+    stream.append(frame.replace(b"{m}", MARKER.encode()))
+    stream.flush()
 
-
-def test_filter_sentinel_and_returncode_not_present():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"stdout"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"stdout", None)
-
-
-def test_filter_sentinel_and_returncode_empty():
-    executor = ExecuteOperation(MagicMock())
-    frame = b""
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"", None)
-
-
-def test_filter_sentinel_and_returncode_nothing_preceeding():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"<completed-sentinel-value-42>after"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"after", 42)
-
-
-def test_filter_sentinel_and_returncode_nothing_following():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"before<completed-sentinel-value-42>"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"before", 42)
-
-
-def test_filter_sentinel_and_returncode_0():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"<completed-sentinel-value-0>"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"", 0)
-
-
-def test_filter_sentinel_and_returncode_255():
-    executor = ExecuteOperation(MagicMock())
-    frame = b"<completed-sentinel-value-255>"
-
-    assert executor._filter_sentinel_and_returncode(frame) == (b"", 255)
+    assert (str(stream.buffer), stream.returncode) == (output, returncode)

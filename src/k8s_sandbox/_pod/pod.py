@@ -8,7 +8,12 @@ from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
-from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
+from k8s_sandbox._pod.error import (
+    ContainerRestartedError,
+    ExecResultUnknownError,
+    PodError,
+    PodReplacedError,
+)
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
@@ -49,6 +54,9 @@ class Pod:
             initial_restart_count,
             restarted_container_behavior,
         )
+        # Whether exec() can start runuser directly to run as a user, per pod,
+        # container start and user (see exec()).
+        self._switch: dict[tuple[str, int, str], bool] = {}
 
     @property
     def info(self) -> PodInfo:
@@ -128,12 +136,14 @@ class Pod:
         To support the required functionality, the supplied command is executed in a
         shell (/bin/sh).
 
-        To allow this method to return when the supplied command has completed, even if
-        backgrounded processes which inherit stdout or stderr are still running, a
-        sentinel value is written to stdout after the supplied command has completed.
-        When this sentinel value is detected, we close the websocket connection. This
-        sentinel value also includes the exit code of the supplied command, as we won't
-        have access to /bin/sh's return code if we manually close the websocket.
+        The exit code comes from the exec's status channel, which reports /bin/sh's own
+        exit status. To allow this method to return when the supplied command has
+        completed, even if backgrounded processes which inherit stdout or stderr are
+        still running, the shell writes a marker to both stdout and stderr once the
+        command exits. The marker holds a random value made up for this exec, so the
+        command's output cannot imitate it, and the command's exit code. If the
+        websocket connection is still open shortly after both markers arrive, we close
+        it and use the marker's exit code.
 
         Args:
           cmd (list[str]): The command and arguments to execute.
@@ -154,10 +164,36 @@ class Pod:
             terminate background processes started by cmd.
         """
         warned_restart = await self.check_for_pod_restart()
-        executor = ExecuteOperation(self._info)
-        result = await self._run_async(
-            lambda: executor.exec(cmd, stdin, cwd, env, user, timeout)
-        )
+        info = self._info
+        executor = ExecuteOperation(info)
+        # Probing once per container spares later execs that switch user two process
+        # starts each.
+        key = (info.uid, info.initial_restart_count, user or "")
+        if user and key not in self._switch:
+            try:
+                self._switch[key] = await self._run_async(
+                    lambda: executor.probe_switch(user)
+                )
+            except PodError:
+                # A probe that timed out: the shell's own check would wait on the same
+                # container, unbounded.
+                raise
+            except Exception:
+                logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
+        # A probe answers for the container it ran in: if this one was replaced or
+        # restarted meanwhile, let its shell check for itself this time.
+        switch = self._switch.get(key, False) if user and self._info == info else False
+        try:
+            result = await self._run_async(
+                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
+            )
+        except ExecResultUnknownError:
+            # A container restarted or replaced under the command explains the lost
+            # result better.
+            if warned_restart is not None:
+                raise warned_restart
+            await self._diagnose_restart_after_failed_exec()
+            raise
         if not result.success:
             if warned_restart is not None:
                 raise warned_restart

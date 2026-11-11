@@ -21,6 +21,13 @@ class GetReturncodeError(Exception):
     pass
 
 
+class ExecResultUnknownError(PodError, GetReturncodeError):
+    """An exec's command was sent to the pod, but its result could not be read.
+
+    The command may have run, and may still be running, so it is not retried.
+    """
+
+
 class ExecutableNotFoundError(Exception):
     """The executable could not be found in the container.
 
