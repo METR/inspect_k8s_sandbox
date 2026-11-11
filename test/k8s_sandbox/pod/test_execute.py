@@ -1601,6 +1601,38 @@ class TestExecStdio:
             await stream.receive()
         await _wait_for(lambda: client.fileno() == -1)
 
+    async def test_the_stream_ends_at_the_exec_s_status(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Not at the server's close, which can come later."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n") + _frame(*_status(0)))
+
+        with anyio.fail_after(30):
+            received = [piece async for piece in _receiving(stream, 65536)]
+
+        assert received == [b"a reply\n"]
+        assert client.fileno() == -1
+
+    async def test_closing_ends_a_pending_receive_at_once(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Without waiting for the server to answer the websocket's close."""
+        client, _ = tls_sockets
+        stream = _stdio(client)
+        receiving = asyncio.create_task(stream.receive())
+        await asyncio.sleep(0)  # It now waits for stdout.
+
+        start = time.monotonic()
+        await stream.aclose()
+        closing = time.monotonic() - start
+
+        with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
+            await receiving
+        assert closing < 1
+        assert client.fileno() == -1
+
     async def test_a_reply_passes_while_the_event_loop_holds_the_gil(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
