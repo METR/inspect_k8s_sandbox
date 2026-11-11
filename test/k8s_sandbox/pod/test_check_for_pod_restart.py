@@ -6,8 +6,13 @@ import traceback
 from unittest.mock import MagicMock, patch
 
 import pytest
+from inspect_ai.util import ExecResult
 
-from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
+from k8s_sandbox._pod.error import (
+    ContainerRestartedError,
+    ContainerStoppedError,
+    PodReplacedError,
+)
 from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.pod import Pod
 
@@ -225,6 +230,9 @@ def test_raise_mode_raises_again_without_reading_the_pod(
             assert mock_client.return_value.read_namespaced_pod.call_count == 1
     # Each raise starts a fresh traceback rather than adding to the last one's.
     assert depths[0] == depths[1]
+    # What it keeps holds no operation's frames.
+    assert pod._restart_error is not None
+    assert pod._restart_error.__traceback__ is None
     # The identity stays the one the sample had.
     assert pod.info.uid == "uid-OLD"
     assert pod.info.initial_restart_count == 0
@@ -367,5 +375,116 @@ def test_raise_mode_fails_every_later_operation_with_the_check_off(monkeypatch):
                     asyncio.run(pod.write_file(b"", pathlib.Path("/x")))
                 assert mock_client.return_value.read_namespaced_pod.call_count == 1
                 exec_op.return_value.exec.assert_not_called()
-                read_op.assert_not_called()
-                write_op.assert_not_called()
+                read_op.return_value.read_file.assert_not_called()
+                write_op.return_value.write_file.assert_not_called()
+
+
+def _inline_executor():
+    """Run the pod's operations inline, without the executor's threads."""
+    executor = MagicMock()
+
+    async def queue(callable):
+        return callable()
+
+    executor.queue_operation = queue
+    return patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
+    )
+
+
+def _healthy_pod_response() -> MagicMock:
+    return _k8s_pod(uid="uid-OLD", container_name="default", restart_count=0)
+
+
+def test_raise_mode_keeps_a_container_that_stopped_under_a_command(monkeypatch):
+    # Kata's 255 before the command's end, while Kubernetes still shows the container
+    # running: later operations must not reach the container that replaces it.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = (
+            _healthy_pod_response()
+        )
+        exec_op.return_value.exec.side_effect = ContainerStoppedError("stopped")
+        pod = _make_pod()
+        with pytest.raises(ContainerRestartedError) as excinfo:
+            asyncio.run(pod.exec(["sleep", "300"], None, None, {}, None, None))
+        assert isinstance(excinfo.value.__cause__, ContainerStoppedError)
+        assert excinfo.value.restart_count == 1
+        exec_op.return_value.exec.reset_mock()
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        exec_op.return_value.exec.assert_not_called()
+        read_op.return_value.read_file.assert_not_called()
+
+
+def test_warn_mode_reports_a_container_that_stopped_under_a_command():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = (
+            _healthy_pod_response()
+        )
+        exec_op.return_value.exec.side_effect = [
+            ContainerStoppedError("stopped"),
+            ExecResult(success=True, returncode=0, stdout="", stderr=""),
+        ]
+        pod = _make_pod(restarted_container_behavior="warn")
+        with pytest.raises(ContainerStoppedError):
+            asyncio.run(pod.exec(["sleep", "300"], None, None, {}, None, None))
+        assert asyncio.run(pod.exec(["true"], None, None, {}, None, None)).success
+
+
+def test_raise_mode_drops_a_result_got_while_a_restart_was_found():
+    # Another operation found the restart while this one ran: its result may come from
+    # the new container.
+    pod = _make_pod()
+    restart = ContainerRestartedError(
+        pod_name="p", container_name="default", restart_count=1, last_reason="Error"
+    )
+
+    def exec_found_meanwhile(*_args):
+        pod._restart_error = restart
+        return ExecResult(success=True, returncode=0, stdout="", stderr="")
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = (
+            _healthy_pod_response()
+        )
+        exec_op.return_value.exec.side_effect = exec_found_meanwhile
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+
+
+def test_warn_mode_reports_a_stopped_container_once():
+    stopped = _raw_pod_response(
+        {
+            "metadata": {"uid": "uid-OLD", "name": "agent-env-abc-default-0"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "default",
+                        "restartCount": 0,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    }
+                ]
+            },
+        }
+    )
+    pod = _make_pod(restarted_container_behavior="warn")
+    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+        mock_client.return_value.read_namespaced_pod.return_value = stopped
+        assert isinstance(pod._check_for_pod_restart_sync(), ContainerRestartedError)
+        assert pod._check_for_pod_restart_sync() is None

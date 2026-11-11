@@ -28,6 +28,15 @@ class ExecResultUnknownError(PodError, GetReturncodeError):
     """
 
 
+class ContainerStoppedError(ExecResultUnknownError):
+    """An exec's container stopped under its command.
+
+    The exec ended before the command did, with the exit status 255 that Kata gives a
+    command whose VM stopped. With ``restarted_container_behavior="raise"`` the exec
+    raises a ``ContainerRestartedError`` instead, from this.
+    """
+
+
 class ExecutableNotFoundError(Exception):
     """The executable could not be found in the container.
 
@@ -80,9 +89,9 @@ class ContainerRestartedError(K8sError):
     """A container in the pod has restarted since the pod was first observed.
 
     The pod itself is the same (same UID), but the container's process was
-    restarted (OOM, crash, liveness probe failure, etc.). Files on disk
-    survive; in-memory state and any background processes started by the agent
-    do not.
+    restarted (OOM, crash, liveness probe failure, a Kata VM's death, etc.).
+    Files on the pod's volumes survive; the container's own filesystem, its
+    in-memory state and any background processes started by the agent do not.
 
     With ``restarted_container_behavior="warn"`` the sandbox provider refreshes
     its cached restart count, so subsequent operations do not report it again

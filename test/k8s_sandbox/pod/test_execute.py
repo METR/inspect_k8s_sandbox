@@ -36,6 +36,7 @@ from kubernetes.stream.ws_client import (
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
     ExecResultUnknownError,
     GetReturncodeError,
     PodError,
@@ -282,7 +283,7 @@ class TestCompletion:
         """Kata's status for a command whose VM stopped under it."""
         ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(255)])
 
-        with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
+        with pytest.raises(ContainerStoppedError):
             _handle(ws)
 
     def test_the_commands_own_255_is_returned(self, short_grace: None) -> None:

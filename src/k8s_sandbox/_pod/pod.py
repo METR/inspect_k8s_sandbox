@@ -10,6 +10,7 @@ from inspect_ai.util import ExecResult
 
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
+    ContainerStoppedError,
     ExecResultUnknownError,
     PodError,
     PodReplacedError,
@@ -21,6 +22,7 @@ from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 
 T = TypeVar("T")
+E = TypeVar("E", bound=BaseException)
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +32,19 @@ def _file_op_restart_check_enabled() -> bool:
     # (only — exec is unaffected and always checks). At high concurrency
     # (200+ ops) the per-op reads can overwhelm the K8s API server; exec's
     # check is the high-signal way we learn a sandbox pod was replaced and
-    # stays unconditional, while file-op API errors are self-revealing. A restart
-    # already raised in "raise" mode is raised again regardless, with no read.
+    # stays unconditional, while file-op API errors are self-revealing.
     return os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() != "false"
+
+
+def _copy(error: E) -> E:
+    """Return ERROR without its traceback and chain, to keep or to raise again.
+
+    One exception raised again collects each raise's frames, and concurrent raises
+    would share them.
+    """
+    copy = type(error).__new__(type(error))
+    copy.args, copy.__dict__ = error.args, dict(vars(error))
+    return copy
 
 
 class Pod:
@@ -58,7 +70,7 @@ class Pod:
         # Whether exec() can start runuser directly to run as a user, per pod,
         # container start and user (see exec()).
         self._switch: dict[tuple[str, int, str], bool] = {}
-        # What a check in "raise" mode detected, which every later check raises.
+        # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
 
     @property
@@ -85,12 +97,6 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        if (error := self._restart_error) is not None:
-            # A copy: raising the one instance again would add each raise's frames
-            # to its traceback, and concurrent operations would share it.
-            again = type(error).__new__(type(error))
-            again.args, again.__dict__ = error.args, dict(vars(error))
-            raise again
         return await self._run_async(self._check_for_pod_restart_sync)
 
     def _check_for_pod_restart_sync(
@@ -100,7 +106,7 @@ class Pod:
             check_for_pod_restart(self._info)
         except (PodReplacedError, ContainerRestartedError) as e:
             if self._info.restarted_container_behavior == "raise":
-                self._restart_error = e
+                self._restart_error = _copy(e)
                 raise
             if isinstance(e, PodReplacedError):
                 self._info = dataclasses.replace(
@@ -196,12 +202,24 @@ class Pod:
             result = await self._run_async(
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
             )
-        except ExecResultUnknownError:
+        except ExecResultUnknownError as e:
             # A container restarted or replaced under the command explains the lost
             # result better.
             if warned_restart is not None:
                 raise warned_restart
             await self._diagnose_restart_after_failed_exec()
+            if (
+                isinstance(e, ContainerStoppedError)
+                and info.restarted_container_behavior == "raise"
+            ):
+                # Gone, though Kubernetes may not show it stopped yet.
+                self._restart_error = ContainerRestartedError(
+                    pod_name=info.name,
+                    container_name=info.default_container_name,
+                    restart_count=info.initial_restart_count + 1,
+                    last_reason="stopped under a command",
+                )
+                raise _copy(self._restart_error) from e
             raise
         if not result.success:
             if warned_restart is not None:
@@ -234,7 +252,7 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        if self._restart_error is not None or _file_op_restart_check_enabled():
+        if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
         await self._run_async(lambda: writer.write_file(data, dst))
@@ -251,12 +269,27 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        if self._restart_error is not None or _file_op_restart_check_enabled():
+        if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
         await self._run_async(lambda: reader.read_file(src, dst))
 
     async def _run_async(self, callable: Callable[[], T]) -> T:
-        """Run a synchronous function asynchronously."""
+        """Run a synchronous function asynchronously.
+
+        Once a check in "raise" mode has detected a restart, raise it instead: before
+        running the function, and after, if it was detected meanwhile.
+        """
+
+        def run() -> T:
+            self._raise_restart()
+            result = callable()
+            self._raise_restart()
+            return result
+
         executor = PodOpExecutor.get_instance()
-        return await executor.queue_operation(callable)
+        return await executor.queue_operation(run)
+
+    def _raise_restart(self) -> None:
+        if self._restart_error is not None:
+            raise _copy(self._restart_error)

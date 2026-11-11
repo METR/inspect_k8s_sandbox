@@ -184,10 +184,10 @@ def check_for_pod_restart(pod: PodInfo) -> None:
             restart_count=status.restart_count,
             last_reason=status.last_terminated_reason or "unknown",
         )
-    if not status.running:
+    if not status.running and status.restart_count + 1 > pod.initial_restart_count:
         # The container stopped, and the kubelet is starting another, which an
         # operation can reach before its restart count is published (seconds later
-        # when the restart replaces a Kata VM).
+        # when the restart replaces a Kata VM). Unless "warn" counted it already.
         raise ContainerRestartedError(
             pod_name=pod.name,
             container_name=status.name,

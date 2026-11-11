@@ -20,7 +20,12 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 from websocket import ABNF
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    GetReturncodeError,
+    PodError,
+)
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import API_TIMEOUT, PodOperation
 
@@ -292,15 +297,17 @@ class ExecuteOperation(PodOperation):
                         ) from e
                     returncode = self._marked_returncode(stdout, stderr)
                 # The shell can only exit 0 once it has written both markers, so a
-                # missing one means the end of the output was lost on the way. 255
-                # before them is Kata's status for a command whose VM stopped under
-                # it, which did not exit 255 itself.
-                if returncode in (0, 255) and None in (
-                    stdout.returncode,
-                    stderr.returncode,
-                ):
+                # missing one means the end of the output was lost on the way.
+                if returncode == 0 and None in (stdout.returncode, stderr.returncode):
                     raise ExecResultUnknownError(
                         "The exec ended without the end of the command's output",
+                        pod=self._pod.name,
+                    )
+                # 255 before them is Kata's status for a command whose VM stopped
+                # under it, which did not exit 255 itself.
+                if returncode == 255 and None in (stdout.returncode, stderr.returncode):
+                    raise ContainerStoppedError(
+                        "The exec's container stopped under the command",
                         pod=self._pod.name,
                     )
             else:
