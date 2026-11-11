@@ -30,7 +30,9 @@ containers which you'd like `K8sSandboxEnvironment` to directly interact with (i
 * `timeout`
 * `base64`
 * `runuser`, at `/sbin/runuser`
-* `id`, in `/usr/bin` or `/bin`
+* `id`
+
+`head`, `mkdir`, `timeout`, `base64` and `id` must be in `/usr/bin` or `/bin`.
 
 ## Cluster requirements
 

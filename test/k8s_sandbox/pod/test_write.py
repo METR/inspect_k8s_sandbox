@@ -1,6 +1,8 @@
+import os
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,3 +36,36 @@ def test_write_file_writes_data_via_chunked_helper(
     assert captured["file_size"] == len(data)
     assert b"".join(call.args[0] for call in ws.write_stdin.call_args_list) == data
     assert ws.write_stdin.call_count > 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_mkdir_and_head_are_not_found_through_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """They run as the container's user."""
+    ran = tmp_path / "ran"
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    for name in ("mkdir", "head"):
+        stub = stubs / name
+        stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+        stub.chmod(0o755)
+    op = WriteFileOperation(MagicMock())
+    exec_kwargs: dict[str, Any] = {}
+
+    def fake_exec(**kwargs: Any) -> Generator[MagicMock, None, None]:
+        exec_kwargs.update(kwargs)
+        yield MagicMock(spec=WSClient)
+
+    monkeypatch.setattr(op, "create_websocket_client_for_exec", fake_exec)
+    dst = tmp_path / "new" / "dir" / "dst"
+    with op._start_write_command(dst, 4):
+        pass
+    env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
+
+    subprocess.run(
+        exec_kwargs["command"], input=b"data", env=env, capture_output=True, timeout=30
+    )
+
+    assert not ran.exists()
+    assert dst.read_bytes() == b"data"

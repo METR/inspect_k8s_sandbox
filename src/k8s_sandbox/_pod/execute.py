@@ -27,7 +27,12 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
-from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
+from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
+    STDIN_CHUNK_SIZE,
+    SYSTEM_PATH,
+    PodOperation,
+)
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
@@ -45,12 +50,9 @@ _TLS_RETRY_SECONDS = 0.01
 # coming, before it lets other tasks run: a few per reply, so a large one rarely waits
 # for a busy event loop.
 _STEPS_PER_TURN = 32
-# The user switch runs `id` and `runuser` as the container's user, before switching,
-# so neither is found through the image's PATH. `id` is looked up in the system
-# directories only (busybox images have just /bin/id, Alpine and Debian 10 just
-# /usr/bin/id); `runuser` is at this path wherever util-linux provides it (Debian,
-# Ubuntu, RHEL and its rebuilds, Alpine).
-_ID_PATH = "/usr/bin:/bin"
+# The user switch runs `runuser` as the container's user, before switching, so it is
+# not found through the image's PATH either (see SYSTEM_PATH): it is at this path
+# wherever util-linux provides it (Debian, Ubuntu, RHEL and its rebuilds, Alpine).
 _RUNUSER = "/sbin/runuser"
 
 logger = logging.getLogger(__name__)
@@ -107,7 +109,7 @@ def _runs_as(user: str) -> str:
     that also falls through to `runuser`.
     """
     current = "id -u" if user.isdigit() else "id -un"
-    return f'[ "$(PATH={_ID_PATH}; {current} 2>/dev/null)" = {shlex.quote(user)} ]'
+    return f'[ "$(PATH={SYSTEM_PATH}; {current} 2>/dev/null)" = {shlex.quote(user)} ]'
 
 
 class ExecuteOperation(PodOperation):
@@ -268,8 +270,10 @@ class ExecuteOperation(PodOperation):
         ).decode("ascii")
         # Pipe user input. Simply writing it to the shell's stdin after a command e.g.
         # `cat` results in `cat` blocking indefinitely as there is no way to close the
-        # stdin stream in v4.channel.k8s.io.
-        return f"echo '{stdin_b64}' | base64 -d | "
+        # stdin stream in v4.channel.k8s.io. `base64` is found in the system
+        # directories, in a subshell of its own (which a pipeline's part runs in
+        # anyway), so the command keeps the PATH.
+        return f"echo '{stdin_b64}' | (PATH={SYSTEM_PATH}; exec base64 -d) | "
 
     def _prefix_timeout(self, timeout: int | None) -> str:
         if timeout is None:
@@ -277,8 +281,11 @@ class ExecuteOperation(PodOperation):
         # Enforce timeout using `timeout` on the Pod. Simpler than alternative of
         # enforcing this on the client side (requires terminating the remote process).
         # `-k 5s` sends SIGKILL after grace period in case user command doesn't respect
-        # SIGTERM.
-        return f"timeout -k 5s {timeout}s "
+        # SIGTERM. `timeout` runs from the path that a substitution finds in the system
+        # directories, so the PATH it sets does not reach the command. With no
+        # `timeout` there, the error names /usr/bin/timeout.
+        find = f"PATH={SYSTEM_PATH}; command -v timeout || echo /usr/bin/timeout"
+        return f'"$({find})" -k 5s {timeout}s '
 
     def _handle_shell_output(
         self, ws_client: WSClient, user: str | None, timeout: int | None, marker: str

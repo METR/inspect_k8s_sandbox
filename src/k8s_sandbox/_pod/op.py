@@ -31,6 +31,13 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
 STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
+# The helpers operations run besides the caller's command (`id` for exec(user=...),
+# `base64` and `timeout` for exec(), `head` and `mkdir` for read_file() and
+# write_file()) run as the container's user, so they are looked up only in these system
+# directories, not through the image's PATH: busybox images have them only in /bin,
+# and Debian 10 and Alpine have some only in /usr/bin. The caller's command keeps the
+# container's PATH.
+SYSTEM_PATH = "/usr/bin:/bin"
 
 logger = logging.getLogger(__name__)
 

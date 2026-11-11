@@ -322,12 +322,16 @@ _SHELLS = [
 ]
 
 
-def _run_script(shell: list[str], script: str) -> subprocess.CompletedProcess[bytes]:
+def _run_script(
+    shell: list[str], script: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
     """Run an exec's script as the pod's shell gets it: stdin stays open after it."""
     read_end, write_end = os.pipe()
     os.write(write_end, script.encode())
     try:
-        return subprocess.run(shell, stdin=read_end, capture_output=True, timeout=10)
+        return subprocess.run(
+            shell, stdin=read_end, capture_output=True, timeout=10, env=env
+        )
     finally:
         os.close(read_end)
         os.close(write_end)
@@ -435,6 +439,35 @@ class TestScriptInAShell:
         result = _run_script(shell, script)
 
         assert result.stdout == _marker(0)
+
+    def test_base64_and_timeout_are_not_found_through_the_path(
+        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """They run as the container's user; the command still gets the PATH."""
+        # The real ones stand in for /usr/bin and /bin: macOS has no /usr/bin/timeout.
+        system = tmp_path / "system"
+        stubs = tmp_path / "stubs"
+        system.mkdir()
+        stubs.mkdir()
+        ran = tmp_path / "ran"
+        for name in ("base64", "timeout"):
+            real = shutil.which(name)
+            if real is None:
+                pytest.skip(f"Requires {name}")
+            (system / name).symlink_to(real)
+            stub = stubs / name
+            stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+            stub.chmod(0o755)
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        path = f"{stubs}:{os.environ['PATH']}"
+        script = ExecuteOperation(MagicMock())._build_shell_script(
+            ["sh", "-c", 'cat; printf %s "$PATH"'], "input", None, {}, 30, MARKER
+        )
+
+        result = _run_script(shell, script, env={**os.environ, "PATH": path})
+
+        assert not ran.exists()
+        assert result.stdout == f"input{path}".encode() + _marker(0)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")

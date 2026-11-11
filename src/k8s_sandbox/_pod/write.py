@@ -8,6 +8,7 @@ from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 from k8s_sandbox._pod.error import PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import (
+    SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
 )
@@ -35,10 +36,12 @@ class WriteFileOperation(PodOperation):
         # fd 3 survives the exec and keeps that pipe open.
         # https://github.com/UKGovernmentBEIS/inspect_k8s_sandbox/issues/225
         keep_stdout_open = "exec 3>&1"
+        # The script runs only helpers, which are found in the system directories.
         command = [
             "/bin/sh",
             "-c",
-            f"{keep_stdout_open}; {mkdir_command} && {head_command} > {dst_quoted}",
+            f"{keep_stdout_open}; PATH={SYSTEM_PATH}; "
+            f"{mkdir_command} && {head_command} > {dst_quoted}",
         ]
         yield from self.create_websocket_client_for_exec(
             command=command,
