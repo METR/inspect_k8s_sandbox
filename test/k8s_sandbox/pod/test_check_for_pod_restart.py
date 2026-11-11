@@ -655,3 +655,24 @@ def test_the_first_restart_found_is_the_one_kept():
         exec_op.return_value.exec.side_effect = stopped
         with pytest.raises(PodReplacedError):
             asyncio.run(pod._run_async(lambda: exec_op.return_value.exec()))
+
+
+def test_a_result_got_before_a_restart_was_found_but_returned_after_it_is_dropped():
+    pod = _make_pod()
+    restart = ContainerRestartedError(
+        pod_name="p", container_name="default", restart_count=1, last_reason="Error"
+    )
+    executor = MagicMock()
+
+    async def queue(callable):
+        result = callable()
+        # Another operation finds the restart before this one resumes.
+        pod._restart_error = restart
+        return result
+
+    executor.queue_operation = queue
+    with patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance", return_value=executor
+    ):
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod._run_async(lambda: "replacement's output"))

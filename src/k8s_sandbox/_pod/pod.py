@@ -286,7 +286,8 @@ class Pod:
         """Run a synchronous function asynchronously.
 
         Once a check in "raise" mode has detected a restart, raise it instead: before
-        running the function, and after, if it was detected meanwhile. In "raise"
+        running the function, and after, if it was detected meanwhile, whether the
+        function returned or failed. In "raise"
         mode a container that stopped under the function counts as restarted.
         """
 
@@ -316,7 +317,10 @@ class Pod:
             return result
 
         executor = PodOpExecutor.get_instance()
-        return await executor.queue_operation(run)
+        result = await executor.queue_operation(run)
+        # Also if it was found before this resumed.
+        self._raise_restart()
+        return result
 
     def _raise_restart(self) -> None:
         if (error := self._restart_error) is not None:
