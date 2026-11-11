@@ -1296,6 +1296,7 @@ def _stdio(client: ssl.SSLSocket) -> PodStdio:
 
 def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
     """Reads the client's (masked) frames on the server's side."""
+    server.settimeout(30)
     ws = websocket.WebSocket()
     ws.sock = server
     ws.connected = True
