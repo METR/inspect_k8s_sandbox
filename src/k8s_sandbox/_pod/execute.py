@@ -626,9 +626,12 @@ class PodStdio(ByteStream):
 
 
 def _cancel_pending() -> bool:
-    """Whether a Task.cancel() is due in this task: anyio's check sees only scopes."""
-    cancelling = getattr(asyncio.current_task(), "cancelling", None)  # Python 3.11+
-    return cancelling is not None and cancelling() > 0
+    """Whether a Task.cancel() is due in this task: anyio's check sees only scopes.
+
+    asyncio's own flag for a cancel requested while the task ran, not yet thrown into
+    it (anyio reads it too); one requested while it waited was thrown at that wait.
+    """
+    return bool(getattr(asyncio.current_task(), "_must_cancel", False))
 
 
 # For _clear_tls_errors: making a TLS object clears the thread's OpenSSL error queue.

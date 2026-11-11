@@ -416,10 +416,11 @@ class TestExecStdioRetry:
         mock_pod.exec_stdio = AsyncMock(return_value=stream)
         mock_pod.check_for_pod_restart = AsyncMock(side_effect=anyio.Event().wait)
 
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools", "bridge"])
-            await anyio.wait_all_tasks_blocked()
-            tasks.cancel_scope.cancel()
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools"])
+                await anyio.wait_all_tasks_blocked()
+                tasks.cancel_scope.cancel()
 
         stream.aclose.assert_awaited_once()
 

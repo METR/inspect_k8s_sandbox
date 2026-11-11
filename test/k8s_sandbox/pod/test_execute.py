@@ -1701,6 +1701,7 @@ class TestExecStdio:
 
         with pytest.raises(asyncio.CancelledError):
             await asyncio.create_task(cancelled_receive())
+        server.sendall(_frame(STDOUT, b"another\n"))
         with anyio.fail_after(30):
             reply = await stream.receive()
         await stream.aclose()
