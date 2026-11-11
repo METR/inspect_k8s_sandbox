@@ -998,6 +998,20 @@ class TestRunuserErrors:
 
         assert result.returncode == 1
 
+    @pytest.mark.parametrize("user", ["root", "0"])
+    def test_a_root_execs_refusal_warns_and_returns_the_failed_result(
+        self, user: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The uid check's refusal in a container that is not root, as runuser's."""
+        stderr = b"runuser: may not be used by non-root users\n"
+        ws = _FakeWSClient([(STDERR, stderr), _status(1)])
+
+        with caplog.at_level("WARNING"):
+            result = _handle(ws, user=user)
+
+        assert result.returncode == 1
+        assert "the container is not running as root" in caplog.text
+
 
 class TestExecChunksStdin:
     def test_exec_writes_shell_script_in_chunks(

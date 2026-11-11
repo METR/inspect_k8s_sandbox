@@ -344,9 +344,9 @@ class ExecuteOperation(PodOperation):
         # PermissionError for exit code 126 and stderr containing "permission denied".
         if result.returncode == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
-        # Only parse runuser errors if the wrapper, or a root exec's uid check, failed
-        # before the command ran and our sentinel was written. If the sentinel was
-        # seen, any runuser stderr came from the user-supplied command.
+        # Without our sentinel, the wrapper or a root exec's uid check may have failed
+        # before the command ran, so parse runuser errors. With it, any runuser
+        # stderr came from the user-supplied command.
         if result.returncode != 0 and user is not None and not saw_completed_sentinel:
             self._check_for_runuser_error(result.stderr, user)
         return result
