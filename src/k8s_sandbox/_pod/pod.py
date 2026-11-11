@@ -3,14 +3,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import ssl
 import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
-from kubernetes.client.exceptions import ApiException  # type: ignore
-from websocket import WebSocketException
 
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
@@ -238,13 +235,10 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        warned = (
+        if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
-            if _file_op_restart_check_enabled()
-            else None
-        )
         writer = WriteFileOperation(self._info)
-        await self._after_failure_check(lambda: writer.write_file(data, dst), warned)
+        await self._after_failure_check(lambda: writer.write_file(data, dst))
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
         """
@@ -258,39 +252,26 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        warned = (
+        if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
-            if _file_op_restart_check_enabled()
-            else None
-        )
         reader = ReadFileOperation(self._info)
-        await self._after_failure_check(lambda: reader.read_file(src, dst), warned)
+        await self._after_failure_check(lambda: reader.read_file(src, dst))
 
-    async def _after_failure_check(
-        self,
-        callable: Callable[[], None],
-        warned: PodReplacedError | ContainerRestartedError | None,
-    ) -> None:
-        """Run a file operation; a restart explains its failure better.
+    async def _after_failure_check(self, callable: Callable[[], None]) -> None:
+        """Run a file operation, and in "raise" mode check for a restart if it fails.
 
-        That is one WARNED of before it, or one found after it failed, also when
-        ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted container
-        has none of the files the sample wrote, so reading one fails there.
+        Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
+        container has none of the files the sample wrote, and the provider's retry of a
+        lost connection must not reach it unchecked. "warn" mode leaves the failure, and
+        any retry, as they were.
         """
         try:
             await self._run_async(callable)
         except (PodReplacedError, ContainerRestartedError):
             raise
-        except (ApiException, WebSocketException, ConnectionError, ssl.SSLError):
-            # Left to the provider's retries, which in "raise" mode must not reach a
-            # restarted container unchecked.
+        except Exception:
             if self._info.restarted_container_behavior == "raise":
                 await self._diagnose_restart_after_failure()
-            raise
-        except Exception:
-            if warned is not None:
-                raise warned
-            await self._diagnose_restart_after_failure()
             raise
 
     async def _run_async(self, callable: Callable[[], T]) -> T:

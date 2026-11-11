@@ -2,7 +2,6 @@ import asyncio
 import io
 import json
 import pathlib
-import ssl
 import traceback
 from unittest.mock import MagicMock, patch
 
@@ -607,21 +606,6 @@ def test_an_operation_that_fails_while_a_restart_is_found_raises_the_restart():
             asyncio.run(pod.exec(["true"], None, None, {}, None, None))
 
 
-def test_warn_mode_raises_the_restart_a_failed_file_operation_was_warned_of():
-    with (
-        _inline_executor(),
-        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
-        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
-    ):
-        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
-            uid="uid-OLD", container_name="default", restart_count=1
-        )
-        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
-        pod = _make_pod(restarted_container_behavior="warn")
-        with pytest.raises(ContainerRestartedError):
-            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
-
-
 def test_the_first_restart_found_is_the_one_kept():
     pod = _make_pod()
 
@@ -718,11 +702,12 @@ def test_the_first_restart_kept_stays():
 @pytest.mark.parametrize(
     "error",
     [
+        # One the provider retries.
         pytest.param(ConnectionResetError(), id="connection-reset"),
-        pytest.param(ssl.SSLEOFError(), id="tls-eof"),
+        pytest.param(FileNotFoundError("/x"), id="file-not-found"),
     ],
 )
-def test_warn_mode_leaves_a_failed_file_operations_connection_error_to_be_retried(
+def test_warn_mode_leaves_a_failed_file_operations_error_as_it_was(
     monkeypatch, check: str, error: Exception
 ):
     monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", check)
@@ -781,6 +766,31 @@ def test_raise_mode_checks_a_failed_file_operation_also_after_a_connection_error
         pod = _make_pod()
         with pytest.raises(ContainerRestartedError):
             asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+
+
+@pytest.mark.parametrize("check_fails", [False, True], ids=["healthy", "check-fails"])
+def test_raise_mode_leaves_a_failed_file_operations_error_if_its_check_finds_nothing(
+    monkeypatch, check_fails: bool
+):
+    # For the provider to retry.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        read_pod = mock_client.return_value.read_namespaced_pod
+        if check_fails:
+            read_pod.side_effect = ConnectionRefusedError()
+        else:
+            read_pod.return_value = _k8s_pod(
+                uid="uid-OLD", container_name="default", restart_count=0
+            )
+        read_op.return_value.read_file.side_effect = ConnectionResetError()
+        pod = _make_pod()
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        read_pod.assert_called_once()
 
 
 def test_a_check_that_gives_up_still_raises_a_restart_kept_meanwhile(monkeypatch):
