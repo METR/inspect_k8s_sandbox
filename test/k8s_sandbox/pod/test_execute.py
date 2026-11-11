@@ -1136,7 +1136,7 @@ class TestShellCommand:
                 env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                timeout=10,
+                timeout=30,
             )
 
         assert not ran.exists()

@@ -186,7 +186,7 @@ switch goes through `runuser`, which calls `setgroups(2)`. A container with
 `capabilities: {drop: [ALL]}` therefore cannot switch users.
 
 Naming the user the container already runs as needs none of those: that case skips
-`runuser` entirely, so it works on a capability-dropped or non-root container, and on an
+`runuser` entirely (it checks the user with `id`, from `/usr/bin` or `/bin`), so it works on a capability-dropped or non-root container, and on an
 image with no `runuser` installed.
 
 When the switch cannot be made, what happens depends on why. A container that is not
