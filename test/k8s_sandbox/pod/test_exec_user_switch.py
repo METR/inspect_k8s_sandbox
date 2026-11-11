@@ -40,10 +40,7 @@ async def test_each_user_is_probed_once() -> None:
 
         await _exec_as(pod, "agent", "agent", "root", None, "agent")
 
-    assert [call.args for call in op.probe_switch.call_args_list] == [
-        ("agent",),
-        ("root",),
-    ]
+    assert [call.args for call in op.probe_switch.call_args_list] == [("agent",)]
     assert _switches(op) == [True, True, False, False, True]
 
 
