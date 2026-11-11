@@ -178,6 +178,7 @@ def test_pod_annotations_reach_only_their_service_pod(
         chart_dir,
         test_resources_dir / "multiple-services-values.yaml",
         "annotations.shared=release,annotations.both=release,"
+        "services.default.dnsRecord=true,services.server.dnsRecord=true,"
         "services.default.podAnnotations.both=default,"
         "services.default.podAnnotations.mine=default,"
         "services.server.podAnnotations.mine=server",

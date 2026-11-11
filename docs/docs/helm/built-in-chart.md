@@ -585,6 +585,16 @@ labels:
 The `k8s_sandbox` package automatically includes the Inspect task name as an annotation.
 This may be useful for determining which task a Pod belongs to.
 
+A service's `podAnnotations` are added to that service's Pod alone; on a clash they win
+over the top-level `annotations`.
+
+```yaml
+services:
+  default:
+    podAnnotations:
+      my-pod-annotation: my-value
+```
+
 ## Render chart without installing
 
 ```sh
