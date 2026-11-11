@@ -497,6 +497,8 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
     else:
         assert result.returncode == 1
         assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
+    if status is None:  # The shell says why before the refusal.
+        assert str(status_file).encode() in result.stderr
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
