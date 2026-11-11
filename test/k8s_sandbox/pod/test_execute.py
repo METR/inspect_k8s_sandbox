@@ -1609,6 +1609,66 @@ class TestExecStdio:
             assert received == line
         await stream.aclose()
 
+    async def test_a_receive_cancelled_as_it_lets_others_run_loses_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Where a turn ends: here the call and its frames end one with stdout read."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        frames = execute_module._STEPS_PER_TURN - 2
+        stderr = b"".join(_frame(STDERR, b"x") for _ in range(frames))
+        server.sendall(stderr + _frame(STDOUT, b"a reply\n"))
+        await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
+        receiving = asyncio.create_task(stream.receive())
+        await asyncio.sleep(0)  # It reads to the turn's end, and lets others run.
+
+        receiving.cancel()
+        received = b""
+        with contextlib.suppress(asyncio.CancelledError):
+            received = await receiving
+        with anyio.fail_after(30):
+            while not received.endswith(b"\n"):
+                received += await stream.receive()
+        await stream.aclose()
+
+        assert received == b"a reply\n"
+
+    async def test_a_receive_in_a_task_already_cancelled_takes_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """By a bare Task.cancel(), which anyio's own check for cancellation misses."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+        await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
+
+        async def cancelled_receive() -> bytes:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            return await stream.receive()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(cancelled_receive())
+        with anyio.fail_after(30):
+            reply = await stream.receive()
+        await stream.aclose()
+
+        assert reply == b"a reply\n"
+
+    @pytest.mark.parametrize("max_bytes", [0, -1])
+    async def test_receiving_nothing_is_refused(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], max_bytes: int
+    ) -> None:
+        """As anyio's streams refuse it: b"" would read as the end of the stream."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+
+        with anyio.fail_after(30), pytest.raises(ValueError):
+            await stream.receive(max_bytes)
+        await stream.aclose()
+
     async def test_stdout_read_before_the_stream_broke_is_kept(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -1803,6 +1863,31 @@ class TestExecStdio:
 
         with pytest.raises(ssl.SSLWantReadError):
             other.recv(10)
+
+    async def test_small_reads_of_one_frame_let_other_tasks_run(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, server = tls_sockets
+        server.sendall(_frame(STDOUT, b"x" * 4096))
+        stream = _stdio(client)
+        turns = 0
+
+        async def other_task() -> None:
+            nonlocal turns
+            while True:
+                turns += 1
+                await anyio.lowlevel.checkpoint()
+
+        received = b""
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                while len(received) < 4096:
+                    received += await stream.receive(1)
+                tasks.cancel_scope.cancel()
+        await stream.aclose()
+
+        assert turns > 50
 
     async def test_a_flood_of_stderr_does_not_hold_the_event_loop(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

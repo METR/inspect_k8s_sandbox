@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import contextlib
 import logging
@@ -41,9 +42,10 @@ _CLOSE_GROUP = "}\n"
 _STDERR_TAIL_BYTES = 4096
 # How often an exec_stdio stream retries TLS that must write to read, or read to write.
 _TLS_RETRY_SECONDS = 0.01
-# The most frames an exec_stdio stream reads, while they keep arriving, before it lets
-# other tasks run: a few per reply, so a large one rarely waits for a busy event loop.
-_FRAMES_PER_TURN = 32
+# The most receive() calls and frames read an exec_stdio stream takes, while they keep
+# coming, before it lets other tasks run: a few per reply, so a large one rarely waits
+# for a busy event loop.
+_STEPS_PER_TURN = 32
 
 logger = logging.getLogger(__name__)
 
@@ -482,11 +484,18 @@ class PodStdio(ByteStream):
         self._ended = False
         self._error: Exception | None = None
         self._closed = False
-        self._unyielded = 0  # Frames read since the stream last let other tasks run.
+        self._unyielded = 0  # Steps since the stream last let other tasks run.
         self._send_lock = anyio.Lock()
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1")
+        # A cancellation already due (by a cancel scope, or a bare Task.cancel(), which
+        # anyio's check misses) lands before the stream takes anything.
         await anyio.lowlevel.checkpoint_if_cancelled()
+        if _cancel_pending():
+            await anyio.lowlevel.checkpoint()
+        await self._turn()
         while not self._stdout or self._closed:
             if self._closed:
                 raise anyio.ClosedResourceError
@@ -505,15 +514,22 @@ class PodStdio(ByteStream):
             except (OSError, websocket.WebSocketException) as e:
                 self._end(e)
             else:
-                self._unyielded += 1
-                if self._unyielded >= _FRAMES_PER_TURN:
-                    # Frames that keep coming (stdout's or stderr's) must not hold the
-                    # event loop; this keeps them, so a cancel here loses nothing.
-                    self._unyielded = 0
-                    await anyio.lowlevel.checkpoint()
+                await self._turn()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
+
+    async def _turn(self) -> None:
+        """Count a call or a frame read, and let other tasks run every so many.
+
+        So that frames or calls that keep coming (a flood of stdout or stderr, or many
+        small reads) do not hold the event loop. What was read stays read, so a cancel
+        here loses nothing.
+        """
+        self._unyielded += 1
+        if self._unyielded >= _STEPS_PER_TURN:
+            self._unyielded = 0
+            await anyio.lowlevel.checkpoint()
 
     def _take(self, frame: ABNF) -> None:
         """Take a frame of the exec's output, up to its status."""
@@ -607,6 +623,12 @@ class PodStdio(ByteStream):
             )
         elif self._stderr:
             log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
+
+
+def _cancel_pending() -> bool:
+    """Whether a Task.cancel() is due in this task: anyio's check sees only scopes."""
+    cancelling = getattr(asyncio.current_task(), "cancelling", None)  # Python 3.11+
+    return cancelling is not None and cancelling() > 0
 
 
 # For _clear_tls_errors: making a TLS object clears the thread's OpenSSL error queue.
