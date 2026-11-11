@@ -32,16 +32,17 @@ STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 # The last line of every exec script, which closes its { } group: see exec().
 _CLOSE_GROUP = "}\n"
-# The users that mean uid 0. exec() runs a command as one of them in the container's
-# own shell, behind _ROOT_CHECK: one program start where `_shell_command`'s check and
-# second shell cost three.
+# The users that mean uid 0, whatever the image's passwd says. exec() runs a command as
+# one of them in the container's own shell, behind _ROOT_CHECK: one program start where
+# `_shell_command`'s check and second shell cost three.
 ROOT_USERS = ("root", "0")
 # The first line of a root exec's script, inside its { } group. Unless the shell is
 # uid 0 it ends the exec before the command runs, with the message and status
 # `runuser -u root` gives in a container that is not root, so the refusal is handled
-# as one. Shell builtins only: the effective uid comes from /proc, not from `id`. The
-# subshell keeps its variables from the command; a fork costs a fraction of a
-# millisecond even where a program start costs 20 ms.
+# as one. Shell builtins only: the effective uid comes from /proc, not from `id`, and a
+# shell that cannot read it is refused too. The subshell keeps its variables from the
+# command; a fork costs a fraction of a millisecond even where a program start costs
+# 20 ms.
 _ROOT_CHECK = (
     '(u=; while read -r k r e x; do [ "$k" = Uid: ] && u=$e && break; done'
     ' </proc/self/status; [ "$u" = 0 ]) ||'

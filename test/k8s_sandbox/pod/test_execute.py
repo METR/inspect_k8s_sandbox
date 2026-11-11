@@ -471,11 +471,14 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 ) -> None:
     """As `runuser -u root` would, also in a container replaced by one not root.
 
-    The check needs no program: only the command is on the PATH here.
+    The check starts no program: only the command is on the PATH here, and an `id`
+    that records being run (busybox runs its own `id` applet instead).
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "touch").symlink_to(shutil.which("touch") or "/usr/bin/touch")
+    (bin_dir / "id").write_text(f"#!/bin/sh\n: > {tmp_path / 'id-ran'}\n")
+    (bin_dir / "id").chmod(0o755)
     status_file = tmp_path / "status"
     if status is not None:
         status_file.write_text(status)
@@ -486,6 +489,7 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
     result = _run_script(shell, script, {"PATH": str(bin_dir), "u": "0"})
 
     assert ran.exists() is runs
+    assert not (tmp_path / "id-ran").exists()
     if runs:
         assert result.returncode == 0
         assert (result.stdout, result.stderr) == (_marker(0), _marker(0))
@@ -496,20 +500,31 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
 @pytest.mark.parametrize("shell", _SHELLS)
-def test_a_root_exec_keeps_the_containers_environment(
+def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
     shell: list[str], tmp_path: Path
 ) -> None:
-    """Whatever the container sets, the uid check leaves for the command."""
+    """The uid check sets nothing the command sees, under any name.
+
+    `-a` exports every variable the shell sets, so any the check left would show.
+    """
     status_file = tmp_path / "status"
     status_file.write_text(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"))
-    script = _root_script(
-        ["sh", "-c", 'printf %s, "$u" "$k" "$r" "$e" "$x"'], status_file
+    kept = dict.fromkeys(["u", "k", "r", "e", "x"], "keep")
+    env = {**os.environ, **kept}
+
+    root = _run_script([*shell, "-a"], _root_script(["env"], status_file), env)
+    plain = _run_script([*shell, "-a"], _script(["env"]), env)
+
+    assert root.returncode == plain.returncode == 0
+    # Names only: bash's EPOCHREALTIME and the like change from one run to the next.
+    names = [
+        {line.partition(b"=")[0] for line in r.stdout.splitlines()}
+        for r in (root, plain)
+    ]
+    assert names[0] == names[1]
+    assert {f"{k}={v}".encode() for k, v in kept.items()} <= set(
+        root.stdout.splitlines()
     )
-    env = {**os.environ, **dict.fromkeys(["u", "k", "r", "e", "x"], "keep")}
-
-    result = _run_script(shell, script, env)
-
-    assert result.stdout == b"keep," * 5 + _marker(0)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")

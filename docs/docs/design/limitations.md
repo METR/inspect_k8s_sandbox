@@ -189,6 +189,11 @@ Naming the user the container already runs as needs none of those: that case ski
 `runuser` entirely, so it works on a capability-dropped or non-root container, and on an
 image with no `runuser` installed.
 
+`user="root"` and `user="0"` both mean uid 0, whatever the image's `/etc/passwd` says,
+and never go through `runuser`: the command runs in the container's own shell once that
+shell has read its uid from `/proc/self/status`. A container that does not run as uid 0
+fails them as it fails a switch it cannot make.
+
 When the switch cannot be made, what happens depends on why. A container that is not
 root, one that has had `CAP_SETGID` dropped, and one without `runuser` installed are all
 properties of the environment rather than bad arguments: each logs a warning and returns
