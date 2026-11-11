@@ -1,8 +1,10 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import io
 import json
+import logging
 import os
 import pwd
 import re
@@ -1442,7 +1444,18 @@ class TestExecStdio:
         tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Its caller sees only the stream end, and closes the stream on it."""
+        """Its caller sees only the stream end, and closes the stream on it.
+
+        Logged in the caller's context, where Inspect finds the sample's log.
+        """
+        sample = contextvars.ContextVar[str | None]("sample", default=None)
+        sample.set("this sample")
+
+        def note_sample(record: logging.LogRecord) -> bool:
+            record.sample = sample.get()
+            return True
+
+        caplog.handler.addFilter(note_sample)
         client, server = tls_sockets
         host_closed = threading.Event()
         stack = contextlib.ExitStack()
@@ -1461,7 +1474,11 @@ class TestExecStdio:
         host_closed.set()
         await _wait_for(lambda: "inspect-sandbox-tools: not found" in caplog.text)
 
-        assert caplog.records[-1].levelname == "WARNING"
+        warning = caplog.records[-1]
+        assert (warning.levelname, getattr(warning, "sample")) == (
+            "WARNING",
+            "this sample",
+        )
 
     async def test_the_reader_resumes_once_there_is_room(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1614,7 +1631,7 @@ class TestExecStdio:
         finally:
             with contextlib.suppress(OSError):  # Fails a send still waiting.
                 server.shutdown(socket.SHUT_RDWR)
-            sender.join()
+            sender.join(30)
 
     async def test_pieces_are_handed_on_while_the_event_loop_is_held(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

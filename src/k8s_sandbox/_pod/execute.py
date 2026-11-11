@@ -2,6 +2,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import contextvars
 import logging
 import re
 import secrets
@@ -146,7 +147,9 @@ class ExecuteOperation(PodOperation):
         if not cmd or cmd[0].startswith("-") or any("\0" in arg for arg in cmd):
             # `exec` alone, or with only its options, would leave the shell reading
             # the stream as commands; shells drop a NUL, which could make either.
-            raise ValueError(f"exec_stdio needs a command, not {cmd!r}")
+            raise ValueError(
+                f"exec_stdio needs a command, not an option, without NULs: {cmd!r}"
+            )
         with ExitStack() as stack:
             # No resize keepalive: CRI-O does not drain resize events for an exec
             # without a TTY, so they would stall the stream's stdin. TCP keepalives
@@ -485,7 +488,11 @@ class PodStdio(ByteStream):
         self._limiter = anyio.CapacityLimiter(1)
         try:
             threading.Thread(
-                target=self._read, args=(stack,), daemon=True, name="pod-stdio"
+                # In the caller's context, where Inspect finds the sample's log.
+                target=contextvars.copy_context().run,
+                args=(self._read, stack),
+                daemon=True,
+                name="pod-stdio",
             ).start()
         except BaseException:
             _shutdown(ws_client)  # So that the close does not wait for the server.
