@@ -77,7 +77,7 @@ class PodOperation(ABC):
             ws_client.write_stdin(data[i : i + _STDIN_CHUNK_SIZE])
 
     def create_websocket_client_for_exec(
-        self, **kwargs
+        self, send_keepalive: bool = True, **kwargs
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
         # Note: ApiException is intentionally not caught; it should fail the eval.
@@ -100,7 +100,8 @@ class PodOperation(ABC):
         )
         try:
             self._discard_duplicate_channel(ws_client)
-            keepalive.start()
+            if send_keepalive:
+                keepalive.start()
             yield ws_client
         finally:
             stop_keepalive.set()

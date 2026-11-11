@@ -1416,6 +1416,44 @@ class TestExecStdio:
             await stream.send_eof()
         await stream.aclose()
 
+    async def test_the_stream_sends_no_resize_keepalive(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """CRI-O does not drain resize events for an exec without a TTY.
+
+        They would stall the stream's stdin.
+        """
+        before = set(threading.enumerate())
+        stream = _stdio(tls_sockets[0])
+        started = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in before and thread.name == "ws-keepalive"
+        ]
+        await stream.aclose()
+
+        assert started == []
+
+    async def test_a_command_that_fails_to_start_is_logged(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Its caller only sees the stream end."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        server.sendall(
+            _frame(STDERR, b"sh: 1: exec: inspect-sandbox-tools: not found\n")
+            + _frame(*_status(127))
+            + _close_frame()
+        )
+
+        with anyio.fail_after(30), pytest.raises(anyio.EndOfStream):
+            await stream.receive()
+        await _wait_for(lambda: "inspect-sandbox-tools: not found" in caplog.text)
+
+        assert caplog.records[-1].levelname == "WARNING"
+
     async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -1518,7 +1556,9 @@ class TestExecStdio:
 
         monkeypatch.setattr(PodOpExecutor, "_instance", None)  # A pool of its own.
         pod = Pod("pod", "ns", None, "default", "uid", 0, "raise")
-        with patch.object(ExecuteOperation, "_interactive_shell", lambda *_: Shell()):
+        with patch.object(
+            ExecuteOperation, "_interactive_shell", lambda *_, **__: Shell()
+        ):
             starting = asyncio.create_task(pod.exec_stdio(["cat"], None))
             await _wait_for(opening.is_set)
             starting.cancel()

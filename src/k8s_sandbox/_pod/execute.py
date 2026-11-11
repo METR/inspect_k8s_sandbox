@@ -25,7 +25,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import ABNF
 
-from k8s_sandbox._logger import log_trace
+from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
@@ -142,8 +142,12 @@ class ExecuteOperation(PodOperation):
         nothing more until the command has answered: dash and busybox sh read ahead.
         """
         with ExitStack() as stack:
+            # No resize keepalive: CRI-O does not drain resize events for an exec
+            # without a TTY, so they would stall the stream's stdin. TCP keepalives
+            # keep the connection alive; a stream idle past the kubelet's stream idle
+            # timeout (4 h by default) closes, and Inspect opens another.
             ws_client = stack.enter_context(
-                self._interactive_shell(_shell_command(user))
+                self._interactive_shell(_shell_command(user), send_keepalive=False)
             )
             ws_client.write_stdin(f"exec {shlex.join(cmd)}\n")
             return stack.pop_all(), ws_client
@@ -190,12 +194,15 @@ class ExecuteOperation(PodOperation):
         return returncode == 1
 
     @contextmanager
-    def _interactive_shell(self, command: list[str]) -> Generator[WSClient, None, None]:
+    def _interactive_shell(
+        self, command: list[str], send_keepalive: bool = True
+    ) -> Generator[WSClient, None, None]:
         # ExecutableNotFoundError from here only means /bin/sh, or runuser once a
         # probe has found it, is missing. A missing `runuser` is otherwise exec'd by
         # the shell rather than by the API server, so it surfaces as a 127 on stderr
         # and is handled by _check_for_runuser_error instead.
         yield from self.create_websocket_client_for_exec(
+            send_keepalive,
             command=command,
             stderr=True,
             stdin=True,
@@ -467,6 +474,7 @@ class PodStdio(ByteStream):
         self._arrived = asyncio.Event()
         self._unread = b""
         self._error: Exception | None = None
+        self._closed = False
         # Writes take no tokens from anyio's shared limiter, so a wedged one can't
         # hold up other threads.
         self._limiter = anyio.CapacityLimiter(1)
@@ -476,6 +484,7 @@ class PodStdio(ByteStream):
 
     def _read(self, stack: ExitStack) -> None:
         stderr = b""
+        wrote = False
         try:
             while self._ws.is_open():
                 try:
@@ -487,6 +496,7 @@ class PodStdio(ByteStream):
                     stderr += self._ws._channels.pop(STDERR_CHANNEL, b"")
                     stderr = stderr[-_STDERR_TAIL_BYTES:]
                     if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
+                        wrote = True
                         put = self._put(stdout)
                         asyncio.run_coroutine_threadsafe(put, self._loop).result()
         except Exception as e:
@@ -498,7 +508,15 @@ class PodStdio(ByteStream):
             with contextlib.suppress(RuntimeError):  # The event loop is closed.
                 self._loop.call_soon_threadsafe(self._end)
             stack.close()
-            if stderr:
+            if not (wrote or self._closed):
+                # It failed to start (a missing user, runuser or executable): the
+                # caller only sees the stream end.
+                log_warn(
+                    "An exec_stdio command ended before writing to stdout.",
+                    status=self._ws._channels.get(ERROR_CHANNEL),
+                    stderr=stderr,
+                )
+            elif stderr:
                 log_trace("An exec_stdio command wrote to stderr.", stderr=stderr)
 
     def _read_waiting(self) -> None:
@@ -559,6 +577,7 @@ class PodStdio(ByteStream):
     async def aclose(self) -> None:
         # Awaits nothing, so that it cannot be cancelled halfway. The reader, woken by
         # either, then closes the websocket and ends a pending receive().
+        self._closed = True
         self._stdout.close()
         _shutdown(self._ws)
 
