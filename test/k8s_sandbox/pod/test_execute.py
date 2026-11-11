@@ -1729,6 +1729,41 @@ class TestExecStdio:
 
         assert first == b"\0a request\n"
 
+    async def test_a_send_cancelled_as_it_is_handed_the_lock_sends_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """A frame cut short would have closed the stream for the sends after it."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        frames: list[bytes] = []
+        second = anyio.CancelScope()
+
+        def read() -> None:
+            while not frames or frames[-1] != b"\0after\n":
+                frames.append(reader.recv_data_frame(True)[1].data)
+
+        async def first() -> None:
+            await stream.send(b"a" * 3 * 1024**2)
+            second.cancel()  # the lock is the second send's now, which has not run
+
+        async def then() -> None:
+            with second:
+                await stream.send(b"b" * 3 * 1024**2)
+
+        reading = threading.Thread(target=read)
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(first)
+                tasks.start_soon(then)
+                await anyio.wait_all_tasks_blocked()  # the first stopped partway
+                reading.start()
+            await stream.send(b"after\n")
+        reading.join(30)
+        await stream.aclose()
+
+        assert [set(frame[1:]) for frame in frames[:-1]] == [{97}] * 3
+
     async def test_receives_in_a_cancelled_tasks_shielded_cleanup_take_few_turns(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:

@@ -554,8 +554,8 @@ class PodStdio(ByteStream):
             self._end(None)
 
     async def send(self, item: bytes) -> None:
-        await _land_pending_cancel()
         async with self._send_lock:
+            await _land_pending_cancel()  # also one that came as it waited for the lock
             try:
                 for i in range(0, len(item), STDIN_CHUNK_SIZE):
                     chunk = b"\0" + item[i : i + STDIN_CHUNK_SIZE]  # Stdin's channel.
