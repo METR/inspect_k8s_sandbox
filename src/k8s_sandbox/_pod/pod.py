@@ -222,6 +222,8 @@ class Pod:
                 "Restart re-check failed; keeping the failed operation's result",
                 exc_info=True,
             )
+            # Unless its worker kept one before it gave up.
+            self._raise_restart()
             return
         if restart is not None:
             raise restart
@@ -278,17 +280,13 @@ class Pod:
         """
         try:
             await self._run_async(callable)
-        except (
-            PodReplacedError,
-            ContainerRestartedError,
-            # Left to the provider's retries, as for exec.
-            ApiException,
-            WebSocketException,
-            ConnectionError,
-        ):
+        except (PodReplacedError, ContainerRestartedError):
             raise
-        except Exception:
-            if warned is not None:
+        except Exception as e:
+            # A connection error is left to the provider's retries, as for exec.
+            if warned is not None and not isinstance(
+                e, (ApiException, WebSocketException, ConnectionError)
+            ):
                 raise warned
             await self._diagnose_restart_after_failure()
             raise

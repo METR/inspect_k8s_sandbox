@@ -761,3 +761,48 @@ def test_warn_mode_raises_the_restart_a_user_probe_was_warned_of_when_it_stops()
         with pytest.raises(ContainerRestartedError):
             asyncio.run(pod.exec(["true"], None, None, {}, "agent", None))
         exec_op.return_value.exec.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ConnectionResetError(), id="connection-reset"),
+        pytest.param(FileNotFoundError("/x"), id="file-not-found"),
+    ],
+)
+def test_raise_mode_checks_a_failed_file_operation_also_after_a_connection_error(
+    monkeypatch, error: Exception
+):
+    # With the check off, the provider would retry a connection error into the
+    # restarted container.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        read_op.return_value.read_file.side_effect = error
+        pod = _make_pod()
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+
+
+def test_a_check_that_gives_up_still_raises_a_restart_kept_meanwhile(monkeypatch):
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    pod = _make_pod()
+
+    async def gives_up() -> None:
+        pod._restart_error = _restart()
+        raise TimeoutError()
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+        patch.object(pod, "check_for_pod_restart", gives_up),
+    ):
+        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
