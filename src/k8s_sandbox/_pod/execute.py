@@ -141,9 +141,10 @@ class ExecuteOperation(PodOperation):
         and execs the command, which inherits the rest of stdin. The caller must write
         nothing more until the command has answered: dash and busybox sh read ahead.
         """
-        if not cmd:
-            # `exec` alone would leave the shell reading the stream as commands.
-            raise ValueError("exec_stdio needs a command")
+        if not cmd or cmd[0].startswith("-"):
+            # `exec` alone, or with only its options, would leave the shell reading
+            # the stream as commands.
+            raise ValueError(f"exec_stdio needs a command, not {cmd!r}")
         with ExitStack() as stack:
             # No resize keepalive: CRI-O does not drain resize events for an exec
             # without a TTY, so they would stall the stream's stdin. TCP keepalives

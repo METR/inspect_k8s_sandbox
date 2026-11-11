@@ -1485,10 +1485,11 @@ class TestExecStdio:
 
         assert client.fileno() == -1
 
-    def test_an_empty_command_is_refused(self) -> None:
-        """`exec` alone would leave a shell reading the stream as commands."""
+    @pytest.mark.parametrize("cmd", [[], ["--"], ["-a", "x"]])
+    def test_a_missing_command_is_refused(self, cmd: list[str]) -> None:
+        """`exec` alone, or with only its options, leaves the shell reading on."""
         with pytest.raises(ValueError):
-            ExecuteOperation(MagicMock()).open_stdio([], None)
+            ExecuteOperation(MagicMock()).open_stdio(cmd, None)
 
     async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
