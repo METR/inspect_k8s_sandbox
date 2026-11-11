@@ -45,6 +45,22 @@ _TLS_RETRY_SECONDS = 0.01
 # coming, before it lets other tasks run: a few per reply, so a large one rarely waits
 # for a busy event loop.
 _STEPS_PER_TURN = 32
+# The users that mean uid 0, whatever the image's passwd says. exec() runs a command as
+# one of them in the container's own shell, behind _ROOT_CHECK: one program start where
+# `_shell_command`'s check and second shell cost three.
+ROOT_USERS = ("root", "0")
+# The first line of a root exec's script, inside its { } group. Unless the shell is
+# uid 0 it ends the exec before the command runs, with the message and status
+# `runuser -u root` gives in a container that is not root, so the refusal is handled
+# as one. Shell builtins only: the effective uid comes from /proc, not from `id`. A
+# shell that cannot read it is refused the same way, after its own error saying why;
+# container runtimes mount /proc. The subshell keeps its variables from the command;
+# a fork costs a fraction of a millisecond even where a program start costs 20 ms.
+_ROOT_CHECK = (
+    '(u=; while read -r k r e x; do [ "$k" = Uid: ] && u=$e && break; done'
+    ' </proc/self/status; [ "$u" = 0 ]) ||'
+    ' { echo "runuser: may not be used by non-root users" >&2; exit 1; }\n'
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +133,12 @@ class ExecuteOperation(PodOperation):
         # The shell ends the command's output with this marker. It holds a random value
         # made up for this exec, so nothing the command prints can be taken for it.
         marker = f"<{COMPLETED_SENTINEL}-{secrets.token_hex(16)}-"
-        shell_script = self._build_shell_script(cmd, stdin, cwd, env, timeout, marker)
-        with self._interactive_shell(_shell_command(user, switch)) as ws_client:
+        root = user in ROOT_USERS
+        shell_script = self._build_shell_script(
+            cmd, stdin, cwd, env, timeout, marker, root=root
+        )
+        shell = ["/bin/sh"] if root else _shell_command(user, switch)
+        with self._interactive_shell(shell) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands. Nothing runs
             # until the group's closing `}` arrives, so a failure before then may be
@@ -224,11 +244,14 @@ class ExecuteOperation(PodOperation):
         env: dict[str, str],
         timeout: int | None,
         marker: str,
+        root: bool = False,
     ) -> str:
         def generate() -> Generator[str, None, None]:
             # A group is read in full before any of it runs, so the command cannot
             # read the rest of the script, marker included, from the shell's stdin.
             yield "{\n"
+            if root:
+                yield _ROOT_CHECK
             if cwd is not None:
                 yield f"cd {shlex.quote(cwd)} || exit $?\n"
             for key, value in env.items():
@@ -361,8 +384,8 @@ class ExecuteOperation(PodOperation):
         # PermissionError for exit code 126 and stderr containing "permission denied".
         if result.returncode == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
-        # Only parse runuser errors if the wrapper failed before it could run the
-        # shell script and write our sentinel. If the sentinel was seen, any runuser
+        # Without our sentinel, the wrapper or a root exec's uid check may have failed
+        # before the command ran, so parse runuser errors. With it, any runuser
         # stderr came from the user-supplied command.
         if result.returncode != 0 and user is not None and not saw_completed_sentinel:
             self._check_for_runuser_error(result.stderr, user)

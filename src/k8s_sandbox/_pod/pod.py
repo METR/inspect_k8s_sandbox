@@ -14,7 +14,7 @@ from k8s_sandbox._pod.error import (
     PodError,
     PodReplacedError,
 )
-from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio
+from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
@@ -169,7 +169,7 @@ class Pod:
         # Probing once per container spares later execs that switch user two process
         # starts each.
         key = (info.uid, info.initial_restart_count, user or "")
-        if user and key not in self._switch:
+        if user and user not in ROOT_USERS and key not in self._switch:
             try:
                 self._switch[key] = await self._run_async(
                     lambda: executor.probe_switch(user)

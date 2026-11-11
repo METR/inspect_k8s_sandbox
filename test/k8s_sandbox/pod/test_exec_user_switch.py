@@ -38,13 +38,10 @@ async def test_each_user_is_probed_once() -> None:
         op.probe_switch.side_effect = lambda user: user == "agent"
         op.exec.return_value = OK
 
-        await _exec_as(pod, "agent", "agent", "root", None, "agent")
+        await _exec_as(pod, "agent", "agent", "root", "0", None, "agent")
 
-    assert [call.args for call in op.probe_switch.call_args_list] == [
-        ("agent",),
-        ("root",),
-    ]
-    assert _switches(op) == [True, True, False, False, True]
+    assert [call.args for call in op.probe_switch.call_args_list] == [("agent",)]
+    assert _switches(op) == [True, True, False, False, False, True]
 
 
 async def test_a_container_that_cannot_switch_is_probed_once() -> None:

@@ -322,12 +322,20 @@ _SHELLS = [
 ]
 
 
-def _run_script(shell: list[str], script: str) -> subprocess.CompletedProcess[bytes]:
+def _run_script(
+    shell: list[str], script: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
     """Run an exec's script as the pod's shell gets it: stdin stays open after it."""
     read_end, write_end = os.pipe()
     os.write(write_end, script.encode())
     try:
-        return subprocess.run(shell, stdin=read_end, capture_output=True, timeout=10)
+        return subprocess.run(
+            [shutil.which(shell[0]) or shell[0], *shell[1:]],
+            stdin=read_end,
+            capture_output=True,
+            timeout=10,
+            env=env,
+        )
     finally:
         os.close(read_end)
         os.close(write_end)
@@ -435,6 +443,103 @@ class TestScriptInAShell:
         result = _run_script(shell, script)
 
         assert result.stdout == _marker(0)
+
+
+def _proc_status(uids: str, gids: str = "1000\t1000\t1000\t1000") -> str:
+    """A /proc/self/status giving these real, effective, saved and filesystem ids."""
+    return f"Name:\tsh\nPid:\t7\nUid:\t{uids}\nGid:\t{gids}\nGroups:\t\n"
+
+
+def _root_script(cmd: list[str], status: Path) -> str:
+    """A root exec's script, whose uid check reads `status` in place of /proc."""
+    script = ExecuteOperation(MagicMock())._build_shell_script(
+        cmd, None, None, {}, None, MARKER, root=True
+    )
+    assert script.count("</proc/self/status") == 1
+    return script.replace("</proc/self/status", f"<{shlex.quote(str(status))}")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+@pytest.mark.parametrize(
+    ("status", "runs"),
+    [
+        pytest.param(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"), True, id="root"),
+        pytest.param(_proc_status("1000\t1000\t1000\t1000"), False, id="uid-1000"),
+        pytest.param(_proc_status("0\t1000\t0\t0"), False, id="effective-uid-1000"),
+        pytest.param(
+            _proc_status("1000\t1000\t1000\t1000", "0\t0\t0\t0"), False, id="gid-0"
+        ),
+        pytest.param("Name:\tsh\nGid:\t0\t0\t0\t0\n", False, id="no-uid"),
+        pytest.param("", False, id="empty"),
+        pytest.param(None, False, id="missing"),
+    ],
+)
+def test_a_root_exec_runs_its_command_only_as_uid_0(
+    shell: list[str], tmp_path: Path, status: str | None, runs: bool
+) -> None:
+    """As `runuser -u root` would, also in a container replaced by one not root.
+
+    The check needs no program from the PATH: only the command is on it here, and an
+    `id` that records being run, so one that starts `id` from it fails too (busybox
+    runs its own `id` applet instead).
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "touch").symlink_to(shutil.which("touch") or "/usr/bin/touch")
+    (bin_dir / "id").write_text(f"#!/bin/sh\n: > {tmp_path / 'id-ran'}\n")
+    (bin_dir / "id").chmod(0o755)
+    status_file = tmp_path / "status"
+    if status is not None:
+        status_file.write_text(status)
+    ran = tmp_path / "ran"
+    script = _root_script(["touch", str(ran)], status_file)
+
+    # A container's own `u=0` is not the check's answer.
+    result = _run_script(shell, script, {"PATH": str(bin_dir), "u": "0"})
+
+    assert ran.exists() is runs
+    assert not (tmp_path / "id-ran").exists()
+    if runs:
+        assert result.returncode == 0
+        assert (result.stdout, result.stderr) == (_marker(0), _marker(0))
+    else:
+        assert result.returncode == 1
+        assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
+    if status is None:  # The shell says why before the refusal.
+        assert str(status_file).encode() in result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
+    shell: list[str], tmp_path: Path
+) -> None:
+    """The uid check leaves the command the environment a plain exec gives it.
+
+    `-a` exports every variable the shell sets, so any the check left would show, and
+    the container's own variables arrive, under names a check might use too.
+    """
+    status_file = tmp_path / "status"
+    status_file.write_text(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"))
+    # Every name the check uses, so one that sets or unsets any of them shows.
+    names = re.findall(r"[A-Za-z_]\w*", execute_module._ROOT_CHECK)
+    kept = dict.fromkeys(names, "keep")
+    env = {**os.environ, **kept}
+
+    root = _run_script([*shell, "-a"], _root_script(["env"], status_file), env)
+    plain = _run_script([*shell, "-a"], _script(["env"]), env)
+
+    assert root.returncode == plain.returncode == 0
+    # Names only: bash's EPOCHREALTIME and the like change from one run to the next.
+    seen = [
+        {line.partition(b"=")[0] for line in r.stdout.splitlines()}
+        for r in (root, plain)
+    ]
+    assert seen[0] == seen[1]
+    assert {f"{k}={v}".encode() for k, v in kept.items()} <= set(
+        root.stdout.splitlines()
+    )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
@@ -935,6 +1040,20 @@ class TestRunuserErrors:
 
         assert result.returncode == 1
 
+    @pytest.mark.parametrize("user", ["root", "0"])
+    def test_a_root_execs_refusal_warns_and_returns_the_failed_result(
+        self, user: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The uid check's refusal in a container that is not root, as runuser's."""
+        stderr = b"runuser: may not be used by non-root users\n"
+        ws = _FakeWSClient([(STDERR, stderr), _status(1)])
+
+        with caplog.at_level("WARNING"):
+            result = _handle(ws, user=user)
+
+        assert result.returncode == 1
+        assert "the container is not running as root" in caplog.text
+
 
 class TestExecChunksStdin:
     def test_exec_writes_shell_script_in_chunks(
@@ -973,6 +1092,34 @@ class TestExecChunksStdin:
         assert ws.write_stdin.call_count > 1
         assert all(len(c.args[0]) <= 16 for c in ws.write_stdin.call_args_list)
         assert result is sentinel
+
+
+@pytest.mark.parametrize(
+    ("user", "shell", "checked"),
+    [
+        ("root", ["/bin/sh"], True),
+        ("0", ["/bin/sh"], True),
+        (None, ["/bin/sh"], False),
+        ("agent", _shell_command("agent"), False),
+    ],
+    ids=["root", "0", "default", "agent"],
+)
+def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
+    monkeypatch: pytest.MonkeyPatch,
+    user: str | None,
+    shell: list[str],
+    checked: bool,
+) -> None:
+    """One program start, not `id` and a second shell; the check runs in it first."""
+    writes, op = _exec_writing_to(monkeypatch)
+    opened = MagicMock(wraps=op._interactive_shell)
+    monkeypatch.setattr(op, "_interactive_shell", opened)
+
+    op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
+
+    opened.assert_called_once_with(shell)
+    check = execute_module._ROOT_CHECK if checked else ""
+    assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
 
 
 def _exec_writing_to(
