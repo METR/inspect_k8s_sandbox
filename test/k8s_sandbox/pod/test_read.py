@@ -37,6 +37,18 @@ def test_read_file_opens_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_a_path_that_looks_like_an_option_is_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "--help").write_bytes(b"contents")
+    command = _exec_kwargs(monkeypatch, Path("--help"))["command"]
+
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=30)
+
+    assert result.stdout == b"contents"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
 def test_head_is_not_found_through_the_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

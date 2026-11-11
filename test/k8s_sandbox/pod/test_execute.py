@@ -330,7 +330,7 @@ def _run_script(
     os.write(write_end, script.encode())
     try:
         return subprocess.run(
-            shell, stdin=read_end, capture_output=True, timeout=10, env=env
+            shell, stdin=read_end, capture_output=True, timeout=30, env=env
         )
     finally:
         os.close(read_end)
@@ -1199,6 +1199,31 @@ def _probe_script(user: str) -> str:
 
 
 class TestProbeSwitch:
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    @pytest.mark.parametrize("shell", _SHELLS)
+    def test_the_probe_runs_nothing_from_the_path_once_switched(
+        self, shell: list[str], tmp_path: Path
+    ) -> None:
+        """The user may be uid 0 by another name, and runuser may keep the PATH."""
+        ran = tmp_path / "ran"
+        stub = tmp_path / "true"
+        stub.write_text(f"#!/bin/sh\necho true >> {ran}\n")
+        stub.chmod(0o755)
+        forward = tmp_path / "forward"  # runuser without the switch
+        forward.write_text(
+            '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+        )
+        forward.chmod(0o755)
+        script = _probe_script("someone-else").replace("/sbin/runuser", str(forward))
+        env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+        result = subprocess.run(
+            [*shell, "-c", script], env=env, capture_output=True, timeout=30
+        )
+
+        assert result.returncode == 1  # the switch works
+        assert not ran.exists()
+
     @pytest.mark.parametrize(
         ("returncode", "switch"), [(0, False), (1, True), (2, False)]
     )

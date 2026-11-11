@@ -39,6 +39,32 @@ def test_write_file_writes_data_via_chunked_helper(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_a_directory_that_looks_like_an_option_is_made(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    op = WriteFileOperation(MagicMock())
+    exec_kwargs: dict[str, Any] = {}
+
+    def fake_exec(**kwargs: Any) -> Generator[MagicMock, None, None]:
+        exec_kwargs.update(kwargs)
+        yield MagicMock(spec=WSClient)
+
+    monkeypatch.setattr(op, "create_websocket_client_for_exec", fake_exec)
+    with op._start_write_command(Path("-dir/dst"), 4):
+        pass
+
+    subprocess.run(
+        exec_kwargs["command"],
+        input=b"data",
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert (tmp_path / "-dir" / "dst").read_bytes() == b"data"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
 def test_mkdir_and_head_are_not_found_through_the_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

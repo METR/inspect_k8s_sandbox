@@ -181,7 +181,8 @@ class ExecuteOperation(PodOperation):
         quoted = shlex.quote(user)
         probe = (
             f"if {_runs_as(user)}; then exit 0; fi; "
-            f"if {_RUNUSER} -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
+            f"if {_RUNUSER} -u {quoted} -- /bin/sh -c : 2>/dev/null; then exit 1; fi; "
+            "exit 2"
         )
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
             deadline = time.monotonic() + API_TIMEOUT

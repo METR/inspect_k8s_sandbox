@@ -24,7 +24,7 @@ class WriteFileOperation(PodOperation):
     def _start_write_command(
         self, dst: Path, file_size: int
     ) -> Generator[WSClient, None, None]:
-        mkdir_command = f"mkdir -p {shlex.quote(dst.parent.as_posix())}"
+        mkdir_command = f"mkdir -p -- {shlex.quote(dst.parent.as_posix())}"
         # Use `head` with `-c <file size>` because we have no way of closing the stdin
         # stream in v4.channel.k8s.io (which means the websocket connection would never
         # close).

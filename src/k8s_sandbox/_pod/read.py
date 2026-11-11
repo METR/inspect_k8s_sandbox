@@ -30,7 +30,7 @@ class ReadFileOperation(PodOperation):
         command = [
             "/bin/sh",
             "-c",
-            f'PATH={SYSTEM_PATH}; exec head -c "$1" "$2"',
+            f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
             "sh",
             str(limits.MAX_READ_FILE_SIZE + 1),
             src.as_posix(),
