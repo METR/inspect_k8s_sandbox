@@ -164,6 +164,13 @@ class ExecuteOperation(PodOperation):
                 ws_client._channels.pop(STDERR_CHANNEL, None)
             ws_client.close()
             returncode = get_returncode(ws_client)
+        # The probe exits 0, 1 or 2: 255 is Kata's status for a stopped container.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The exec's container stopped under the user probe",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         return returncode == 1
 
     @contextmanager

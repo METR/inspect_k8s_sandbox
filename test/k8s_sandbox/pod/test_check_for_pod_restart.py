@@ -576,3 +576,82 @@ def test_a_file_read_that_fails_in_a_healthy_container_keeps_its_error(monkeypat
         asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
         # One read, after the failure; none for the read that succeeded.
         assert mock_client.return_value.read_namespaced_pod.call_count == 1
+
+
+def test_an_operation_that_fails_while_a_restart_is_found_raises_the_restart():
+    pod = _make_pod()
+    restart = ContainerRestartedError(
+        pod_name="p", container_name="default", restart_count=1, last_reason="Error"
+    )
+
+    def times_out_meanwhile(*_args):
+        pod._restart_error = restart
+        raise TimeoutError("Command timed out")
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = (
+            _healthy_pod_response()
+        )
+        exec_op.return_value.exec.side_effect = times_out_meanwhile
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+
+
+def test_warn_mode_raises_the_restart_a_failed_file_operation_was_warned_of():
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
+        pod = _make_pod(restarted_container_behavior="warn")
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+
+
+def test_a_check_after_a_failure_that_hangs_keeps_the_failure(monkeypatch):
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    monkeypatch.setattr("k8s_sandbox._pod.pod.API_TIMEOUT", 0.01)
+    pod = _make_pod()
+
+    async def slow() -> ContainerRestartedError:
+        # Slower than the bound, after which the failure stands.
+        await asyncio.sleep(1)
+        return ContainerRestartedError(
+            pod_name="p", container_name="default", restart_count=1, last_reason="Error"
+        )
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+        patch.object(pod, "check_for_pod_restart", slow),
+    ):
+        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
+        with pytest.raises(FileNotFoundError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+
+
+def test_the_first_restart_found_is_the_one_kept():
+    pod = _make_pod()
+
+    def stopped(*_args):
+        # Another operation found the pod replaced while this one ran.
+        pod._restart_error = PodReplacedError(
+            pod_name="p", old_uid="uid-OLD", new_uid="uid-NEW", new_restart_count=0
+        )
+        raise ContainerStoppedError("stopped")
+
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        exec_op.return_value.exec.side_effect = stopped
+        with pytest.raises(PodReplacedError):
+            asyncio.run(pod._run_async(lambda: exec_op.return_value.exec()))

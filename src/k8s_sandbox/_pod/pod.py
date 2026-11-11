@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import os
@@ -17,7 +18,7 @@ from k8s_sandbox._pod.error import (
 )
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 
@@ -94,8 +95,10 @@ class Pod:
             check_for_pod_restart(self._info)
         except (PodReplacedError, ContainerRestartedError) as e:
             if self._info.restarted_container_behavior == "raise":
-                # A copy, without the frames of the operations it passes through.
-                self._restart_error = type(e)(**vars(e))
+                # A copy, without the frames of the operations it passes through. The
+                # first detection stays, if concurrent ones made two.
+                if self._restart_error is None:
+                    self._restart_error = type(e)(**vars(e))
                 raise
             if isinstance(e, PodReplacedError):
                 self._info = dataclasses.replace(
@@ -206,7 +209,8 @@ class Pod:
 
     async def _diagnose_restart_after_failure(self) -> None:
         try:
-            restart = await self.check_for_pod_restart()
+            # Bounded: the operation's own error is already known.
+            restart = await asyncio.wait_for(self.check_for_pod_restart(), API_TIMEOUT)
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
@@ -229,10 +233,13 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        if _file_op_restart_check_enabled():
+        warned = (
             await self.check_for_pod_restart()
+            if _file_op_restart_check_enabled()
+            else None
+        )
         writer = WriteFileOperation(self._info)
-        await self._after_failure_check(lambda: writer.write_file(data, dst))
+        await self._after_failure_check(lambda: writer.write_file(data, dst), warned)
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
         """
@@ -246,22 +253,32 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        if _file_op_restart_check_enabled():
+        warned = (
             await self.check_for_pod_restart()
+            if _file_op_restart_check_enabled()
+            else None
+        )
         reader = ReadFileOperation(self._info)
-        await self._after_failure_check(lambda: reader.read_file(src, dst))
+        await self._after_failure_check(lambda: reader.read_file(src, dst), warned)
 
-    async def _after_failure_check(self, callable: Callable[[], None]) -> None:
-        """Run a file operation; if it fails, a restart found since explains it better.
+    async def _after_failure_check(
+        self,
+        callable: Callable[[], None],
+        warned: PodReplacedError | ContainerRestartedError | None,
+    ) -> None:
+        """Run a file operation; a restart explains its failure better.
 
-        Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
-        container has none of the files the sample wrote, so reading one fails there.
+        That is one WARNED of before it, or one found after it failed, also when
+        ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted container
+        has none of the files the sample wrote, so reading one fails there.
         """
         try:
             await self._run_async(callable)
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
+            if warned is not None:
+                raise warned
             await self._diagnose_restart_after_failure()
             raise
 
@@ -281,13 +298,19 @@ class Pod:
                 info = self._info
                 if info.restarted_container_behavior == "raise":
                     # Gone, though Kubernetes may not show it stopped yet.
-                    error = self._restart_error = ContainerRestartedError(
-                        pod_name=info.name,
-                        container_name=info.default_container_name,
-                        restart_count=info.initial_restart_count + 1,
-                        last_reason="stopped under an operation",
-                    )
+                    if self._restart_error is None:
+                        self._restart_error = ContainerRestartedError(
+                            pod_name=info.name,
+                            container_name=info.default_container_name,
+                            restart_count=info.initial_restart_count + 1,
+                            last_reason="stopped under an operation",
+                        )
+                    error = self._restart_error
                     raise type(error)(**vars(error)) from e
+                raise
+            except Exception:
+                # A restart found while it ran explains its failure better.
+                self._raise_restart()
                 raise
             self._raise_restart()
             return result

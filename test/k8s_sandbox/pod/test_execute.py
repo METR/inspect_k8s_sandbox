@@ -751,6 +751,24 @@ def test_the_probe_reads_a_status_tls_has_already_decrypted(
     assert answer is True
 
 
+def test_the_probe_reports_a_container_that_stopped_under_it(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe exits 0, 1 or 2; 255 is Kata's status for a stopped container."""
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
+    client, server = tls_sockets
+    server.sendall(_frame(*_status(255)) + _close_frame())
+    op = ExecuteOperation(MagicMock())
+
+    @contextmanager
+    def shell(command: list[str]) -> Generator[WSClient, None, None]:
+        yield _SocketWSClient(client)
+
+    with patch.object(op, "_interactive_shell", shell):
+        with pytest.raises(ContainerStoppedError):
+            op.probe_switch("agent")
+
+
 def test_the_probe_gives_up_on_a_frame_cut_off(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
