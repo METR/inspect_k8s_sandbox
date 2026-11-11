@@ -37,7 +37,11 @@ def test_default_chart(chart_dir: Path) -> None:
         for c in services[0]["spec"]["template"]["spec"]["containers"]
         if c["name"] == "default"
     )
-    assert default_container["command"] == ["tail", "-f", "/dev/null"]
+    assert default_container["command"] == [
+        "sh",
+        "-c",
+        "trap '' HUP INT QUIT TERM; while true; do sleep 3600 & wait; done",
+    ]
 
 
 def test_additional_resources(chart_dir: Path, test_resources_dir: Path) -> None:
@@ -365,6 +369,13 @@ def test_init_containers_with_all_fields(
     )
     assert agent_env_var is not None
     assert "agent-env-my-release" in agent_env_var["value"]
+    assert {"name": "GREETING", "value": "hello"} in init_container["env"]
+
+    # Test volumeMounts, onto a volume the service declares
+    assert init_container["volumeMounts"] == [
+        {"name": "shared", "mountPath": "/shared"}
+    ]
+    assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
 
 
 def test_resource_requests_and_limits(
@@ -952,7 +963,7 @@ def test_service_command_null_omits_entrypoint(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
     # Compose `command:` without `entrypoint:` is converted to `command: null`
-    # plus `args`. Helm must delete the chart-default `tail -f /dev/null` so the
+    # plus `args`. Helm must delete the chart's default idle loop so the
     # image ENTRYPOINT runs with the user's args as CMD.
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "service-command-null-values.yaml"

@@ -96,8 +96,12 @@ services:
     runtimeClassName: gvisor
     # -- The container's image name.
     image: "python:3.12-bookworm"
-    # -- The container's entrypoint command.
-    command: ["tail", "-f", "/dev/null"]
+    # -- The container's entrypoint command. The default idle loop reaps orphaned
+    # processes and requires sh and sleep in the image.
+    command:
+      - sh
+      - -c
+      - "trap '' HUP INT QUIT TERM; while true; do sleep 3600 & wait; done"
     # -- The container's entrypoint arguments.
     args: []
     # -- The container's working directory.
@@ -121,7 +125,8 @@ services:
     # -- Init containers to run before the main container starts. Useful for waiting for
     # dependencies to become ready (e.g., database connectivity checks). Each init container
     # supports: `name` (required), `image` (required), `command`, `args`, `imagePullPolicy`,
-    # `workingDir`, `resources`, and `securityContext`. The `$AGENT_ENV` environment variable
+    # `workingDir`, `env` (`name`/`value` pairs), `volumeMounts` (of volumes in the service's
+    # `volumes:`), `resources`, and `securityContext`. The `$AGENT_ENV` environment variable
     # is automatically injected. Note: init containers cannot reliably access external domains
     # from `allowDomains` due to CoreDNS starting after init containers complete.
     initContainers: []
