@@ -4,7 +4,10 @@ from typing import Generator
 from unittest.mock import MagicMock
 
 import pytest
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
+    WSClient,
+)
 from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
@@ -70,8 +73,14 @@ def test_a_255_is_a_stopped_container(
 )
 @pytest.mark.parametrize(
     ("frames", "stopped"),
-    [([_status(255)], True), ([_status(2)], False), ([], False)],
-    ids=["255", "another-status", "no-status"],
+    [
+        ([_status(255)], True),
+        ([_status(2)], False),
+        # As for an exec into a dead container: no exit code, nor even `details`.
+        ([(ERROR_CHANNEL, b'{"status":"Failure","reason":"InternalError"}')], False),
+        ([], False),
+    ],
+    ids=["255", "another-status", "no-exit-code", "no-status"],
 )
 def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
     frames: list[tuple[int, bytes]], stopped: bool, lost: Exception
