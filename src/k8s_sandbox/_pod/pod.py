@@ -205,14 +205,21 @@ class Pod:
 
         Closing the stream ends the command's stdin and stdout.
         """
-        await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
         stack, ws_client = await PodOpExecutor.get_instance().queue_operation(
             lambda: operation.open_stdio(cmd, user),
             # The websocket opened for a caller that stopped waiting.
             discard=lambda opened: opened[0].close(),
         )
-        return PodStdio(operation, stack, ws_client)
+        stream = PodStdio(operation, stack, ws_client)
+        try:
+            # After the open, so that a pod replaced or restarted before or while it
+            # opened is found too: nothing checks again while the stream lasts.
+            await self.check_for_pod_restart()
+        except BaseException:
+            await stream.aclose()
+            raise
+        return stream
 
     async def _diagnose_restart_after_failed_exec(self) -> None:
         try:

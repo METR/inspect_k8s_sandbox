@@ -475,12 +475,16 @@ class PodStdio(ByteStream):
         stderr = b""
         try:
             while self._ws.is_open():
-                _update(self._ws, None)
-                stderr += self._ws._channels.pop(STDERR_CHANNEL, b"")
-                stderr = stderr[-_STDERR_TAIL_BYTES:]
-                if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
-                    put = self._put(stdout)
-                    asyncio.run_coroutine_threadsafe(put, self._loop).result()
+                try:
+                    _update(self._ws, None)
+                finally:
+                    # Also what an update() that then failed read: from kubernetes 37
+                    # it reads every frame waiting.
+                    stderr += self._ws._channels.pop(STDERR_CHANNEL, b"")
+                    stderr = stderr[-_STDERR_TAIL_BYTES:]
+                    if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
+                        put = self._put(stdout)
+                        asyncio.run_coroutine_threadsafe(put, self._loop).result()
         except Exception as e:
             # A failed read, or the stream closed under the reader.
             if ERROR_CHANNEL not in self._ws._channels:
@@ -526,6 +530,11 @@ class PodStdio(ByteStream):
             )
         except (OSError, websocket.WebSocketException) as e:
             raise anyio.BrokenResourceError from e
+        except BaseException:
+            # The write goes on in its thread, and a later send() would interleave
+            # with it: the stream can carry nothing more.
+            await self.aclose()
+            raise
 
     async def send_eof(self) -> None:
         raise NotImplementedError("v4.channel.k8s.io cannot close stdin alone")
