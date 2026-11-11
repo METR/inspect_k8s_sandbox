@@ -43,6 +43,7 @@ from kubernetes.stream.ws_client import (
 import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
     ExecResultUnknownError,
     GetReturncodeError,
     PodError,
@@ -286,6 +287,36 @@ class TestCompletion:
 
         with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
             _handle(ws)
+
+    @pytest.mark.parametrize(
+        "frames",
+        [
+            pytest.param([(STDOUT, b"the start of the output")], id="no-marker"),
+            pytest.param([(STDOUT, _marker(255))], id="stdout-marker-only"),
+            pytest.param([(STDERR, _marker(255))], id="stderr-marker-only"),
+            # The command exited 0, then the VM stopped before its shell did.
+            pytest.param(
+                [(STDOUT, _marker(0)), (STDERR, _marker(0))], id="markers-say-0"
+            ),
+        ],
+    )
+    def test_255_without_both_markers_is_not_the_commands_exit_code(
+        self, frames: list[tuple[int, bytes]]
+    ) -> None:
+        """Kata's status for a command whose VM stopped under it."""
+        ws = _FakeWSClient([*frames, _status(255)])
+
+        with pytest.raises(ContainerStoppedError, match='"returncode": "255"'):
+            _handle(ws)
+
+    def test_the_commands_own_255_is_returned(self) -> None:
+        ws = _FakeWSClient(
+            [(STDOUT, _marker(255)), (STDERR, _marker(255)), _status(255)]
+        )
+
+        result = _handle(ws)
+
+        assert result.returncode == 255
 
     def test_held_back_bytes_are_kept_when_the_stream_ends_without_a_marker(
         self,
@@ -869,6 +900,24 @@ def test_the_probe_reads_a_status_tls_has_already_decrypted(
         answer = op.probe_switch("agent")
 
     assert answer is True
+
+
+def test_the_probe_reports_a_container_that_stopped_under_it(
+    tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe exits 0, 1 or 2; 255 is Kata's status for a stopped container."""
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
+    client, server = tls_sockets
+    server.sendall(_frame(*_status(255)) + _close_frame())
+    op = ExecuteOperation(MagicMock())
+
+    @contextmanager
+    def shell(command: list[str]) -> Generator[WSClient, None, None]:
+        yield _SocketWSClient(client)
+
+    with patch.object(op, "_interactive_shell", shell):
+        with pytest.raises(ContainerStoppedError):
+            op.probe_switch("agent")
 
 
 def test_the_probe_gives_up_on_a_frame_cut_off(

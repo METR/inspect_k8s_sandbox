@@ -28,6 +28,15 @@ class ExecResultUnknownError(PodError, GetReturncodeError):
     """
 
 
+class ContainerStoppedError(ExecResultUnknownError):
+    """An operation's container stopped under it.
+
+    The operation ended with the exit status 255 that Kata gives a command whose VM
+    stopped, before its command did. With ``restarted_container_behavior="raise"`` the
+    operation raises a ``ContainerRestartedError`` instead, from this.
+    """
+
+
 class ExecutableNotFoundError(Exception):
     """The executable could not be found in the container.
 
@@ -47,9 +56,10 @@ class PodReplacedError(K8sError):
     any state held in its filesystem or memory that did not reside on a
     persistent volume.
 
-    The sandbox provider refreshes its cached pod identity when this is
-    raised, so subsequent operations target the new pod and will not re-raise
-    ``PodReplacedError`` unless yet another replacement occurs.
+    With ``restarted_container_behavior="warn"`` the sandbox provider refreshes
+    its cached pod identity, so subsequent operations target the new pod and do
+    not report it again unless yet another replacement occurs. With ``"raise"``
+    every later operation in the sandbox raises it again.
     """
 
     def __init__(  # noqa: D107
@@ -79,13 +89,14 @@ class ContainerRestartedError(K8sError):
     """A container in the pod has restarted since the pod was first observed.
 
     The pod itself is the same (same UID), but the container's process was
-    restarted (OOM, crash, liveness probe failure, etc.). Files on disk
-    survive; in-memory state and any background processes started by the agent
-    do not.
+    restarted (OOM, crash, liveness probe failure, a Kata VM's death, etc.).
+    Files on the pod's volumes survive; the container's own filesystem, its
+    in-memory state and any background processes started by the agent do not.
 
-    The sandbox provider refreshes its cached restart count when this is
-    raised, so subsequent operations will not re-raise
-    ``ContainerRestartedError`` unless a further restart occurs.
+    With ``restarted_container_behavior="warn"`` the sandbox provider refreshes
+    its cached restart count, so subsequent operations do not report it again
+    unless a further restart occurs. With ``"raise"`` every later operation in
+    the sandbox raises it again.
     """
 
     def __init__(  # noqa: D107

@@ -4,9 +4,13 @@ from pathlib import Path
 from typing import Generator
 
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from websocket import WebSocketException
 
-from k8s_sandbox._pod.error import PodError
-from k8s_sandbox._pod.get_returncode import get_returncode
+from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.get_returncode import (
+    get_returncode,
+    raise_if_stopped_before_lost,
+)
 from k8s_sandbox._pod.op import (
     PodOperation,
     raise_for_known_read_write_errors,
@@ -52,8 +56,19 @@ class WriteFileOperation(PodOperation):
     def _handle_stream_output(self, ws_client: WSClient) -> None:
         # Wait until the websocket connection is closed. All stderr will be stored by us
         # in memory anyway so there is no value in streaming it.
-        ws_client.run_forever()
+        try:
+            ws_client.run_forever()
+        except (OSError, WebSocketException) as e:
+            raise_if_stopped_before_lost(ws_client, e, self._pod.name)
+            raise
         returncode = get_returncode(ws_client)
+        # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The container stopped while writing the file.",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         if returncode != 0:
             stderr = ws_client.read_stderr()
             raise_for_known_read_write_errors(stderr)

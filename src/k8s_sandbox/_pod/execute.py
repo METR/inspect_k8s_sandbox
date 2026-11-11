@@ -25,7 +25,12 @@ from websocket import ABNF
 
 from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    GetReturncodeError,
+    PodError,
+)
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
 
@@ -216,6 +221,13 @@ class ExecuteOperation(PodOperation):
                 ws_client._channels.pop(STDERR_CHANNEL, None)
             ws_client.close()
             returncode = get_returncode(ws_client)
+        # The probe exits 0, 1 or 2: 255 is Kata's status for a stopped container.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The exec's container stopped under the user probe",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         return returncode == 1
 
     @contextmanager
@@ -360,6 +372,17 @@ class ExecuteOperation(PodOperation):
                     raise ExecResultUnknownError(
                         "The exec ended without the end of the command's output",
                         pod=self._pod.name,
+                    )
+                # 255 unless both say so is Kata's status for a command whose VM
+                # stopped under its shell.
+                if returncode == 255 and (stdout.returncode, stderr.returncode) != (
+                    255,
+                    255,
+                ):
+                    raise ContainerStoppedError(
+                        "The exec's container stopped under the command",
+                        pod=self._pod.name,
+                        returncode=returncode,
                     )
             else:
                 # Both markers are in but no exit status: a background process is

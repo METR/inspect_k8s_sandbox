@@ -4,7 +4,11 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     WSClient,
 )
 
-from k8s_sandbox._pod.error import ExecutableNotFoundError, GetReturncodeError
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecutableNotFoundError,
+    GetReturncodeError,
+)
 
 
 def get_returncode(ws_client: WSClient) -> int:
@@ -39,3 +43,29 @@ def get_returncode(ws_client: WSClient) -> int:
         "and there was no entry in `details.causes` with `reason`=='ExitCode'. "
         f"Error channel: {channel_value}",
     )
+
+
+def raise_if_stopped_before_lost(
+    ws_client: WSClient, lost: BaseException, pod: str
+) -> None:
+    """
+    Raise ContainerStoppedError if the exec reported 255 before its connection was lost.
+
+    255 is Kata's status for a command whose VM stopped, for a command (``head``,
+    ``mkdir``) that never exits 255 itself. Otherwise LOST, the error that lost the
+    connection, stands: the caller raises it.
+    """
+    if ERROR_CHANNEL not in ws_client._channels:
+        return
+    if ws_client.is_open():
+        ws_client.close()
+    try:
+        returncode = get_returncode(ws_client)
+    except Exception:
+        return
+    if returncode == 255:
+        raise ContainerStoppedError(
+            "The container stopped before the connection was lost.",
+            pod=pod,
+            returncode=returncode,
+        ) from lost

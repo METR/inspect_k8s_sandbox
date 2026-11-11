@@ -4,10 +4,17 @@ from typing import Generator
 from unittest.mock import MagicMock
 
 import pytest
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
+    WSClient,
+)
+from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
+import k8s_sandbox._pod.write as writefile_module
+from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.write import WriteFileOperation
+from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
 
 
 def test_write_file_writes_data_via_chunked_helper(
@@ -34,3 +41,53 @@ def test_write_file_writes_data_via_chunked_helper(
     assert captured["file_size"] == len(data)
     assert b"".join(call.args[0] for call in ws.write_stdin.call_args_list) == data
     assert ws.write_stdin.call_count > 1
+
+
+@pytest.mark.parametrize(
+    ("returncode", "error"),
+    [
+        # `head` and `mkdir` never exit 255: Kata's status for a stopped VM.
+        pytest.param(255, ContainerStoppedError, id="container-stopped"),
+        pytest.param(2, PodError, id="failed"),
+    ],
+)
+def test_a_255_is_a_stopped_container(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, error: type[Exception]
+) -> None:
+    monkeypatch.setattr(writefile_module, "get_returncode", lambda _ws: returncode)
+    op = WriteFileOperation(MagicMock())
+    ws = MagicMock(spec=WSClient)
+    ws.is_open.return_value = False
+    ws.read_stderr.return_value = ""
+
+    with pytest.raises(error) as raised:
+        op._handle_stream_output(ws)
+
+    assert type(raised.value) is error
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [ConnectionResetError(), WebSocketConnectionClosedException()],
+    ids=["reset", "closed"],
+)
+@pytest.mark.parametrize(
+    ("frames", "stopped"),
+    [
+        ([_status(255)], True),
+        ([_status(2)], False),
+        # As for an exec into a dead container: no exit code, nor even `details`.
+        ([(ERROR_CHANNEL, b'{"status":"Failure","reason":"InternalError"}')], False),
+        ([], False),
+    ],
+    ids=["255", "another-status", "no-exit-code", "no-status"],
+)
+def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
+    frames: list[tuple[int, bytes]], stopped: bool, lost: Exception
+) -> None:
+    ws = _FakeWSClient(frames, error=lost)
+
+    with pytest.raises(Exception) as raised:
+        WriteFileOperation(MagicMock())._handle_stream_output(ws)
+
+    assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))

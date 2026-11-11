@@ -61,7 +61,10 @@ def test_parse_pod_extracts_key_fields():
         container_names=("default", "sidecar"),
         container_statuses=(
             ContainerStatus(
-                name="default", restart_count=2, last_terminated_reason="OOMKilled"
+                name="default",
+                restart_count=2,
+                last_terminated_reason="OOMKilled",
+                running=True,
             ),
         ),
     )
@@ -114,11 +117,11 @@ def test_read_pod_requests_raw_json_and_parses():
     api.read_namespaced_pod.return_value = _raw_response(_pod_body(uid="uid-42"))
 
     # Act
-    snapshot = read_pod(api, name="pod", namespace="ns")
+    snapshot = read_pod(api, name="pod", namespace="ns", request_timeout=60)
 
     # Assert
     api.read_namespaced_pod.assert_called_once_with(
-        name="pod", namespace="ns", _preload_content=False
+        name="pod", namespace="ns", _preload_content=False, _request_timeout=60
     )
     assert snapshot.uid == "uid-42"
 
@@ -185,3 +188,40 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     pod = list_pods(api, "ns", label_selector="app=x")[0]
 
     assert (pod.ready, pod.phase) == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "running"),
+    [
+        pytest.param({"running": {}}, True, id="running"),
+        pytest.param({"terminated": {"exitCode": 255}}, False, id="stopped"),
+        pytest.param({"waiting": {"reason": "ContainerCreating"}}, False, id="waiting"),
+        pytest.param({}, True, id="not-published"),
+    ],
+)
+def test_parse_pod_reads_whether_a_container_runs(state: dict, running: bool):
+    snapshot = _parse_pod(
+        _pod_body(container_statuses=[{"name": "default", "state": state}])
+    )
+
+    status = snapshot.status_for("default")
+    assert status is not None
+    assert status.running is running
+
+
+def test_parse_pod_takes_the_current_stops_reason_first():
+    snapshot = _parse_pod(
+        _pod_body(
+            container_statuses=[
+                {
+                    "name": "default",
+                    "state": {"terminated": {"reason": "Error"}},
+                    "lastState": {"terminated": {"reason": "OOMKilled"}},
+                }
+            ]
+        )
+    )
+
+    status = snapshot.status_for("default")
+    assert status is not None
+    assert status.last_terminated_reason == "Error"

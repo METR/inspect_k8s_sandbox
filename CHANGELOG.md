@@ -12,6 +12,27 @@
 - A warning is logged when Compose `init: true` is ignored on non-default services
   or on the default service with an explicit `command` or `entrypoint`.
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
+- With `restarted_container_behavior="raise"`, every operation after a detected pod
+  replacement or container restart fails with the same `PodReplacedError` or
+  `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
+  it was detected. `read_file()` and `write_file()` do too when
+  `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
+  waiting to start again, counts as restarted.
+- With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` that
+  fails checks whether the container restarted or the pod was replaced, also when
+  `INSPECT_POD_RESTART_CHECK=false`, and raises that instead. Otherwise its error stands,
+  and a connection error is still retried. Each check costs one pod read.
+- The pod read that checks for a restart gives up when the API server sends nothing for
+  60 seconds (the kubernetes client tries up to four times), and the operation then
+  fails, instead of waiting on a stalled API server without end. A server that keeps
+  sending, however slowly, is still waited on.
+- An operation whose container stopped under it, which Kata reports with exit code 255
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`, also
+  when the connection is lost after the client read that status.
+  Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
+  `write_file()` were retried, reaching the container that replaced it. With
+  `restarted_container_behavior="raise"`, or for an `exec()` whose check after it sees
+  the restart, it raises `ContainerRestartedError` instead.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
