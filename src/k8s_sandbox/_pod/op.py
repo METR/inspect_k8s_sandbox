@@ -206,7 +206,12 @@ def _send_keepalive(ws_client: WSClient, stop: threading.Event) -> None:
     [2] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/websocket.go#L339-L349
     [3] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/hybi.go#L290-L302
     [4] https://github.com/kubernetes/kubernetes/blob/77b02b7ad40d36cd803856de5ba5922c947cb0aa/staging/src/k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go#L348-L356
+
+    Nothing is sent on v5.channel.k8s.io, which kubernetes>=37 negotiates first: there,
+    resize frames on an exec without a TTY stop the server reading the exec's stdin.
     """
+    if getattr(ws_client, "subprotocol", None) == "v5.channel.k8s.io":
+        return
     payload = json.dumps({"Width": 80, "Height": 24}).encode()  # Size is arbitrary
     while not stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
         try:
