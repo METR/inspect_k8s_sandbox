@@ -7,6 +7,9 @@
   `ContainerRestartedError`, `read_file()` and `write_file()` included (also when
   `INSPECT_POD_RESTART_CHECK=false`). Before, only the first one raised, and a solver
   that caught it carried on in the new container.
+- A container that Kubernetes shows stopped, or waiting to start again, now counts as
+  restarted, so an operation cannot reach its replacement before the new restart count
+  is published (seconds later when the restart replaces a Kata VM).
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a

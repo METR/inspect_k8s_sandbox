@@ -85,9 +85,12 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        if self._restart_error is not None:
-            # Without the traceback of its last raise, which would grow with each.
-            raise self._restart_error.with_traceback(None)
+        if (error := self._restart_error) is not None:
+            # A copy: raising the one instance again would add each raise's frames
+            # to its traceback, and concurrent operations would share it.
+            again = type(error).__new__(type(error))
+            again.args, again.__dict__ = error.args, dict(vars(error))
+            raise again
         return await self._run_async(self._check_for_pod_restart_sync)
 
     def _check_for_pod_restart_sync(

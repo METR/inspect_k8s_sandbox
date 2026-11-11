@@ -95,6 +95,71 @@ def test_container_restarted_raises_typed():
     assert err.last_reason == "OOMKilled"
 
 
+@pytest.mark.parametrize(
+    ("state", "last_state", "reason"),
+    [
+        pytest.param(
+            {"terminated": {"reason": "Error", "exitCode": 255}},
+            {},
+            "Error",
+            id="stopped",
+        ),
+        pytest.param(
+            {"waiting": {"reason": "ContainerCreating"}},
+            {"terminated": {"reason": "OOMKilled"}},
+            "OOMKilled",
+            id="starting-again",
+        ),
+    ],
+)
+def test_container_not_running_raises_before_its_restart_count_moves(
+    state: dict, last_state: dict, reason: str
+):
+    # Between a Kata VM's death and its new containers starting, the pod shows the
+    # container stopped at the old restart count.
+    pod = _raw_pod_response(
+        {
+            "metadata": {"uid": "uid-1", "name": "agent-env-abc-default-0"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "default",
+                        "restartCount": 0,
+                        "state": state,
+                        "lastState": last_state,
+                    }
+                ]
+            },
+        }
+    )
+    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+        mock_client.return_value.read_namespaced_pod.return_value = pod
+        with pytest.raises(ContainerRestartedError) as excinfo:
+            check_for_pod_restart(_pod_info(uid="uid-1", restart_count=0))
+    assert excinfo.value.restart_count == 1
+    assert excinfo.value.last_reason == reason
+
+
+def test_running_container_does_not_raise():
+    pod = _raw_pod_response(
+        {
+            "metadata": {"uid": "uid-1", "name": "agent-env-abc-default-0"},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": "default",
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-11-11T00:00:00Z"}},
+                    }
+                ]
+            },
+        }
+    )
+    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+        mock_client.return_value.read_namespaced_pod.return_value = pod
+        check_for_pod_restart(_pod_info(uid="uid-1", restart_count=0))
+
+
 def _make_pod(restarted_container_behavior: str = "raise") -> Pod:
     return Pod(
         name="agent-env-abc-default-0",
@@ -152,7 +217,10 @@ def test_raise_mode_raises_again_without_reading_the_pod(
             for _ in range(2):
                 with pytest.raises(error_type) as again:
                     asyncio.run(pod.check_for_pod_restart())
-                assert again.value is first.value
+                # A fresh copy each time, so concurrent raises don't share one.
+                assert again.value is not first.value
+                assert vars(again.value) == vars(first.value)
+                assert str(again.value) == str(first.value)
                 depths.append(len(traceback.extract_tb(again.value.__traceback__)))
             assert mock_client.return_value.read_namespaced_pod.call_count == 1
     # Each raise starts a fresh traceback rather than adding to the last one's.
