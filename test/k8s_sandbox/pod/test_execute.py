@@ -471,8 +471,9 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 ) -> None:
     """As `runuser -u root` would, also in a container replaced by one not root.
 
-    The check starts no program: only the command is on the PATH here, and an `id`
-    that records being run (busybox runs its own `id` applet instead).
+    The check needs no program: only the command is on the PATH here, and an `id`
+    that records being run, so one that starts `id` from the PATH fails too (busybox
+    runs its own `id` applet instead).
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -503,13 +504,16 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
     shell: list[str], tmp_path: Path
 ) -> None:
-    """The uid check sets nothing the command sees, under any name.
+    """The uid check leaves the command the environment a plain exec gives it.
 
-    `-a` exports every variable the shell sets, so any the check left would show.
+    `-a` exports every variable the shell sets, so any the check left would show, and
+    the container's own variables arrive, under names a check might use too.
     """
     status_file = tmp_path / "status"
     status_file.write_text(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"))
-    kept = dict.fromkeys(["u", "k", "r", "e", "x"], "keep")
+    # Every name the check uses, so one that sets or unsets any of them shows.
+    names = re.findall(r"[A-Za-z_]\w*", execute_module._ROOT_CHECK)
+    kept = dict.fromkeys(names, "keep")
     env = {**os.environ, **kept}
 
     root = _run_script([*shell, "-a"], _root_script(["env"], status_file), env)
@@ -517,11 +521,11 @@ def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
 
     assert root.returncode == plain.returncode == 0
     # Names only: bash's EPOCHREALTIME and the like change from one run to the next.
-    names = [
+    seen = [
         {line.partition(b"=")[0] for line in r.stdout.splitlines()}
         for r in (root, plain)
     ]
-    assert names[0] == names[1]
+    assert seen[0] == seen[1]
     assert {f"{k}={v}".encode() for k, v in kept.items()} <= set(
         root.stdout.splitlines()
     )
