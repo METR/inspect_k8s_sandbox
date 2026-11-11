@@ -19,8 +19,8 @@
 - `exec(user=...)` runs fewer programs per call after its first call as each user,
   where the container switches to that user.
 - Add a per-service `podAnnotations` value: annotations for that service's Pod
-  alone, over the top-level `annotations` (which every resource gets), for a
-  runtime that reads per-pod settings from annotations.
+  alone, over the top-level `annotations`, for a runtime that reads per-pod
+  settings from annotations.
 
 ## 2026-10-09 0.14.0
 
