@@ -101,24 +101,41 @@ def test_container_restarted_raises_typed():
 
 
 @pytest.mark.parametrize(
-    ("state", "last_state", "reason"),
+    ("state", "last_state", "restart_count", "reason"),
     [
         pytest.param(
             {"terminated": {"reason": "Error", "exitCode": 255}},
             {},
+            0,
             "Error",
             id="stopped",
+        ),
+        # Its own reason, not its previous instance's.
+        pytest.param(
+            {"terminated": {"reason": "Error", "exitCode": 255}},
+            {"terminated": {"reason": "OOMKilled"}},
+            2,
+            "Error",
+            id="stopped-after-restarts",
         ),
         pytest.param(
             {"waiting": {"reason": "ContainerCreating"}},
             {"terminated": {"reason": "OOMKilled"}},
+            0,
             "OOMKilled",
             id="starting-again",
+        ),
+        pytest.param(
+            {"waiting": {"reason": "ContainerCreating"}},
+            {},
+            0,
+            "unknown",
+            id="no-history",
         ),
     ],
 )
 def test_container_not_running_raises_before_its_restart_count_moves(
-    state: dict, last_state: dict, reason: str
+    state: dict, last_state: dict, restart_count: int, reason: str
 ):
     # Between a Kata VM's death and its new containers starting, the pod shows the
     # container stopped at the old restart count.
@@ -129,7 +146,7 @@ def test_container_not_running_raises_before_its_restart_count_moves(
                 "containerStatuses": [
                     {
                         "name": "default",
-                        "restartCount": 0,
+                        "restartCount": restart_count,
                         "state": state,
                         "lastState": last_state,
                     }
@@ -140,8 +157,8 @@ def test_container_not_running_raises_before_its_restart_count_moves(
     with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
         mock_client.return_value.read_namespaced_pod.return_value = pod
         with pytest.raises(ContainerRestartedError) as excinfo:
-            check_for_pod_restart(_pod_info(uid="uid-1", restart_count=0))
-    assert excinfo.value.restart_count == 1
+            check_for_pod_restart(_pod_info(uid="uid-1", restart_count=restart_count))
+    assert excinfo.value.restart_count == restart_count + 1
     assert excinfo.value.last_reason == reason
 
 
@@ -340,7 +357,16 @@ def test_env_var_default_keeps_file_op_check(monkeypatch):
                 assert mock_client.return_value.read_namespaced_pod.call_count == 1
 
 
-def test_raise_mode_fails_every_later_operation_with_the_check_off(monkeypatch):
+@pytest.mark.parametrize(
+    ("uid", "restart_count", "error_type"),
+    [
+        pytest.param("uid-NEW", 0, PodReplacedError, id="replaced"),
+        pytest.param("uid-OLD", 1, ContainerRestartedError, id="restarted"),
+    ],
+)
+def test_raise_mode_fails_every_later_operation_with_the_check_off(
+    monkeypatch, uid: str, restart_count: int, error_type: type[Exception]
+):
     # A solver that caught the restart error must not carry on in the new container,
     # through a file operation either, when INSPECT_POD_RESTART_CHECK=false skips
     # their pod reads.
@@ -357,7 +383,7 @@ def test_raise_mode_fails_every_later_operation_with_the_check_off(monkeypatch):
         mock_get_instance.return_value = executor
         with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
             mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
-                uid="uid-OLD", container_name="default", restart_count=1
+                uid=uid, container_name="default", restart_count=restart_count
             )
             with (
                 patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
@@ -365,13 +391,13 @@ def test_raise_mode_fails_every_later_operation_with_the_check_off(monkeypatch):
                 patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
             ):
                 pod = _make_pod()
-                with pytest.raises(ContainerRestartedError):
+                with pytest.raises(error_type):
                     asyncio.run(pod.exec(["true"], None, None, {}, None, None))
-                with pytest.raises(ContainerRestartedError):
+                with pytest.raises(error_type):
                     asyncio.run(pod.exec(["true"], None, None, {}, None, None))
-                with pytest.raises(ContainerRestartedError):
+                with pytest.raises(error_type):
                     asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
-                with pytest.raises(ContainerRestartedError):
+                with pytest.raises(error_type):
                     asyncio.run(pod.write_file(b"", pathlib.Path("/x")))
                 assert mock_client.return_value.read_namespaced_pod.call_count == 1
                 exec_op.return_value.exec.assert_not_called()
@@ -488,3 +514,22 @@ def test_warn_mode_reports_a_stopped_container_when_its_count_moves():
         mock_client.return_value.read_namespaced_pod.return_value = stopped
         assert pod._check_for_pod_restart_sync() is None
         assert pod.info.initial_restart_count == 0
+
+
+def test_raise_mode_keeps_a_container_that_stopped_under_a_file_operation(monkeypatch):
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+        patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+    ):
+        read_op.return_value.read_file.side_effect = ContainerStoppedError("stopped")
+        pod = _make_pod()
+        with pytest.raises(ContainerRestartedError) as excinfo:
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        assert isinstance(excinfo.value.__cause__, ContainerStoppedError)
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+        mock_client.return_value.read_namespaced_pod.assert_not_called()
+        exec_op.return_value.exec.assert_not_called()

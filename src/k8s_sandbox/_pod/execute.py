@@ -309,6 +309,7 @@ class ExecuteOperation(PodOperation):
                     raise ContainerStoppedError(
                         "The exec's container stopped under the command",
                         pod=self._pod.name,
+                        returncode=returncode,
                     )
             else:
                 # Both markers are in but no exit status: a background process is

@@ -9,6 +9,7 @@ from tenacity import wait_none
 
 from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
     ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
@@ -284,6 +285,16 @@ class TestReadFileRetryPermanent:
         mock_read.side_effect = FileNotFoundError("no such file")
 
         with pytest.raises(FileNotFoundError):
+            await sandbox.read_file("/tmp/test.txt")
+
+        assert mock_read.call_count == 1
+
+    async def test_stopped_container_not_retried(self) -> None:
+        # A retry would read from the container that replaces it.
+        sandbox, mock_read = _make_sandbox_with_mock_read()
+        mock_read.side_effect = ContainerStoppedError("stopped")
+
+        with pytest.raises(K8sError):
             await sandbox.read_file("/tmp/test.txt")
 
         assert mock_read.call_count == 1

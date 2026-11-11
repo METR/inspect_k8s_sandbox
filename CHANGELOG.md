@@ -8,10 +8,11 @@
   it was detected. `read_file()` and `write_file()` do too when
   `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
   waiting to start again, counts as restarted.
-- `exec()` raises `ContainerStoppedError`, an `ExecResultUnknownError`, instead of
-  returning exit code 255 when the command's container stopped under it, as Kata reports
-  a command whose VM stopped. With `restarted_container_behavior="raise"` it raises
-  `ContainerRestartedError` instead.
+- An operation whose container stopped under it, which Kata reports with exit code 255
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`.
+  Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
+  `write_file()` were retried, reaching the container that replaced it. With
+  `restarted_container_behavior="raise"` it raises `ContainerRestartedError` instead.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a

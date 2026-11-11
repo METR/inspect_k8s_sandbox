@@ -191,24 +191,12 @@ class Pod:
             result = await self._run_async(
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
             )
-        except ExecResultUnknownError as e:
+        except ExecResultUnknownError:
             # A container restarted or replaced under the command explains the lost
             # result better.
             if warned_restart is not None:
                 raise warned_restart
             await self._diagnose_restart_after_failed_exec()
-            if (
-                isinstance(e, ContainerStoppedError)
-                and info.restarted_container_behavior == "raise"
-            ):
-                # Gone, though Kubernetes may not show it stopped yet.
-                error = self._restart_error = ContainerRestartedError(
-                    pod_name=info.name,
-                    container_name=info.default_container_name,
-                    restart_count=info.initial_restart_count + 1,
-                    last_reason="stopped under a command",
-                )
-                raise type(error)(**vars(error)) from e
             raise
         if not result.success:
             if warned_restart is not None:
@@ -267,12 +255,26 @@ class Pod:
         """Run a synchronous function asynchronously.
 
         Once a check in "raise" mode has detected a restart, raise it instead: before
-        running the function, and after, if it was detected meanwhile.
+        running the function, and after, if it was detected meanwhile. In "raise"
+        mode a container that stopped under the function counts as restarted.
         """
 
         def run() -> T:
             self._raise_restart()
-            result = callable()
+            try:
+                result = callable()
+            except ContainerStoppedError as e:
+                info = self._info
+                if info.restarted_container_behavior == "raise":
+                    # Gone, though Kubernetes may not show it stopped yet.
+                    error = self._restart_error = ContainerRestartedError(
+                        pod_name=info.name,
+                        container_name=info.default_container_name,
+                        restart_count=info.initial_restart_count + 1,
+                        last_reason="stopped under an operation",
+                    )
+                    raise type(error)(**vars(error)) from e
+                raise
             self._raise_restart()
             return result
 

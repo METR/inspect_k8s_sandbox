@@ -29,11 +29,11 @@ class ExecResultUnknownError(PodError, GetReturncodeError):
 
 
 class ContainerStoppedError(ExecResultUnknownError):
-    """An exec's container stopped under its command.
+    """An operation's container stopped under it.
 
-    The exec ended before the command did, with the exit status 255 that Kata gives a
-    command whose VM stopped. With ``restarted_container_behavior="raise"`` the exec
-    raises a ``ContainerRestartedError`` instead, from this.
+    The operation ended with the exit status 255 that Kata gives a command whose VM
+    stopped, before its command did. With ``restarted_container_behavior="raise"`` the
+    operation raises a ``ContainerRestartedError`` instead, from this.
     """
 
 

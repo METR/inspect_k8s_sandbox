@@ -5,7 +5,7 @@ from typing import Generator
 
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 
-from k8s_sandbox._pod.error import PodError
+from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import (
     PodOperation,
@@ -54,6 +54,13 @@ class WriteFileOperation(PodOperation):
         # in memory anyway so there is no value in streaming it.
         ws_client.run_forever()
         returncode = get_returncode(ws_client)
+        # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The container stopped while writing the file.",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         if returncode != 0:
             stderr = ws_client.read_stderr()
             raise_for_known_read_write_errors(stderr)

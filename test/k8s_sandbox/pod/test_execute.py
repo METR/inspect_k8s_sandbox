@@ -279,11 +279,21 @@ class TestCompletion:
         with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
             _handle(ws)
 
-    def test_255_without_the_markers_is_not_the_commands_exit_code(self) -> None:
+    @pytest.mark.parametrize(
+        "frames",
+        [
+            pytest.param([(STDOUT, b"the start of the output")], id="no-marker"),
+            pytest.param([(STDOUT, _marker(255))], id="stdout-marker-only"),
+            pytest.param([(STDERR, _marker(255))], id="stderr-marker-only"),
+        ],
+    )
+    def test_255_without_both_markers_is_not_the_commands_exit_code(
+        self, frames: list[tuple[int, bytes]]
+    ) -> None:
         """Kata's status for a command whose VM stopped under it."""
-        ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(255)])
+        ws = _FakeWSClient([*frames, _status(255)])
 
-        with pytest.raises(ContainerStoppedError):
+        with pytest.raises(ContainerStoppedError, match='"returncode": "255"'):
             _handle(ws)
 
     def test_the_commands_own_255_is_returned(self, short_grace: None) -> None:

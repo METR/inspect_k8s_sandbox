@@ -7,7 +7,7 @@ from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import PodError
+from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import (
     PodOperation,
@@ -53,6 +53,13 @@ class ReadFileOperation(PodOperation):
             if ws_client.peek_stderr():
                 stderr.append(ws_client.read_stderr())
         returncode = get_returncode(ws_client)
+        # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The container stopped while reading the file.",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         if returncode != 0:
             stderr_str = str(stderr)
             raise_for_known_read_write_errors(stderr_str)
