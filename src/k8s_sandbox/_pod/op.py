@@ -1,15 +1,28 @@
+import hashlib
 import json
 import logging
+import shlex
 import threading
 from abc import ABC
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Generator, Literal
+from typing import Callable, Generator, Literal
 
 from kubernetes.stream import stream  # type: ignore
 from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
+from websocket import WebSocketException
 
 from k8s_sandbox._kubernetes_api import k8s_client
-from k8s_sandbox._pod.error import ContainerRestartedError, PodReplacedError
+from k8s_sandbox._pod.error import (
+    ContainerRestartedError,
+    ContainerStoppedError,
+    PodError,
+    PodReplacedError,
+)
+from k8s_sandbox._pod.get_returncode import (
+    get_returncode,
+    raise_if_stopped_before_lost,
+)
 from k8s_sandbox._pod.snapshot import read_pod
 
 # The duration to wait for an initial response from the k8s API server.
@@ -31,6 +44,14 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
 STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
+# AWS Nitro Sandboxes (EKS's `isolated-sandbox` runtime) can reorder an exec's stdin
+# that arrives faster than the runtime forwards it, silently (staging, 2026-11: 0 of
+# 2,500 payloads of 64 KiB corrupted, 4 of 500 at 128 KiB, every one at 16 MiB). So a
+# bigger payload goes one piece of at most this size per exec, each piece checked
+# against the sha256 the container computes (PodOperation._stage).
+STDIN_PIECE_SIZE = 64 * 1024
+# How many times a piece is sent before its corruption is an error.
+_PIECE_ATTEMPTS = 3
 # The helpers operations run besides the caller's command (`id` for exec(user=...),
 # `base64` and `timeout` for exec(), `head` and `mkdir` for read_file() and
 # write_file()) run as the container's user, so they are looked up only in these system
@@ -82,6 +103,80 @@ class PodOperation(ABC):
         """
         for i in range(0, len(data), STDIN_CHUNK_SIZE):
             ws_client.write_stdin(data[i : i + STDIN_CHUNK_SIZE])
+
+    def _stage(self, data: bytes, as_user: Callable[[list[str]], list[str]]) -> str:
+        """Write `data` to a file named `data` in a new temporary directory in a pod.
+
+        Returns the directory. Each exec sends at most STDIN_PIECE_SIZE bytes of stdin,
+        and a piece whose sha256 comes back different is sent again. `as_user` wraps
+        each command so that it runs as the caller's user.
+        """
+        directory: str | None = None
+        for start in range(0, len(data), STDIN_PIECE_SIZE):
+            piece = data[start : start + STDIN_PIECE_SIZE]
+            name = f"{start // STDIN_PIECE_SIZE:08d}"
+            for _ in range(_PIECE_ATTEMPTS):
+                into = "$(mktemp -d)" if directory is None else shlex.quote(directory)
+                script = (
+                    f'd={into} && head -c {len(piece)} > "$d/{name}" && echo "$d" '
+                    f'&& sha256sum < "$d/{name}"'
+                )
+                directory, digest = self._run_piece(as_user, script, piece)
+                if digest == hashlib.sha256(piece).hexdigest():
+                    break
+            else:
+                raise PodError(
+                    f"A stdin piece arrived corrupted {_PIECE_ATTEMPTS} times.",
+                    pod=self._pod.name,
+                    piece=name,
+                )
+        assert directory is not None
+        # The pieces' zero-padded names keep the glob in order.
+        script = (
+            f'd={shlex.quote(directory)} && cat "$d"/0* > "$d/data" && rm -f "$d"/0* '
+            '&& echo "$d" && sha256sum < "$d/data"'
+        )
+        _, digest = self._run_piece(as_user, script, b"")
+        if digest != hashlib.sha256(data).hexdigest():
+            raise PodError(
+                "A staged stdin payload was joined corrupted.", pod=self._pod.name
+            )
+        return directory
+
+    def _run_piece(
+        self, as_user: Callable[[list[str]], list[str]], script: str, piece: bytes
+    ) -> tuple[str, str]:
+        """Run `script` on `piece`; return the directory and the hash it prints."""
+        command = as_user(["/bin/sh", "-c", f"PATH={SYSTEM_PATH}; {script}"])
+        exec_command = contextmanager(self.create_websocket_client_for_exec)
+        with exec_command(
+            command=command, stderr=True, stdin=True, stdout=True, binary=False
+        ) as ws_client:
+            if piece:
+                ws_client.write_stdin(piece)
+            try:
+                ws_client.run_forever()
+            except (OSError, WebSocketException) as e:
+                raise_if_stopped_before_lost(ws_client, e, self._pod.name)
+                raise
+            returncode = get_returncode(ws_client)
+            # None of the commands exits 255: Kata gives it when the VM stopped.
+            if returncode == 255:
+                raise ContainerStoppedError(
+                    "The container stopped while staging stdin.",
+                    pod=self._pod.name,
+                    returncode=returncode,
+                )
+            if returncode != 0:
+                stderr = ws_client.read_stderr()
+                raise_for_known_read_write_errors(stderr)
+                raise PodError(
+                    "Unrecognised error staging stdin.",
+                    returncode=returncode,
+                    stderr=stderr,
+                )
+            directory, digest = (ws_client.read_stdout().split() + ["", ""])[:2]
+        return directory, digest
 
     def create_websocket_client_for_exec(
         self, send_keepalive: bool = True, **kwargs
