@@ -1560,15 +1560,69 @@ class TestExecStdio:
     ) -> None:
         """Its command may run in the replacement."""
         client, server = tls_sockets
+        restart = RuntimeError("restarted")
         found: list[Exception] = []
         stream = _stdio(client, restarted=lambda: found[0] if found else None)
-        server.sendall(_frame(STDOUT, b"ready\n") + _frame(STDOUT, b"a reply\n"))
+        # One frame, so that the reply is read along with the ready line.
+        server.sendall(_frame(STDOUT, b"ready\na reply\n"))
 
         with anyio.fail_after(30):
             assert await stream.receive(6) == b"ready\n"
-            found.append(RuntimeError("restarted"))
-            with pytest.raises(anyio.BrokenResourceError):
+            found.append(restart)
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
                 await stream.receive()
+
+        assert dropped.value.__cause__ is restart
+
+    async def test_a_restart_found_while_a_receive_waits_drops_the_reply(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Where Inspect's reader usually is, while a request waits for its reply."""
+        client, server = tls_sockets
+        restart = RuntimeError("restarted")
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+
+        with anyio.fail_after(30):
+            receiving = asyncio.create_task(stream.receive())
+            for _ in range(10):  # Until it waits on the socket.
+                await asyncio.sleep(0)
+            assert not receiving.done()
+            found.append(restart)
+            server.sendall(_frame(STDOUT, b"a reply\n"))
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
+                await receiving
+
+        assert dropped.value.__cause__ is restart
+
+    async def test_a_restart_found_before_a_receive_raises_with_nothing_to_read(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        stream = _stdio(client, restarted=lambda: RuntimeError("restarted"))
+
+        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+            await stream.receive()
+
+    async def test_a_send_that_finds_a_restart_ends_a_waiting_receive_too(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        client, _ = tls_sockets
+        restart = RuntimeError("restarted")
+        found: list[Exception] = []
+        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+
+        with anyio.fail_after(30):
+            receiving = asyncio.create_task(stream.receive())
+            for _ in range(10):  # Until it waits on the socket.
+                await asyncio.sleep(0)
+            found.append(restart)
+            with pytest.raises(anyio.BrokenResourceError):
+                await stream.send(b"a request\n")
+            with pytest.raises(anyio.BrokenResourceError) as dropped:
+                await receiving
+
+        assert dropped.value.__cause__ is restart
 
     async def test_a_restart_found_since_it_opened_fails_a_send(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

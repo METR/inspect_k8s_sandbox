@@ -571,6 +571,8 @@ class PodStdio(ByteStream):
                 self._end(e)
             else:
                 await self._turn()
+        # Also for a reply that came while this waited.
+        self._drop_if_restarted()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
