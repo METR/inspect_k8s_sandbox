@@ -96,19 +96,20 @@ class PodOpExecutor:
 
         This method is async-safe but not thread-safe.
         """
-        async with concurrency("pod-op", self._max_workers):
-            # The executor does not propagate the caller's context into the
-            # worker thread, so pass it directly to preserve Inspect
-            # sandbox config overrides
-            context = contextvars.copy_context()
-            future = self._executor.submit(context.run, callable)
-            try:
+        future: Future[T] | None = None
+        try:
+            async with concurrency("pod-op", self._max_workers):
+                # The executor does not propagate the caller's context into the
+                # worker thread, so pass it directly to preserve Inspect
+                # sandbox config overrides
+                context = contextvars.copy_context()
+                future = self._executor.submit(context.run, callable)
                 return await asyncio.wrap_future(future)
-            except BaseException:
-                if discard is not None:
-                    # Runs once: now if the result is already in, else when it is.
-                    future.add_done_callback(lambda done: _discard(done, discard))
-                raise
+        except BaseException:
+            if discard is not None and future is not None:
+                # Runs once: now if the result is already in, else when it is.
+                future.add_done_callback(lambda done: _discard(done, discard))
+            raise
 
 
 def _discard(future: Future[T], discard: Callable[[T], object]) -> None:

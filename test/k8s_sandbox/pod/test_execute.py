@@ -1401,12 +1401,43 @@ class TestExecStdio:
         """Its reader waits for room in a full buffer, which closing must end."""
         client, server = tls_sockets
         stream = _stdio(client)
-        server.sendall(b"".join(_frame(STDOUT, b"x") for _ in range(32)))
-        await _wait_for(lambda: stream._stdout.statistics().current_buffer_used == 16)
+        piece = _frame(STDOUT, b"x" * execute_module._STDIO_PIECE_BYTES)
 
+        def send() -> None:
+            with contextlib.suppress(OSError):  # The client stopped reading.
+                for _ in range(32):
+                    server.sendall(piece)
+
+        sender = threading.Thread(target=send)
+        sender.start()
+        try:
+            await _wait_for(
+                lambda: stream._stdout.statistics().current_buffer_used == 16
+            )
+
+            await stream.aclose()
+
+            await _wait_for(lambda: client.fileno() == -1)
+        finally:
+            with contextlib.suppress(OSError):  # Fails a send still waiting.
+                server.shutdown(socket.SHUT_RDWR)
+            sender.join()
+
+    async def test_frames_already_waiting_reach_the_stream_as_one_piece(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Each piece waits for the event loop, which a busy runner keeps slow."""
+        client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
+        server.sendall(b"".join(_frame(STDOUT, b"x" * 4096) for _ in range(32)))
+        stream = _stdio(client)
+
+        with anyio.fail_after(30):
+            first = await stream.receive(1024**2)
         await stream.aclose()
 
-        await _wait_for(lambda: client.fileno() == -1)
+        assert len(first) == 32 * 4096
 
     async def test_an_open_whose_caller_stopped_waiting_is_closed(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

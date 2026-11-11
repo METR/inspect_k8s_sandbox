@@ -41,6 +41,9 @@ EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 _CLOSE_GROUP = "}\n"
 # Kept from an exec_stdio command's stderr, to explain one that failed to start.
 _STDERR_TAIL_BYTES = 4096
+# The most stdout an exec_stdio stream's reader gathers from frames already waiting
+# before it hands them on: each hand-off waits for the event loop.
+_STDIO_PIECE_BYTES = 256 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +480,7 @@ class PodStdio(ByteStream):
             while self._ws.is_open():
                 try:
                     _update(self._ws, None)
+                    self._read_waiting()
                 finally:
                     # Also what an update() that then failed read: from kubernetes 37
                     # it reads every frame waiting.
@@ -497,6 +501,19 @@ class PodStdio(ByteStream):
             if stderr:
                 log_trace("An exec_stdio command wrote to stderr.", stderr=stderr)
 
+    def _read_waiting(self) -> None:
+        """Read on while stdout's frames are already waiting, up to a piece.
+
+        So that a busy event loop paces pieces rather than frames.
+        """
+        channels = self._ws._channels
+        read = len(channels.get(STDOUT_CHANNEL, b""))
+        while 0 < read < _STDIO_PIECE_BYTES and self._ws.is_open():
+            _update(self._ws, 0)
+            read, before = len(channels.get(STDOUT_CHANNEL, b"")), read
+            if read == before:
+                return
+
     async def _put(self, stdout: bytes) -> None:
         await self._stdout_in.send(stdout)
         self._arrived.set()
@@ -514,7 +531,7 @@ class PodStdio(ByteStream):
                 await self._arrived.wait()
             except anyio.EndOfStream:
                 if self._error is not None:
-                    raise anyio.BrokenResourceError from self._error
+                    raise anyio.BrokenResourceError(repr(self._error)) from self._error
                 raise
         data, self._unread = self._unread[:max_bytes], self._unread[max_bytes:]
         return data
@@ -529,7 +546,7 @@ class PodStdio(ByteStream):
                 limiter=self._limiter,
             )
         except (OSError, websocket.WebSocketException) as e:
-            raise anyio.BrokenResourceError from e
+            raise anyio.BrokenResourceError(repr(e)) from e
         except BaseException:
             # The write goes on in its thread, and a later send() would interleave
             # with it: the stream can carry nothing more.
