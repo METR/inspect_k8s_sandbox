@@ -877,6 +877,7 @@ name = "inspect-k8s-sandbox"
 version = "0.14.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "inspect-ai" },
     { name = "jsonschema" },
     { name = "kubernetes" },
@@ -900,6 +901,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.10.0" },
     { name = "inspect-ai", specifier = ">=0.3.236" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "kubernetes", specifier = ">=35.0.0" },
