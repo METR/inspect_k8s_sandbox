@@ -45,6 +45,13 @@ _TLS_RETRY_SECONDS = 0.01
 # coming, before it lets other tasks run: a few per reply, so a large one rarely waits
 # for a busy event loop.
 _STEPS_PER_TURN = 32
+# The user switch runs `id` and `runuser` as the container's user, before switching,
+# so neither is found through the image's PATH. `id` is looked up in the system
+# directories only (busybox images have just /bin/id, Alpine and Debian 10 just
+# /usr/bin/id); `runuser` is at this path wherever util-linux provides it (Debian,
+# Ubuntu, RHEL and its rebuilds, Alpine).
+_ID_PATH = "/usr/bin:/bin"
+_RUNUSER = "/sbin/runuser"
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +82,13 @@ def _shell_command(
         return list(command)
     if not user or switch:
         # An empty user matches nothing; leave runuser to reject it as it did before.
-        return ["runuser", "-u", user, "--", *command]
+        return [_RUNUSER, "-u", user, "--", *command]
     run = shlex.join(command)
     return [
         "/bin/sh",
         "-c",
         f"if {_runs_as(user)}; then exec {run}; fi; "
-        f"exec runuser -u {shlex.quote(user)} -- {run}",
+        f"exec {_RUNUSER} -u {shlex.quote(user)} -- {run}",
     ]
 
 
@@ -100,7 +107,7 @@ def _runs_as(user: str) -> str:
     that also falls through to `runuser`.
     """
     current = "id -u" if user.isdigit() else "id -un"
-    return f'[ "$({current} 2>/dev/null)" = {shlex.quote(user)} ]'
+    return f'[ "$(PATH={_ID_PATH}; {current} 2>/dev/null)" = {shlex.quote(user)} ]'
 
 
 class ExecuteOperation(PodOperation):
@@ -172,7 +179,7 @@ class ExecuteOperation(PodOperation):
         quoted = shlex.quote(user)
         probe = (
             f"if {_runs_as(user)}; then exit 0; fi; "
-            f"if runuser -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
+            f"if {_RUNUSER} -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
         )
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
             deadline = time.monotonic() + API_TIMEOUT
@@ -405,7 +412,11 @@ class ExecuteOperation(PodOperation):
                 stderr,
             )
             return
-        if re.search(r"runuser: not found", stderr, re.IGNORECASE):
+        # dash and busybox say "not found" for a missing /sbin/runuser, bash "No such
+        # file or directory".
+        if re.search(
+            r"runuser: (?:not found|no such file or directory)", stderr, re.IGNORECASE
+        ):
             logger.warning(
                 "exec(user=%r) failed: switching users needs the runuser binary, "
                 "which is not installed in this container. Docs: %s\n%s",

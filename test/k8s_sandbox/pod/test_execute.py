@@ -1074,13 +1074,13 @@ class TestShellCommand:
         command = _shell_command("agent")
 
         assert command[:2] == ["/bin/sh", "-c"]
-        assert "exec runuser -u agent -- /bin/sh" in command[2]
+        assert "exec /sbin/runuser -u agent -- /bin/sh" in command[2]
 
     def test_user_skips_runuser_when_already_that_user(self) -> None:
         """A no-op switch still needs CAP_SETGID, so avoid runuser when we can."""
         script = _shell_command("agent")[2]
 
-        assert '[ "$(id -un 2>/dev/null)" = agent ]' in script
+        assert '[ "$(PATH=/usr/bin:/bin; id -un 2>/dev/null)" = agent ]' in script
         assert "then exec /bin/sh; fi" in script
 
     def test_a_name_is_compared_against_the_name_and_a_uid_against_the_uid(
@@ -1091,13 +1091,13 @@ class TestShellCommand:
         by_uid = _shell_command("1000")[2]
 
         assert "id -un" in by_name and "id -u " not in by_name
-        assert '[ "$(id -u 2>/dev/null)" = 1000 ]' in by_uid
+        assert '[ "$(PATH=/usr/bin:/bin; id -u 2>/dev/null)" = 1000 ]' in by_uid
         assert "id -un" not in by_uid
 
     def test_runuser_is_started_directly_once_a_probe_found_it_works(self) -> None:
         """No check, and so two fewer process starts."""
         assert _shell_command("agent", switch=True) == [
-            "runuser",
+            "/sbin/runuser",
             "-u",
             "agent",
             "--",
@@ -1114,7 +1114,32 @@ class TestShellCommand:
 
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
-        assert _shell_command("") == ["runuser", "-u", "", "--", "/bin/sh"]
+        assert _shell_command("") == ["/sbin/runuser", "-u", "", "--", "/bin/sh"]
+
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    @pytest.mark.parametrize("shell", _SHELLS)
+    def test_id_and_runuser_are_not_found_through_the_path(
+        self, shell: list[str], tmp_path: Path
+    ) -> None:
+        """They run as the container's user, before the switch."""
+        ran = tmp_path / "ran"
+        for name in ("id", "runuser"):
+            stub = tmp_path / name
+            stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+            stub.chmod(0o755)
+        env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+        user = "someone-else"
+        for script in (_shell_command(user)[2], _probe_script(user)):
+            subprocess.run(
+                [*shell, "-c", script],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=10,
+            )
+
+        assert not ran.exists()
 
     @pytest.mark.parametrize("user", ["a b", "a;rm -rf /", "$(whoami)", "'"])
     def test_user_is_quoted(self, user: str) -> None:
@@ -1181,15 +1206,14 @@ class TestProbeSwitch:
         expected: int,
         tmp_path: Path,
     ) -> None:
+        script = _probe_script(user)
         if runuser is not None:
             stub = tmp_path / "runuser"
             stub.write_text(f"#!/bin/sh\n{runuser}\n")
             stub.chmod(0o755)
-        path = f"{tmp_path}:{os.environ['PATH']}"
+            script = script.replace("/sbin/runuser", str(stub))
 
-        result = subprocess.run(
-            [*shell, "-c", _probe_script(user)], env={**os.environ, "PATH": path}
-        )
+        result = subprocess.run([*shell, "-c", script])
 
         assert result.returncode == expected
 
@@ -1304,6 +1328,23 @@ class TestRunuserErrorMessages:
     @pytest.mark.parametrize(
         "stderr",
         [
+            "/bin/sh: 1: exec: /sbin/runuser: not found",  # dash
+            "/bin/sh: exec: line 0: /sbin/runuser: not found",  # busybox
+            "/bin/sh: line 1: /sbin/runuser: No such file or directory",  # bash
+        ],
+    )
+    def test_a_missing_runuser_is_named(
+        self, stderr: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        executor = ExecuteOperation(MagicMock())
+
+        executor._check_for_runuser_error(stderr, "agent")
+
+        assert "runuser binary" in caplog.text
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
             "ls: /nope: No such file",
             "newgrp: cannot set groups: Operation not permitted",
             "su: cannot set groups: Operation not permitted",
@@ -1377,9 +1418,9 @@ class TestExecStdio:
         assert stream.call_args.kwargs["command"] == [
             "/bin/sh",
             "-c",
-            'if [ "$(id -un 2>/dev/null)" = agent ]; '
+            'if [ "$(PATH=/usr/bin:/bin; id -un 2>/dev/null)" = agent ]; '
             "then exec printf '%s\n' 'a b'; fi; "
-            "exec runuser -u agent -- printf '%s\n' 'a b'",
+            "exec /sbin/runuser -u agent -- printf '%s\n' 'a b'",
         ]
         assert first.data == b"\x00a request\n"
 

@@ -181,7 +181,7 @@ result in undesirable coupling between your tools and sandbox.
 
 That said, if you need to run commands as different users, the `user` parameter to
 `exec()` is supported. To switch to a *different* user, you must run the container as
-root, ensure that `runuser` is installed in the container, and keep `CAP_SETGID` — the
+root, ensure that `runuser` is installed at `/sbin/runuser`, and keep `CAP_SETGID` — the
 switch goes through `runuser`, which calls `setgroups(2)`. A container with
 `capabilities: {drop: [ALL]}` therefore cannot switch users.
 

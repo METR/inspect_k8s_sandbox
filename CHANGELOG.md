@@ -24,6 +24,8 @@
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
   taking one each. Needs anyio 4.14 or later.
+- `exec(user=...)` runs `runuser` as `/sbin/runuser`, and `id` from `/usr/bin` or
+  `/bin`, rather than finding either through the image's `PATH`.
 
 ## 2026-10-09 0.14.0
 
