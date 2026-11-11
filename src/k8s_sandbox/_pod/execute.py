@@ -515,11 +515,12 @@ class PodStdio(ByteStream):
             if ERROR_CHANNEL not in self._ws._channels:
                 self._error = e
         finally:
+            closed = self._closed  # Before the end is seen: its reader closes on it.
             _shutdown(self._ws)
             self._ended = True
             self._wake()
             stack.close()
-            if not (wrote or self._closed):
+            if not (wrote or closed):
                 # It failed to start (a missing user, runuser or executable): the
                 # caller only sees the stream end.
                 log_warn(

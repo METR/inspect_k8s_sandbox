@@ -1442,9 +1442,13 @@ class TestExecStdio:
         tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Its caller only sees the stream end."""
+        """Its caller sees only the stream end, and closes the stream on it."""
         client, server = tls_sockets
-        stream = _stdio(client)
+        host_closed = threading.Event()
+        stack = contextlib.ExitStack()
+        # The reader finishes closing only once the host has closed the stream.
+        stack.callback(host_closed.wait, 30)
+        stream = PodStdio(stack, _SocketWSClient(client))
         server.sendall(
             _frame(STDERR, b"sh: 1: exec: inspect-sandbox-tools: not found\n")
             + _frame(*_status(127))
@@ -1453,9 +1457,32 @@ class TestExecStdio:
 
         with anyio.fail_after(30), pytest.raises(anyio.EndOfStream):
             await stream.receive()
+        await stream.aclose()
+        host_closed.set()
         await _wait_for(lambda: "inspect-sandbox-tools: not found" in caplog.text)
 
         assert caplog.records[-1].levelname == "WARNING"
+
+    async def test_the_reader_resumes_once_there_is_room(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Reading a piece from a full buffer lets the reader go on."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        pieces = execute_module._STDIO_PIECES
+        lines = [b"%d\n" % i for i in range(pieces + 2)]
+        for count, line in enumerate(lines[:pieces], start=1):
+            server.sendall(_frame(STDOUT, line))  # A piece of its own.
+            await _wait_for(lambda: len(stream._pieces) == count)
+        server.sendall(b"".join(_frame(STDOUT, line) for line in lines[pieces:]))
+
+        received = b""
+        with anyio.fail_after(30):
+            while received.count(b"\n") < len(lines):
+                received += await stream.receive()
+        await stream.aclose()
+
+        assert received == b"".join(lines)
 
     async def test_a_stream_whose_reader_cannot_start_closes_its_socket(
         self,
@@ -1489,7 +1516,6 @@ class TestExecStdio:
         """`exec` alone, or with only its options, leaves the shell reading on."""
         with (
             patch.object(op_module, "k8s_client", autospec=True),
-            patch.object(op_module, "stream", autospec=True),
             pytest.raises(ValueError),
         ):
             ExecuteOperation(MagicMock()).open_stdio(cmd, None)
@@ -1607,7 +1633,7 @@ class TestExecStdio:
     async def test_frames_already_waiting_reach_the_stream_as_one_piece(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """Each piece waits for the event loop, which a busy runner keeps slow."""
+        """So that the 16-piece buffer holds more than 16 frames, and wakes once."""
         client, server = tls_sockets
         client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
