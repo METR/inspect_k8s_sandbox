@@ -326,9 +326,12 @@ class Pod:
                 # A restart found while it ran explains its failure better.
                 self._raise_restart()
                 raise
-            if self._restart_error is not None and discard is not None:
-                discard(result)
-            self._raise_restart()
+            try:
+                self._raise_restart()
+            except (PodReplacedError, ContainerRestartedError):
+                if discard is not None:
+                    discard(result)
+                raise
             return result
 
         # Not queued behind other operations if it was found already, but suspended
@@ -346,10 +349,13 @@ class Pod:
             # Also if it was found before this resumed.
             self._raise_restart()
             raise
-        if self._restart_error is not None and discard is not None:
-            # Not on the event loop: closing a connection can wait on the server.
-            threading.Thread(target=discard, args=(result,), daemon=True).start()
-        self._raise_restart()
+        try:
+            self._raise_restart()
+        except (PodReplacedError, ContainerRestartedError):
+            if discard is not None:
+                # Not on the event loop: closing a connection can wait on the server.
+                threading.Thread(target=discard, args=(result,), daemon=True).start()
+            raise
         return result
 
     def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:

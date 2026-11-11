@@ -1001,3 +1001,29 @@ def test_exec_stdio_closes_a_stream_off_the_event_loop_if_a_restart_came_with_it
 
     assert closed.wait(30)
     assert closed_on[0] is not threading.main_thread()
+
+
+@pytest.mark.parametrize(
+    "found_on", [2, 3], ids=["in-the-worker", "after-the-worker-returned"]
+)
+def test_a_result_rejected_at_its_last_check_is_discarded(found_on: int):
+    pod = _make_pod()
+    discarded = threading.Event()
+    checks = 0
+    raise_restart = pod._raise_restart
+
+    def checking():
+        nonlocal checks
+        checks += 1
+        if checks == found_on:
+            # Recorded by another operation right before this check.
+            pod._restart_error = _restart()
+        raise_restart()
+
+    with _inline_executor(), patch.object(pod, "_raise_restart", checking):
+        with pytest.raises(ContainerRestartedError):
+            asyncio.run(
+                pod._run_async(lambda: "a stream", discard=lambda _: discarded.set())
+            )
+
+    assert discarded.wait(10)
