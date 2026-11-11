@@ -18,10 +18,10 @@
   shell builtin in dash, bash and busybox).
 - `exec(user=...)` runs fewer programs per call after its first call as each user,
   where the container switches to that user.
-- `exec(user="root")` runs fewer programs on every call, and no longer needs `id` or
-  `runuser` in the image. In a container that is not root, `exec(user="0")` now
-  fails as `exec(user="root")` does, with a warning, rather than raising a
-  `RuntimeError` that says the user does not exist.
+- `exec(user="root")` no longer needs `id` or `runuser` in the image, and is faster
+  where starting a program is slow. In a container that is not root,
+  `exec(user="0")` now fails as `exec(user="root")` does, with a warning, rather
+  than raising a `RuntimeError` that says the user does not exist.
 
 ## 2026-10-09 0.14.0
 

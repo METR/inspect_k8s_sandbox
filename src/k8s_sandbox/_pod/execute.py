@@ -36,16 +36,16 @@ _CLOSE_GROUP = "}\n"
 # own shell, behind _ROOT_CHECK: one program start where `_shell_command`'s check and
 # second shell cost three.
 ROOT_USERS = ("root", "0")
-# The first lines of a root exec's script, inside its { } group. Unless the shell is
-# uid 0 they end the exec before the command runs, with the message and status
+# The first line of a root exec's script, inside its { } group. Unless the shell is
+# uid 0 it ends the exec before the command runs, with the message and status
 # `runuser -u root` gives in a container that is not root, so the refusal is handled
 # as one. Shell builtins only: the effective uid comes from /proc, not from `id`. The
-# prefix keeps its variables from replacing any the container sets for the command.
+# subshell keeps its variables from the command; a fork costs a fraction of a
+# millisecond even where a program start costs 20 ms.
 _ROOT_CHECK = (
-    "_k8s_u=; while read -r _k8s_k _k8s_r _k8s_e _k8s_x; do"
-    ' [ "$_k8s_k" = Uid: ] && _k8s_u=$_k8s_e && break; done </proc/self/status\n'
-    '[ "$_k8s_u" = 0 ] || { echo "runuser: may not be used by non-root users" >&2;'
-    " exit 1; }\n"
+    '(u=; while read -r k r e x; do [ "$k" = Uid: ] && u=$e && break; done'
+    ' </proc/self/status; [ "$u" = 0 ]) ||'
+    ' { echo "runuser: may not be used by non-root users" >&2; exit 1; }\n'
 )
 
 logger = logging.getLogger(__name__)

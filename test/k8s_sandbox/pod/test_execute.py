@@ -446,8 +446,8 @@ def _root_script(cmd: list[str], status: Path) -> str:
     script = ExecuteOperation(MagicMock())._build_shell_script(
         cmd, None, None, {}, None, MARKER, root=True
     )
-    assert " </proc/self/status\n" in script
-    return script.replace(" </proc/self/status\n", f" <{shlex.quote(str(status))}\n")
+    assert script.count("</proc/self/status") == 1
+    return script.replace("</proc/self/status", f"<{shlex.quote(str(status))}")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
@@ -471,7 +471,7 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 ) -> None:
     """As `runuser -u root` would, also in a container replaced by one not root.
 
-    The check starts no program: only the command is on the PATH here.
+    The check needs no program: only the command is on the PATH here.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -482,11 +482,13 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
     ran = tmp_path / "ran"
     script = _root_script(["touch", str(ran)], status_file)
 
-    result = _run_script(shell, script, {"PATH": str(bin_dir)})
+    # A container's own `u=0` is not the check's answer.
+    result = _run_script(shell, script, {"PATH": str(bin_dir), "u": "0"})
 
     assert ran.exists() is runs
     if runs:
         assert result.returncode == 0
+        assert (result.stdout, result.stderr) == (_marker(0), _marker(0))
     else:
         assert result.returncode == 1
         assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
