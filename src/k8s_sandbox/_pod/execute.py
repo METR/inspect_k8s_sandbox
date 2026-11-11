@@ -485,7 +485,7 @@ class PodStdio(ByteStream):
         self._error: Exception | None = None
         self._closed = False
         self._unyielded = 0  # Steps since the stream last let other tasks run.
-        self._send_lock = anyio.Lock()
+        self._send_lock = anyio.Lock(fast_acquire=True)  # Free: no turn of the loop.
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:

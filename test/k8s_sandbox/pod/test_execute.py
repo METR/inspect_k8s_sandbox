@@ -1560,11 +1560,12 @@ class TestExecStdio:
     async def test_a_flood_of_stdout_does_not_hold_the_event_loop(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """Each receive() lets other tasks run, which can cancel the reads."""
+        """Reads of it let other tasks run, which can cancel them: losing nothing."""
         client, server = tls_sockets
         client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
-        server.sendall(b"".join(_frame(STDOUT, b"x") for _ in range(1000)))
+        flood = b"".join(_frame(STDOUT, b"x") for _ in range(1000))
+        server.sendall(flood + _frame(*_status(0)))
         stream = _stdio(client)
         received = b""
 
@@ -1580,17 +1581,67 @@ class TestExecStdio:
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(read_all)
                 tasks.start_soon(cancel, tasks.cancel_scope)
+            cancelled_at = len(received)
+            rest = b"".join([piece async for piece in _receiving(stream, 65536)])
+
+        assert cancelled_at < 1000  # Cancelled mid-flood.
+        assert received + rest == b"x" * 1000
+
+    async def test_a_large_reply_costs_a_busy_event_loop_few_turns(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """A turn for every receive() made 48 MiB take minutes under load on staging."""
+        client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
+        server.sendall(b"".join(_frame(STDOUT, b"x") for _ in range(640)))
+        stream = _stdio(client)
+        turns = 0
+
+        async def other_task() -> None:
+            nonlocal turns
+            while True:
+                turns += 1
+                await anyio.lowlevel.checkpoint()
+
+        received = b""
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                while len(received) < 640:
+                    received += await stream.receive()
+                tasks.cancel_scope.cancel()
         await stream.aclose()
 
-        assert len(received) < 1000  # Cancelled mid-flood.
+        assert turns < 160
+
+    async def test_a_send_with_room_takes_no_turn_of_the_event_loop(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Each turn of a busy loop is a burst of other work: a request waits for it."""
+        stream = _stdio(tls_sockets[0])
+        turns = 0
+
+        async def other_task() -> None:
+            nonlocal turns
+            turns += 1
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                await stream.send(b"a request\n")
+                sent_with = turns
+        await stream.aclose()
+
+        assert sent_with == 0
 
     async def test_a_receive_cancelled_at_any_step_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """A Task.cancel() can land before, during or after the stdout it takes."""
+        """A Task.cancel() can land before it runs, or once it has (it ends in one)."""
         client, server = tls_sockets
         stream = _stdio(client)
-        for steps in range(4):
+        for steps in range(2):
             line = b"reply %d\n" % steps
             server.sendall(_frame(STDOUT, line))
             await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
