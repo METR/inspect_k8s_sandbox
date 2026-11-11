@@ -161,6 +161,12 @@ class ExecuteOperation(PodOperation):
                 lambda command: (
                     command if root else _shell_command(user, switch, command=command)
                 ),
+                # A user switch fails as it would have for the shell itself.
+                lambda stderr: (
+                    None
+                    if user is None
+                    else self._check_for_runuser_error(stderr, user)
+                ),
             )
             staged = shlex.quote(directory)
             shell_script = (

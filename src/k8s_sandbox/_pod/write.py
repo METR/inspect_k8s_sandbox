@@ -22,7 +22,9 @@ from k8s_sandbox._pod.op import (
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         if len(data) > STDIN_PIECE_SIZE:
-            directory = self._stage(data, lambda command: command)
+            directory = self._stage(
+                data, lambda command: command, raise_for_known_read_write_errors
+            )
             with self._start_join_command(directory, dst) as ws_client:
                 self._handle_stream_output(ws_client)
             return

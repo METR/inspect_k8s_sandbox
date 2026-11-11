@@ -104,12 +104,18 @@ class PodOperation(ABC):
         for i in range(0, len(data), STDIN_CHUNK_SIZE):
             ws_client.write_stdin(data[i : i + STDIN_CHUNK_SIZE])
 
-    def _stage(self, data: bytes, as_user: Callable[[list[str]], list[str]]) -> str:
+    def _stage(
+        self,
+        data: bytes,
+        as_user: Callable[[list[str]], list[str]],
+        check: Callable[[str], None],
+    ) -> str:
         """Write `data` to a file named `data` in a new temporary directory in a pod.
 
         Returns the directory. Each exec sends at most STDIN_PIECE_SIZE bytes of stdin,
         and a piece whose sha256 comes back different is sent again. `as_user` wraps
-        each command so that it runs as the caller's user.
+        each command so that it runs as the caller's user; `check` may raise the
+        caller's own error for the stderr of a command that failed.
         """
         directory: str | None = None
         for start in range(0, len(data), STDIN_PIECE_SIZE):
@@ -121,7 +127,7 @@ class PodOperation(ABC):
                     f'd={into} && head -c {len(piece)} > "$d/{name}" && echo "$d" '
                     f'&& sha256sum < "$d/{name}"'
                 )
-                directory, digest = self._run_piece(as_user, script, piece)
+                directory, digest = self._run_piece(as_user, script, piece, check)
                 if digest == hashlib.sha256(piece).hexdigest():
                     break
             else:
@@ -136,7 +142,7 @@ class PodOperation(ABC):
             f'd={shlex.quote(directory)} && cat "$d"/0* > "$d/data" && rm -f "$d"/0* '
             '&& echo "$d" && sha256sum < "$d/data"'
         )
-        _, digest = self._run_piece(as_user, script, b"")
+        _, digest = self._run_piece(as_user, script, b"", check)
         if digest != hashlib.sha256(data).hexdigest():
             raise PodError(
                 "A staged stdin payload was joined corrupted.", pod=self._pod.name
@@ -144,7 +150,11 @@ class PodOperation(ABC):
         return directory
 
     def _run_piece(
-        self, as_user: Callable[[list[str]], list[str]], script: str, piece: bytes
+        self,
+        as_user: Callable[[list[str]], list[str]],
+        script: str,
+        piece: bytes,
+        check: Callable[[str], None],
     ) -> tuple[str, str]:
         """Run `script` on `piece`; return the directory and the hash it prints."""
         command = as_user(["/bin/sh", "-c", f"PATH={SYSTEM_PATH}; {script}"])
@@ -169,7 +179,7 @@ class PodOperation(ABC):
                 )
             if returncode != 0:
                 stderr = ws_client.read_stderr()
-                raise_for_known_read_write_errors(stderr)
+                check(stderr)
                 raise PodError(
                     "Unrecognised error staging stdin.",
                     returncode=returncode,

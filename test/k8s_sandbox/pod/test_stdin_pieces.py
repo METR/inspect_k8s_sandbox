@@ -25,6 +25,7 @@ import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.execute import ExecuteOperation, _shell_command
+from k8s_sandbox._pod.op import raise_for_known_read_write_errors
 from k8s_sandbox._pod.write import WriteFileOperation
 from test.k8s_sandbox.pod.test_execute import _SHELLS, MARKER
 
@@ -47,7 +48,11 @@ class _FakeContainer:
         self._corrupt_join = corrupt_join
 
     def run_piece(
-        self, as_user: Callable[[list[str]], list[str]], script: str, piece: bytes
+        self,
+        as_user: Callable[[list[str]], list[str]],
+        script: str,
+        piece: bytes,
+        check: Callable[[str], None],
     ) -> tuple[str, str]:
         self.commands.append(as_user(["/bin/sh", "-c", script]))
         self.frames.append(len(piece))
@@ -91,7 +96,7 @@ class _FakeContainer:
 def _stage(data: bytes, container: _FakeContainer) -> str:
     op = WriteFileOperation(MagicMock())
     op._run_piece = container.run_piece  # type: ignore[method-assign]
-    return op._stage(data, lambda command: command)
+    return op._stage(data, lambda command: command, lambda stderr: None)
 
 
 class TestStage:
@@ -141,7 +146,10 @@ class TestStage:
         sent: list[int] = []
 
         def run_piece(
-            as_user: Callable[[list[str]], list[str]], script: str, piece: bytes
+            as_user: Callable[[list[str]], list[str]],
+            script: str,
+            piece: bytes,
+            check: Callable[[str], None],
         ) -> tuple[str, str]:
             sent.append(len(piece))
             command = as_user(["/bin/sh", "-c", script])
@@ -151,7 +159,7 @@ class TestStage:
 
         op = WriteFileOperation(MagicMock())
         op._run_piece = run_piece  # type: ignore[method-assign]
-        directory = op._stage(data, lambda command: command)
+        directory = op._stage(data, lambda command: command, lambda stderr: None)
         try:
             assert Path(directory, "data").read_bytes() == data
             assert sorted(p.name for p in Path(directory).iterdir()) == ["data"]
@@ -176,7 +184,9 @@ class TestRunPiece:
         ws.read_stdout.return_value = "/tmp/tmp.x\n" + "ab" * 32 + "  -\n"
         piece = os.urandom(HAZARD)
 
-        result = self._op_with_ws(ws)._run_piece(lambda c: c, "true", piece)
+        result = self._op_with_ws(ws)._run_piece(
+            lambda c: c, "true", piece, lambda stderr: None
+        )
 
         assert result == ("/tmp/tmp.x", "ab" * 32)
         assert [call.args[0] for call in ws.write_stdin.call_args_list] == [piece]
@@ -185,6 +195,7 @@ class TestRunPiece:
         ("returncode", "stderr", "error"),
         [
             (255, "", ContainerStoppedError),
+            # The caller's check raises its own error for a failure it knows.
             (1, "head: /x: Permission denied", PermissionError),
             (1, "something else", PodError),
         ],
@@ -201,7 +212,9 @@ class TestRunPiece:
         ws.read_stderr.return_value = stderr
 
         with pytest.raises(error):
-            self._op_with_ws(ws)._run_piece(lambda c: c, "true", b"x")
+            self._op_with_ws(ws)._run_piece(
+                lambda c: c, "true", b"x", raise_for_known_read_write_errors
+            )
 
 
 class TestWriteFile:
@@ -255,6 +268,22 @@ class TestWriteFile:
         assert container.files[directory] == {"data": data}
         assert max(container.frames) <= HAZARD
 
+    def test_a_failed_stage_raises_the_file_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        op = WriteFileOperation(MagicMock())
+        ws = MagicMock(spec=WSClient)
+        ws.read_stderr.return_value = "mktemp: /tmp/tmp.X: Permission denied"
+
+        def create(**kwargs: object) -> Generator[MagicMock, None, None]:
+            yield ws
+
+        monkeypatch.setattr(op_module, "get_returncode", lambda ws: 1)
+        monkeypatch.setattr(op, "create_websocket_client_for_exec", create)
+
+        with pytest.raises(PermissionError):
+            op.write_file(os.urandom(HAZARD + 1), Path("/tmp/dst"))
+
     def test_the_join_command_writes_dst_and_removes_the_stage(self) -> None:
         op = WriteFileOperation(MagicMock())
         captured: dict[str, object] = {}
@@ -290,7 +319,11 @@ class TestExec:
             shells.append(command)
             yield ws
 
-        def stage(data: bytes, as_user: Callable[[list[str]], list[str]]) -> str:
+        def stage(
+            data: bytes,
+            as_user: Callable[[list[str]], list[str]],
+            check: Callable[[str], None],
+        ) -> str:
             stages.append(data)
             wrapped.append(as_user(["/bin/sh", "-c", "piece"]))
             return staged
@@ -346,6 +379,43 @@ class TestExec:
         _, wrapped, _ = self._exec(monkeypatch, os.urandom(HAZARD), user=user)
 
         assert wrapped == [wrap]
+
+    @pytest.mark.parametrize(
+        ("user", "stderr", "error"),
+        [
+            ("ghost", "runuser: user ghost does not exist", RuntimeError),
+            # Not FileNotFoundError: that is write_file's, for its destination.
+            (None, "mktemp: /nope/tmp.X: No such file or directory", PodError),
+        ],
+    )
+    def test_a_failed_stage_raises_what_the_shell_would_have(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        user: str | None,
+        stderr: str,
+        error: type[Exception],
+    ) -> None:
+        op = ExecuteOperation(MagicMock())
+        ws = MagicMock(spec=WSClient)
+        ws.read_stderr.return_value = stderr
+
+        def create(**kwargs: object) -> Generator[MagicMock, None, None]:
+            yield ws
+
+        @contextmanager
+        def no_shell(command: list[str]) -> Generator[MagicMock, None, None]:
+            raise AssertionError("ran the shell")
+            yield
+
+        monkeypatch.setattr(op_module, "get_returncode", lambda ws: 1)
+        monkeypatch.setattr(op, "create_websocket_client_for_exec", create)
+        monkeypatch.setattr(op, "_interactive_shell", no_shell)
+
+        with pytest.raises(error) as raised:
+            op.exec(
+                ["cat"], os.urandom(HAZARD), cwd=None, env={}, user=user, timeout=None
+            )
+        assert type(raised.value) is error
 
     @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
     @pytest.mark.parametrize("shell", _SHELLS)
