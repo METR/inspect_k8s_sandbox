@@ -24,8 +24,8 @@
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
   taking one each. Needs anyio 4.14 or later.
-- The task name and sample UUID reach Helm as escaped strings (`--set-string`), so
-  Helm's `--set` syntax in them is part of their value.
+- The task name and sample UUID reach the chart verbatim, as strings, whatever
+  characters they contain (a comma, `=`, a leading `{`, or a name such as `123`).
 
 ## 2026-10-09 0.14.0
 

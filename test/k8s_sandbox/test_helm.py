@@ -402,6 +402,7 @@ async def test_helm_install_no_extra_values() -> None:
         ("has=equals", "has\\=equals"),
         ("back\\slash", "back\\\\slash"),
         ("a,b.c=d\\e", "a\\,b\\.c\\=d\\\\e"),
+        ("{list}", "\\{list}"),
     ],
 )
 def test_helm_escape(value: str, expected: str) -> None:
@@ -420,10 +421,17 @@ async def test_helm_install_extra_values_escaped() -> None:
     assert "--set-string=sampleMetadataKey=val\\,with\\.special\\=chars" in args
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["task,allowDomains={*},runtimeClassName=other.a=b\\c", "{a}", "123", "true"],
+)
 async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
-    tmp_path: Path,
+    tmp_path: Path, name: str
 ) -> None:
-    """Helm's --set syntax in either ends up in its value, not as values of its own."""
+    """Helm's --set syntax in either ends up in its value, not as values of its own.
+
+    Nor does Helm read a name as a list, number or boolean.
+    """
     chart = tmp_path / "chart"
     (chart / "templates").mkdir(parents=True)
     (chart / "Chart.yaml").write_text("apiVersion: v2\nname: values\nversion: 0.1.0\n")
@@ -431,7 +439,6 @@ async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: values\n"
         "data:\n  values: {{ toJson .Values | quote }}\n"
     )
-    name = "task,allowDomains={*},runtimeClassName=other.a=b\\c"
     uuid = "uuid,allowEntities={world}"
     release = Release(name, chart, ValuesSource.none(), None, sample_uuid=uuid)
 

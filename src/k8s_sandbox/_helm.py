@@ -622,14 +622,16 @@ def _helm_escape(value: str) -> str:
     r"""Escape special characters for Helm's strvals parser.
 
     Helm's ``--set`` / ``--set-string`` flags use a custom parser that treats
-    ``\\``, ``,``, ``.`` and ``=`` as metacharacters.  Each must be escaped
-    with a leading backslash so the value is passed through literally.
+    ``\\``, ``,``, ``.`` and ``=`` as metacharacters, and a value starting with
+    ``{`` as a list.  Each must be escaped with a leading backslash so the value
+    is passed through literally.
     """
     # Order matters: escape backslashes first to avoid double-escaping.
     value = value.replace("\\", "\\\\")
     value = value.replace(",", "\\,")
     value = value.replace(".", "\\.")
     value = value.replace("=", "\\=")
+    value = value.replace("{", "\\{")
     return value
 
 
