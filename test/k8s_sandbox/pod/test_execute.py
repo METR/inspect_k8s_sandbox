@@ -44,7 +44,6 @@ from k8s_sandbox._pod.error import (
     ExecResultUnknownError,
     GetReturncodeError,
     PodError,
-    PodReplacedError,
 )
 from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio, _shell_command
 from k8s_sandbox._pod.pod import Pod
@@ -1518,37 +1517,6 @@ class TestExecStdio:
         with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
             await stream.receive()
         await _wait_for(lambda: client.fileno() == -1)
-
-    async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
-    ) -> None:
-        """Nothing checks the pod again while the stream lasts."""
-        client, _ = tls_sockets
-        opened, closed = threading.Event(), threading.Event()
-
-        class Shell:
-            def __enter__(self) -> WSClient:
-                opened.set()
-                return _SocketWSClient(client)
-
-            def __exit__(self, *exc_info: object) -> None:
-                closed.set()
-
-        def check_for_pod_restart(info: object) -> None:
-            if opened.is_set():
-                raise PodReplacedError(
-                    pod_name="pod", old_uid="uid", new_uid="new", new_restart_count=0
-                )
-
-        pod = Pod("pod", "ns", None, "default", "uid", 0, "raise")
-        with (
-            patch.object(ExecuteOperation, "_interactive_shell", lambda *_: Shell()),
-            patch.object(pod_module, "check_for_pod_restart", check_for_pod_restart),
-            pytest.raises(PodReplacedError),
-        ):
-            await pod.exec_stdio(["cat"], None)
-
-        await _wait_for(closed.is_set)
 
 
 async def _receiving(stream: PodStdio, max_bytes: int) -> AsyncIterator[bytes]:

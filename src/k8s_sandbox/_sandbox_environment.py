@@ -324,6 +324,16 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             async for attempt in _retry():
                 with attempt:
                     stream = await self._pod.exec_stdio(cmd, user)
+            try:
+                # After the open, so that a pod replaced or restarted before or while
+                # it opened is found too: nothing checks again while the stream lasts.
+                # Retried alone, so that the command is not started again.
+                async for attempt in _retry():
+                    with attempt:
+                        await self._pod.check_for_pod_restart()
+            except BaseException:
+                await stream.aclose()
+                raise
             return stream
 
     async def write_file(self, file: str, contents: str | bytes) -> None:

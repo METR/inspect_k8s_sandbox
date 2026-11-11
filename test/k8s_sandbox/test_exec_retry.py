@@ -13,6 +13,7 @@ from k8s_sandbox._pod.error import (
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
+    PodReplacedError,
 )
 from k8s_sandbox._sandbox_environment import (
     K8sError,
@@ -398,6 +399,35 @@ class TestExecStdioRetry:
         with pytest.raises(K8sError):
             await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
+        assert mock_pod.exec_stdio.call_count == 1
+
+    async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
+        """Nothing checks the pod again while the stream lasts."""
+        sandbox, mock_pod = _make_sandbox()
+        stream = AsyncMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(
+            side_effect=PodReplacedError(
+                pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
+            )
+        )
+
+        with pytest.raises(K8sError):
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = MagicMock()
+        mock_pod.exec_stdio = AsyncMock(return_value=stream)
+        mock_pod.check_for_pod_restart = AsyncMock(
+            side_effect=[ApiException(status=503, reason="Unavailable"), None]
+        )
+
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert opened is stream
         assert mock_pod.exec_stdio.call_count == 1
 
     async def test_the_default_user_is_used(self) -> None:

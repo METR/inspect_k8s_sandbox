@@ -211,15 +211,7 @@ class Pod:
             # The websocket opened for a caller that stopped waiting.
             discard=lambda opened: opened[0].close(),
         )
-        stream = PodStdio(operation, stack, ws_client)
-        try:
-            # After the open, so that a pod replaced or restarted before or while it
-            # opened is found too: nothing checks again while the stream lasts.
-            await self.check_for_pod_restart()
-        except BaseException:
-            await stream.aclose()
-            raise
-        return stream
+        return PodStdio(operation, stack, ws_client)
 
     async def _diagnose_restart_after_failed_exec(self) -> None:
         try:
