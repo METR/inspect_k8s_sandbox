@@ -1041,7 +1041,8 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
     op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
 
     opened.assert_called_once_with(shell)
-    assert "".join(writes).startswith("{\n" + execute_module._ROOT_CHECK) is checked
+    check = execute_module._ROOT_CHECK if checked else ""
+    assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
 
 
 def _exec_writing_to(
