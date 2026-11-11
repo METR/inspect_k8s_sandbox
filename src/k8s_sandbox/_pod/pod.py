@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
 import os
@@ -21,7 +20,7 @@ from k8s_sandbox._pod.error import (
 )
 from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 
@@ -213,8 +212,7 @@ class Pod:
 
     async def _diagnose_restart_after_failure(self) -> None:
         try:
-            # Bounded: the operation's own error is already known.
-            restart = await asyncio.wait_for(self.check_for_pod_restart(), API_TIMEOUT)
+            restart = await self.check_for_pod_restart()
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:

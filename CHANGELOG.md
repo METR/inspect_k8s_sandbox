@@ -11,6 +11,9 @@
 - A `read_file()` or `write_file()` that fails checks whether the container restarted or
   the pod was replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that
   instead, as `exec()` already did. It costs one pod read per failed attempt.
+- The pod read that checks for a restart times out after 60 seconds per attempt (the
+  kubernetes client tries up to four times), and the operation then fails, instead of
+  waiting on a stalled API server without end.
 - An operation whose container stopped under it, which Kata reports with exit code 255
   when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`.
   Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
