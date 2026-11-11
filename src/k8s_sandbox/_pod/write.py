@@ -12,6 +12,7 @@ from k8s_sandbox._pod.get_returncode import (
     raise_if_stopped_before_lost,
 )
 from k8s_sandbox._pod.op import (
+    SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
 )
@@ -27,7 +28,7 @@ class WriteFileOperation(PodOperation):
     def _start_write_command(
         self, dst: Path, file_size: int
     ) -> Generator[WSClient, None, None]:
-        mkdir_command = f"mkdir -p {shlex.quote(dst.parent.as_posix())}"
+        mkdir_command = f"mkdir -p -- {shlex.quote(dst.parent.as_posix())}"
         # Use `head` with `-c <file size>` because we have no way of closing the stdin
         # stream in v4.channel.k8s.io (which means the websocket connection would never
         # close).
@@ -39,10 +40,12 @@ class WriteFileOperation(PodOperation):
         # fd 3 survives the exec and keeps that pipe open.
         # https://github.com/UKGovernmentBEIS/inspect_k8s_sandbox/issues/225
         keep_stdout_open = "exec 3>&1"
+        # The script runs only helpers, which are found in the system directories.
         command = [
             "/bin/sh",
             "-c",
-            f"{keep_stdout_open}; {mkdir_command} && {head_command} > {dst_quoted}",
+            f"{keep_stdout_open}; PATH={SYSTEM_PATH}; "
+            f"{mkdir_command} && {head_command} > {dst_quoted}",
         ]
         yield from self.create_websocket_client_for_exec(
             command=command,

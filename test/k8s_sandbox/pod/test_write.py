@@ -1,6 +1,8 @@
+import os
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 from unittest.mock import MagicMock
 
 import pytest
@@ -91,3 +93,62 @@ def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
         WriteFileOperation(MagicMock())._handle_stream_output(ws)
 
     assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_a_directory_that_looks_like_an_option_is_made(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    op = WriteFileOperation(MagicMock())
+    exec_kwargs: dict[str, Any] = {}
+
+    def fake_exec(**kwargs: Any) -> Generator[MagicMock, None, None]:
+        exec_kwargs.update(kwargs)
+        yield MagicMock(spec=WSClient)
+
+    monkeypatch.setattr(op, "create_websocket_client_for_exec", fake_exec)
+    with op._start_write_command(Path("-dir/dst"), 4):
+        pass
+
+    subprocess.run(
+        exec_kwargs["command"],
+        input=b"data",
+        cwd=tmp_path,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert (tmp_path / "-dir" / "dst").read_bytes() == b"data"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_mkdir_and_head_are_not_found_through_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """They run as the container's user."""
+    ran = tmp_path / "ran"
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    for name in ("mkdir", "head"):
+        stub = stubs / name
+        stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+        stub.chmod(0o755)
+    op = WriteFileOperation(MagicMock())
+    exec_kwargs: dict[str, Any] = {}
+
+    def fake_exec(**kwargs: Any) -> Generator[MagicMock, None, None]:
+        exec_kwargs.update(kwargs)
+        yield MagicMock(spec=WSClient)
+
+    monkeypatch.setattr(op, "create_websocket_client_for_exec", fake_exec)
+    dst = tmp_path / "new" / "dir" / "dst"
+    with op._start_write_command(dst, 4):
+        pass
+    env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
+
+    subprocess.run(
+        exec_kwargs["command"], input=b"data", env=env, capture_output=True, timeout=30
+    )
+
+    assert not ran.exists()
+    assert dst.read_bytes() == b"data"

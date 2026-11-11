@@ -1,4 +1,6 @@
 import io
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Generator
 from unittest.mock import MagicMock
@@ -16,9 +18,8 @@ from k8s_sandbox._pod.read import ReadFileOperation
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
 
 
-def test_read_file_opens_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A read exec without stdin hangs or truncates on Kata Containers' Go shim
-    # (kata-containers/kata-containers#9071).
+def _exec_kwargs(monkeypatch: pytest.MonkeyPatch, src: Path) -> dict[str, Any]:
+    """The arguments read_file() opens its exec with."""
     op = ReadFileOperation(MagicMock())
     exec_kwargs: dict[str, Any] = {}
 
@@ -29,7 +30,14 @@ def test_read_file_opens_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(op, "create_websocket_client_for_exec", fake_exec)
     monkeypatch.setattr(op, "_handle_stream_output", lambda ws_client, dst: None)
 
-    op.read_file(Path("/tmp/src"), io.BytesIO())
+    op.read_file(src, io.BytesIO())
+    return exec_kwargs
+
+
+def test_read_file_opens_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A read exec without stdin hangs or truncates on Kata Containers' Go shim
+    # (kata-containers/kata-containers#9071).
+    exec_kwargs = _exec_kwargs(monkeypatch, Path("/tmp/src"))
 
     assert exec_kwargs["stdin"] is True
     assert exec_kwargs["command"][-1] == "/tmp/src"
@@ -101,3 +109,35 @@ def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
         ReadFileOperation(MagicMock())._handle_stream_output(ws, io.BytesIO())
 
     assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_a_path_that_looks_like_an_option_is_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "--help").write_bytes(b"contents")
+    command = _exec_kwargs(monkeypatch, Path("--help"))["command"]
+
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=30)
+
+    assert result.stdout == b"contents"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_head_is_not_found_through_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It runs as the container's user."""
+    ran = tmp_path / "ran"
+    stub = tmp_path / "head"
+    stub.write_text(f"#!/bin/sh\necho head >> {ran}\n")
+    stub.chmod(0o755)
+    src = tmp_path / "src"
+    src.write_bytes(b"contents")
+    command = _exec_kwargs(monkeypatch, src)["command"]
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+    result = subprocess.run(command, env=env, capture_output=True, timeout=30)
+
+    assert not ran.exists()
+    assert result.stdout == b"contents"

@@ -32,7 +32,12 @@ from k8s_sandbox._pod.error import (
     PodError,
 )
 from k8s_sandbox._pod.get_returncode import get_returncode, returncode_from_status
-from k8s_sandbox._pod.op import API_TIMEOUT, STDIN_CHUNK_SIZE, PodOperation
+from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
+    STDIN_CHUNK_SIZE,
+    SYSTEM_PATH,
+    PodOperation,
+)
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
@@ -66,6 +71,10 @@ _ROOT_CHECK = (
     ' </proc/self/status; [ "$u" = 0 ]) ||'
     ' { echo "runuser: may not be used by non-root users" >&2; exit 1; }\n'
 )
+# The user switch runs `runuser` as the container's user, before switching, so it is
+# not found through the image's PATH either (see SYSTEM_PATH): it is at this path
+# wherever util-linux provides it (Debian, Ubuntu, RHEL and its rebuilds, Alpine).
+_RUNUSER = "/sbin/runuser"
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +105,13 @@ def _shell_command(
         return list(command)
     if not user or switch:
         # An empty user matches nothing; leave runuser to reject it as it did before.
-        return ["runuser", "-u", user, "--", *command]
+        return [_RUNUSER, "-u", user, "--", *command]
     run = shlex.join(command)
     return [
         "/bin/sh",
         "-c",
         f"if {_runs_as(user)}; then exec {run}; fi; "
-        f"exec runuser -u {shlex.quote(user)} -- {run}",
+        f"exec {_RUNUSER} -u {shlex.quote(user)} -- {run}",
     ]
 
 
@@ -121,7 +130,7 @@ def _runs_as(user: str) -> str:
     that also falls through to `runuser`.
     """
     current = "id -u" if user.isdigit() else "id -un"
-    return f'[ "$({current} 2>/dev/null)" = {shlex.quote(user)} ]'
+    return f'[ "$(PATH={SYSTEM_PATH}; {current} 2>/dev/null)" = {shlex.quote(user)} ]'
 
 
 class ExecuteOperation(PodOperation):
@@ -197,7 +206,8 @@ class ExecuteOperation(PodOperation):
         quoted = shlex.quote(user)
         probe = (
             f"if {_runs_as(user)}; then exit 0; fi; "
-            f"if runuser -u {quoted} -- true 2>/dev/null; then exit 1; fi; exit 2"
+            f"if {_RUNUSER} -u {quoted} -- /bin/sh -c : 2>/dev/null; then exit 1; fi; "
+            "exit 2"
         )
         with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
             deadline = time.monotonic() + API_TIMEOUT
@@ -216,7 +226,7 @@ class ExecuteOperation(PodOperation):
                 except (OSError, websocket.WebSocketException):
                     if ERROR_CHANNEL not in ws_client._channels:
                         raise
-                # The probe prints nothing, so keep nothing a planted `id` might.
+                # The probe prints nothing, so keep nothing `id` or `runuser` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
             ws_client.close()
@@ -296,8 +306,10 @@ class ExecuteOperation(PodOperation):
         ).decode("ascii")
         # Pipe user input. Simply writing it to the shell's stdin after a command e.g.
         # `cat` results in `cat` blocking indefinitely as there is no way to close the
-        # stdin stream in v4.channel.k8s.io.
-        return f"echo '{stdin_b64}' | base64 -d | "
+        # stdin stream in v4.channel.k8s.io. `base64` is found in the system
+        # directories, in a subshell of its own (which a pipeline's part runs in
+        # anyway), so the command keeps the PATH.
+        return f"echo '{stdin_b64}' | (PATH={SYSTEM_PATH}; exec base64 -d) | "
 
     def _prefix_timeout(self, timeout: int | None) -> str:
         if timeout is None:
@@ -305,8 +317,11 @@ class ExecuteOperation(PodOperation):
         # Enforce timeout using `timeout` on the Pod. Simpler than alternative of
         # enforcing this on the client side (requires terminating the remote process).
         # `-k 5s` sends SIGKILL after grace period in case user command doesn't respect
-        # SIGTERM.
-        return f"timeout -k 5s {timeout}s "
+        # SIGTERM. `timeout` runs from the path that a substitution finds in the system
+        # directories, so the PATH it sets does not reach the command. With no
+        # `timeout` there, the error names /usr/bin/timeout.
+        find = f"PATH={SYSTEM_PATH}; command -v timeout || echo /usr/bin/timeout"
+        return f'"$({find})" -k 5s {timeout}s '
 
     def _handle_shell_output(
         self, ws_client: WSClient, user: str | None, timeout: int | None, marker: str
@@ -451,10 +466,14 @@ class ExecuteOperation(PodOperation):
                 stderr,
             )
             return
-        if re.search(r"runuser: not found", stderr, re.IGNORECASE):
+        # dash and busybox say "not found" for a missing /sbin/runuser, bash "No such
+        # file or directory".
+        if re.search(
+            r"runuser: (?:not found|no such file or directory)", stderr, re.IGNORECASE
+        ):
             logger.warning(
                 "exec(user=%r) failed: switching users needs the runuser binary, "
-                "which is not installed in this container. Docs: %s\n%s",
+                "at /sbin/runuser, which this container lacks. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
                 stderr,

@@ -69,6 +69,11 @@
   where starting a program is slow. In a container that is not root,
   `exec(user="0")` now fails as `exec(user="root")` does, with a warning, rather
   than raising a `RuntimeError` that says the user does not exist.
+- `exec()`, `read_file()` and `write_file()` no longer find the programs they run
+  besides the caller's command through the image's `PATH`: `exec(user=...)` runs
+  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head` and `mkdir` come
+  from `/usr/bin` or `/bin`, so images need them there. The caller's command still
+  runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.
 
 ## 2026-10-09 0.14.0
 

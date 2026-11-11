@@ -185,12 +185,12 @@ result in undesirable coupling between your tools and sandbox.
 
 That said, if you need to run commands as different users, the `user` parameter to
 `exec()` is supported. To switch to a *different* user, you must run the container as
-root, ensure that `runuser` is installed in the container, and keep `CAP_SETGID` — the
+root, ensure that `runuser` is installed at `/sbin/runuser`, and keep `CAP_SETGID` — the
 switch goes through `runuser`, which calls `setgroups(2)`. A container with
 `capabilities: {drop: [ALL]}` therefore cannot switch users.
 
 Naming the user the container already runs as needs none of those: that case skips
-`runuser` entirely, so it works on a capability-dropped or non-root container, and on an
+`runuser` entirely (it checks the user with `id`, from `/usr/bin` or `/bin`), so it works on a capability-dropped or non-root container, and on an
 image with no `runuser` installed.
 
 `user="root"` and `user="0"` both mean uid 0, whatever the image's `/etc/passwd` says,

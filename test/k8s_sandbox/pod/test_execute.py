@@ -364,7 +364,7 @@ def _run_script(
             [shutil.which(shell[0]) or shell[0], *shell[1:]],
             stdin=read_end,
             capture_output=True,
-            timeout=10,
+            timeout=30,
             env=env,
         )
     finally:
@@ -474,6 +474,35 @@ class TestScriptInAShell:
         result = _run_script(shell, script)
 
         assert result.stdout == _marker(0)
+
+    def test_base64_and_timeout_are_not_found_through_the_path(
+        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """They run as the container's user; the command still gets the PATH."""
+        # The real ones stand in for /usr/bin and /bin: macOS has no /usr/bin/timeout.
+        system = tmp_path / "system"
+        stubs = tmp_path / "stubs"
+        system.mkdir()
+        stubs.mkdir()
+        ran = tmp_path / "ran"
+        for name in ("base64", "timeout"):
+            real = shutil.which(name)
+            if real is None:
+                pytest.skip(f"Requires {name}")
+            (system / name).symlink_to(real)
+            stub = stubs / name
+            stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+            stub.chmod(0o755)
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        path = f"{stubs}:{os.environ['PATH']}"
+        script = ExecuteOperation(MagicMock())._build_shell_script(
+            ["sh", "-c", 'cat; printf %s "$PATH"'], "input", None, {}, 30, MARKER
+        )
+
+        result = _run_script(shell, script, env={**os.environ, "PATH": path})
+
+        assert not ran.exists()
+        assert result.stdout == f"input{path}".encode() + _marker(0)
 
 
 def _proc_status(uids: str, gids: str = "1000\t1000\t1000\t1000") -> str:
@@ -1270,13 +1299,13 @@ class TestShellCommand:
         command = _shell_command("agent")
 
         assert command[:2] == ["/bin/sh", "-c"]
-        assert "exec runuser -u agent -- /bin/sh" in command[2]
+        assert "exec /sbin/runuser -u agent -- /bin/sh" in command[2]
 
     def test_user_skips_runuser_when_already_that_user(self) -> None:
         """A no-op switch still needs CAP_SETGID, so avoid runuser when we can."""
         script = _shell_command("agent")[2]
 
-        assert '[ "$(id -un 2>/dev/null)" = agent ]' in script
+        assert '[ "$(PATH=/usr/bin:/bin; id -un 2>/dev/null)" = agent ]' in script
         assert "then exec /bin/sh; fi" in script
 
     def test_a_name_is_compared_against_the_name_and_a_uid_against_the_uid(
@@ -1287,13 +1316,13 @@ class TestShellCommand:
         by_uid = _shell_command("1000")[2]
 
         assert "id -un" in by_name and "id -u " not in by_name
-        assert '[ "$(id -u 2>/dev/null)" = 1000 ]' in by_uid
+        assert '[ "$(PATH=/usr/bin:/bin; id -u 2>/dev/null)" = 1000 ]' in by_uid
         assert "id -un" not in by_uid
 
     def test_runuser_is_started_directly_once_a_probe_found_it_works(self) -> None:
         """No check, and so two fewer process starts."""
         assert _shell_command("agent", switch=True) == [
-            "runuser",
+            "/sbin/runuser",
             "-u",
             "agent",
             "--",
@@ -1310,7 +1339,32 @@ class TestShellCommand:
 
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
-        assert _shell_command("") == ["runuser", "-u", "", "--", "/bin/sh"]
+        assert _shell_command("") == ["/sbin/runuser", "-u", "", "--", "/bin/sh"]
+
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    @pytest.mark.parametrize("shell", _SHELLS)
+    def test_id_and_runuser_are_not_found_through_the_path(
+        self, shell: list[str], tmp_path: Path
+    ) -> None:
+        """They run as the container's user, before the switch."""
+        ran = tmp_path / "ran"
+        for name in ("id", "runuser"):
+            stub = tmp_path / name
+            stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+            stub.chmod(0o755)
+        env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+        user = "someone-else"
+        for script in (_shell_command(user)[2], _probe_script(user)):
+            subprocess.run(
+                [*shell, "-c", script],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+            )
+
+        assert not ran.exists()
 
     @pytest.mark.parametrize("user", ["a b", "a;rm -rf /", "$(whoami)", "'"])
     def test_user_is_quoted(self, user: str) -> None:
@@ -1337,6 +1391,31 @@ def _probe_script(user: str) -> str:
 
 
 class TestProbeSwitch:
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    @pytest.mark.parametrize("shell", _SHELLS)
+    def test_the_probe_runs_nothing_from_the_path_once_switched(
+        self, shell: list[str], tmp_path: Path
+    ) -> None:
+        """The user may be uid 0 by another name, and runuser may keep the PATH."""
+        ran = tmp_path / "ran"
+        stub = tmp_path / "true"
+        stub.write_text(f"#!/bin/sh\necho true >> {ran}\n")
+        stub.chmod(0o755)
+        forward = tmp_path / "forward"  # runuser without the switch
+        forward.write_text(
+            '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+        )
+        forward.chmod(0o755)
+        script = _probe_script("someone-else").replace("/sbin/runuser", str(forward))
+        env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+
+        result = subprocess.run(
+            [*shell, "-c", script], env=env, capture_output=True, timeout=30
+        )
+
+        assert result.returncode == 1  # the switch works
+        assert not ran.exists()
+
     @pytest.mark.parametrize(
         ("returncode", "switch"), [(0, False), (1, True), (2, False)]
     )
@@ -1377,21 +1456,20 @@ class TestProbeSwitch:
         expected: int,
         tmp_path: Path,
     ) -> None:
+        script = _probe_script(user)
         if runuser is not None:
             stub = tmp_path / "runuser"
             stub.write_text(f"#!/bin/sh\n{runuser}\n")
             stub.chmod(0o755)
-        path = f"{tmp_path}:{os.environ['PATH']}"
+            script = script.replace("/sbin/runuser", str(stub))
 
-        result = subprocess.run(
-            [*shell, "-c", _probe_script(user)], env={**os.environ, "PATH": path}
-        )
+        result = subprocess.run([*shell, "-c", script])
 
         assert result.returncode == expected
 
 
 class TestProbeBounds:
-    """A planted `id` or `runuser` can hold the probe's output open or flood it."""
+    """A misbehaving `id` or `runuser` can hold the probe's output open or flood it."""
 
     def test_gives_up_on_a_probe_that_never_ends(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1496,6 +1574,23 @@ class TestRunuserErrorMessages:
         executor = ExecuteOperation(MagicMock())
 
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "/bin/sh: 1: exec: /sbin/runuser: not found",  # dash
+            "/bin/sh: exec: line 0: /sbin/runuser: not found",  # busybox
+            "/bin/sh: line 1: /sbin/runuser: No such file or directory",  # bash
+        ],
+    )
+    def test_a_missing_runuser_is_named(
+        self, stderr: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        executor = ExecuteOperation(MagicMock())
+
+        executor._check_for_runuser_error(stderr, "agent")
+
+        assert "runuser binary" in caplog.text
 
     @pytest.mark.parametrize(
         "stderr",
@@ -1696,9 +1791,9 @@ class TestExecStdio:
         assert stream.call_args.kwargs["command"] == [
             "/bin/sh",
             "-c",
-            'if [ "$(id -un 2>/dev/null)" = agent ]; '
+            'if [ "$(PATH=/usr/bin:/bin; id -un 2>/dev/null)" = agent ]; '
             "then exec printf '%s\n' 'a b'; fi; "
-            "exec runuser -u agent -- printf '%s\n' 'a b'",
+            "exec /sbin/runuser -u agent -- printf '%s\n' 'a b'",
         ]
         assert first.data == b"\x00a request\n"
 
