@@ -1615,62 +1615,64 @@ class TestExecStdio:
         assert received == [b"a reply\n"]
         assert client.fileno() == -1
 
-    async def test_closing_ends_a_pending_receive_at_once(
+    async def test_closing_ends_a_pending_receive_without_a_close_handshake(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """Without waiting for the server to answer the websocket's close."""
-        client, _ = tls_sockets
+        """websocket-client's handshake waits up to 3 s for the server's answer."""
+        client, server = tls_sockets
         stream = _stdio(client)
+        reader = _reader(server)
+        reader.recv_data_frame(True)  # The line open_stdio() wrote.
         receiving = asyncio.create_task(stream.receive())
         await asyncio.sleep(0)  # It now waits for stdout.
 
-        start = time.monotonic()
         await stream.aclose()
-        closing = time.monotonic() - start
 
         with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
             await receiving
-        assert closing < 1
+        with pytest.raises((websocket.WebSocketConnectionClosedException, OSError)):
+            reader.recv_frame()  # The connection ended, with no close frame first.
         assert client.fileno() == -1
 
-    async def test_a_reply_passes_while_the_event_loop_holds_the_gil(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    async def test_requests_and_replies_pass_while_other_threads_are_starved(
+        self,
+        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """As a busy runner's does, where a thread waiting for the GIL may never run.
+        """As a busy runner's event loop can starve them of the GIL, for good.
 
-        CPython makes the holder give it up only once one hold outlasts the switch
-        interval, so an event loop busy for less at a time starves every thread (on
-        Linux; macOS often hands it over).
+        CPython hands the GIL to a waiting thread only once one hold outlasts the
+        switch interval, so an event loop busy for less at a time keeps it.
         """
         client, server = tls_sockets
-        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
-        stream = _stdio(client)
-        reply = b"x" * 65536 + b"\n"
+        released = threading.Event()
+        start = threading.Thread.start
 
-        async def busy() -> None:  # Its send fits in the buffers: it never waits.
-            server.sendall(
-                b"".join(
-                    _frame(STDOUT, reply[i : i + 16384])
-                    for i in range(0, len(reply), 16384)
-                )
-            )
-            while True:
-                hold = time.perf_counter() + sys.getswitchinterval() / 5
-                while time.perf_counter() < hold:
-                    pass
-                await anyio.sleep(0)
+        def held_back(thread: threading.Thread) -> None:
+            run = thread.run
 
-        received = b""
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(busy)
+            def run_once_released() -> None:
+                released.wait(30)
+                run()
+
+            thread.run = run_once_released  # type: ignore[method-assign]
+            start(thread)
+
+        monkeypatch.setattr(threading.Thread, "start", held_back)
+        try:
+            stream = _stdio(client)
+            reader = _reader(server)
+            reader.recv_data_frame(True)  # The line open_stdio() wrote.
+            server.sendall(_frame(STDOUT, b"ready\n"))
             with anyio.fail_after(30):
-                while not received.endswith(b"\n"):
-                    received += await stream.receive()
-            tasks.cancel_scope.cancel()
+                ready = await stream.receive()
+                await stream.send(b"a request\n")
+            _, request = reader.recv_data_frame(True)
+        finally:
+            released.set()
         await stream.aclose()
 
-        assert received == reply
+        assert (ready, request.data) == (b"ready\n", b"\x00a request\n")
 
     async def test_a_frame_split_across_reads_is_read_whole(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
