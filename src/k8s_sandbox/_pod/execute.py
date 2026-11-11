@@ -249,6 +249,8 @@ class ExecuteOperation(PodOperation):
             yield f"({pipe}{self._prefix_timeout(timeout)}{shlex.join(command)})\n"
             # Store the returncode so that the `printf` below doesn't overwrite it.
             yield "returncode=$?\n"
+            # `printf` is a builtin in dash, bash and busybox, but not every shell.
+            yield f"PATH={SYSTEM_PATH}\n"
             # End both streams with the marker and the returncode. The exec's status
             # channel reports the returncode when the shell exits; the markers are for
             # when a background process keeps stdout or stderr, and so the exec, open.
