@@ -4,6 +4,7 @@ from k8s_sandbox._error import K8sError
 from k8s_sandbox._pod import GetReturncodeError, PodError
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
+    ContainerStoppedError,
     ExecResultUnknownError,
     PodReplacedError,
 )
@@ -14,6 +15,7 @@ from k8s_sandbox._sandbox_environment import (
 
 __all__ = [
     "ContainerRestartedError",
+    "ContainerStoppedError",
     "ExecResultUnknownError",
     "GetReturncodeError",
     "K8sError",
