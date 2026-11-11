@@ -1475,6 +1475,8 @@ class TestExecStdio:
             server.sendall(_frame(STDOUT, line))  # A piece of its own.
             await _wait_for(lambda: len(stream._pieces) == count)
         server.sendall(b"".join(_frame(STDOUT, line) for line in lines[pieces:]))
+        # The reader waits for room (CPython's Condition keeps its waiters there).
+        await _wait_for(lambda: bool(stream._room._waiters))  # type: ignore[attr-defined]
 
         received = b""
         with anyio.fail_after(30):
