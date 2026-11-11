@@ -1395,22 +1395,6 @@ class TestExecStdio:
 
         assert frame.data == b"\x00" + request
 
-    async def test_sends_take_no_tokens_of_anyio_s_shared_limiter(
-        self,
-        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """A wedged write must not hold up the other threads Inspect starts."""
-        client, _ = tls_sockets
-        stream = _stdio(client)
-        shared = anyio.to_thread.current_default_thread_limiter()
-        monkeypatch.setattr(shared, "total_tokens", 1)
-
-        async with shared:  # All its tokens are taken.
-            with anyio.fail_after(30):
-                await stream.send(b"a request\n")
-        await stream.aclose()
-
     async def test_the_stream_cannot_end_stdin_alone(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -1457,11 +1441,7 @@ class TestExecStdio:
 
         caplog.handler.addFilter(note_sample)
         client, server = tls_sockets
-        host_closed = threading.Event()
-        stack = contextlib.ExitStack()
-        # The reader finishes closing only once the host has closed the stream.
-        stack.callback(host_closed.wait, 30)
-        stream = PodStdio(stack, _SocketWSClient(client))
+        stream = _stdio(client)
         server.sendall(
             _frame(STDERR, b"sh: 1: exec: inspect-sandbox-tools: not found\n")
             + _frame(*_status(127))
@@ -1471,64 +1451,12 @@ class TestExecStdio:
         with anyio.fail_after(30), pytest.raises(anyio.EndOfStream):
             await stream.receive()
         await stream.aclose()
-        host_closed.set()
-        await _wait_for(lambda: "inspect-sandbox-tools: not found" in caplog.text)
 
         warning = caplog.records[-1]
         assert (warning.levelname, getattr(warning, "sample")) == (
             "WARNING",
             "this sample",
         )
-
-    async def test_the_reader_resumes_once_there_is_room(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
-    ) -> None:
-        """Reading a piece from a full buffer lets the reader go on."""
-        client, server = tls_sockets
-        stream = _stdio(client)
-        pieces = execute_module._STDIO_PIECES
-        lines = [b"%d\n" % i for i in range(pieces + 2)]
-        for count, line in enumerate(lines[:pieces], start=1):
-            server.sendall(_frame(STDOUT, line))  # A piece of its own.
-            await _wait_for(lambda: len(stream._pieces) == count)
-        server.sendall(b"".join(_frame(STDOUT, line) for line in lines[pieces:]))
-        # The reader waits for room (CPython's Condition keeps its waiters there).
-        await _wait_for(lambda: bool(stream._room._waiters))  # type: ignore[attr-defined]
-
-        received = b""
-        with anyio.fail_after(30):
-            while received.count(b"\n") < len(lines):
-                received += await stream.receive()
-        await stream.aclose()
-
-        assert received == b"".join(lines)
-
-    async def test_a_stream_whose_reader_cannot_start_closes_its_socket(
-        self,
-        tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """As when the runner has run out of threads."""
-        client, _ = tls_sockets
-        op = ExecuteOperation(MagicMock())
-        with (
-            patch.object(op_module, "k8s_client", autospec=True),
-            patch.object(
-                op_module, "stream", autospec=True, return_value=_SocketWSClient(client)
-            ),
-        ):
-            stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
-
-        class Thread(threading.Thread):
-            def start(self) -> None:
-                raise RuntimeError("can't start new thread")
-
-        fake = types.SimpleNamespace(Thread=Thread, Condition=threading.Condition)
-        monkeypatch.setattr(execute_module, "threading", fake)
-        with pytest.raises(RuntimeError):
-            PodStdio(stack, ws)
-
-        assert client.fileno() == -1
 
     @pytest.mark.parametrize(
         "cmd", [[], ["--"], ["-a", "x"], ["\0--"], ["printf", "x\0y"]]
@@ -1563,8 +1491,9 @@ class TestExecStdio:
         stream = _stdio(client)
         receiving = asyncio.create_task(stream.receive())
         await asyncio.sleep(0)  # It now waits for stdout.
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+        select.select([client], [], [], 30)  # Its wait is over, but it has not run.
 
-        stream._put(b"a reply\n")  # As the reader thread does.
         receiving.cancel()
         with pytest.raises(asyncio.CancelledError):
             await receiving
@@ -1583,21 +1512,17 @@ class TestExecStdio:
 
         await stream.aclose()
 
-        with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
+        with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
             await sending
-        await _wait_for(lambda: client.fileno() == -1)
+        assert client.fileno() == -1
 
     async def test_the_stream_ends_with_the_exec_while_a_send_is_stuck(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """The pod no longer reads stdin, so the send holds the websocket's send lock.
-
-        Answering the server's close would need that lock.
-        """
+        """The pod no longer reads stdin: the send waits for room that never comes."""
         client, server = tls_sockets
         stream = _stdio(client)
         sending = await _send_in_progress(stream, server)
-        await _wait_for(stream._ws.sock.lock.locked)
 
         server.sendall(_frame(*_status(1)) + _close_frame())
 
@@ -1606,66 +1531,6 @@ class TestExecStdio:
                 await stream.receive()
             with pytest.raises(anyio.BrokenResourceError):
                 await sending
-
-    async def test_closing_a_stream_nobody_reads_closes_its_socket(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
-    ) -> None:
-        """Its reader waits for room in a full buffer, which closing must end."""
-        client, server = tls_sockets
-        stream = _stdio(client)
-        piece = _frame(STDOUT, b"x" * execute_module._STDIO_PIECE_BYTES)
-
-        def send() -> None:
-            with contextlib.suppress(OSError):  # The client stopped reading.
-                for _ in range(32):
-                    server.sendall(piece)
-
-        sender = threading.Thread(target=send)
-        sender.start()
-        try:
-            await _wait_for(lambda: len(stream._pieces) == execute_module._STDIO_PIECES)
-
-            await stream.aclose()
-
-            await _wait_for(lambda: client.fileno() == -1)
-        finally:
-            with contextlib.suppress(OSError):  # Fails a send still waiting.
-                server.shutdown(socket.SHUT_RDWR)
-            sender.join(30)
-
-    async def test_pieces_are_handed_on_while_the_event_loop_is_held(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
-    ) -> None:
-        """A busy runner holds its event loop: the reader must not wait for it."""
-        client, server = tls_sockets
-        stream = _stdio(client)
-        deadline = time.monotonic() + 30
-
-        # The event loop is held until both pieces are in (or the budget runs out).
-        for count, line in enumerate((b"one\n", b"two\n"), start=1):
-            server.sendall(_frame(STDOUT, line))
-            while len(stream._pieces) < count and time.monotonic() < deadline:
-                threading.Event().wait(0.01)
-        pieces = list(stream._pieces)
-        await stream.aclose()
-
-        assert pieces == [b"one\n", b"two\n"]
-
-    async def test_frames_already_waiting_reach_the_stream_as_one_piece(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
-    ) -> None:
-        """So that the 16-piece buffer holds more than 16 frames, and wakes once."""
-        client, server = tls_sockets
-        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
-        server.sendall(b"".join(_frame(STDOUT, b"x" * 4096) for _ in range(32)))
-        stream = _stdio(client)
-
-        with anyio.fail_after(30):
-            first = await stream.receive(1024**2)
-        await stream.aclose()
-
-        assert len(first) == 32 * 4096
 
     async def test_an_open_whose_caller_stopped_waiting_is_closed(
         self,
@@ -1706,10 +1571,7 @@ class TestExecStdio:
             await _wait_for(closed.is_set)
 
     async def test_output_read_before_a_failed_read_is_kept(self) -> None:
-        """Read in the same pass, as frames already waiting are.
-
-        So is every frame waiting, by kubernetes 37's update().
-        """
+        """Over a plain socket, which a lost connection ends without TLS's alert."""
         client, server = socket.socketpair()
         ws = _SocketWSClient(client)
         server.sendall(_frame(STDOUT, b"a reply\n"))
@@ -1726,7 +1588,7 @@ class TestExecStdio:
     async def test_a_cancelled_send_closes_the_stream(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """Its write goes on in its thread, and a later send would interleave."""
+        """A frame cut short would corrupt any later one."""
         client, server = tls_sockets
         stream = _stdio(client)
         sending = await _send_in_progress(stream, server)
@@ -1738,6 +1600,84 @@ class TestExecStdio:
         with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
             await stream.receive()
         await _wait_for(lambda: client.fileno() == -1)
+
+    async def test_a_reply_passes_while_the_event_loop_holds_the_gil(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """As a busy runner's does, where a thread waiting for the GIL may never run.
+
+        CPython makes the holder give it up only once one hold outlasts the switch
+        interval, so an event loop busy for less at a time starves every thread (on
+        Linux; macOS often hands it over).
+        """
+        client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
+        stream = _stdio(client)
+        reply = b"x" * 65536 + b"\n"
+
+        async def busy() -> None:  # Its send fits in the buffers: it never waits.
+            server.sendall(
+                b"".join(
+                    _frame(STDOUT, reply[i : i + 16384])
+                    for i in range(0, len(reply), 16384)
+                )
+            )
+            while True:
+                hold = time.perf_counter() + sys.getswitchinterval() / 5
+                while time.perf_counter() < hold:
+                    pass
+                await anyio.sleep(0)
+
+        received = b""
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(busy)
+            with anyio.fail_after(30):
+                while not received.endswith(b"\n"):
+                    received += await stream.receive()
+            tasks.cancel_scope.cancel()
+        await stream.aclose()
+
+        assert received == reply
+
+    async def test_a_frame_split_across_reads_is_read_whole(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """websocket-client keeps the part read while the read waits for the rest."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        frame = _frame(STDOUT, b"a reply\n")
+        receiving = asyncio.create_task(stream.receive())
+
+        for part in (frame[:1], frame[1:5], frame[5:]):  # Header, then payload.
+            await _wait_for(lambda: not select.select([client], [], [], 0)[0])
+            assert not receiving.done()
+            server.sendall(part)
+        with anyio.fail_after(30):
+            reply = await receiving
+        await stream.aclose()
+
+        assert reply == b"a reply\n"
+
+    async def test_a_message_in_several_frames_is_read_whole(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """With a ping between them, as RFC 6455 lets a server send."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        abnf = websocket.ABNF
+        server.sendall(
+            abnf(0, 0, 0, 0, abnf.OPCODE_BINARY, 0, bytes([STDOUT]) + b"a r").format()
+            + abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, b"").format()
+            + abnf(0, 0, 0, 0, abnf.OPCODE_CONT, 0, b"ep").format()
+            + abnf(1, 0, 0, 0, abnf.OPCODE_CONT, 0, b"ly\n").format()
+            + _frame(*_status(0))
+        )
+
+        with anyio.fail_after(30):
+            received = [piece async for piece in _receiving(stream, 65536)]
+
+        assert b"".join(received) == b"a reply\n"
 
 
 async def _receiving(stream: PodStdio, max_bytes: int) -> AsyncIterator[bytes]:

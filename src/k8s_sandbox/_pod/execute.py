@@ -1,18 +1,14 @@
-import asyncio
 import base64
-import collections
 import contextlib
-import contextvars
 import logging
 import re
 import secrets
 import shlex
 import socket
 import ssl
-import threading
 import time
 from contextlib import ExitStack, contextmanager
-from typing import Generator
+from typing import Awaitable, Callable, Generator, cast
 
 import anyio
 import websocket
@@ -31,7 +27,7 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, GetReturncodeError, PodError
 from k8s_sandbox._pod.get_returncode import get_returncode
-from k8s_sandbox._pod.op import API_TIMEOUT, PodOperation
+from k8s_sandbox._pod.op import _STDIN_CHUNK_SIZE, API_TIMEOUT, PodOperation
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
 # How long to wait, once both end markers have arrived, for the exec to end by itself
@@ -43,10 +39,8 @@ EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 _CLOSE_GROUP = "}\n"
 # Kept from an exec_stdio command's stderr, to explain one that failed to start.
 _STDERR_TAIL_BYTES = 4096
-# The most stdout an exec_stdio stream's reader gathers from frames already waiting
-# into one piece, and the most pieces it holds for the stream's reader (4 MiB).
-_STDIO_PIECE_BYTES = 256 * 1024
-_STDIO_PIECES = 16
+# How often an exec_stdio stream retries TLS that must write to read, or read to write.
+_TLS_RETRY_SECONDS = 0.01
 
 logger = logging.getLogger(__name__)
 
@@ -465,149 +459,142 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
 class PodStdio(ByteStream):
     """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio()).
 
-    A thread reads the websocket into a bounded buffer, so a slow reader of the
-    stream stops it, and then TCP. It hands pieces on without waiting for the event
-    loop, which a busy runner keeps slow, and waits only for room. It owns the
-    websocket: once the exec ends or the stream is closed, it closes the websocket.
+    receive() and send() read and write the websocket's socket, made non-blocking,
+    in the task that calls them: no thread has to win the GIL from a busy event loop
+    to pass a reply on. Nothing is read while no one receives, so a slow reader stops
+    the command through TCP. The websocket closes at the exec's status, or once the
+    stream is closed.
     """
 
     def __init__(self, stack: ExitStack, ws_client: WSClient) -> None:
+        self._stack = stack
         self._ws = ws_client
-        self._loop = asyncio.get_running_loop()
-        self._pieces: collections.deque[bytes] = collections.deque()
-        self._room = threading.Condition()  # Guards the pieces and _closed.
-        # Set when a piece of stdout, or its end, arrives. receive() takes a piece
-        # only once awake, so one cancelled meanwhile loses nothing.
-        self._arrived = asyncio.Event()
-        self._unread = b""
+        sock = ws_client.sock.sock
+        self._fd = sock.fileno()  # websocket-client closes the socket at its end.
+        sock.setblocking(False)
+        self._sock = sock
+        self._stdout = bytearray()
+        self._message = b""  # A message's frames so far, until its last.
+        self._stderr = b""
+        self._status: bytes | None = None
+        self._wrote = False
         self._ended = False
         self._error: Exception | None = None
         self._closed = False
-        # Writes take no tokens from anyio's shared limiter, so a wedged one can't
-        # hold up other threads.
-        self._limiter = anyio.CapacityLimiter(1)
-        try:
-            threading.Thread(
-                # In the caller's context, where Inspect finds the sample's log.
-                target=contextvars.copy_context().run,
-                args=(self._read, stack),
-                daemon=True,
-                name="pod-stdio",
-            ).start()
-        except BaseException:
-            _shutdown(ws_client)  # So that the close does not wait for the server.
-            stack.close()
-            raise
-
-    def _read(self, stack: ExitStack) -> None:
-        stderr = b""
-        wrote = False
-        try:
-            # Up to the exec's status, not its close: answering the server's close
-            # needs the send lock, which a send() the pod no longer reads holds.
-            while self._ws.is_open() and ERROR_CHANNEL not in self._ws._channels:
-                try:
-                    _update(self._ws, None)
-                    self._read_waiting()
-                finally:
-                    # Also what an update() that then failed read: from kubernetes 37
-                    # it reads every frame waiting.
-                    stderr += self._ws._channels.pop(STDERR_CHANNEL, b"")
-                    stderr = stderr[-_STDERR_TAIL_BYTES:]
-                    if stdout := self._ws._channels.pop(STDOUT_CHANNEL, b""):
-                        wrote = True
-                        self._put(stdout)
-        except Exception as e:
-            # A failed read, or the stream closed under the reader.
-            if ERROR_CHANNEL not in self._ws._channels:
-                self._error = e
-        finally:
-            closed = self._closed  # Before the end is seen: its reader closes on it.
-            _shutdown(self._ws)
-            self._ended = True
-            self._wake()
-            stack.close()
-            if not (wrote or closed):
-                # It failed to start (a missing user, runuser or executable): the
-                # caller only sees the stream end.
-                log_warn(
-                    "An exec_stdio command ended before writing to stdout.",
-                    status=self._ws._channels.get(ERROR_CHANNEL),
-                    stderr=stderr,
-                )
-            elif stderr:
-                log_trace("An exec_stdio command wrote to stderr.", stderr=stderr)
-
-    def _read_waiting(self) -> None:
-        """Read on while stdout's frames are already waiting, up to a piece."""
-        channels = self._ws._channels
-        read = len(channels.get(STDOUT_CHANNEL, b""))
-        while 0 < read < _STDIO_PIECE_BYTES:
-            _update(self._ws, 0)
-            read, before = len(channels.get(STDOUT_CHANNEL, b"")), read
-            if read == before:
-                return
-
-    def _put(self, stdout: bytes) -> None:
-        with self._room:
-            while len(self._pieces) >= _STDIO_PIECES and not self._closed:
-                self._room.wait()
-            if self._closed:
-                raise anyio.ClosedResourceError
-            self._pieces.append(stdout)
-        self._wake()
-
-    def _wake(self) -> None:
-        with contextlib.suppress(RuntimeError):  # The event loop is closed.
-            self._loop.call_soon_threadsafe(self._arrived.set)
+        self._send_lock = anyio.Lock()
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
-        while not self._unread:
-            self._arrived.clear()
-            ended = self._ended  # Before the pieces: the last is in by the time it is.
-            with self._room:
-                if self._closed:
-                    raise anyio.ClosedResourceError
-                if self._pieces:
-                    self._unread = self._pieces.popleft()
-                    self._room.notify()
-                    continue
-            if ended:
+        while not self._stdout or self._closed:
+            if self._closed:
+                raise anyio.ClosedResourceError
+            if self._ended:
                 if self._error is not None:
                     raise anyio.BrokenResourceError(repr(self._error)) from self._error
                 raise anyio.EndOfStream
-            await self._arrived.wait()
-        data, self._unread = self._unread[:max_bytes], self._unread[max_bytes:]
+            try:
+                # websocket-client keeps a frame read in part for the next call.
+                self._take(self._ws.sock.recv_frame())
+            except (ssl.SSLWantReadError, BlockingIOError):
+                await self._wait(anyio.wait_readable)
+            except ssl.SSLWantWriteError:
+                await anyio.sleep(_TLS_RETRY_SECONDS)  # See send().
+            except (OSError, websocket.WebSocketException) as e:
+                self._end(e)
+        data = bytes(self._stdout[:max_bytes])
+        del self._stdout[:max_bytes]
         return data
 
+    def _take(self, frame: ABNF) -> None:
+        """Take a frame of the exec's output, up to its status."""
+        if frame.opcode == ABNF.OPCODE_CLOSE:
+            self._end(None)
+            return
+        payload = cast(bytes, frame.data)  # recv_frame() reads bytes.
+        if frame.opcode == ABNF.OPCODE_CONT:
+            message = self._message + payload
+        elif frame.opcode in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
+            message = payload
+        else:
+            # A ping goes unanswered: the API server sends none, and a pong could
+            # land inside a frame a send() has begun.
+            return
+        self._message = b"" if frame.fin else message
+        if not frame.fin or len(message) < 2:
+            return
+        channel, data = message[0], memoryview(message)[1:]
+        if channel == STDOUT_CHANNEL:
+            self._stdout += data
+            self._wrote = True
+        elif channel == STDERR_CHANNEL:
+            self._stderr = (self._stderr + data)[-_STDERR_TAIL_BYTES:]
+        elif channel == ERROR_CHANNEL:
+            self._status = bytes(data)
+            self._end(None)
+
     async def send(self, item: bytes) -> None:
-        try:
-            await anyio.to_thread.run_sync(
-                PodOperation._write_stdin_chunked,
-                self._ws,
-                item,
-                abandon_on_cancel=True,
-                limiter=self._limiter,
-            )
-        except (OSError, websocket.WebSocketException) as e:
-            raise anyio.BrokenResourceError(repr(e)) from e
-        except BaseException:
-            # The write goes on in its thread, and a later send() would interleave
-            # with it: the stream can carry nothing more.
-            await self.aclose()
-            raise
+        async with self._send_lock:
+            try:
+                for i in range(0, len(item), _STDIN_CHUNK_SIZE):
+                    chunk = b"\0" + item[i : i + _STDIN_CHUNK_SIZE]  # Stdin's channel.
+                    frame = ABNF.create_frame(chunk, ABNF.OPCODE_BINARY).format()
+                    await self._write(memoryview(frame))
+            except OSError as e:
+                self._end(e)
+                raise anyio.BrokenResourceError(repr(e)) from e
+            except anyio.get_cancelled_exc_class():
+                # A frame cut short would corrupt any later one.
+                self._close()
+                raise
+
+    async def _write(self, data: memoryview) -> None:
+        while data:
+            if self._closed:
+                raise anyio.ClosedResourceError
+            if self._ended:
+                raise anyio.BrokenResourceError("the exec has ended") from self._error
+            try:
+                data = data[self._sock.send(data) :]
+            except (ssl.SSLWantWriteError, BlockingIOError):
+                await self._wait(anyio.wait_writable)
+            except ssl.SSLWantReadError:
+                # TLS 1.3 never reads to write (1.2 could, to renegotiate), and the
+                # read and write directions may not both wait on the socket at once.
+                await anyio.sleep(_TLS_RETRY_SECONDS)
+
+    async def _wait(self, wait: Callable[[int], Awaitable[None]]) -> None:
+        """Wait for the socket; the stream ending or closing meanwhile ends the wait."""
+        with contextlib.suppress(anyio.ClosedResourceError):
+            await wait(self._fd)
 
     async def send_eof(self) -> None:
         raise NotImplementedError("v4.channel.k8s.io cannot close stdin alone")
 
     async def aclose(self) -> None:
-        # Awaits nothing, so that it cannot be cancelled halfway. The reader, woken by
-        # either, then closes the websocket.
-        with self._room:
-            self._closed = True
-            self._room.notify()
-        self._arrived.set()  # Ends a pending receive() at once.
-        _shutdown(self._ws)
+        self._close()  # Awaits nothing, so that it cannot be cancelled halfway.
+
+    def _close(self) -> None:
+        self._closed = True
+        self._end(None)
+
+    def _end(self, error: Exception | None) -> None:
+        """Close the websocket, ending a receive() or send() waiting on its socket."""
+        if self._ended:
+            return
+        self._ended = True
+        self._error = error
+        anyio.notify_closing(self._fd)
+        _shutdown(self._ws)  # So that closing it does not wait for the server.
+        self._stack.close()
+        if not (self._wrote or self._closed):
+            # It failed to start (a missing user, runuser or executable): the caller
+            # only sees the stream end.
+            log_warn(
+                "An exec_stdio command ended before writing to stdout.",
+                status=self._status,
+                stderr=self._stderr,
+            )
+        elif self._stderr:
+            log_trace("An exec_stdio command wrote to stderr.", stderr=self._stderr)
 
 
 def _shutdown(ws_client: WSClient) -> None:
