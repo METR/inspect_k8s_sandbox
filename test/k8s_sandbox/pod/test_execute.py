@@ -1252,7 +1252,7 @@ class TestProbeSwitch:
 
 
 class TestProbeBounds:
-    """A planted `id` or `runuser` can hold the probe's output open or flood it."""
+    """A misbehaving `id` or `runuser` can hold the probe's output open or flood it."""
 
     def test_gives_up_on_a_probe_that_never_ends(
         self, monkeypatch: pytest.MonkeyPatch

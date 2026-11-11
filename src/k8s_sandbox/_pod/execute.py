@@ -200,7 +200,7 @@ class ExecuteOperation(PodOperation):
                 except (OSError, websocket.WebSocketException):
                     if ERROR_CHANNEL not in ws_client._channels:
                         raise
-                # The probe prints nothing, so keep nothing a planted `id` might.
+                # The probe prints nothing, so keep nothing `id` or `runuser` might.
                 ws_client._channels.pop(STDOUT_CHANNEL, None)
                 ws_client._channels.pop(STDERR_CHANNEL, None)
             ws_client.close()
@@ -426,7 +426,7 @@ class ExecuteOperation(PodOperation):
         ):
             logger.warning(
                 "exec(user=%r) failed: switching users needs the runuser binary, "
-                "which is not installed in this container. Docs: %s\n%s",
+                "at /sbin/runuser, which this container lacks. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
                 stderr,
