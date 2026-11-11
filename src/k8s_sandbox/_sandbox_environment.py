@@ -319,6 +319,8 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         if user is None:
             user = self._config.default_user
         with self._log_op("K8s open exec stdio in Pod", (), cmd=cmd):
+            # A retry may start the command again: the earlier one's stdin ends with
+            # its connection.
             async for attempt in _retry():
                 with attempt:
                     stream = await self._pod.exec_stdio(cmd, user)

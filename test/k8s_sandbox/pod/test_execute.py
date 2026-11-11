@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -1281,14 +1282,14 @@ class TestRunuserErrorMessages:
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
 
 
-def _stdio(client: ssl.SSLSocket, user: str | None = None) -> PodStdio:
+def _stdio(client: ssl.SSLSocket) -> PodStdio:
     """A stream on `client`, opened as Pod.exec_stdio() opens one."""
     op = ExecuteOperation(MagicMock())
     with (
         patch.object(op_module, "k8s_client"),
         patch.object(op_module, "stream", return_value=_SocketWSClient(client)),
     ):
-        stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], user)
+        stack, ws = op.open_stdio(["inspect-sandbox-tools", "bridge"], None)
     return PodStdio(op, stack, ws)
 
 
@@ -1298,6 +1299,16 @@ def _reader(server: ssl.SSLSocket) -> websocket.WebSocket:
     ws.sock = server
     ws.connected = True
     return ws
+
+
+async def _send_in_progress(
+    stream: PodStdio, server: ssl.SSLSocket
+) -> asyncio.Task[None]:
+    """A send more than the socket buffers hold, once its first bytes are out."""
+    _reader(server).recv_data_frame(True)  # The line open_stdio() wrote.
+    sending = asyncio.create_task(stream.send(b"x" * 64 * 1024**2))
+    await _wait_for(lambda: bool(select.select([server], [], [], 0)[0]))
+    return sending
 
 
 async def _wait_for(condition: Callable[[], bool]) -> None:
@@ -1384,16 +1395,15 @@ class TestExecStdio:
     async def test_closing_fails_a_send_the_server_is_not_reading(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        client, _ = tls_sockets
+        client, server = tls_sockets
         stream = _stdio(client)
-        # More than the socket buffers hold, so that the send waits for the server.
-        sending = asyncio.create_task(stream.send(b"x" * 64 * 1024**2))
-        await asyncio.sleep(0)
+        sending = await _send_in_progress(stream, server)
 
         await stream.aclose()
 
         with anyio.fail_after(30), pytest.raises(anyio.BrokenResourceError):
             await sending
+        await _wait_for(lambda: client.fileno() == -1)
 
     async def test_closing_a_stream_nobody_reads_closes_its_socket(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
@@ -1475,17 +1485,13 @@ class TestExecStdio:
 
             await _wait_for(closed.is_set)
 
-    async def test_output_read_by_an_update_that_then_failed_is_kept(self) -> None:
-        """As kubernetes 37's update() can: read every frame waiting, then fail."""
+    async def test_output_read_before_a_failed_read_is_kept(self) -> None:
+        """Read in the same pass, as frames already waiting are.
+
+        So is every frame waiting, by kubernetes 37's update().
+        """
         client, server = socket.socketpair()
         ws = _SocketWSClient(client)
-        read_one = ws.update
-
-        def read_all_then_fail(timeout: float | None = 0) -> None:
-            while True:
-                read_one(timeout)
-
-        ws.update = read_all_then_fail  # type: ignore[method-assign]
         server.sendall(_frame(STDOUT, b"a reply\n"))
         server.close()
         stream = PodStdio(ExecuteOperation(MagicMock()), contextlib.ExitStack(), ws)
@@ -1501,10 +1507,9 @@ class TestExecStdio:
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
         """Its write goes on in its thread, and a later send would interleave."""
-        client, _ = tls_sockets
+        client, server = tls_sockets
         stream = _stdio(client)
-        sending = asyncio.create_task(stream.send(b"x" * 64 * 1024**2))
-        await asyncio.sleep(0)
+        sending = await _send_in_progress(stream, server)
 
         sending.cancel()  # As Task.cancel() can, which no shield stops.
         with pytest.raises(asyncio.CancelledError):
@@ -1512,6 +1517,7 @@ class TestExecStdio:
 
         with anyio.fail_after(30), pytest.raises(anyio.ClosedResourceError):
             await stream.receive()
+        await _wait_for(lambda: client.fileno() == -1)
 
     async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
