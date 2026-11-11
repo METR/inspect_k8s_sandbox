@@ -535,3 +535,44 @@ def test_warn_mode_carries_on_after_a_restart():
         for _ in range(2):
             assert asyncio.run(pod.exec(["true"], None, None, {}, None, None)).success
         assert exec_op.return_value.exec.call_count == 2
+
+
+def test_a_file_read_that_fails_in_a_restarted_container_raises_the_restart(
+    monkeypatch,
+):
+    # With the check off: the replacement has none of the sample's files.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=1
+        )
+        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
+        pod = _make_pod()
+        for _ in range(2):
+            with pytest.raises(ContainerRestartedError):
+                asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        assert mock_client.return_value.read_namespaced_pod.call_count == 1
+
+
+def test_a_file_read_that_fails_in_a_healthy_container_keeps_its_error(monkeypatch):
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with (
+        _inline_executor(),
+        patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
+        patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+    ):
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-OLD", container_name="default", restart_count=0
+        )
+        read_op.return_value.read_file.side_effect = FileNotFoundError("/x")
+        pod = _make_pod()
+        with pytest.raises(FileNotFoundError):
+            asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        read_op.return_value.read_file.side_effect = None
+        asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+        # One read, after the failure; none for the read that succeeded.
+        assert mock_client.return_value.read_namespaced_pod.call_count == 1

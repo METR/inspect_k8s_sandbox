@@ -196,22 +196,22 @@ class Pod:
             # result better.
             if warned_restart is not None:
                 raise warned_restart
-            await self._diagnose_restart_after_failed_exec()
+            await self._diagnose_restart_after_failure()
             raise
         if not result.success:
             if warned_restart is not None:
                 raise warned_restart
-            await self._diagnose_restart_after_failed_exec()
+            await self._diagnose_restart_after_failure()
         return result
 
-    async def _diagnose_restart_after_failed_exec(self) -> None:
+    async def _diagnose_restart_after_failure(self) -> None:
         try:
             restart = await self.check_for_pod_restart()
         except (PodReplacedError, ContainerRestartedError):
             raise
         except Exception:
             logger.warning(
-                "Post-exec restart re-check failed; returning original exec result",
+                "Restart re-check failed; keeping the failed operation's result",
                 exc_info=True,
             )
             return
@@ -232,7 +232,7 @@ class Pod:
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
-        await self._run_async(lambda: writer.write_file(data, dst))
+        await self._after_failure_check(lambda: writer.write_file(data, dst))
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
         """
@@ -249,7 +249,21 @@ class Pod:
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
-        await self._run_async(lambda: reader.read_file(src, dst))
+        await self._after_failure_check(lambda: reader.read_file(src, dst))
+
+    async def _after_failure_check(self, callable: Callable[[], None]) -> None:
+        """Run a file operation; if it fails, a restart found since explains it better.
+
+        Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
+        container has none of the files the sample wrote, so reading one fails there.
+        """
+        try:
+            await self._run_async(callable)
+        except (PodReplacedError, ContainerRestartedError):
+            raise
+        except Exception:
+            await self._diagnose_restart_after_failure()
+            raise
 
     async def _run_async(self, callable: Callable[[], T]) -> T:
         """Run a synchronous function asynchronously.

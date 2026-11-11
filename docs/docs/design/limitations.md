@@ -42,8 +42,8 @@ chart](../helm//built-in-chart.md#resource-requests-and-limits).
 You can reduce the impact of a container restarting by using persistent volumes.
 
 The framework will issue a warning if a container restarts during an eval. If a
-subsequent `exec()` fails after a detected restart, the restart is raised as the cause
-regardless of mode. If you set the `restarted_container_behavior` parameter to `raise`,
+subsequent `exec()`, `read_file()` or `write_file()` fails after a detected restart, the
+restart is raised as the cause regardless of mode. If you set the `restarted_container_behavior` parameter to `raise`,
 the eval will fail the sample immediately on detection, even if `exec()` has not failed.
 Every later `exec()`, `read_file()` and `write_file()` in that sandbox raises the same
 error, so a solver that catches it cannot carry on in the restarted container.
