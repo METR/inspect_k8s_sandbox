@@ -356,14 +356,18 @@ class Release:
                 # Returns the rendered manifest, which is where the pod count for the
                 # readiness wait comes from.
                 "--output=json",
-                # Annotation do not have strict length reqs. Quoting/escaping
-                # handled by asyncio.create_subprocess_exec.
-                f"--set=annotations.inspectTaskName={self.task_name}",
+                # Annotations have no strict length limit. Escaped as a string, so
+                # the name is the annotation's value and sets nothing else.
+                "--set-string=annotations.inspectTaskName="
+                + _helm_escape(self.task_name),
                 # Include a label to identify releases created by Inspect.
                 _labels_arg(),
             ]
             + (
-                [f"--set=labels.inspectSampleUUID={self.sample_uuid}"]
+                [
+                    "--set-string=labels.inspectSampleUUID="
+                    + _helm_escape(self.sample_uuid)
+                ]
                 if self.sample_uuid
                 else []
             )
