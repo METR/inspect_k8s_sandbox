@@ -1537,6 +1537,53 @@ class TestExecStdio:
 
         assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
+    async def test_a_receive_cancelled_as_stdout_arrives_loses_nothing(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """By Task.cancel(), which a memory stream's own receive() loses data to."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        receiving = asyncio.create_task(stream.receive())
+        await anyio.wait_all_tasks_blocked()  # It now waits for stdout.
+        server.sendall(_frame(STDOUT, b"a reply\n"))
+        select.select([client], [], [], 30)  # Its wait is over, but it has not run.
+
+        receiving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await receiving
+        with anyio.fail_after(30):
+            reply = await stream.receive()
+        await stream.aclose()
+
+        assert reply == b"a reply\n"
+
+    async def test_a_flood_of_stdout_does_not_hold_the_event_loop(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Each receive() lets other tasks run, which can cancel the reads."""
+        client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
+        server.sendall(b"".join(_frame(STDOUT, b"x") for _ in range(1000)))
+        stream = _stdio(client)
+        received = b""
+
+        async def read_all() -> None:
+            nonlocal received
+            while len(received) < 1000:
+                received += await stream.receive()
+
+        async def cancel(scope: anyio.CancelScope) -> None:
+            scope.cancel()
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(read_all)
+                tasks.start_soon(cancel, tasks.cancel_scope)
+        await stream.aclose()
+
+        assert len(received) < 1000  # Cancelled mid-flood.
+
     async def test_a_receive_cancelled_once_it_has_run_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -1615,7 +1662,8 @@ class TestExecStdio:
         reading.join(30)
         await stream.aclose()
 
-        assert sorted(set(frame[1:]) for frame in frames) == [{97}] * 3 + [{98}] * 3
+        # The first send's frames all go out before the second's.
+        assert [set(frame[1:]) for frame in frames] == [{97}] * 3 + [{98}] * 3
 
     async def test_closing_fails_a_send_the_server_is_not_reading(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

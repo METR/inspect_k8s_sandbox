@@ -482,7 +482,9 @@ class PodStdio(ByteStream):
         self._send_lock = anyio.Lock()
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
-        await anyio.lowlevel.checkpoint_if_cancelled()
+        # A checkpoint, as anyio's own streams' receive() is: a flood of stdout lets
+        # other tasks run too, and a caller already cancelled takes nothing.
+        await anyio.lowlevel.checkpoint()
         while not self._stdout or self._closed:
             if self._closed:
                 raise anyio.ClosedResourceError
@@ -501,8 +503,7 @@ class PodStdio(ByteStream):
                 self._end(e)
             else:
                 if not self._stdout:
-                    # A flood of frames without stdout (stderr, say) must not hold the
-                    # event loop; stdout ends the call, and its reader's limit a flood.
+                    # Nor a flood of frames without stdout (stderr, say), in one call.
                     await anyio.lowlevel.checkpoint()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
