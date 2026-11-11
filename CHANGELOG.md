@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- With `restarted_container_behavior="raise"`, every operation after a detected pod
+  replacement or container restart now raises the same `PodReplacedError` or
+  `ContainerRestartedError`, `read_file()` and `write_file()` included (also when
+  `INSPECT_POD_RESTART_CHECK=false`). Before, only the first one raised, and a solver
+  that caught it carried on in the new container.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a

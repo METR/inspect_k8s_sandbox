@@ -47,9 +47,10 @@ class PodReplacedError(K8sError):
     any state held in its filesystem or memory that did not reside on a
     persistent volume.
 
-    The sandbox provider refreshes its cached pod identity when this is
-    raised, so subsequent operations target the new pod and will not re-raise
-    ``PodReplacedError`` unless yet another replacement occurs.
+    With ``restarted_container_behavior="warn"`` the sandbox provider refreshes
+    its cached pod identity, so subsequent operations target the new pod and do
+    not report it again unless yet another replacement occurs. With ``"raise"``
+    every later operation in the sandbox raises it again.
     """
 
     def __init__(  # noqa: D107
@@ -83,9 +84,10 @@ class ContainerRestartedError(K8sError):
     survive; in-memory state and any background processes started by the agent
     do not.
 
-    The sandbox provider refreshes its cached restart count when this is
-    raised, so subsequent operations will not re-raise
-    ``ContainerRestartedError`` unless a further restart occurs.
+    With ``restarted_container_behavior="warn"`` the sandbox provider refreshes
+    its cached restart count, so subsequent operations do not report it again
+    unless a further restart occurs. With ``"raise"`` every later operation in
+    the sandbox raises it again.
     """
 
     def __init__(  # noqa: D107

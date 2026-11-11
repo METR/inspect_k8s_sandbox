@@ -30,7 +30,8 @@ def _file_op_restart_check_enabled() -> bool:
     # (only — exec is unaffected and always checks). At high concurrency
     # (200+ ops) the per-op reads can overwhelm the K8s API server; exec's
     # check is the high-signal way we learn a sandbox pod was replaced and
-    # stays unconditional, while file-op API errors are self-revealing.
+    # stays unconditional, while file-op API errors are self-revealing. A restart
+    # already raised in "raise" mode is raised again regardless, with no read.
     return os.environ.get("INSPECT_POD_RESTART_CHECK", "true").lower() != "false"
 
 
@@ -57,13 +58,16 @@ class Pod:
         # Whether exec() can start runuser directly to run as a user, per pod,
         # container start and user (see exec()).
         self._switch: dict[tuple[str, int, str], bool] = {}
+        # What a check in "raise" mode detected, which every later check raises.
+        self._restart_error: PodReplacedError | ContainerRestartedError | None = None
 
     @property
     def info(self) -> PodInfo:
         """The current cached pod identity.
 
         Note that ``uid`` and ``initial_restart_count`` may be replaced by
-        ``check_for_pod_restart`` if a replacement or restart is observed.
+        ``check_for_pod_restart`` if a replacement or restart is observed in
+        ``"warn"`` mode.
         """
         return self._info
 
@@ -72,14 +76,18 @@ class Pod:
     ) -> PodReplacedError | ContainerRestartedError | None:
         """Check whether the pod has been replaced or its container has restarted.
 
-        On detection, refreshes the cached identity (``uid`` and/or
-        ``initial_restart_count``) so subsequent operations target the new pod
-        without re-raising the same condition. Whether the detection raises is
-        governed by ``restarted_container_behavior``:
+        What a detection does is governed by ``restarted_container_behavior``:
 
-        - ``"warn"``: log a warning and return the detected error.
-        - ``"raise"``: raise ``PodReplacedError`` or ``ContainerRestartedError``.
+        - ``"warn"``: log a warning, refresh the cached identity (``uid`` and/or
+          ``initial_restart_count``) so subsequent operations target the new pod
+          without reporting the same condition, and return the detected error.
+        - ``"raise"``: raise ``PodReplacedError`` or ``ContainerRestartedError``, and
+          raise it again on every later check, without reading the pod: the pod or
+          container the sample had is gone.
         """
+        if self._restart_error is not None:
+            # Without the traceback of its last raise, which would grow with each.
+            raise self._restart_error.with_traceback(None)
         return await self._run_async(self._check_for_pod_restart_sync)
 
     def _check_for_pod_restart_sync(
@@ -87,25 +95,23 @@ class Pod:
     ) -> PodReplacedError | ContainerRestartedError | None:
         try:
             check_for_pod_restart(self._info)
-        except PodReplacedError as e:
-            self._info = dataclasses.replace(
-                self._info,
-                uid=e.new_uid,
-                initial_restart_count=e.new_restart_count,
-            )
-            if self._info.restarted_container_behavior == "warn":
-                logger.warning(str(e))
-                return e
-            raise
-        except ContainerRestartedError as e:
-            self._info = dataclasses.replace(
-                self._info,
-                initial_restart_count=e.restart_count,
-            )
-            if self._info.restarted_container_behavior == "warn":
-                logger.warning(str(e))
-                return e
-            raise
+        except (PodReplacedError, ContainerRestartedError) as e:
+            if self._info.restarted_container_behavior == "raise":
+                self._restart_error = e
+                raise
+            if isinstance(e, PodReplacedError):
+                self._info = dataclasses.replace(
+                    self._info,
+                    uid=e.new_uid,
+                    initial_restart_count=e.new_restart_count,
+                )
+            else:
+                self._info = dataclasses.replace(
+                    self._info,
+                    initial_restart_count=e.restart_count,
+                )
+            logger.warning(str(e))
+            return e
         return None
 
     async def exec(
@@ -225,7 +231,7 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        if _file_op_restart_check_enabled():
+        if self._restart_error is not None or _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
         await self._run_async(lambda: writer.write_file(data, dst))
@@ -242,7 +248,7 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        if _file_op_restart_check_enabled():
+        if self._restart_error is not None or _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
         await self._run_async(lambda: reader.read_file(src, dst))

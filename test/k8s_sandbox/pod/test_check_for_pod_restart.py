@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import pathlib
+import traceback
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -106,23 +107,59 @@ def _make_pod(restarted_container_behavior: str = "raise") -> Pod:
     )
 
 
-def test_pod_auto_refreshes_uid_after_replacement():
+def test_warn_mode_refreshes_uid_after_replacement():
+    pod = _make_pod(restarted_container_behavior="warn")
+    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+            uid="uid-NEW", container_name="default", restart_count=2
+        )
+        assert isinstance(pod._check_for_pod_restart_sync(), PodReplacedError)
+        # Cached identity is refreshed so a subsequent call against the new pod
+        # does NOT report it again.
+        assert pod.info.uid == "uid-NEW"
+        assert pod.info.initial_restart_count == 2
+        assert pod._check_for_pod_restart_sync() is None
+
+
+@pytest.mark.parametrize(
+    ("uid", "restart_count", "error_type"),
+    [
+        pytest.param("uid-NEW", 0, PodReplacedError, id="replaced"),
+        pytest.param("uid-OLD", 1, ContainerRestartedError, id="restarted"),
+    ],
+)
+def test_raise_mode_raises_again_without_reading_the_pod(
+    uid: str, restart_count: int, error_type: type[Exception]
+):
     pod = _make_pod()
-    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
-        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
-            uid="uid-NEW", container_name="default", restart_count=2
-        )
-        with pytest.raises(PodReplacedError):
-            pod._check_for_pod_restart_sync()
-    # Cached identity is refreshed so a subsequent call against the new pod
-    # does NOT re-raise.
-    assert pod.info.uid == "uid-NEW"
-    assert pod.info.initial_restart_count == 2
-    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
-        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
-            uid="uid-NEW", container_name="default", restart_count=2
-        )
-        pod._check_for_pod_restart_sync()  # no raise
+    with patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance"
+    ) as mock_get_instance:
+        executor = MagicMock()
+
+        async def queue(callable):
+            return callable()
+
+        executor.queue_operation = queue
+        mock_get_instance.return_value = executor
+        with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+            mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+                uid=uid, container_name="default", restart_count=restart_count
+            )
+            with pytest.raises(error_type) as first:
+                asyncio.run(pod.check_for_pod_restart())
+            depths = []
+            for _ in range(2):
+                with pytest.raises(error_type) as again:
+                    asyncio.run(pod.check_for_pod_restart())
+                assert again.value is first.value
+                depths.append(len(traceback.extract_tb(again.value.__traceback__)))
+            assert mock_client.return_value.read_namespaced_pod.call_count == 1
+    # Each raise starts a fresh traceback rather than adding to the last one's.
+    assert depths[0] == depths[1]
+    # The identity stays the one the sample had.
+    assert pod.info.uid == "uid-OLD"
+    assert pod.info.initial_restart_count == 0
 
 
 def test_warn_mode_logs_and_does_not_raise_but_still_refreshes(caplog):
@@ -137,21 +174,16 @@ def test_warn_mode_logs_and_does_not_raise_but_still_refreshes(caplog):
     assert any("has been replaced" in r.message for r in caplog.records)
 
 
-def test_pod_auto_refreshes_restart_count_after_container_restart():
-    pod = _make_pod()
+def test_warn_mode_refreshes_restart_count_after_container_restart():
+    pod = _make_pod(restarted_container_behavior="warn")
     with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
         mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
             uid="uid-OLD", container_name="default", restart_count=4
         )
-        with pytest.raises(ContainerRestartedError):
-            pod._check_for_pod_restart_sync()
-    assert pod.info.initial_restart_count == 4
-    # Same restart_count next time → no raise.
-    with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
-        mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
-            uid="uid-OLD", container_name="default", restart_count=4
-        )
-        pod._check_for_pod_restart_sync()
+        assert isinstance(pod._check_for_pod_restart_sync(), ContainerRestartedError)
+        assert pod.info.initial_restart_count == 4
+        # Same restart_count next time → nothing to report.
+        assert pod._check_for_pod_restart_sync() is None
 
 
 # --- INSPECT_POD_RESTART_CHECK gating (METR-private; not upstream) -----------
@@ -230,3 +262,42 @@ def test_env_var_default_keeps_file_op_check(monkeypatch):
                 with pytest.raises(PodReplacedError):
                     asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
                 assert mock_client.return_value.read_namespaced_pod.call_count == 1
+
+
+def test_raise_mode_fails_every_later_operation_with_the_check_off(monkeypatch):
+    # A solver that caught the restart error must not carry on in the new container,
+    # through a file operation either, when INSPECT_POD_RESTART_CHECK=false skips
+    # their pod reads.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    with patch(
+        "k8s_sandbox._pod.executor.PodOpExecutor.get_instance"
+    ) as mock_get_instance:
+        executor = MagicMock()
+
+        async def queue(callable):
+            return callable()
+
+        executor.queue_operation = queue
+        mock_get_instance.return_value = executor
+        with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
+            mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+                uid="uid-OLD", container_name="default", restart_count=1
+            )
+            with (
+                patch("k8s_sandbox._pod.pod.ReadFileOperation") as read_op,
+                patch("k8s_sandbox._pod.pod.WriteFileOperation") as write_op,
+                patch("k8s_sandbox._pod.pod.ExecuteOperation") as exec_op,
+            ):
+                pod = _make_pod()
+                with pytest.raises(ContainerRestartedError):
+                    asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+                with pytest.raises(ContainerRestartedError):
+                    asyncio.run(pod.exec(["true"], None, None, {}, None, None))
+                with pytest.raises(ContainerRestartedError):
+                    asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
+                with pytest.raises(ContainerRestartedError):
+                    asyncio.run(pod.write_file(b"", pathlib.Path("/x")))
+                assert mock_client.return_value.read_namespaced_pod.call_count == 1
+                exec_op.return_value.exec.assert_not_called()
+                read_op.assert_not_called()
+                write_op.assert_not_called()
