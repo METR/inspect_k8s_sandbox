@@ -23,7 +23,7 @@
   later.
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
-  taking one each. Needs anyio 4.10 or later.
+  taking one each. Needs anyio 4.14 or later.
 
 ## 2026-10-09 0.14.0
 
