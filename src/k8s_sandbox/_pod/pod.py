@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import ssl
 import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
@@ -220,7 +221,7 @@ class Pod:
                 "Restart re-check failed; keeping the failed operation's result",
                 exc_info=True,
             )
-            # Unless its worker kept one before it gave up.
+            # Unless an operation kept one meanwhile.
             self._raise_restart()
             return
         if restart is not None:
@@ -280,11 +281,14 @@ class Pod:
             await self._run_async(callable)
         except (PodReplacedError, ContainerRestartedError):
             raise
-        except Exception as e:
-            # A connection error is left to the provider's retries, as for exec.
-            if warned is not None and not isinstance(
-                e, (ApiException, WebSocketException, ConnectionError)
-            ):
+        except (ApiException, WebSocketException, ConnectionError, ssl.SSLError):
+            # Left to the provider's retries, which in "raise" mode must not reach a
+            # restarted container unchecked.
+            if self._info.restarted_container_behavior == "raise":
+                await self._diagnose_restart_after_failure()
+            raise
+        except Exception:
+            if warned is not None:
                 raise warned
             await self._diagnose_restart_after_failure()
             raise

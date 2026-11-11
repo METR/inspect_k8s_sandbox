@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import pathlib
+import ssl
 import traceback
 from unittest.mock import MagicMock, patch
 
@@ -61,9 +62,11 @@ def test_no_change_does_not_raise():
         )
         # Should not raise
         check_for_pod_restart(_pod_info())
-    # A stalled read gives up rather than hold its thread.
+    # A stalled read gives up rather than hold its thread. The kubernetes client
+    # ignores a timeout that is not an int.
     read = mock_client.return_value.read_namespaced_pod.call_args
     assert read.kwargs["_request_timeout"] == API_TIMEOUT
+    assert isinstance(API_TIMEOUT, int)
 
 
 def test_missing_container_statuses_skips_restart_check():
@@ -710,7 +713,19 @@ def test_the_first_restart_kept_stays():
     assert pod._keep(second) is first
 
 
-def test_warn_mode_leaves_a_failed_file_operations_connection_error_to_be_retried():
+# Whether the check before it warned of the restart, or the check after it would.
+@pytest.mark.parametrize("check", ["true", "false"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ConnectionResetError(), id="connection-reset"),
+        pytest.param(ssl.SSLEOFError(), id="tls-eof"),
+    ],
+)
+def test_warn_mode_leaves_a_failed_file_operations_connection_error_to_be_retried(
+    monkeypatch, check: str, error: Exception
+):
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", check)
     with (
         _inline_executor(),
         patch("k8s_sandbox._pod.op.k8s_client") as mock_client,
@@ -719,9 +734,9 @@ def test_warn_mode_leaves_a_failed_file_operations_connection_error_to_be_retrie
         mock_client.return_value.read_namespaced_pod.return_value = _k8s_pod(
             uid="uid-OLD", container_name="default", restart_count=1
         )
-        read_op.return_value.read_file.side_effect = ConnectionResetError()
+        read_op.return_value.read_file.side_effect = error
         pod = _make_pod(restarted_container_behavior="warn")
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(type(error)):
             asyncio.run(pod.read_file(pathlib.Path("/x"), io.BytesIO()))
 
 
