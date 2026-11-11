@@ -504,6 +504,32 @@ class TestScriptInAShell:
         assert not ran.exists()
         assert result.stdout == f"input{path}".encode() + _marker(0)
 
+    def test_printf_is_not_found_through_the_path(
+        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Where the shell has no printf builtin: bash with its builtin turned off."""
+        if shell[0] != "bash":
+            pytest.skip("Needs bash, whose printf builtin can be turned off")
+        system = tmp_path / "system"
+        stubs = tmp_path / "stubs"
+        system.mkdir()
+        stubs.mkdir()
+        ran = tmp_path / "ran"
+        (system / "printf").symlink_to(shutil.which("printf") or "/usr/bin/printf")
+        stub = stubs / "printf"
+        stub.write_text(f"#!/bin/sh\necho printf >> {ran}\n")
+        stub.chmod(0o755)
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        script = "enable -n printf\n" + ExecuteOperation(
+            MagicMock()
+        )._build_shell_script(["true"], None, None, {}, None, MARKER)
+        path = f"{stubs}:{os.environ['PATH']}"
+
+        result = _run_script(shell, script, env={**os.environ, "PATH": path})
+
+        assert not ran.exists()
+        assert result.stdout == _marker(0)
+
 
 def _proc_status(uids: str, gids: str = "1000\t1000\t1000\t1000") -> str:
     """A /proc/self/status giving these real, effective, saved and filesystem ids."""
