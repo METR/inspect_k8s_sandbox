@@ -1584,24 +1584,29 @@ class TestExecStdio:
 
         assert len(received) < 1000  # Cancelled mid-flood.
 
-    async def test_a_receive_cancelled_once_it_has_run_loses_nothing(
+    async def test_a_receive_cancelled_at_any_step_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """A Task.cancel() can land after the stdout it took, as well as before."""
+        """A Task.cancel() can land before, during or after the stdout it takes."""
         client, server = tls_sockets
         stream = _stdio(client)
-        server.sendall(_frame(STDOUT, b"a reply\n"))
-        await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
-        receiving = asyncio.create_task(stream.receive())
-        await asyncio.sleep(0)  # It runs one step.
+        for steps in range(4):
+            line = b"reply %d\n" % steps
+            server.sendall(_frame(STDOUT, line))
+            await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
+            receiving = asyncio.create_task(stream.receive())
+            for _ in range(steps):
+                await asyncio.sleep(0)  # It runs that many steps.
 
-        receiving.cancel()
-        received = b""
-        with contextlib.suppress(asyncio.CancelledError):
-            received = await receiving
-        with anyio.fail_after(30):
-            while received != b"a reply\n":
-                received += await stream.receive()
+            receiving.cancel()
+            received = b""
+            with contextlib.suppress(asyncio.CancelledError):
+                received = await receiving
+            with anyio.fail_after(30):
+                while not received.endswith(b"\n"):
+                    received += await stream.receive()
+
+            assert received == line
         await stream.aclose()
 
     async def test_stdout_read_before_the_stream_broke_is_kept(
@@ -1802,28 +1807,30 @@ class TestExecStdio:
     async def test_a_flood_of_stderr_does_not_hold_the_event_loop(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """Other tasks run, and can cancel the read, while it lasts: losing nothing."""
+        """Other tasks run again and again while the one receive() reading it lasts."""
         client, server = tls_sockets
         client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024**2)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024**2)
         flood = b"".join(_frame(STDERR, b"x") for _ in range(10_000))
         server.sendall(flood + _frame(STDOUT, b"a reply\n"))
         stream = _stdio(client)
-        first = None
+        turns = 0
 
-        async def cancel(scope: anyio.CancelScope) -> None:
-            scope.cancel()
+        async def other_task() -> None:
+            nonlocal turns
+            while True:
+                turns += 1
+                await anyio.lowlevel.checkpoint()
 
         with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
-                tasks.start_soon(cancel, tasks.cancel_scope)
-                first = await stream.receive()
-        assert first is None  # Cancelled by the other task, mid-flood.
-        with anyio.fail_after(30):
-            reply = await stream.receive()
+                tasks.start_soon(other_task)
+                reply = await stream.receive()
+                tasks.cancel_scope.cancel()
         await stream.aclose()
 
         assert reply == b"a reply\n"
+        assert turns > 100
 
     async def test_a_receive_whose_caller_was_cancelled_takes_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

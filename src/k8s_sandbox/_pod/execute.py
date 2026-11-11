@@ -41,6 +41,9 @@ _CLOSE_GROUP = "}\n"
 _STDERR_TAIL_BYTES = 4096
 # How often an exec_stdio stream retries TLS that must write to read, or read to write.
 _TLS_RETRY_SECONDS = 0.01
+# The most frames an exec_stdio stream reads, while they keep arriving, before it lets
+# other tasks run: a few per reply, so a large one rarely waits for a busy event loop.
+_FRAMES_PER_TURN = 32
 
 logger = logging.getLogger(__name__)
 
@@ -479,12 +482,11 @@ class PodStdio(ByteStream):
         self._ended = False
         self._error: Exception | None = None
         self._closed = False
+        self._unyielded = 0  # Frames read since the stream last let other tasks run.
         self._send_lock = anyio.Lock()
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
-        # A checkpoint, as anyio's own streams' receive() is: a flood of stdout lets
-        # other tasks run too, and a caller already cancelled takes nothing.
-        await anyio.lowlevel.checkpoint()
+        await anyio.lowlevel.checkpoint_if_cancelled()
         while not self._stdout or self._closed:
             if self._closed:
                 raise anyio.ClosedResourceError
@@ -497,13 +499,17 @@ class PodStdio(ByteStream):
                 self._take(self._ws.sock.recv_frame())
             except (ssl.SSLWantReadError, BlockingIOError):
                 await self._wait(anyio.wait_readable)
+                self._unyielded = 0
             except ssl.SSLWantWriteError:
                 await anyio.sleep(_TLS_RETRY_SECONDS)  # See send().
             except (OSError, websocket.WebSocketException) as e:
                 self._end(e)
             else:
-                if not self._stdout:
-                    # Nor a flood of frames without stdout (stderr, say), in one call.
+                self._unyielded += 1
+                if self._unyielded >= _FRAMES_PER_TURN:
+                    # Frames that keep coming (stdout's or stderr's) must not hold the
+                    # event loop; this keeps them, so a cancel here loses nothing.
+                    self._unyielded = 0
                     await anyio.lowlevel.checkpoint()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
