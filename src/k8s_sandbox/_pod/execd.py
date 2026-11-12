@@ -580,13 +580,14 @@ class ExecdClient:
             drained = 0
             while time.monotonic() < end:
                 item = await _next(call.queue, end - time.monotonic())
-                if isinstance(item, tuple) and item[0] == EXIT:
-                    break
+                if not isinstance(item, tuple) or item[0] == EXIT:
+                    break  # its exit, or a dropped connection
                 # execd exits only once its window has room; past HOLD it isn't execd
-                if isinstance(item, tuple) and item[0] in (STDOUT, STDERR):
-                    if drained < call.hold:
-                        drained += len(item[1])
-                        await _taken(link, call, item[0], len(item[1]))
+                if item[0] in (STDOUT, STDERR):
+                    if drained + len(item[1]) > call.hold:
+                        break
+                    drained += len(item[1])
+                    await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
         # Even with no exit: it frees what execd holds for the call.

@@ -367,7 +367,7 @@ async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None
     await daemons.serve(full_after_kill)
     with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
         await asyncio.wait_for(
-            daemons.client().exec(["yes"], None, None, {}, None, 0.2), 5
+            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
         )
     await asyncio.wait_for(released.wait(), 5)
 
@@ -378,24 +378,40 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(
     monkeypatch.setattr(execd, "KILL_WAIT", 1.0)
     acked = 0
 
-    async def floods_after_kill(
+    async def sends_while_acked(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         nonlocal acked
         _, call_id, _ = await read_frame(r)  # START
+        more = frame(execd.STDOUT, call_id, b"x" * (execd.CHUNK * 3 // 2))
         while True:
             kind, _, payload = await read_frame(r)
             if kind == execd.ACK:
                 acked = max(acked, sum(json.loads(payload).values()))
-            elif kind == execd.KILL:  # a stand-in that never exits, sending all it can
-                for _ in range(3 * execd.HOLD // execd.CHUNK):
-                    w.write(frame(execd.STDOUT, call_id, b"x" * execd.CHUNK))
-                    await w.drain()
+            if kind in (execd.KILL, execd.ACK):  # never exits; sends again when acked
+                w.write(more)
 
-    await daemons.serve(floods_after_kill)
+    await daemons.serve(sends_while_acked)
     with pytest.raises(TimeoutError):
-        await daemons.client().exec(["yes"], None, None, {}, None, 0.2)
-    assert acked <= execd.HOLD + execd.ACK_EVERY
+        await daemons.client().exec(["yes"], None, None, {}, None, 1)
+    assert 0 < acked <= execd.HOLD
+
+
+async def test_a_timed_out_call_is_released_with_no_exit(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 0.5)
+    released = asyncio.Event()
+
+    async def never_exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            if (await read_frame(r))[0] == execd.RELEASE:
+                released.set()
+
+    await daemons.serve(never_exits)
+    with pytest.raises(TimeoutError):
+        await daemons.client().exec(["sleep", "9"], None, None, {}, None, 1)
+    await asyncio.wait_for(released.wait(), 5)
 
 
 async def test_a_failed_restart_after_start_is_not_retryable(

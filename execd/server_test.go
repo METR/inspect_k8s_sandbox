@@ -287,7 +287,7 @@ func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
 }
 
 func TestCallsThatEndBeforeTheirTurnHoldOthersOutputBackOnlySoLong(t *testing.T) {
-	charge(100_000)                     // exits already hold the turns 100 ms ahead
+	charge(100_000)                     // exits already hold the turns as far ahead as they may
 	t.Cleanup(func() { slot.Store(0) }) // the turns are shared: leave none taken
 	for i := range 1000 {
 		cl := &call{id: uint64(1000 + i), sub: testConn(t)}
