@@ -55,6 +55,8 @@ type call struct {
 	out      [2][]byte // stdout, stderr: what the process wrote and the client has not acked
 	base     [2]int    // the stream offset of out[i][0]
 	sent     [2]int    // the offset up to which the current subscriber has been sent output
+	flushed  time.Time // when output was last sent
+	deferred bool      // a flush waits for its millisecond
 	room     *sync.Cond
 	gone     bool // released: drop any further output
 	exited   bool
@@ -511,7 +513,29 @@ func (cl *call) output(stream int, data []byte) {
 		return
 	}
 	cl.out[stream] = append(cl.out[stream], data...)
-	cl.flush()
+	cl.flushSoon()
+}
+
+// flushSoon flushes at most once a millisecond, so a stream of small writes makes few frames.
+func (cl *call) flushSoon() {
+	wait := time.Millisecond - time.Since(cl.flushed)
+	if wait <= 0 {
+		cl.flushed = time.Now()
+		cl.flush()
+		return
+	}
+	if !cl.deferred {
+		cl.deferred = true
+		time.AfterFunc(wait, func() {
+			cl.mu.Lock()
+			defer cl.mu.Unlock()
+			cl.deferred = false
+			if !cl.gone && !cl.exited { // finish flushed it all, with the exit
+				cl.flushed = time.Now()
+				cl.flush()
+			}
+		})
+	}
 }
 
 func (cl *call) ack(req resumeRequest) {

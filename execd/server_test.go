@@ -179,3 +179,33 @@ func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 		t.Fatal("dumpable: a same-uid process could reopen the start's stdout through /proc")
 	}
 }
+
+func TestManySmallWritesMakeFewFrames(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	lines := "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done"
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", lines}, Env: map[string]string{}, Tag: "w"})
+
+	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
+
+	outputs := 0
+	for {
+		select {
+		case f := <-frames:
+			switch f.kind {
+			case fStdout:
+				outputs++
+			case fExit:
+				// The client paces frames at 4,096 a second: a frame a line would crawl.
+				if outputs > 2000 {
+					t.Fatalf("%d frames for 20,000 lines", outputs)
+				}
+				return
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+}
