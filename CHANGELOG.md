@@ -3,11 +3,10 @@
 ## Unreleased
 
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
-  mounted read-only at `/opt/execd/execd` (so the sandbox can't replace it) and TCP
-  port 24601 reachable from the client at the pod's IP, runs `exec()`, `read_file()`,
-  `write_file()` and `exec_stdio()` over TLS to execd instead of Kubernetes exec stdin.
-  There, a timed-out `exec()` and its background processes get SIGKILL at once, not
-  SIGTERM.
+  mounted read-only at `/opt/execd/execd` and TCP port 24601 reachable from the client
+  at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
+  TLS to execd instead of Kubernetes exec stdin. There, a timed-out `exec()` and its
+  background processes get SIGKILL at once, not SIGTERM.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

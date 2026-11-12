@@ -87,9 +87,8 @@ def held(stream: execd.ExecdStream) -> int:
     return sum(len(item[1]) for item in queued if isinstance(item, tuple))
 
 
-@pytest.mark.req_k8s  # the release reads the cluster config
 async def test_an_annotated_pod_runs_every_operation_over_execd(
-    daemons: Daemons,
+    daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
     starts = 0
 
@@ -102,6 +101,8 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
     await daemons.serve(exits)
+    # As in test_helm.py: no cluster config needed.
+    monkeypatch.setattr("k8s_sandbox._helm.get_default_namespace", lambda _: "default")
     release = Release(__file__, None, ValuesSource.none(), None)
     release._ready_pods = [
         _parse_pod(
