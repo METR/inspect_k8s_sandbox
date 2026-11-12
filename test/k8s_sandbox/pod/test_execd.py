@@ -553,7 +553,7 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
 
 
 async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> None:
-    stdin = b"x" * (3 * execd.CHUNK)
+    stdin = b"x" * (2 * execd.STDIN_WINDOW)
     received = 0
 
     async def floods_resumed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -565,7 +565,7 @@ async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> 
             if kind == execd.STDIN and not payload:
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
                 return
-            if not received:  # once some stdin is in, a restart from 0 repeats it
+            if not received:  # before any ack, so the upload can't have finished
                 w.write(
                     b"".join(frame(execd.RESUMED, call_id, resumed) for _ in range(64))
                 )
@@ -580,37 +580,33 @@ async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> 
     assert received == len(stdin)
 
 
-async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None:
+async def test_concurrent_sends_on_a_stream_stay_whole(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "STDIN_WINDOW", 1 << 30)  # only the socket holds sends
+    size = 16 << 20  # more than the socket buffers, so the first send waits partway
     received = bytearray()
-    done = asyncio.Event()
     go = asyncio.Event()
 
     async def records_stdin(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
-        await go.wait()  # unread, the first chunk holds up its send
-        while len(received) < 4 * execd.CHUNK:
+        await read_frame(r)  # START
+        await go.wait()  # unread, the sends back up
+        while len(received) < 2 * size:
             kind, _, payload = await read_frame(r)
             if kind == execd.STDIN:
                 received.extend(payload)
-                w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 0}'))
-        done.set()
 
     await daemons.serve(records_stdin)
     stream = await daemons.client().open_stream(["cat"], None)
 
-    sends = asyncio.gather(
-        stream.send(b"A" * (2 * execd.CHUNK)), stream.send(b"B" * (2 * execd.CHUNK))
-    )
+    sends = asyncio.gather(stream.send(b"A" * size), stream.send(b"B" * size))
     for _ in range(10):  # both sends under way
         await asyncio.sleep(0)
     go.set()
     await asyncio.wait_for(sends, 30)
-    await asyncio.wait_for(done.wait(), 30)
+    await until(lambda: len(received) == 2 * size)
 
-    assert bytes(received) in (
-        b"A" * (2 * execd.CHUNK) + b"B" * (2 * execd.CHUNK),
-        b"B" * (2 * execd.CHUNK) + b"A" * (2 * execd.CHUNK),
-    )
+    assert bytes(received) in (b"A" * size + b"B" * size, b"B" * size + b"A" * size)
 
 
 async def test_a_stream_cancelled_as_it_starts_is_killed(

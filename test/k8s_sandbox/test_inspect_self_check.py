@@ -52,14 +52,16 @@ async def sandboxes(
     ids=["root", "non-root"],
 )
 async def sandbox_env(
-    request: pytest.FixtureRequest, sandboxes: dict[str, K8sSandboxEnvironment]
+    request: pytest.FixtureRequest,
+    transport: str,
+    sandboxes: dict[str, K8sSandboxEnvironment],
 ) -> K8sSandboxEnvironment:
     key, xfails = request.param
     reason = xfails.get(request.node.originalname)
     if reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
     nonstrict_reason = _NONSTRICT_XFAILS.get(request.node.originalname)
-    if nonstrict_reason is not None:
+    if nonstrict_reason is not None and transport == "exec":  # execd must keep it all
         request.node.add_marker(
             pytest.mark.xfail(reason=nonstrict_reason, strict=False)
         )
