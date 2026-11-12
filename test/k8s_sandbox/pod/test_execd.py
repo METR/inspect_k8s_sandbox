@@ -1249,7 +1249,7 @@ async def test_what_tls_decryption_costs_is_paced(
     server.close()
 
 
-async def test_a_stream_s_plain_decryption_is_not_charged(
+async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
     tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
 ) -> None:
     context, pin = tls
@@ -1265,15 +1265,24 @@ async def test_a_stream_s_plain_decryption_is_not_charged(
     server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
     monkeypatch.setattr(execd.time, "thread_time", lambda: 0.0)  # charge bytes only
+    charged: list[float] = []
+
+    async def take(_: execd.Pace, n: int, frames: int = 1, tls: float = 0.0) -> None:
+        charged.append(tls)
+
+    monkeypatch.setattr(execd.Pace, "take", take)
 
     async def start(replace: bool) -> execd.Daemon:
         return execd.Daemon("127.0.0.1", pin, b"key")
 
     client = execd.ExecdClient(start)
+    await client._get()
+    charged.clear()  # the handshake's and AUTH's
+
     await client.exec(["yes"], None, None, {}, None, 30)
 
-    # As padding, the 256 KiB would cost over 100 µs: only TLS's own bytes count.
-    assert client._pace.tls < 50e-6
+    # Records' headers and tags; as padding, the 256 KiB would cost over 100 µs.
+    assert 0 < sum(charged) < 50e-6
     server.close()
 
 
@@ -1286,10 +1295,11 @@ async def test_a_handshake_s_decryption_is_paced_too(
     cpu = iter([0.0, 5.0])  # the first pass takes 5 s
     monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 5.0))
     monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
+    monkeypatch.setattr(execd, "RAW_READ", 64)  # the server's flight takes many passes
     pace = execd.Pace()
 
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), pace)
 
     await pipe.close()
     server.close()
-    assert pace.tls == 5.0
+    assert pace.tls > 5.0  # the first pass's CPU, and the bytes the rest took

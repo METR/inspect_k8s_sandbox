@@ -283,6 +283,24 @@ func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
 	}
 }
 
+func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	s.calls[13] = &call{id: 13, out: [2][]byte{[]byte("out"), []byte("err")}}
+	s.calls[13].room = sync.NewCond(&s.calls[13].mu)
+	c, frames := recordedConn(t)
+	before := max(time.Duration(slot.Load()), time.Since(epoch))
+
+	s.resume(c, frame{kind: fResume, id: 13, payload: []byte(`{"stdout":0,"stderr":0}`)})
+
+	<-frames
+	<-frames
+	<-frames // RESUMED, then what each stream has waiting
+	// Resumes sent without turns, many calls resuming at once, would pass the client's frame pace.
+	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
+		t.Fatalf("turns moved %v for the two frames a resume sent", moved)
+	}
+}
+
 func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
 	c, frames := recordedConn(t)
 	cl := &call{id: 9, sub: c, deferred: true} // its flush is set, and its time has come
