@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import ssl
 import subprocess
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -154,29 +155,30 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
     assert stream._link.closed
 
 
-async def test_a_stream_acks_what_its_reader_takes(daemons: Daemons) -> None:
-    acked = asyncio.Event()
+async def test_a_stream_acks_only_what_its_reader_takes(daemons: Daemons) -> None:
+    acks = 0
+    start: dict[str, object] = {}
 
-    async def waits_for_an_ack(
-        r: asyncio.StreamReader, w: asyncio.StreamWriter
-    ) -> None:
-        _, call_id, _ = await read_frame(r)  # START
+    async def counts_acks(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal acks
+        _, call_id, payload = await read_frame(r)  # START
+        start.update(json.loads(payload))
         piece = frame(execd.STDOUT, call_id, b"x" * (64 << 10))
-        w.write(
-            piece * (execd.STREAM_WINDOW // (64 << 10))
-        )  # execd's window, then it waits
-        while (await read_frame(r))[0] != execd.ACK:
-            pass
-        acked.set()
-        await r.read()
+        w.write(piece * (execd.STREAM_WINDOW // (64 << 10)))  # then execd waits
+        while True:
+            acks += (await read_frame(r))[0] == execd.ACK
 
-    await daemons.serve(waits_for_an_ack)
+    await daemons.serve(counts_acks)
     stream = await daemons.client().open_stream(["cat"], None)
+    await until(lambda: held(stream) == execd.STREAM_WINDOW)
+    await asyncio.sleep(0.1)  # time for an ack sent on arrival to land
+    assert acks == 0
     got = 0
     while got < execd.STREAM_WINDOW:
         got += len(await stream.receive())
 
-    await asyncio.wait_for(acked.wait(), 10)
+    await until(lambda: acks > 0)
+    assert start["stream"]  # so execd ends it with its connection
 
 
 async def test_send_waiting_for_room_fails_when_the_connection_closes(
@@ -663,8 +665,11 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
 async def test_the_timeout_runs_from_the_start_of_the_command(
     daemons: Daemons,
 ) -> None:
+    timeouts = []
+
     async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
+        _, call_id, payload = await read_frame(r)  # START
+        timeouts.append(json.loads(payload)["timeout"])
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         await r.read()
 
@@ -679,6 +684,33 @@ async def test_the_timeout_runs_from_the_start_of_the_command(
     client._start = slow_start
 
     assert (await client.exec(["true"], None, None, {}, None, 1)).success
+    assert timeouts == [1]  # execd kills it then, even with no client connected
+
+
+async def test_a_command_times_out_while_its_daemon_is_restarted(
+    daemons: Daemons,
+) -> None:
+    client = daemons.client()
+    first: asyncio.Server
+
+    async def stuck(replace: bool) -> execd.Daemon:
+        await asyncio.sleep(3600)
+        raise AssertionError
+
+    async def dies_after_start(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)  # START
+        client._start = stuck  # the restart never finishes
+        first.close()
+        w.close()
+
+    first = await daemons.serve(dies_after_start)
+    t = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, 1), 30)
+    assert time.monotonic() - t < 10
 
 
 async def test_unasked_unknown_call_errors_start_nothing_again(
