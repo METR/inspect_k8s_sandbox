@@ -497,7 +497,7 @@ func (cl *call) feedStdin(w *os.File) {
 }
 
 // Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
-const maxUnacked, streamUnacked = 32 << 20, 1 << 20
+const maxUnacked, streamUnacked = 4 << 20, 1 << 20
 
 func (cl *call) output(stream int, data []byte) {
 	cl.mu.Lock()
