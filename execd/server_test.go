@@ -1,178 +1,126 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"io"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
 
-func testConn(t *testing.T) *conn {
-	a, b := net.Pipe()
-	go io.Copy(io.Discard, b) //nolint:errcheck // drains what the server sends
-	t.Cleanup(func() { a.Close(); b.Close() })
-	return &conn{nc: a, dead: make(chan struct{})}
-}
+var testKey = []byte("the key")
 
-func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
-	var timers []func()
-	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
-	t.Cleanup(func() { afterFunc = time.AfterFunc })
+// As the daemon runs: orphans come to this process, and it reaps them.
+func TestMain(m *testing.M) {
+	prctl(prSetChildSubreaper, 1)
 	startReaper()
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "10"}, Env: map[string]string{}, Tag: "t"})
-	first := testConn(t)
-	s.start(first, frame{kind: fStart, id: 1, payload: req})
-	t.Cleanup(s.get(1).kill)
-	resume := frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)}
-
-	s.detach(first)
-	again := testConn(t)
-	s.resume(again, resume)
-	s.detach(again)
-	timers[0]() // the first drop's
-
-	if s.get(1) == nil {
-		t.Fatal("released by the first drop's timer, though resumed since")
-	}
-	timers[1]()
-	if s.get(1) != nil {
-		t.Fatal("not released by its last drop's timer")
-	}
+	os.Exit(m.Run())
 }
 
-func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
-	startReaper()
-	dir, _ := filepath.EvalSymlinks(t.TempDir())
-	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
-	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
-	wd, _ := os.Getwd()
-	os.Chdir(dir)
-	t.Cleanup(func() { os.Chdir(wd) })
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"hello"}, Env: map[string]string{"PATH": "bin"}, Cwd: "work", Tag: "p"})
-
-	s.start(testConn(t), frame{kind: fStart, id: 2, payload: req})
-
-	// As a shell finds it: work/bin/hello, run in work.
-	if code := exitCode(t, s.get(2)); code != 7 {
-		t.Fatalf("exit %d, want hello's 7", code)
-	}
+func testServer() *server {
+	sum := sha256.Sum256(testKey)
+	s, _ := newServer(hex.EncodeToString(sum[:]))
+	return s
 }
 
-func exitCode(t *testing.T, cl *call) int {
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		cl.mu.Lock()
-		exited, code := cl.exited, cl.code
-		cl.mu.Unlock()
-		if exited {
-			return code
-		}
-	}
-	t.Fatal("the command never exited")
-	return 0
+// connect gives a server a connection, and returns the client's end and the frames execd sends on it.
+func connect(t *testing.T, s *server) (net.Conn, <-chan frame) {
+	client, daemon := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	s.preauth <- struct{}{}
+	go s.handle(daemon)
+	return client, received(client)
 }
 
-func TestStdinFromADroppedConnectionIsNotWrittenAgain(t *testing.T) {
-	startReaper()
-	s, _ := newServer(strings.Repeat("00", 32))
-	out := filepath.Join(t.TempDir(), "stdin")
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "cat > " + out}, Env: map[string]string{}, Stdin: true, Tag: "s"})
-	first := testConn(t)
-	s.authenticated(first)
-	s.dispatch(first, frame{kind: fStart, id: 3, payload: req})
-	s.dispatch(first, frame{kind: fStdin, id: 3, payload: []byte("AAAA")})
-	again := testConn(t)
-	s.authenticated(again)
-	s.detach(first)
-	s.dispatch(again, frame{kind: fResume, id: 3, payload: []byte(`{"stdout":0,"stderr":0}`)})
-
-	s.get(3).writeStdin(first, []byte("BBBB"))                             // still in flight on the dropped connection
-	s.dispatch(again, frame{kind: fStdin, id: 3, payload: []byte("BBBB")}) // resent from RESUMED's count
-	s.dispatch(again, frame{kind: fStdin, id: 3})
-
-	exitCode(t, s.get(3))
-	if got, _ := os.ReadFile(out); string(got) != "AAAABBBB" {
-		t.Fatalf("stdin was %q", got)
-	}
-}
-
-func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "r"})
-	first := testConn(t)
-	s.authenticated(first)
-	s.authenticated(testConn(t))
-
-	s.dispatch(first, frame{kind: fStart, id: 4, payload: req}) // its call may have run and been released
-
-	if s.get(4) != nil {
-		t.Fatal("a START from a replaced connection ran")
-	}
-}
-
-func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
-	startReaper()
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}, Env: map[string]string{}, Tag: "h", Timeout: 1e18})
-	c := testConn(t)
-	s.authenticated(c)
-
-	s.dispatch(c, frame{kind: fStart, id: 5, payload: req})
-
-	if code := exitCode(t, s.get(5)); code != 3 {
-		t.Fatalf("exit %d, want 3: the timeout fired at once", code)
-	}
-}
-
-// recordedConn is a connection whose sent frames arrive on the channel.
-func recordedConn(t *testing.T) (*conn, <-chan frame) {
-	a, b := net.Pipe()
-	frames := make(chan frame, 64)
+// received is closed when execd closes the connection.
+func received(client net.Conn) <-chan frame {
+	frames := make(chan frame, 1<<16)
 	go func() {
+		defer close(frames)
 		for {
-			f, err := readFrameMax(b, maxPayload)
+			f, err := readFrame(client, chunk)
 			if err != nil {
 				return
 			}
 			frames <- f
 		}
 	}()
-	t.Cleanup(func() { a.Close(); b.Close() })
-	return &conn{nc: a, dead: make(chan struct{})}, frames
+	return frames
 }
 
-func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	cwd := "/" + strings.Repeat("\x01", 5000) // six bytes each, escaped to JSON
-	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: cwd, Tag: "e"})
+// begin starts a call, as the client does.
+func begin(t *testing.T, s *server, req startRequest) (net.Conn, <-chan frame) {
+	client, frames := connect(t, s)
+	request(client, req)
+	return client, frames
+}
 
-	s.dispatch(c, frame{kind: fStart, id: 6, payload: req})
+func request(client net.Conn, req startRequest) {
+	payload, _ := json.Marshal(req)
+	client.Write(encodeFrame(fAuth, testKey))
+	client.Write(encodeFrame(fStart, payload))
+}
 
-	for {
+// next returns the next frame of a kind, or fails once execd closes the connection without one.
+func next(t *testing.T, frames <-chan frame, kind byte) frame {
+	t.Helper()
+	for budget := time.After(30 * time.Second); ; {
 		select {
-		case f := <-frames:
-			if f.kind != fExit {
-				continue
+		case f, open := <-frames:
+			if !open {
+				t.Fatalf("the connection closed with no frame of kind %d", kind)
 			}
-			if len(f.payload) > 4096 { // the client's MAX_CONTROL: past it, it reconnects for ever
-				t.Fatalf("EXIT is %d bytes", len(f.payload))
+			if f.kind == kind {
+				return f
 			}
-			return
-		case <-time.After(10 * time.Second):
-			t.Fatal("no EXIT")
+		case <-budget:
+			t.Fatalf("no frame of kind %d", kind)
 		}
 	}
 }
 
+func exit(t *testing.T, frames <-chan frame) exitStatus {
+	t.Helper()
+	var status exitStatus
+	json.Unmarshal(next(t, frames, fExit).payload, &status)
+	return status
+}
+
+// until waits for a condition; the budget only bounds a hang.
+func until(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); !condition(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+	}
+}
+
+func gone(pid int) bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }
+
+// pids reads the process ids a command printed, one a line.
+func pids(t *testing.T, frames <-chan frame, n int) []int {
+	t.Helper()
+	var out string
+	for strings.Count(out, "\n") < n {
+		out += string(next(t, frames, fStdout).payload)
+	}
+	ids := make([]int, n)
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fmt.Sscan(line, &ids[i])
+		t.Cleanup(func() { syscall.Kill(ids[i], syscall.SIGKILL) })
+	}
+	return ids
+}
+
+// First: a command run as another user resets the flag to the host's fs.suid_dumpable.
 func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	const prGetDumpable = 3
 	// init() has run, as it runs before main.
@@ -181,165 +129,284 @@ func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	}
 }
 
-func TestManySmallWritesMakeFewFrames(t *testing.T) {
-	startReaper()
-	s, _ := newServer(strings.Repeat("00", 32))
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	lines := "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done"
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", lines}, Env: map[string]string{}, Tag: "w"})
+func TestOnlyTheKeyStartsACommand(t *testing.T) {
+	made := filepath.Join(t.TempDir(), "made")
+	client, frames := connect(t, testServer())
+	req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}})
 
-	began := time.Now()
-	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
+	client.Write(encodeFrame(fAuth, []byte("not the key")))
+	client.Write(encodeFrame(fStart, req))
 
-	outputs := 0
-	for {
+	for range frames { // until execd closes the connection
+	}
+	if _, err := os.Stat(made); err == nil {
+		t.Fatal("a connection without the key ran a command")
+	}
+}
+
+func TestAnAuthOverItsBoundIsRefusedAtItsHeader(t *testing.T) {
+	s := testServer()
+	s.authTimeout = time.Hour // so only the bound closes the connection
+	client, frames := connect(t, s)
+
+	client.Write([]byte{fAuth, 0, 0, 0, maxKey + 1}) // and no payload: execd must not wait for one
+
+	select {
+	case <-frames:
+	case <-time.After(30 * time.Second):
+		t.Fatal("execd waited for an AUTH payload over its bound")
+	}
+}
+
+func TestAConnectionThatSendsNoAuthIsClosed(t *testing.T) {
+	s := testServer()
+	s.authTimeout = 50 * time.Millisecond
+
+	_, frames := connect(t, s)
+
+	select {
+	case <-frames:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a connection that never authenticated stayed open")
+	}
+	until(t, "its slot was never freed", func() bool { return len(s.preauth) == 0 })
+}
+
+type listener chan net.Conn
+
+func (l listener) Accept() (net.Conn, error) { return <-l, nil }
+func (l listener) Close() error              { return nil }
+func (l listener) Addr() net.Addr            { return nil }
+
+func TestConnectionsPastTheBoundWaitForASlot(t *testing.T) {
+	s, l := testServer(), make(listener)
+	go s.serve(l)
+	var unauthenticated []net.Conn
+	for range maxPreauth {
+		client, daemon := net.Pipe()
+		t.Cleanup(func() { client.Close() })
+		l <- daemon
+		unauthenticated = append(unauthenticated, client)
+	}
+	client, daemon := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+
+	select {
+	case l <- daemon:
+		t.Fatal("accepted a connection past the bound")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unauthenticated[0].Close()
+	select {
+	case l <- daemon: // not refused: a burst of calls waits its turn
+	case <-time.After(30 * time.Second):
+		t.Fatal("a freed slot let no connection in")
+	}
+
+	frames := received(client)
+	request(client, startRequest{Argv: []string{"true"}})
+	if status := exit(t, frames); status.Code != 0 {
+		t.Fatalf("exit %+v", status)
+	}
+}
+
+func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
+	s := testServer()
+	s.authTimeout = time.Hour // so only the refusal closes a connection
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	t.Cleanup(func() { l.Close() })
+	go s.serve(l)
+
+	for range maxPreauth + 1 { // more than the slots: a refusal must not keep one
+		client, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { client.Close() })
+
 		select {
-		case f := <-frames:
-			switch f.kind {
-			case fStdout:
-				outputs++
-			case fExit:
-				// The client paces frames at 4,096 a second: a frame a line would crawl.
-				if took := time.Since(began); outputs > int(took/time.Millisecond)+2 {
-					t.Fatalf("%d frames for 20,000 lines in %v: more than one a millisecond", outputs, took)
-				}
-				return
-			}
+		case <-received(client):
 		case <-time.After(30 * time.Second):
-			t.Fatal("no EXIT")
+			t.Fatal("a connection from loopback was not refused")
 		}
 	}
 }
 
-func TestCallsTakeTurnsToSend(t *testing.T) {
-	var sent []<-chan frame
-	began := time.Now()
-	for i := range 20 {
-		c, frames := recordedConn(t)
-		cl := &call{id: uint64(10 + i), sub: c}
-		cl.room = sync.NewCond(&cl.mu)
-		cl.output(0, []byte("x")) // each call's first: only the turns hold it
-		sent = append(sent, frames)
-	}
+func TestStdinReachesTheCommandAndItsEndEndsIt(t *testing.T) {
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"wc", "-c"}, Stdin: true})
 
-	for _, frames := range sent {
-		<-frames
+	for range 4 { // more than a pipe holds
+		client.Write(encodeFrame(fStdin, make([]byte, chunk)))
 	}
+	client.Write(encodeFrame(fStdin, nil))
 
-	// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
-	if took := time.Since(began); took < 6*time.Millisecond {
-		t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
+	if counted := strings.TrimSpace(string(next(t, frames, fStdout).payload)); counted != "1048576" {
+		t.Fatalf("the command read %s bytes of stdin, want 1048576", counted)
+	}
+	if status := exit(t, frames); status.Code != 0 {
+		t.Fatalf("exit %+v", status)
 	}
 }
 
-func TestCallsWithNoConnectionTakeNoTurns(t *testing.T) {
-	for i := range 200 {
-		cl := &call{id: uint64(100 + i)} // its connection dropped: the resume sends what it has
-		cl.room = sync.NewCond(&cl.mu)
-		cl.output(0, []byte("x"))
+func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
+	finished := filepath.Join(t.TempDir(), "finished")
+	// A child in the command's process group without its environment, one that left the group, then the command waits on its stdin.
+	script := `env -i sleep 100 & echo $!; setsid sleep 100 & echo $!; echo $$; cat; touch "$1"`
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", finished}, Stdin: true})
+	started := pids(t, frames, 3)
+
+	client.Close()
+
+	for _, pid := range started {
+		until(t, "a process outlived the call's connection", func() bool { return gone(pid) })
 	}
-	c, frames := recordedConn(t)
-	cl := &call{id: 99, sub: c}
-	cl.room = sync.NewCond(&cl.mu)
-	began := time.Now()
-
-	cl.output(0, []byte("x"))
-
-	<-frames
-	if took := time.Since(began); took > 30*time.Millisecond {
-		t.Fatalf("a live call waited %v behind calls with nowhere to send", took)
+	if _, err := os.Stat(finished); err == nil {
+		t.Fatal("the command took its lost connection for the end of its stdin")
 	}
 }
 
-func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
-	c, frames := recordedConn(t)
-	cl := &call{id: 12, sub: c, out: [2][]byte{[]byte("out"), nil}}
-	cl.room = sync.NewCond(&cl.mu)
-	before := max(time.Duration(slot.Load()), time.Since(epoch))
+func TestAStreamsEndClosesStdinAndKillsOnlyItsCommand(t *testing.T) {
+	ended := filepath.Join(t.TempDir(), "ended")
+	// A child shares the stream's stdin and process group, as a tools server its command started would.
+	script := `exec 3<&0; (cat <&3; touch "$1") & echo $$; exec sleep 100`
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", ended}, Stdin: true, Stream: true})
+	command := pids(t, frames, 1)[0]
 
-	cl.finish(0, "")
+	client.Close()
 
-	<-frames
-	<-frames // the output, then the exit
-	// Exits sent without turns, many calls ending at once, would pass the client's frame pace.
-	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
-		t.Fatalf("turns moved %v for the two frames an exit sent", moved)
+	until(t, "the stream's command outlived it", func() bool { return gone(command) })
+	until(t, "the child never saw stdin end: it was killed, or stdin stayed open", func() bool {
+		_, err := os.Stat(ended)
+		return err == nil
+	})
+}
+
+func TestAClientGoneIsFoundWhileItsCommandLeavesStdinUnread(t *testing.T) {
+	s := testServer()
+	s.pingEvery = 10 * time.Millisecond
+	client, frames := begin(t, s, startRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 100"}, Stdin: true})
+	command := pids(t, frames, 1)[0]
+	// More than the pipe holds: execd waits on the command, reads no more, and so can't see the connection close.
+	client.Write(encodeFrame(fStdin, make([]byte, chunk)))
+
+	client.Close()
+
+	until(t, "the command outlived its client", func() bool { return gone(command) })
+}
+
+func TestACwdThatCantBeEnteredFailsAsCdDoes(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "data"), nil, 0o644)
+	user := ""
+	if os.Getuid() == 0 { // root enters any directory: run as a user the temporary directory's parent keeps out
+		user = "nobody"
+	}
+
+	// A file that can't be run fails the same way in the kernel, and must stay a 126.
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"./data"}, Cwd: dir})
+	denied := exit(t, frames)
+	os.Chmod(dir, 0)
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	_, frames = begin(t, testServer(), startRequest{Argv: []string{"true"}, Cwd: dir, User: user})
+	entered := exit(t, frames)
+
+	if denied.Code != 126 {
+		t.Fatalf("a file that can't be run: %+v, want 126", denied)
+	}
+	if entered.Code != 1 || !strings.HasPrefix(entered.Error, "cd: ") {
+		t.Fatalf("a cwd that can't be entered: %+v, want cd's failure", entered)
 	}
 }
 
-func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
-	for range 100_000 {
-		charge(3) // calls ending faster than turns come: three minutes of turns
-	}
-	c, frames := recordedConn(t)
-	cl := &call{id: 97, sub: c}
-	cl.room = sync.NewCond(&cl.mu)
+func TestATimeoutKillsTheCommandAndSaysSo(t *testing.T) {
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sleep", "100"}, Timeout: 0.05})
 
-	cl.output(0, []byte("x"))
+	status := exit(t, frames)
+
+	if !status.Timeout || status.Code != 128+int(syscall.SIGKILL) {
+		t.Fatalf("exit %+v, want a timeout's SIGKILL", status)
+	}
+}
+
+func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}, Timeout: 1e18})
+
+	if status := exit(t, frames); status.Code != 3 || status.Timeout {
+		t.Fatalf("exit %+v, want 3: the timeout fired at once", status)
+	}
+}
+
+func TestOutputWrittenBeforeTheExitArrivesThoughAChildHoldsThePipe(t *testing.T) {
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!"}})
+
+	pids(t, frames, 1) // the child's, which keeps stdout open: the exit must not wait for it
+	if status := exit(t, frames); status.Code != 0 {
+		t.Fatalf("exit %+v", status)
+	}
+}
+
+func TestAClientThatNeverClosesIsDroppedAfterTheExit(t *testing.T) {
+	s := testServer()
+	s.lingerFor = 50 * time.Millisecond
+	_, frames := begin(t, s, startRequest{Argv: []string{"true"}})
+
+	exit(t, frames)
 
 	select {
-	case <-frames:
-	case <-time.After(time.Second):
-		t.Fatal("output held over a second behind exits' turns")
+	case _, open := <-frames:
+		if open {
+			t.Fatal("a frame after the exit")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("execd kept the connection of a client that never closed it")
 	}
 }
 
-func TestCallsThatEndBeforeTheirTurnHoldOthersOutputBackOnlySoLong(t *testing.T) {
-	charge(100_000)                     // exits already hold the turns 100 ms ahead
-	t.Cleanup(func() { slot.Store(0) }) // the turns are shared: leave none taken
-	for i := range 1000 {
-		cl := &call{id: uint64(1000 + i), sub: testConn(t)}
-		cl.room = sync.NewCond(&cl.mu)
-		cl.output(0, []byte("x")) // its flush waits for a turn
-		cl.finish(0, "")          // and it ends before the turn comes
-	}
+func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
+	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
+	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
+	wd, _ := os.Getwd()
+	os.Chdir(dir)
+	t.Cleanup(func() { os.Chdir(wd) })
 
-	if ahead := time.Duration(slot.Load()) - time.Since(epoch); ahead > 2*slotAhead {
-		t.Fatalf("turns run %v ahead after 1,000 short calls", ahead)
-	}
-}
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"hello"}, Env: map[string]string{"PATH": "bin"}, Cwd: "work"})
 
-func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	s.calls[13] = &call{id: 13, out: [2][]byte{[]byte("out"), []byte("err")}}
-	s.calls[13].room = sync.NewCond(&s.calls[13].mu)
-	c, frames := recordedConn(t)
-	before := max(time.Duration(slot.Load()), time.Since(epoch))
-
-	s.resume(c, frame{kind: fResume, id: 13, payload: []byte(`{"stdout":0,"stderr":0}`)})
-
-	<-frames
-	<-frames
-	<-frames // RESUMED, then what each stream has waiting
-	// Resumes sent without turns, many calls resuming at once, would pass the client's frame pace.
-	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
-		t.Fatalf("turns moved %v for the two frames a resume sent", moved)
+	// As a shell finds it: work/bin/hello, run in work.
+	if status := exit(t, frames); status.Code != 7 {
+		t.Fatalf("exit %+v, want hello's 7", status)
 	}
 }
 
-func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
-	c, frames := recordedConn(t)
-	cl := &call{id: 9, sub: c, deferred: true} // its flush is set, and its time has come
-	cl.room = sync.NewCond(&cl.mu)
+func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
+	cwd := "/" + strings.Repeat("\x01", 5000) // six bytes each, escaped to JSON
 
-	cl.output(0, []byte("x"))
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, Cwd: cwd})
 
-	select {
-	case <-frames: // and the waiting flush sends another
-		t.Fatal("sent at once, as well as by the flush that waits")
-	case <-time.After(50 * time.Millisecond):
+	if n := len(next(t, frames, fExit).payload); n > 4096 { // the client's MAX_CONTROL
+		t.Fatalf("EXIT is %d bytes", n)
 	}
 }
 
-func TestAChargeNeverGivesBackTurnsTaken(t *testing.T) {
-	ahead := time.Since(epoch) + 200*time.Millisecond // waiting flushes have taken the turns before this
-	slot.Store(int64(ahead))
-	t.Cleanup(func() { slot.Store(0) })
+func TestManySmallWritesMakeAtMostAFrameAMillisecond(t *testing.T) {
+	lines := "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done"
+	began := time.Now()
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", lines}})
 
-	charge(1)
+	outputs, size := 0, 0
+	for f := range frames {
+		if f.kind == fExit {
+			break
+		}
+		outputs++
+		size += len(f.payload)
+	}
 
-	if got := time.Duration(slot.Load()); got < ahead {
-		t.Fatalf("turns moved back %v: flushes waiting for them would send together", ahead-got)
+	if size != 108890 {
+		t.Fatalf("%d bytes of output, want the 108,890 the lines make", size)
+	}
+	// The client fails a pod whose execd sends ten times this.
+	if took := time.Since(began); outputs > int(took/time.Millisecond)+2 {
+		t.Fatalf("%d frames for 20,000 lines in %v: more than one a millisecond", outputs, took)
 	}
 }

@@ -12,5 +12,5 @@ jobs:
         with:
           go-version: "1.26"
           cache: false  # no go.sum to key it on
-      - run: go vet ./... && go test ./...
+      - run: go vet ./... && go test -race ./...
         working-directory: execd

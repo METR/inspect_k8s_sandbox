@@ -208,11 +208,17 @@ class Pod:
           timeout (int | None): The optional timeout for cmd to complete in. Defaults to
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
-            terminate background processes started by cmd. On a pod with execd, cmd and
-            every process it started get SIGKILL instead.
+            terminate background processes started by cmd. On a pod with execd, cmd's
+            process group gets SIGKILL instead, as does a process that left the group
+            but runs as execd's user with the environment cmd gave it.
         """
         if self._execd is not None:
-            return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
+            try:
+                return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
+            except ExecResultUnknownError:
+                # As below: a restart explains a lost connection better.
+                await self._diagnose_restart_after_failure()
+                raise
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
@@ -258,7 +264,8 @@ class Pod:
         """Start a command as exec() would, and join a stream to its stdin and stdout.
 
         Closing the stream ends the command's stdin and stdout. Until then the stream
-        holds the exec's connection, so callers must close it.
+        holds the exec's connection, so callers must close it. On a pod with execd,
+        closing it also kills the command, though not the processes it started.
 
         In "raise" mode a restart found already, or one Kubernetes shows, raises here
         as for exec(), rather than starting the command in the replacement. A stream

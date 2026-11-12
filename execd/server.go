@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -21,74 +22,32 @@ import (
 	"unsafe"
 )
 
-// server owns every process; a call outlives its connection, so a client can resume it.
+// server authenticates connections; each then runs one command.
 type server struct {
-	keyHash []byte
-	mu      sync.Mutex
-	calls   map[uint64]*call
-	preauth chan struct{} // a slot per connection not yet authenticated
-	current *conn         // the newest authenticated connection: the client's only live one
+	keyHash     []byte
+	preauth     chan struct{} // a slot per connection not yet authenticated
+	authTimeout time.Duration // for a connection to send its AUTH
+	pingEvery   time.Duration
+	// After an exit execd reads on this long for the client to close: closing first, with stdin unread, would reset the connection under the EXIT.
+	lingerFor time.Duration
 }
 
-const idleTimeout = 60 * time.Second
+// Bounds on unauthenticated connections: the AUTH payload, and how many at once.
+const maxKey, maxPreauth = 64, 32
 
-// abandonAfter outlasts the client's reconnect window (5 minutes).
-const abandonAfter = 6 * time.Minute
+const maxStart = 16 << 20 // a START: argv and env as JSON
 
-var afterFunc = time.AfterFunc // tests fire the abandon timers themselves
-
-// Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
-const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
-
+// call is one command and the connection it runs on.
 type call struct {
-	id  uint64
-	tag string
-	pid int
-	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
-	stdinQ   [][]byte
-	stdinGot int  // bytes of stdin received
-	stdinPut int  // bytes of stdin written to the process
-	stream   bool // killed when its connection drops, as nothing resumes it
-	detached int  // times its connection dropped
-	stdinEOF bool // the client closed stdin
+	s        *server
+	nc       net.Conn
+	wmu      sync.Mutex // a frame at a time
+	stream   bool
+	tag      string
+	timedOut atomic.Bool
 	mu       sync.Mutex
-	out      [2][]byte // stdout, stderr: what the process wrote and the client has not acked
-	base     [2]int    // the stream offset of out[i][0]
-	sent     [2]int    // the offset up to which the current subscriber has been sent output
-	flushed  time.Time // when output was last sent
-	deferred bool      // a flush waits for its millisecond
-	room     *sync.Cond
-	gone     bool // released: drop any further output
-	exited   bool
-	code     int
-	startErr string // why the command never started, if it didn't
-	sub      *conn  // the connection streaming this call, if any
-}
-
-type conn struct {
-	nc   net.Conn
-	wmu  sync.Mutex
-	dead chan struct{}
-	once sync.Once
-}
-
-func (c *conn) send(kind byte, id uint64, payload []byte) {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	select {
-	case <-c.dead:
-		return
-	default:
-	}
-	// A peer that stops reading (a partitioned network) must not stall the call forever.
-	c.nc.SetWriteDeadline(time.Now().Add(idleTimeout))
-	if _, err := c.nc.Write(encodeFrame(kind, id, payload)); err != nil {
-		c.close()
-	}
-}
-
-func (c *conn) close() {
-	c.once.Do(func() { close(c.dead); c.nc.Close() })
+	pid      int      // 0 until the command starts, and once it is reaped
+	stdin    *os.File // nil once closed
 }
 
 func newServer(keyHashHex string) (*server, error) {
@@ -96,25 +55,25 @@ func newServer(keyHashHex string) (*server, error) {
 	if err != nil || len(h) != sha256.Size {
 		return nil, fmt.Errorf("key hash must be 64 hex characters")
 	}
-	return &server{keyHash: h, calls: map[uint64]*call{}, preauth: make(chan struct{}, maxPreauth)}, nil
+	return &server{
+		keyHash: h, preauth: make(chan struct{}, maxPreauth),
+		authTimeout: 10 * time.Second, pingEvery: 15 * time.Second, lingerFor: time.Minute,
+	}, nil
 }
 
 func (s *server) serve(l net.Listener) {
 	for {
+		s.preauth <- struct{}{} // past the bound, connections wait in the listen queue
 		nc, err := l.Accept()
+		if err == nil && !fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+			go s.handle(nc)
+			continue
+		}
+		<-s.preauth
 		if err != nil {
 			// A transient error, such as running out of file descriptors, must not end the daemon.
 			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		if fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
-			nc.Close()
-			continue
-		}
-		select {
-		case s.preauth <- struct{}{}:
-			go s.handle(&conn{nc: nc, dead: make(chan struct{})})
-		default: // a flood of unauthenticated connections
+		} else {
 			nc.Close()
 		}
 	}
@@ -135,150 +94,31 @@ func fromThisPod(nc net.Conn) bool {
 	return false
 }
 
-func (s *server) handle(c *conn) {
-	defer s.detach(c)
-	defer c.close()
+func (s *server) handle(nc net.Conn) {
+	defer nc.Close()
 	// Before AUTH the peer is anyone who can reach the port: bound its time and memory.
-	c.nc.SetReadDeadline(time.Now().Add(authTimeout))
-	first, err := readFrameMax(c.nc, maxKey)
+	nc.SetReadDeadline(time.Now().Add(s.authTimeout))
+	auth, err := readFrame(nc, maxKey)
 	<-s.preauth
-	if err != nil || first.kind != fAuth {
+	if err != nil || auth.kind != fAuth {
 		return
 	}
-	got := sha256.Sum256(first.payload)
+	got := sha256.Sum256(auth.payload)
 	if subtle.ConstantTimeCompare(got[:], s.keyHash) != 1 {
 		return
 	}
-	s.authenticated(c)
-	c.send(fOK, 0, nil)
-	for {
-		c.nc.SetReadDeadline(time.Now().Add(idleTimeout)) // clients ping every 15 s
-		f, err := readFrameMax(c.nc, maxPayload)
-		if err != nil {
-			return
-		}
-		s.dispatch(c, f)
-	}
-}
-
-// authenticated makes c the client's connection and closes the one it replaces.
-func (s *server) authenticated(c *conn) {
-	s.mu.Lock()
-	old := s.current
-	s.current = c
-	s.mu.Unlock()
-	if old != nil {
-		old.close()
-	}
-}
-
-func (s *server) dispatch(c *conn, f frame) {
-	s.mu.Lock()
-	stale := s.current != c
-	s.mu.Unlock()
-	if stale { // a late frame from a replaced connection: a START would run its command again
-		return
-	}
-	switch f.kind {
-	case fStart:
-		s.start(c, f)
-	case fStdin:
-		if cl := s.get(f.id); cl != nil {
-			cl.writeStdin(c, f.payload)
-		}
-	case fKill:
-		if cl := s.get(f.id); cl != nil {
-			cl.kill()
-		}
-	case fResume:
-		s.resume(c, f)
-	case fAck:
-		var req resumeRequest
-		if cl := s.get(f.id); cl != nil && json.Unmarshal(f.payload, &req) == nil {
-			cl.ack(req)
-		}
-	case fRelease:
-		s.release(f.id)
-	case fPing:
-		c.send(fPong, f.id, nil)
-	}
-}
-
-// detach stops streaming to a closed connection; its calls keep running and buffering.
-func (s *server) detach(c *conn) {
-	s.mu.Lock()
-	calls := make([]*call, 0, len(s.calls))
-	for _, cl := range s.calls {
-		calls = append(calls, cl)
-	}
-	s.mu.Unlock()
-	for _, cl := range calls {
-		cl.mu.Lock()
-		mine := cl.sub == c
-		if mine {
-			cl.sub = nil
-			cl.detached++
-		}
-		detached := cl.detached
-		cl.mu.Unlock()
-		switch {
-		case mine && cl.stream: // nothing resumes a stream
-			cl.kill()
-			s.release(cl.id)
-		case mine: // a client that hasn't resumed it by then has given up
-			afterFunc(abandonAfter, func() {
-				cl.mu.Lock()
-				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
-				cl.mu.Unlock()
-				if orphaned {
-					cl.kill()
-					s.release(cl.id)
-				}
-			})
-		}
-	}
-}
-
-// release forgets a call and frees its buffered output.
-func (s *server) release(id uint64) {
-	s.mu.Lock()
-	cl := s.calls[id]
-	delete(s.calls, id)
-	s.mu.Unlock()
-	if cl != nil {
-		cl.mu.Lock()
-		cl.gone, cl.out = true, [2][]byte{}
-		cl.room.Broadcast()
-		cl.mu.Unlock()
-	}
-}
-
-func (s *server) get(id uint64) *call {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls[id]
-}
-
-func (s *server) start(c *conn, f frame) {
+	nc.SetReadDeadline(time.Time{})
+	start, err := readFrame(nc, maxStart)
 	var req startRequest
-	if err := json.Unmarshal(f.payload, &req); err != nil || len(req.Argv) == 0 {
-		c.send(fError, f.id, []byte("bad start request"))
+	if err != nil || start.kind != fStart || json.Unmarshal(start.payload, &req) != nil || len(req.Argv) == 0 {
 		return
 	}
-	if req.Env == nil { // "env": null
-		req.Env = map[string]string{}
-	}
-	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
-	cl.room = sync.NewCond(&cl.mu)
-	s.mu.Lock()
-	if _, dup := s.calls[f.id]; dup {
-		s.mu.Unlock()
-		c.send(fError, f.id, []byte("call id in use"))
-		return
-	}
-	s.calls[f.id] = cl
-	s.mu.Unlock()
-	if err := cl.run(req); err != nil {
+	(&call{s: s, nc: nc, stream: req.Stream}).serve(req)
+}
+
+// serve runs the command and feeds it stdin until the client closes the connection.
+func (c *call) serve(req startRequest) {
+	if err := c.start(req); err != nil {
 		// Report like a shell would: the message on stderr and 126 or 127 as the exit code.
 		code := 126
 		if strings.HasPrefix(err.Error(), "cd: ") {
@@ -287,33 +127,106 @@ func (s *server) start(c *conn, f frame) {
 			code = 127
 		}
 		msg := err.Error()
-		cl.output(1, []byte("execd: "+msg+"\n"))
+		stderr := "execd: " + msg + "\n"
+		c.send(fStderr, []byte(stderr[max(0, len(stderr)-chunk):])) // its end says why
 		// Out of band too, so the command's own stderr can't fake it; capped, so even
 		// escaped to JSON it fits the client's 4 KiB control frame.
-		cl.finish(code, msg[:min(len(msg), 512)])
+		c.finish(exitStatus{Code: code, Error: msg[:min(len(msg), 512)]})
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() { // a write is what finds a client gone while the read below waits on the command
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(c.s.pingEvery):
+				c.send(fPing, nil)
+			}
+		}
+	}()
+	for {
+		f, err := readFrame(c.nc, chunk)
+		if err != nil {
+			break
+		}
+		if f.kind == fStdin {
+			c.writeStdin(f.payload)
+		}
+	}
+	c.drop()
+}
+
+func (c *call) send(kind byte, payload []byte) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if _, err := c.nc.Write(encodeFrame(kind, payload)); err != nil {
+		c.drop()
 	}
 }
 
-func (s *server) resume(c *conn, f frame) {
-	var req resumeRequest
-	cl := s.get(f.id)
-	if cl == nil || json.Unmarshal(f.payload, &req) != nil {
-		c.send(fError, f.id, []byte("unknown call"))
+// drop ends a call whose client is gone; it frees serve's read, or its write to a command that isn't reading.
+func (c *call) drop() {
+	c.nc.Close()
+	c.kill() // before stdin ends, which the command must not take for the end of its input
+	c.closeStdin()
+}
+
+// finish sends the exit, then waits only so long for the client to close.
+func (c *call) finish(status exitStatus) {
+	b, _ := json.Marshal(status)
+	c.send(fExit, b)
+	c.nc.SetReadDeadline(time.Now().Add(c.s.lingerFor))
+}
+
+// writeStdin waits while the command doesn't read, so TCP holds back the rest.
+func (c *call) writeStdin(data []byte) {
+	if len(data) == 0 {
+		c.closeStdin()
 		return
 	}
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.sub = c
-	// Tell the client how much stdin arrived, so it can send the rest.
-	got, _ := json.Marshal(map[string]any{"stdin": cl.stdinGot, "eof": cl.stdinEOF, "put": cl.stdinPut})
-	c.send(fResumed, f.id, got)
-	cl.ackLocked(req) // the client has everything before the offsets it resumes from
-	cl.sent = [2]int{cl.base[0], cl.base[1]}
-	charge(cl.flush())
+	c.mu.Lock()
+	w := c.stdin
+	c.mu.Unlock()
+	if w != nil {
+		w.Write(data) // a command that exits without reading its stdin makes this fail; that is not an error
+	}
 }
 
-func (cl *call) run(req startRequest) error {
-	req.Env["HAWK_NEXT_EXEC"] = req.Tag
+func (c *call) closeStdin() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stdin != nil {
+		c.stdin.Close()
+		c.stdin = nil
+	}
+}
+
+// kill stops a running command: a stream's own process, else its process group and every process still carrying its tag.
+func (c *call) kill() {
+	c.mu.Lock()
+	pid := c.pid
+	c.mu.Unlock()
+	switch {
+	case pid == 0: // never started, or reaped: its id may now be another's
+	case c.stream:
+		syscall.Kill(pid, syscall.SIGKILL)
+	default:
+		syscall.Kill(-pid, syscall.SIGKILL)
+		killTagged(c.tag)
+	}
+}
+
+func (c *call) start(req startRequest) error {
+	if req.Env == nil { // "env": null
+		req.Env = map[string]string{}
+	}
+	if !req.Stream { // nothing looks for a stream's processes
+		tag := make([]byte, 8)
+		rand.Read(tag)
+		c.tag = hex.EncodeToString(tag)
+		req.Env["HAWK_NEXT_EXEC"] = c.tag
+	}
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	if req.User != "" {
 		cred, home, name, err := lookupUser(req.User)
@@ -358,20 +271,23 @@ func (cl *call) run(req startRequest) error {
 		if stdinW != nil {
 			stdinW.Close()
 		}
+		if errors.Is(err, syscall.EACCES) && req.Cwd != "" && !entered(req.Cwd, attr) {
+			return fmt.Errorf("cd: %s: %w", req.Cwd, syscall.EACCES)
+		}
 		return err
 	}
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
-	cl.mu.Lock()
-	cl.pid = p.Pid // before Release, which sets it to -1
-	cl.mu.Unlock()
+	c.mu.Lock()
+	c.pid, c.stdin = p.Pid, stdinW // before Release, which sets the Pid to -1
+	c.mu.Unlock()
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
-	}
-	if stdinW != nil {
-		go cl.feedStdin(stdinW)
+		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), func() {
+			c.timedOut.Store(true)
+			c.kill()
+		})
 	}
 	var drained sync.WaitGroup
 	var read [2]atomic.Int64 // bytes read from each pipe
@@ -380,28 +296,18 @@ func (cl *call) run(req startRequest) error {
 		drained.Add(1)
 		go func() {
 			defer drained.Done()
-			defer r.Close()
-			buf := make([]byte, 256<<10)
-			for {
-				n, err := r.Read(buf)
-				if n > 0 {
-					read[i].Add(int64(n))
-					cl.output(i, buf[:n])
-				}
-				if err != nil {
-					return
-				}
-			}
+			c.copyOut(byte(fStdout+i), r, &read[i])
 		}()
 	}
 	go func() {
 		code := <-exited
-		cl.mu.Lock()
-		cl.pid = 0 // reaped: its id may now be another group's
-		cl.mu.Unlock()
+		c.mu.Lock()
+		c.pid = 0
+		c.mu.Unlock()
 		if deadline != nil {
 			deadline.Stop()
 		}
+		status := exitStatus{Code: code, Timeout: c.timedOut.Load()}
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
@@ -414,7 +320,7 @@ func (cl *call) run(req startRequest) error {
 		for {
 			select {
 			case <-done:
-				cl.finish(code, "")
+				c.finish(status)
 				return
 			case <-time.After(10 * time.Millisecond):
 			}
@@ -423,15 +329,47 @@ func (cl *call) run(req startRequest) error {
 				delivered = delivered && (read[i].Load() >= want[i] || buffered(r) == 0)
 			}
 			if delivered && time.Now().After(grace) {
-				outR.SetReadDeadline(time.Now())
-				errR.SetReadDeadline(time.Now())
+				outR.Close()
+				errR.Close()
 				<-done
-				cl.finish(code, "")
+				c.finish(status)
 				return
 			}
 		}
 	}()
 	return nil
+}
+
+// entered says whether a start with these credentials gets into dir: its exec of nothing fails only after the chdir.
+func entered(dir string, sys *syscall.SysProcAttr) bool {
+	_, err := os.StartProcess("", []string{""}, &os.ProcAttr{Dir: dir, Sys: sys})
+	return errors.Is(err, syscall.ENOENT)
+}
+
+// copyOut sends a pipe's output: a full buffer at once, less only a millisecond after the last, so small writes make few frames.
+func (c *call) copyOut(kind byte, r *os.File, read *atomic.Int64) {
+	defer r.Close()
+	buf := make([]byte, chunk)
+	var sent time.Time
+	for {
+		r.SetReadDeadline(time.Time{})
+		n, err := r.Read(buf)
+		read.Add(int64(n))
+		for err == nil && n < len(buf) {
+			r.SetReadDeadline(sent.Add(time.Millisecond))
+			var m int
+			m, err = r.Read(buf[n:])
+			read.Add(int64(m))
+			n += m
+		}
+		if n > 0 {
+			c.send(kind, buf[:n])
+			sent = time.Now()
+		}
+		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			return
+		}
+	}
 }
 
 // buffered says how many bytes wait unread in a pipe (0 once it is closed).
@@ -451,189 +389,6 @@ func stdinPipe(wanted bool) (*os.File, *os.File, error) {
 		return f, nil, err
 	}
 	return os.Pipe()
-}
-
-func (cl *call) writeStdin(c *conn, data []byte) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	if cl.sub != c || cl.stdinEOF || cl.exited { // a dropped connection's: its RESUME counted what came
-		return
-	}
-	if len(data) == 0 {
-		cl.stdinEOF = true
-	} else {
-		cl.stdinQ = append(cl.stdinQ, data)
-		cl.stdinGot += len(data)
-	}
-	cl.room.Broadcast()
-}
-
-func (cl *call) feedStdin(w *os.File) {
-	defer w.Close()
-	for {
-		cl.mu.Lock()
-		for len(cl.stdinQ) == 0 && !cl.stdinEOF && !cl.exited {
-			cl.room.Wait()
-		}
-		if len(cl.stdinQ) == 0 {
-			cl.mu.Unlock()
-			return
-		}
-		data := cl.stdinQ[0]
-		cl.stdinQ = cl.stdinQ[1:]
-		cl.mu.Unlock()
-		// A command that exits without reading its stdin makes this fail; that is not an error.
-		if _, err := w.Write(data); err != nil {
-			return
-		}
-		cl.mu.Lock()
-		cl.stdinPut += len(data)
-		if cl.sub != nil {
-			b, _ := json.Marshal(map[string]int{"stdin": cl.stdinPut})
-			cl.sub.send(fStdinAck, cl.id, b)
-		}
-		cl.mu.Unlock()
-	}
-}
-
-// Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
-const maxUnacked, streamUnacked = 32 << 20, 1 << 20
-
-func (cl *call) output(stream int, data []byte) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	limit := maxUnacked
-	if cl.stream {
-		limit = streamUnacked
-	}
-	for len(cl.out[stream]) > limit && !cl.gone {
-		cl.room.Wait()
-	}
-	if cl.gone {
-		return
-	}
-	cl.out[stream] = append(cl.out[stream], data...)
-	cl.flushSoon()
-}
-
-// When the next call may send output, since start: calls take turns, so together they keep within the client's frame pace.
-var slot atomic.Int64
-
-var epoch = time.Now() // turns are measured from here, on the monotonic clock
-
-const slotEvery, slotBurst = 600 * time.Microsecond, 8
-
-const slotAhead = 100 * time.Millisecond // how long exits' and resumes' turns may hold others' output
-
-// flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
-func (cl *call) flushSoon() {
-	if cl.deferred || cl.sub == nil {
-		return // the waiting flush sends this too, or the resume does
-	}
-	now := time.Now()
-	at := now.Sub(epoch)
-	if !cl.flushed.IsZero() {
-		at = max(at, cl.flushed.Add(time.Millisecond).Sub(epoch))
-	}
-	for {
-		taken := time.Duration(slot.Load())
-		send := max(at, taken-slotBurst*slotEvery)
-		if slot.CompareAndSwap(int64(taken), int64(max(taken, send)+slotEvery)) {
-			at = send
-			break
-		}
-	}
-	wait := at - now.Sub(epoch)
-	if wait <= 0 {
-		cl.flushed = now
-		cl.flush()
-		return
-	}
-	cl.deferred = true
-	time.AfterFunc(wait, func() {
-		cl.mu.Lock()
-		defer cl.mu.Unlock()
-		cl.deferred = false
-		if !cl.gone && !cl.exited { // finish flushed it all, with the exit
-			cl.flushed = time.Now()
-			cl.flush()
-		}
-	})
-}
-
-// charge takes the turns of frames a flush sent without one: an exit's, or a resume's.
-func charge(frames int) {
-	for frames > 0 {
-		taken, now := time.Duration(slot.Load()), time.Since(epoch)
-		next := min(max(taken, now)+time.Duration(frames)*slotEvery, now+slotAhead)
-		if next <= taken || slot.CompareAndSwap(int64(taken), int64(next)) {
-			return
-		}
-	}
-}
-
-func (cl *call) ack(req resumeRequest) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.ackLocked(req)
-}
-
-// ackLocked forgets output the client confirmed it has.
-func (cl *call) ackLocked(req resumeRequest) {
-	for i, upto := range []int{req.Stdout, req.Stderr} {
-		n := min(max(upto-cl.base[i], 0), len(cl.out[i]))
-		cl.out[i] = cl.out[i][n:]
-		cl.base[i] += n
-		cl.sent[i] = max(cl.sent[i], cl.base[i])
-	}
-	cl.room.Broadcast()
-}
-
-// kill stops the call's process group, and every process still carrying its tag.
-func (cl *call) kill() {
-	cl.mu.Lock()
-	pid := cl.pid
-	cl.mu.Unlock()
-	if pid > 0 { // 0, not started or reaped, would be -0: execd's own group
-		syscall.Kill(-pid, syscall.SIGKILL)
-	}
-	killTagged(cl.tag)
-}
-
-func (cl *call) finish(code int, startErr string) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.exited, cl.code, cl.startErr = true, code, startErr
-	cl.room.Broadcast()
-	if cl.deferred { // the turn its waiting flush took goes unused: this flush sends its output
-		slot.Add(-int64(slotEvery))
-	}
-	charge(cl.flush())
-}
-
-// flush sends what the subscriber hasn't seen, then the exit; holding cl.mu keeps them in order.
-func (cl *call) flush() (frames int) {
-	if cl.sub == nil {
-		return 0
-	}
-	for i, kind := range []byte{fStdout, fStderr} {
-		end := cl.base[i] + len(cl.out[i])
-		for cl.sent[i] < end {
-			next := min(end, cl.sent[i]+1<<20)
-			cl.sub.send(kind, cl.id, cl.out[i][cl.sent[i]-cl.base[i]:next-cl.base[i]])
-			cl.sent[i] = next
-			frames++
-		}
-	}
-	if cl.exited {
-		b, _ := json.Marshal(struct {
-			Code  int    `json:"code"`
-			Error string `json:"error,omitempty"`
-		}{cl.code, cl.startErr})
-		cl.sub.send(fExit, cl.id, b)
-		frames++
-	}
-	return frames
 }
 
 // childEnv is execd's own environment, plus the call's.
