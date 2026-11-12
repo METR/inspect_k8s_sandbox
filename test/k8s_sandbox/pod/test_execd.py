@@ -1231,6 +1231,34 @@ async def test_what_tls_decryption_costs_is_paced(
     server.close()
 
 
+async def test_a_stream_s_plain_decryption_is_not_charged(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    context, pin = tls
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"x" * (256 << 10)))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+    monkeypatch.setattr(execd.time, "thread_time", lambda: 0.0)  # charge bytes only
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    client = execd.ExecdClient(start)
+    await client.exec(["yes"], None, None, {}, None, 30)
+
+    # As padding, the 256 KiB would cost over 100 µs: only TLS's own bytes count.
+    assert client._pace.tls < 50e-6
+    server.close()
+
+
 async def test_a_handshake_s_decryption_is_paced_too(
     tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
 ) -> None:
