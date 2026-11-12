@@ -582,7 +582,7 @@ class ExecdClient:
                 item = await _next(call.queue, end - time.monotonic())
                 if not isinstance(item, tuple) or item[0] == EXIT:
                     break  # its exit, or a dropped connection
-                # execd exits only once its window has room; past HOLD it isn't execd
+                # acks let execd finish; past HOLD give up, as RELEASE frees the call
                 if item[0] in (STDOUT, STDERR):
                     if drained + len(item[1]) > call.hold:
                         break

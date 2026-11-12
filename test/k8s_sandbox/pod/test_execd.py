@@ -372,10 +372,7 @@ async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None
     await asyncio.wait_for(released.wait(), 5)
 
 
-async def test_a_timed_out_call_takes_no_more_than_its_hold(
-    daemons: Daemons, monkeypatch: MonkeyPatch
-) -> None:
-    monkeypatch.setattr(execd, "KILL_WAIT", 1.0)
+async def test_a_timed_out_call_takes_no_more_than_its_hold(daemons: Daemons) -> None:
     acked = 0
 
     async def sends_while_acked(
@@ -392,9 +389,26 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(
                 w.write(more)
 
     await daemons.serve(sends_while_acked)
-    with pytest.raises(TimeoutError):
-        await daemons.client().exec(["yes"], None, None, {}, None, 1)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
+        )
     assert 0 < acked <= execd.HOLD
+
+
+async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
+    daemons: Daemons,
+) -> None:
+    async def drops_on_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while (await read_frame(r))[0] != execd.KILL:
+            pass
+        w.transport.abort()
+
+    await daemons.serve(drops_on_kill)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["sleep", "9"], None, None, {}, None, 1), 5
+        )
 
 
 async def test_a_timed_out_call_is_released_with_no_exit(
