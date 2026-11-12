@@ -164,7 +164,7 @@ class Link:
             data = HEADER.pack(kind, call_id, len(payload)) + payload
             try:
                 await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 # A peer that stopped reading must not hold the lock, and with it
                 # every other call's frames, timeouts and pings.
                 await self.close()
@@ -249,7 +249,7 @@ class ExecdClient:
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 return link
-            except (Dropped, ConnectionError, OSError, TimeoutError) as e:
+            except (Dropped, ConnectionError, OSError, asyncio.TimeoutError) as e:
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
                 # Gone (a root agent can kill it, or its container restarted) or out of
@@ -311,7 +311,7 @@ class ExecdClient:
                     )
                     try:
                         item = await asyncio.wait_for(call.queue.get(), left)
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         await self._kill(link, call)
                         finished = True
                         yield EXIT, None
@@ -362,7 +362,7 @@ class ExecdClient:
                             f"execd: {payload.decode(errors='replace')}",
                             pod=link.daemon.ip,
                         )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 raise
             except OSError as e:  # ConnectionError too
                 raise ExecResultUnknownError(
@@ -400,7 +400,7 @@ class ExecdClient:
                 if isinstance(item, tuple) and item[0] == EXIT:
                     break
             await link.send(RELEASE, call.id)
-        except (ConnectionError, OSError, TimeoutError):
+        except (ConnectionError, OSError, asyncio.TimeoutError):
             pass
 
     async def exec(
@@ -613,5 +613,8 @@ class ExecdStream(ByteStream):
         self._closed = True
         self._link.calls.pop(self._call.id, None)
         with contextlib.suppress(ConnectionError, OSError):
+            await self._link.send(
+                STDIN, self._call.id
+            )  # EOF: the command may end itself
             await self._link.send(KILL, self._call.id)
             await self._link.send(RELEASE, self._call.id)

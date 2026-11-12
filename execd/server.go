@@ -15,8 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // server owns every process started through it. A call outlives the connection that
@@ -294,7 +296,9 @@ func (cl *call) run(req startRequest) error {
 		go cl.feedStdin(stdinW)
 	}
 	var drained sync.WaitGroup
-	for i, r := range []*os.File{outR, errR} {
+	var read [2]atomic.Int64 // bytes read from each pipe
+	pipes := []*os.File{outR, errR}
+	for i, r := range pipes {
 		drained.Add(1)
 		go func() {
 			defer drained.Done()
@@ -303,6 +307,7 @@ func (cl *call) run(req startRequest) error {
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
+					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
 				if err != nil {
@@ -313,19 +318,49 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		code := <-exited
-		// A background child that kept stdout open must not hold the call open forever.
+		// All the command wrote before it exited is in the pipes: read it, however slowly the
+		// client takes it. Then, 100 ms on, stop reading, so a background child that keeps a
+		// pipe open can't hold the call open forever.
+		var want [2]int64
+		for i, r := range pipes {
+			want[i] = buffered(r) // before the count, so want can't fall short
+			want[i] += read[i].Load()
+		}
 		done := make(chan struct{})
 		go func() { drained.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(100 * time.Millisecond):
-			outR.SetReadDeadline(time.Now())
-			errR.SetReadDeadline(time.Now())
-			<-done
+		grace := time.Now().Add(100 * time.Millisecond)
+		for {
+			select {
+			case <-done:
+				cl.finish(code)
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+			delivered := true
+			for i, r := range pipes {
+				delivered = delivered && (read[i].Load() >= want[i] || buffered(r) == 0)
+			}
+			if delivered && time.Now().After(grace) {
+				outR.SetReadDeadline(time.Now())
+				errR.SetReadDeadline(time.Now())
+				<-done
+				cl.finish(code)
+				return
+			}
 		}
-		cl.finish(code)
 	}()
 	return nil
+}
+
+// buffered says how many bytes wait unread in a pipe (0 once it is closed).
+func buffered(f *os.File) int64 {
+	var n int32
+	if rc, err := f.SyscallConn(); err == nil {
+		rc.Control(func(fd uintptr) {
+			syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TIOCINQ, uintptr(unsafe.Pointer(&n)))
+		})
+	}
+	return int64(n)
 }
 
 func stdinPipe(wanted bool) (*os.File, *os.File, error) {
