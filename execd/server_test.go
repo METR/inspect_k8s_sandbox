@@ -19,28 +19,29 @@ func testConn(t *testing.T) *conn {
 }
 
 func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
-	abandonAfter = time.Second
+	var timers []func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "10"}, Env: map[string]string{}, Tag: "t"})
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 1, payload: req})
 	t.Cleanup(s.get(1).kill)
+	resume := frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)}
 
-	s.detach(first) // its timer fires at 1.0 s
-	time.Sleep(200 * time.Millisecond)
+	s.detach(first)
 	again := testConn(t)
-	s.resume(again, frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)})
-	time.Sleep(300 * time.Millisecond)
-	s.detach(again) // at 0.5 s; its timer fires at 1.5 s
-	time.Sleep(700 * time.Millisecond)
+	s.resume(again, resume)
+	s.detach(again)
+	timers[0]() // the first drop's
 
 	if s.get(1) == nil {
-		t.Fatal("released at 1.2 s by the first drop's timer, though resumed since")
+		t.Fatal("released by the first drop's timer, though resumed since")
 	}
-	time.Sleep(600 * time.Millisecond)
+	timers[1]()
 	if s.get(1) != nil {
-		t.Fatal("not released 1 s after its last drop")
+		t.Fatal("not released by its last drop's timer")
 	}
 }
 

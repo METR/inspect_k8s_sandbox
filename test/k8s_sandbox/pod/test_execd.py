@@ -6,7 +6,6 @@ import json
 import shutil
 import ssl
 import subprocess
-import time
 import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -159,6 +158,8 @@ async def test_a_stream_acks_only_what_its_reader_takes(daemons: Daemons) -> Non
     acks = 0
     start: dict[str, object] = {}
 
+    marked = asyncio.Event()
+
     async def counts_acks(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         nonlocal acks
         _, call_id, payload = await read_frame(r)  # START
@@ -166,12 +167,16 @@ async def test_a_stream_acks_only_what_its_reader_takes(daemons: Daemons) -> Non
         piece = frame(execd.STDOUT, call_id, b"x" * (64 << 10))
         w.write(piece * (execd.STREAM_WINDOW // (64 << 10)))  # then execd waits
         while True:
-            acks += (await read_frame(r))[0] == execd.ACK
+            kind, _, payload = await read_frame(r)
+            acks += kind == execd.ACK
+            if kind == execd.STDIN and payload == b"marker":
+                marked.set()
 
     await daemons.serve(counts_acks)
     stream = await daemons.client().open_stream(["cat"], None)
     await until(lambda: held(stream) == execd.STREAM_WINDOW)
-    await asyncio.sleep(0.1)  # time for an ack sent on arrival to land
+    await stream.send(b"marker")  # behind any ack sent on arrival
+    await asyncio.wait_for(marked.wait(), 30)
     assert acks == 0
     got = 0
     while got < execd.STREAM_WINDOW:
@@ -299,9 +304,14 @@ async def test_connection_lost_after_start_is_not_retryable(
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
+    peers: list[asyncio.StreamWriter] = []
+
     async def stops_reading(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        peers.append(w)
         await read_frame(r)  # START
-        await asyncio.sleep(3600)  # frozen: its receive window fills
+        while True:  # alive, but never reads again: its receive window fills
+            w.write(frame(execd.PONG, 0))
+            await asyncio.sleep(0.05)
 
     await daemons.serve(stops_reading)
     monkeypatch.setattr(execd, "DEAD_AFTER", 0.5)
@@ -312,7 +322,12 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
         with pytest.raises((TimeoutError, ExecResultUnknownError)):
             await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
 
-    await asyncio.wait_for(times_out(), 30)  # a hang fails here, outside the raises
+    task = asyncio.ensure_future(times_out())
+    done, _ = await asyncio.wait({task}, timeout=15)
+    for peer in peers:  # frees a hung client, so a failure ends here
+        peer.transport.abort()
+    assert done, "the blocked write held up the timeout"
+    await task
 
 
 async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
@@ -738,11 +753,9 @@ async def test_a_command_times_out_while_its_daemon_is_restarted(
         w.close()
 
     first = await daemons.serve(dies_after_start)
-    t = time.monotonic()
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not the 30 s bound
         await asyncio.wait_for(client.exec(["true"], None, None, {}, None, 1), 30)
-    assert time.monotonic() - t < 10
 
 
 async def test_stdin_acks_that_report_progress_keep_the_connection(

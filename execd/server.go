@@ -31,8 +31,10 @@ type server struct {
 
 const idleTimeout = 60 * time.Second
 
-// abandonAfter outlasts the client's reconnect window (5 minutes); a var for tests.
-var abandonAfter = 6 * time.Minute
+// abandonAfter outlasts the client's reconnect window (5 minutes).
+const abandonAfter = 6 * time.Minute
+
+var afterFunc = time.AfterFunc // tests fire the abandon timers themselves
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -199,7 +201,7 @@ func (s *server) detach(c *conn) {
 			cl.kill()
 			s.release(cl.id)
 		case mine: // a client that hasn't resumed it by then has given up
-			time.AfterFunc(abandonAfter, func() {
+			afterFunc(abandonAfter, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
 				cl.mu.Unlock()
