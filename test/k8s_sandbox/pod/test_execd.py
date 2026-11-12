@@ -687,18 +687,65 @@ async def test_a_call_cancelled_while_another_writes_is_killed(
         with scope:
             await client.exec(["sleep", "60"], None, None, {}, None, None)
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(call)
-        await until(lambda: execd.START in got)
-        link = client._link
-        assert link is not None
-        async with link._wlock:  # another call's write
-            scope.cancel()  # anyio cancels again at each await, unlike asyncio
-            await asyncio.sleep(0.1)
+    task = asyncio.create_task(call())
+    await until(lambda: execd.START in got)
+    link = client._link
+    assert link is not None
+    async with link._wlock:  # another call's write
+        scope.cancel()  # anyio cancels again at each await, unlike asyncio
+        await asyncio.sleep(0.1)
+    await task
     await until(lambda: execd.RELEASE in got)
 
     assert execd.KILL in got
     assert not link.calls
+
+
+async def test_a_call_cancelled_as_it_exits_is_released(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    got: list[int] = []
+    go, releasing = asyncio.Event(), asyncio.Event()
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            got.append(kind)
+            if kind == execd.START:
+                await go.wait()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(exits)
+    send = execd.Link.send
+
+    async def signals_release(
+        link: execd.Link, kind: int, call_id: int, payload: bytes = b""
+    ) -> None:
+        if kind == execd.RELEASE:
+            releasing.set()
+        await send(link, kind, call_id, payload)
+
+    monkeypatch.setattr(execd.Link, "send", signals_release)
+    client = daemons.client()
+    scope = anyio.CancelScope()
+
+    async def call() -> None:
+        with scope:
+            await client.exec(["true"], None, None, {}, None, None)
+
+    task = asyncio.create_task(call())
+    await until(lambda: execd.START in got)
+    link = client._link
+    assert link is not None
+    async with link._wlock:  # another call's write
+        go.set()
+        await releasing.wait()
+        scope.cancel()
+        await asyncio.sleep(0.1)
+    await task
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.KILL not in got  # it exited: a KILL would end what it left running
 
 
 async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> None:

@@ -523,9 +523,13 @@ class ExecdClient:
                         yield kind, payload
                         await _taken(link, call, kind, len(payload))
                     elif kind == EXIT:
-                        finished = True
-                        with contextlib.suppress(OSError):
-                            await link.send(RELEASE, call.id)
+                        finished = True  # no KILL: it would end what it left running
+                        try:
+                            with contextlib.suppress(OSError):
+                                await link.send(RELEASE, call.id)
+                        except BaseException:  # cut off: it may not have gone out
+                            await link.send_last(call.id, RELEASE)
+                            raise
                         yield EXIT, json.loads(payload)  # {"code": n[, "error": ...]}
                         return
                     elif kind == RESUMED:  # send the stdin it didn't get
