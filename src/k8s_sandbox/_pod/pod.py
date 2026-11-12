@@ -97,18 +97,14 @@ class Pod:
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
         cmd += ["--replace"] if replace else []
-        result = await self._run_async(
-            lambda: ExecuteOperation(info).exec(cmd, None, None, {}, None, 60)
+        code, stdout, stderr = await self._run_async(
+            lambda: ExecuteOperation(info).run_argv(cmd)
         )
-        if "address already in use" in result.stderr:
-            raise DaemonRunning(result.stderr)
-        if not result.success or len(result.stdout.split()) != 2:
-            raise PodError(
-                "execd did not start",
-                returncode=result.returncode,
-                stderr=result.stderr,
-            )
-        return Daemon(pod.ip, result.stdout.split()[1], key)
+        if b"address already in use" in stderr:
+            raise DaemonRunning(stderr.decode(errors="replace"))
+        if code != 0 or len(stdout.split()) != 2:
+            raise PodError("execd did not start", returncode=code, stderr=stderr)
+        return Daemon(pod.ip, stdout.split()[1].decode(), key)
 
     @property
     def info(self) -> PodInfo:

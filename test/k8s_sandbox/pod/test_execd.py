@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from collections.abc import Awaitable, Callable
 
@@ -206,3 +207,42 @@ async def test_connection_lost_after_start_is_not_retryable(
     # A ConnectionError would be retried, running the command again.
     with pytest.raises(ExecResultUnknownError):
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+
+
+async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def stops_reading(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # START
+        await asyncio.sleep(3600)  # frozen: its receive window fills
+
+    await daemons.serve(stops_reading)
+    monkeypatch.setattr(execd, "DEAD_AFTER", 0.5)
+    monkeypatch.setattr(execd, "KILL_WAIT", 0.5)
+    sandbox = daemons.client()
+
+    async def times_out() -> None:
+        with pytest.raises((TimeoutError, ExecResultUnknownError)):
+            await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
+
+    await asyncio.wait_for(times_out(), 10)  # a hang fails here, outside the raises
+
+
+async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
+    flooded = asyncio.Event()
+
+    async def tiny_frames(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        with contextlib.suppress(ConnectionError):
+            for _ in range(4 * execd.MAX_QUEUED):
+                w.write(frame(execd.STDOUT, call_id))  # empty: no bytes to count
+                await w.drain()
+        flooded.set()
+
+    await daemons.serve(tiny_frames)
+    stream = await daemons.client().open_stream(["cat"], None)
+    await asyncio.wait_for(flooded.wait(), 10)
+    await asyncio.sleep(0.1)
+
+    assert stream._call.queue.qsize() <= execd.MAX_QUEUED + 1  # + the drop notice
+    assert stream._link.closed

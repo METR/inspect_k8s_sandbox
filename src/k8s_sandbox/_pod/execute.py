@@ -240,6 +240,33 @@ class ExecuteOperation(PodOperation):
             )
         return returncode == 1
 
+    def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
+        """Run `cmd`, as the container's user, with nothing on its stdin.
+
+        Its argv travels in the exec request. Returns its exit status, stdout and stderr
+        (for short output).
+        """
+        out = {STDOUT_CHANNEL: b"", STDERR_CHANNEL: b""}
+        with self._interactive_shell(cmd) as ws_client:
+            deadline = time.monotonic() + API_TIMEOUT
+            while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    raise PodError(f"{cmd[0]} timed out", pod=self._pod.name)
+                ws_client.sock.settimeout(wait)
+                try:
+                    _update(ws_client, wait)
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except (OSError, websocket.WebSocketException):
+                    if ERROR_CHANNEL not in ws_client._channels:
+                        raise
+                for channel in out:
+                    out[channel] += ws_client._channels.pop(channel, b"")
+            ws_client.close()
+            returncode = get_returncode(ws_client)
+        return returncode, out[STDOUT_CHANNEL], out[STDERR_CHANNEL]
+
     @contextmanager
     def _interactive_shell(
         self, command: list[str], send_keepalive: bool = True

@@ -66,6 +66,7 @@ ACK_EVERY = 4 << 20
 # Output a call may hold here that its caller hasn't taken: past it, the peer ignores
 # the acks (it isn't execd), and the connection is dropped.
 HOLD = 2 * ((32 << 20) + CHUNK)
+MAX_QUEUED = 4096  # frames, of any kind
 # Stdin a call may have in flight beyond what execd has written to the process, so the
 # daemon's queue (in the sandbox's memory) stays small for any size of input.
 STDIN_WINDOW = 8 << 20
@@ -75,6 +76,7 @@ RECONNECT_FOR = 300.0
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
+KILL_WAIT = 10.0  # for a killed command's exit
 
 
 @dataclass(frozen=True)
@@ -104,9 +106,7 @@ class _Pipe:
         await self._writer.drain()
 
     async def close(self) -> None:
-        self._writer.close()
-        with contextlib.suppress(Exception):
-            await self._writer.wait_closed()
+        self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
 async def _connect(daemon: Daemon) -> _Pipe:
@@ -161,7 +161,14 @@ class Link:
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
         async with self._wlock:
-            await self.pipe.write(HEADER.pack(kind, call_id, len(payload)) + payload)
+            data = HEADER.pack(kind, call_id, len(payload)) + payload
+            try:
+                await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
+            except TimeoutError:
+                # A peer that stopped reading must not hold the lock, and with it
+                # every other call's frames, timeouts and pings.
+                await self.close()
+                raise ConnectionError("execd stopped reading") from None
 
     async def _read(self) -> None:
         reader = self.pipe.reader
@@ -182,6 +189,8 @@ class Link:
                         c.got[kind - STDOUT] += len(payload)
                         if sum(c.got) - sum(c.taken) > HOLD:
                             return
+                    if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
+                        return
                     c.queue.put_nowait((kind, payload))
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
             pass
@@ -286,7 +295,7 @@ class ExecdClient:
         start = json.dumps(request).encode()
         deadline = None if timeout is None else time.monotonic() + timeout
         link = await self._get()
-        call = Call(int.from_bytes(os.urandom(8)) >> 1, link.daemon)
+        call = Call(int.from_bytes(os.urandom(8), "big") >> 1, link.daemon)
         link.calls[call.id] = call
         sender: asyncio.Task[None] | None = None
         finished = False
@@ -385,7 +394,7 @@ class ExecdClient:
         """Kill the call's processes and wait briefly for its exit."""
         try:
             await link.send(KILL, call.id)
-            end = time.monotonic() + 10
+            end = time.monotonic() + KILL_WAIT
             while time.monotonic() < end:
                 item = await asyncio.wait_for(call.queue.get(), end - time.monotonic())
                 if isinstance(item, tuple) and item[0] == EXIT:
@@ -513,7 +522,7 @@ class ExecdClient:
     async def open_stream(self, argv: list[str], user: str | None) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
         link = await self._get()
-        call = Call(int.from_bytes(os.urandom(8)) >> 1, link.daemon)
+        call = Call(int.from_bytes(os.urandom(8), "big") >> 1, link.daemon)
         link.calls[call.id] = call
         request = {
             "argv": argv,

@@ -26,12 +26,14 @@ type server struct {
 	keyHash []byte
 	mu      sync.Mutex
 	calls   map[uint64]*call
+	preauth chan struct{} // a slot per connection not yet authenticated
 }
 
 const idleTimeout = 60 * time.Second
 
-// authTimeout bounds the TLS handshake and the AUTH frame; maxKey bounds AUTH's payload.
-const authTimeout, maxKey = 10 * time.Second, 64
+// authTimeout bounds the TLS handshake and the AUTH frame; maxKey bounds AUTH's payload;
+// maxPreauth bounds the connections doing either at once.
+const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 
 type call struct {
 	id  uint64
@@ -85,7 +87,7 @@ func newServer(keyHashHex string) (*server, error) {
 	if err != nil || len(h) != sha256.Size {
 		return nil, fmt.Errorf("key hash must be 64 hex characters")
 	}
-	return &server{keyHash: h, calls: map[uint64]*call{}}, nil
+	return &server{keyHash: h, calls: map[uint64]*call{}, preauth: make(chan struct{}, maxPreauth)}, nil
 }
 
 func (s *server) serve(l net.Listener) {
@@ -96,7 +98,12 @@ func (s *server) serve(l net.Listener) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go s.handle(&conn{nc: nc, dead: make(chan struct{})})
+		select {
+		case s.preauth <- struct{}{}:
+			go s.handle(&conn{nc: nc, dead: make(chan struct{})})
+		default: // a flood of unauthenticated connections
+			nc.Close()
+		}
 	}
 }
 
@@ -106,6 +113,7 @@ func (s *server) handle(c *conn) {
 	// Before AUTH the peer is anyone who can reach the port: bound its time and memory.
 	c.nc.SetReadDeadline(time.Now().Add(authTimeout))
 	first, err := readFrameMax(c.nc, maxKey)
+	<-s.preauth
 	if err != nil || first.kind != fAuth {
 		return
 	}
@@ -188,6 +196,9 @@ func (s *server) start(c *conn, f frame) {
 	if err := json.Unmarshal(f.payload, &req); err != nil || len(req.Argv) == 0 {
 		c.send(fError, f.id, []byte("bad start request"))
 		return
+	}
+	if req.Env == nil { // "env": null
+		req.Env = map[string]string{}
 	}
 	cl := &call{id: f.id, tag: req.Tag, sub: c}
 	cl.room = sync.NewCond(&cl.mu)
@@ -471,12 +482,12 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var err error
 	if uidPart, gidPart, ok := strings.Cut(name, ":"); ok { // "uid:gid", as a spec may give
 		cred, home, uname, err := lookupUser(uidPart)
-		if gid, gErr := strconv.Atoi(gidPart); err == nil && cred != nil && gErr == nil {
+		if gid, gErr := strconv.ParseUint(gidPart, 10, 32); err == nil && cred != nil && gErr == nil {
 			cred.Gid, cred.Groups = uint32(gid), nil
 		}
 		return cred, home, uname, err
 	}
-	if _, numErr := strconv.Atoi(name); numErr == nil {
+	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil { // no uid wraps to 0
 		if u, err = user.LookupId(name); err != nil {
 			u = &user.User{Uid: name, Gid: name, Username: name, HomeDir: "/"}
 		}
