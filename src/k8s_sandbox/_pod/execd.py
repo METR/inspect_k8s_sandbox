@@ -393,6 +393,7 @@ class ExecdClient:
         self._pace = Pace()
         self._opened = float("-inf")
         self._backoff = 0.0
+        self._failed: BaseException | None = None  # why the open under way last failed
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -418,6 +419,7 @@ class ExecdClient:
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
+                self._failed = e
                 if link is not None:
                     await link.close()
                 if time.monotonic() > deadline:
@@ -436,12 +438,16 @@ class ExecdClient:
             return link
         if self._opening is None or self._opening.done():
             wait = FIRST_OPEN_FOR if link is None else RECONNECT_FOR
+            self._failed = None
             self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
-        # Shared: callers wait on one reconnect; only a resume waits out its window.
+            # Retrieved here, as no caller may still wait when it fails.
+            self._opening.add_done_callback(lambda f: f.cancelled() or f.exception())
+        # Shared: callers wait on one open; a new call gives up on a reopen sooner.
         opening = self._opening
-        await asyncio.wait({opening}, timeout=None if stale else FIRST_OPEN_FOR)
+        new_call = stale is None and link is not None
+        await asyncio.wait({opening}, timeout=FIRST_OPEN_FOR if new_call else None)
         if not opening.done():
-            raise ConnectionError("execd unreachable")
+            raise ConnectionError(f"execd unreachable: {self._failed!r}")
         self._link = opening.result()
         return self._link
 

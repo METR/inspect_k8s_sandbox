@@ -552,7 +552,7 @@ async def test_callers_share_one_reconnect(
     assert opens == 1
 
 
-async def test_a_new_call_waits_for_a_reconnect_only_as_long_as_a_first_open(
+async def test_only_a_resume_waits_out_a_reconnect(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -564,23 +564,30 @@ async def test_a_new_call_waits_for_a_reconnect_only_as_long_as_a_first_open(
     await daemons.serve(answers)
     client = daemons.client()
     await client.exec(["true"], None, None, {}, None, 10)
-    assert client._link is not None
-    await client._link.close()
+    stale = client._link
+    assert stale is not None
+    await stale.close()
 
-    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
-        raise ConnectionRefusedError
+    back = asyncio.Event()
+    connect = execd._connect
+
+    async def refused_until_back(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        if not back.is_set():
+            raise ConnectionRefusedError
+        return await connect(daemon, pace)
 
     async def still_running(replace: bool) -> execd.Daemon:
         raise execd.DaemonRunning("address already in use")
 
-    monkeypatch.setattr(execd, "_connect", refused)
-    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 0.2)
+    monkeypatch.setattr(execd, "_connect", refused_until_back)
+    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 0.5)  # past the reconnect's first try
     client._start = still_running
+    resume = asyncio.create_task(client._get(stale))
 
-    with pytest.raises(ConnectionError):  # not the 300 s a resume may wait
+    with pytest.raises(ConnectionError, match="ConnectionRefusedError"):
         await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
-    assert client._opening is not None
-    client._opening.cancel()
+    back.set()
+    assert await asyncio.wait_for(resume, 30) is not stale
 
 
 async def test_a_call_cancelled_as_its_connection_opens_starts_nothing(
