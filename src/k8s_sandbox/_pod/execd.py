@@ -36,6 +36,7 @@ from anyio.abc import ByteStream
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 
+from k8s_sandbox._error import K8sError
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
@@ -241,6 +242,7 @@ class ExecdClient:
     async def _open(self, deadline: float) -> Link:
         delay = 0.2
         while True:
+            link = None
             try:
                 if self._daemon is None:
                     self._daemon = await self._start(self._link is None)
@@ -250,6 +252,8 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 return link
             except (Dropped, ConnectionError, OSError, asyncio.TimeoutError) as e:
+                if link is not None:
+                    await link.close()
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
                 # Gone (a root agent can kill it, or its container restarted) or out of
@@ -364,7 +368,9 @@ class ExecdClient:
                         )
             except asyncio.TimeoutError:
                 raise
-            except OSError as e:  # ConnectionError too
+            except (K8sError, ExecResultUnknownError):
+                raise  # a restart found while reconnecting, or already the answer
+            except Exception as e:  # a lost connection, or a restart that failed
                 raise ExecResultUnknownError(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,

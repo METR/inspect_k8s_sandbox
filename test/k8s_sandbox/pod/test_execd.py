@@ -8,7 +8,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from k8s_sandbox._pod import execd
-from k8s_sandbox._pod.error import ExecResultUnknownError
+from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
@@ -246,3 +246,25 @@ async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
 
     assert stream._call.queue.qsize() <= execd.MAX_QUEUED + 1  # + the drop notice
     assert stream._link.closed
+
+
+async def test_a_failed_restart_after_start_is_not_retryable(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def start_fails(replace: bool) -> execd.Daemon:
+        raise PodError("execd did not start")
+
+    async def dies_after_start(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)  # START
+        sandbox._start = start_fails
+        server.close()
+        w.close()
+
+    server = await daemons.serve(dies_after_start)
+    sandbox = daemons.client()
+
+    # PodError is retried too, which would run the command again.
+    with pytest.raises(ExecResultUnknownError):
+        await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)

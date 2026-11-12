@@ -6,6 +6,7 @@
   mounted read-only at `/opt/execd/execd` and TCP port 24601 open to the client, runs
   `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over the pod network
   instead of Kubernetes exec stdin, which AWS Nitro Sandboxes reorder above 32 KiB.
+  There, an `exec()` that times out has its whole process group killed.
 - Fix `write_file()` and `exec()` silently corrupting stdin over 32 KiB on AWS Nitro
   Sandboxes (EKS's `isolated-sandbox` runtime). On every runtime, stdin over 32 KiB now
   goes in hash-checked pieces of up to 64 KiB, one exec each, and needs `mktemp`,
