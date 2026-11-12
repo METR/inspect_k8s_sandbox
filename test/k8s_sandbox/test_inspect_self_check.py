@@ -33,9 +33,17 @@ _NONSTRICT_XFAILS = {
 }
 
 
+@pytest.fixture(scope="module", params=["exec", "execd"])
+def transport(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
 @pytest_asyncio.fixture(scope="module")
-async def sandboxes() -> AsyncGenerator[dict[str, K8sSandboxEnvironment], None]:
-    async with install_sandbox_environments(__file__, "values.yaml") as envs:
+async def sandboxes(
+    transport: str,
+) -> AsyncGenerator[dict[str, K8sSandboxEnvironment], None]:
+    values = "values.yaml" if transport == "exec" else "execd-values.yaml"
+    async with install_sandbox_environments(__file__, values) as envs:
         yield envs
 
 
@@ -56,3 +64,12 @@ async def sandbox_env(
             pytest.mark.xfail(reason=nonstrict_reason, strict=False)
         )
     return sandboxes[key]
+
+
+async def test_annotation_picks_transport(
+    transport: str, sandbox_env: K8sSandboxEnvironment
+) -> None:
+    # execd starts a command itself; Kubernetes exec starts it from a shell.
+    result = await sandbox_env.exec(["sh", "-c", "cat /proc/$PPID/cmdline"])
+    assert result.success, result.stderr
+    assert ("execd" in result.stdout) == (transport == "execd"), result.stdout

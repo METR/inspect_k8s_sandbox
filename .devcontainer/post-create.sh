@@ -47,6 +47,9 @@ reclaimPolicy: Delete
 volumeBindingMode: Immediate
 EOF
 
+  echo "Building execd for test/k8s_sandbox/resources/execd-values.yaml..."
+  minikube image build -t execd:local execd
+
   # Install Cilium CLI. Previously, the ghcr.io/audacioustux/devcontainers/cilium:1
   # devcontainer feature was used, but it doesn't allow a specific version of the CLI to
   # be installed and the latest version failed at `cilium install`.
