@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - claude/fix-ci-startup-run*
   pull_request:
     branches:
       - main
