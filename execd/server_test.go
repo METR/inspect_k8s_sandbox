@@ -46,17 +46,30 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 }
 
 func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
+	startReaper()
 	dir, _ := filepath.EvalSymlinks(t.TempDir())
 	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
-	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\n"), 0o755)
+	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
 	wd, _ := os.Getwd()
 	os.Chdir(dir)
 	t.Cleanup(func() { os.Chdir(wd) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"hello"}, Env: map[string]string{"PATH": "bin"}, Cwd: "work", Tag: "p"})
 
-	got, err := lookPath("hello", []string{"PATH=bin"}, "work")
+	s.start(testConn(t), frame{kind: fStart, id: 2, payload: req})
 
-	// The child starts in cwd, so a path relative to execd's own cwd would miss.
-	if err != nil || got != filepath.Join(dir, "work", "bin", "hello") {
-		t.Fatalf("lookPath = %q, %v", got, err)
+	// As a shell finds it: work/bin/hello, run in work.
+	cl := s.get(2)
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		cl.mu.Lock()
+		exited, code := cl.exited, cl.code
+		cl.mu.Unlock()
+		if exited {
+			if code != 7 {
+				t.Fatalf("exit %d, want hello's 7", code)
+			}
+			return
+		}
 	}
+	t.Fatal("hello never exited")
 }
