@@ -62,6 +62,7 @@ HEADER = struct.Struct(">BQI")
 CHUNK = 1 << 20
 # execd sends at most CHUNK of output per frame; anything larger is not execd.
 MAX_FRAME = 2 * CHUNK
+MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
 # execd holds output until acked, and pauses the command past 32 MiB per stream.
 ACK_EVERY = 4 << 20
 # Output a call may hold here that its caller hasn't taken: past it, the peer ignores
@@ -144,6 +145,7 @@ class Call:
     acked: int = 0
     stdin_put: int = 0  # stdin execd has written to the process
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
+    closed: bool = False  # by its caller
 
 
 class Link:
@@ -180,7 +182,7 @@ class Link:
         try:
             while True:
                 kind, call_id, n = HEADER.unpack(await reader.readexactly(HEADER.size))
-                if n > MAX_FRAME:
+                if n > (MAX_FRAME if kind in (STDOUT, STDERR) else MAX_CONTROL):
                     return
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
@@ -190,12 +192,13 @@ class Link:
                     c.stdin_put = max(c.stdin_put, json.loads(payload)["stdin"])
                     c.stdin_room.set()
                 elif (c := self.calls.get(call_id)) is not None and kind != PONG:
-                    if kind in (STDOUT, STDERR):
-                        c.got[kind - STDOUT] += len(payload)
-                        if sum(c.got) - sum(c.taken) > HOLD:
-                            return
+                    # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
+                    if kind in (STDOUT, STDERR):
+                        if sum(c.got) + n - sum(c.taken) > HOLD:
+                            return
+                        c.got[kind - STDOUT] += n
                     c.queue.put_nowait((kind, payload))
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
             pass
@@ -262,15 +265,18 @@ class ExecdClient:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
                 # Gone (a root agent can kill it, or its container restarted) or out of
                 # reach: a start tells which, as a live daemon keeps its port.
-                with contextlib.suppress(DaemonRunning):
-                    self._daemon = await self._start(self._link is None)
+                # A daemon that isn't ours (one whose start we never heard back from)
+                # is replaced; a live one of ours keeps its calls.
+                not_ours = isinstance(e, NotOurDaemon)
+                try:
+                    self._daemon = await self._start(self._link is None or not_ours)
                     continue
-                if isinstance(e, NotOurDaemon):
-                    # Something else holds the port, and keeps it: waiting won't help.
-                    raise RuntimeError(
-                        f"TCP port {EXECD_PORT} in the sandbox is held by a process "
-                        "other than execd"
-                    ) from e
+                except DaemonRunning:
+                    if not_ours:  # what holds the port isn't execd: it won't let go
+                        raise RuntimeError(
+                            f"TCP port {EXECD_PORT} in the sandbox is held by a "
+                            "process other than execd"
+                        ) from e
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 5.0)
 
@@ -549,7 +555,11 @@ class ExecdClient:
             "stdin": True,
             "tag": os.urandom(8).hex(),
         }
-        await link.send(START, call.id, json.dumps(request).encode())
+        try:
+            await link.send(START, call.id, json.dumps(request).encode())
+        except BaseException:
+            link.calls.pop(call.id, None)
+            raise
         return ExecdStream(link, call)
 
 
@@ -557,7 +567,7 @@ async def _window(link: Link, call: Call, sent: int) -> None:
     """Wait until the call has room for more stdin in flight."""
     while sent - call.stdin_put >= STDIN_WINDOW:
         call.stdin_room.clear()
-        if link.closed:
+        if link.closed or call.closed:
             raise ConnectionError("execd connection closed")
         await call.stdin_room.wait()
 
@@ -628,6 +638,8 @@ class ExecdStream(ByteStream):
         if self._closed:
             return
         self._closed = True
+        self._call.closed = True
+        self._call.stdin_room.set()  # a send waiting for room sees the close
         self._link.calls.pop(self._call.id, None)
         with contextlib.suppress(ConnectionError, OSError):
             await self._link.send(

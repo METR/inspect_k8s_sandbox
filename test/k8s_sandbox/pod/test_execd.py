@@ -285,3 +285,94 @@ async def test_a_port_held_by_another_process_fails_at_once(
 
     with pytest.raises(RuntimeError, match="held by a process other than execd"):
         await asyncio.wait_for(sandbox.exec(["true"], None, None, {}, None, None), 5)
+
+
+async def test_a_frame_the_cap_refuses_is_asked_for_again(daemons: Daemons) -> None:
+    flooded = asyncio.Event()
+
+    async def one_too_many(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        with contextlib.suppress(ConnectionError):
+            for _ in range(execd.MAX_QUEUED + 1):
+                w.write(frame(execd.STDOUT, call_id, b"x"))
+                await w.drain()
+        flooded.set()
+
+    await daemons.serve(one_too_many)
+    stream = await daemons.client().open_stream(["cat"], None)
+    await asyncio.wait_for(flooded.wait(), 10)
+    await asyncio.sleep(0.1)
+
+    assert stream._link.closed
+    # What a resume would ask for: the refused byte is not counted as received.
+    assert stream._call.got[0] == execd.MAX_QUEUED
+
+
+async def test_a_large_control_frame_drops_the_connection(daemons: Daemons) -> None:
+    async def large_error(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.ERROR, call_id, b"x" * (execd.MAX_CONTROL + 1)))
+        await asyncio.sleep(3600)
+
+    await daemons.serve(large_error)
+    stream = await daemons.client().open_stream(["cat"], None)
+    await asyncio.sleep(0.2)
+
+    assert stream._link.closed
+    assert held(stream) == 0
+
+
+async def test_closing_a_stream_ends_a_send_waiting_for_room(daemons: Daemons) -> None:
+    async def never_acks_stdin(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        while True:
+            await read_frame(r)
+
+    await daemons.serve(never_acks_stdin)
+    stream = await daemons.client().open_stream(["cat"], None)
+    send = asyncio.create_task(stream.send(b"x" * (2 * execd.STDIN_WINDOW)))
+    await asyncio.sleep(0.2)
+
+    await stream.aclose()
+
+    with pytest.raises(anyio.BrokenResourceError):
+        await asyncio.wait_for(send, 5)
+
+
+async def test_a_daemon_that_is_not_ours_is_replaced(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    await daemons.serve(answers)
+    sandbox = daemons.client()
+    starts = []
+    start = sandbox._start
+
+    async def recorded(replace: bool) -> execd.Daemon:
+        starts.append(replace)
+        return await start(replace)
+
+    sandbox._start = recorded
+    await sandbox.exec(["true"], None, None, {}, None, 10)
+    first, connect = sandbox._daemon, execd._connect
+
+    async def another_execd_on_first(daemon: execd.Daemon) -> execd._Pipe:
+        # Our start's reply was lost, and that daemon now holds the port.
+        if daemon is first:
+            raise execd.NotOurDaemon("certificate mismatch")
+        return await connect(daemon)
+
+    monkeypatch.setattr(execd, "_connect", another_execd_on_first)
+    assert sandbox._link is not None
+    await sandbox._link.close()
+
+    await sandbox.exec(["true"], None, None, {}, None, 10)
+
+    assert starts == [True, True]
