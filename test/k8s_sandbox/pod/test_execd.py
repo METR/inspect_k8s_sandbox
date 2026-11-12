@@ -416,13 +416,20 @@ async def test_a_frame_the_cap_refuses_is_asked_for_again(daemons: Daemons) -> N
     assert stream._call.got[0] == execd.MAX_QUEUED
 
 
-async def test_a_large_control_frame_drops_the_connection(daemons: Daemons) -> None:
-    async def large_error(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+@pytest.mark.parametrize(
+    ("kind", "size"),
+    [(execd.ERROR, execd.MAX_CONTROL + 1), (execd.STDIN_ACK, execd.MAX_ACK + 1)],
+)
+async def test_a_large_control_frame_drops_the_connection(
+    daemons: Daemons, kind: int, size: int
+) -> None:
+    async def large(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.ERROR, call_id, b"x" * (execd.MAX_CONTROL + 1)))
+        # JSON, so only its size can drop the connection
+        w.write(frame(kind, call_id, b'{"stdin": 0}'.ljust(size)))
         await asyncio.sleep(3600)
 
-    await daemons.serve(large_error)
+    await daemons.serve(large)
     stream = await daemons.client().open_stream(["cat"], None)
     await until(lambda: stream._link.closed)
 
@@ -816,51 +823,80 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
         await pod._start_execd(False)
 
 
-async def test_a_resumed_offset_out_of_range_sends_stdin_from_its_start(
+async def test_a_resume_resends_only_stdin_execd_has_not_written(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
-    offsets: list[int] = []
     upload = execd.ExecdClient._upload
 
-    async def recorded(
+    async def bounded(
         client: execd.ExecdClient,
         link: execd.Link,
         call: execd.Call,
         data: bytes | None,
         offset: int,
     ) -> None:
-        offsets.append(offset)
         if offset >= 0:  # below zero, it would hold the loop for ever
             await upload(client, link, call, data, offset)
 
-    monkeypatch.setattr(execd.ExecdClient, "_upload", recorded)
-    stdin: list[bytes] = []
+    monkeypatch.setattr(execd.ExecdClient, "_upload", bounded)
+    resent: list[bytes] = []
     connections = 0
 
-    async def resumes_below_zero(
+    async def acks_then_resumes_below_zero(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         nonlocal connections
         connections += 1
         _, call_id, _ = await read_frame(r)  # START, then RESUME
         if connections == 1:
+            while await read_frame(r) != (execd.STDIN, call_id, b""):  # stdin's end
+                pass
+            w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 3}'))  # all written
             w.close()  # dropped, so the client resumes
             return
         got = {"stdin": -(10**30), "eof": False, "put": 0}
         w.write(frame(execd.RESUMED, call_id, json.dumps(got).encode()))
-        while not stdin or stdin[-1]:  # to the empty frame that closes stdin
+        while not resent or resent[-1]:  # to the empty frame that closes stdin
             kind, _, payload = await read_frame(r)
             if kind == execd.STDIN:
-                stdin.append(payload)
+                resent.append(payload)
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         await r.read()
 
-    await daemons.serve(resumes_below_zero)
+    await daemons.serve(acks_then_resumes_below_zero)
 
     await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
 
-    assert offsets[-1] == 0
-    assert stdin == [b"abc", b""]
+    assert resent == [b""]
+
+
+async def test_an_unknown_call_whose_stdin_execd_wrote_is_not_started_again(
+    daemons: Daemons,
+) -> None:
+    starts = 0
+
+    async def acks_then_forgets(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                if starts > 1:  # started again: answer, so the test ends
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif (kind, payload, starts) == (execd.STDIN, b"", 1):
+                w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 3}'))
+                w.close()  # dropped, so the client resumes
+                return
+            elif kind == execd.RESUME:
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+
+    await daemons.serve(acks_then_forgets)
+
+    with pytest.raises(ExecResultUnknownError):
+        await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
+    assert starts == 1
 
 
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])

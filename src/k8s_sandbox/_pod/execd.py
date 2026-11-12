@@ -52,6 +52,7 @@ CHUNK = 1 << 20
 # execd sends at most CHUNK of output per frame; anything larger is not execd.
 MAX_FRAME = 2 * CHUNK
 MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
+MAX_ACK = 64  # execd's {"stdin": n}; each one is parsed, even a stray
 ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
 HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
@@ -222,7 +223,9 @@ class Link:
                 if frames % 256 == 0:  # let callers take what is queued
                     await asyncio.sleep(0)
                 kind, call_id, n = HEADER.unpack(await reader.readexactly(HEADER.size))
-                if n > (MAX_FRAME if kind in (STDOUT, STDERR) else MAX_CONTROL):
+                if n > (MAX_FRAME if kind in (STDOUT, STDERR) else MAX_CONTROL) or (
+                    kind == STDIN_ACK and n > MAX_ACK
+                ):
                     return
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
@@ -429,8 +432,10 @@ class ExecdClient:
                         got = json.loads(payload)
                         call.stdin_put = max(call.stdin_put, got["put"])
                         if stdin is not None and not got["eof"]:
-                            # Clamped: a stand-in's offset could loop over nothing.
-                            offset = min(max(int(got["stdin"]), 0), len(stdin))
+                            # Clamped: a stand-in can't loop or resend what's written.
+                            offset = int(
+                                min(max(got["stdin"], call.stdin_put), len(stdin))
+                            )
                             sender.cancel()
                             sender = asyncio.create_task(
                                 self._upload(link, call, stdin, offset)
@@ -440,6 +445,7 @@ class ExecdClient:
                         and payload == b"unknown call"
                         and call.resuming
                         and not any(call.got)
+                        and not call.stdin_put
                     ):
                         # The same daemon never got the START: nothing ran, so start it.
                         call.resuming = False
