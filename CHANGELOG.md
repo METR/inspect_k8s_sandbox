@@ -5,15 +5,15 @@
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client,
   and only it, at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and
-  `exec_stdio()` over TLS to execd instead of Kubernetes exec stdin. There, a timed-out
-  `exec()` and its background processes get SIGKILL at once, not SIGTERM. One that
-  leaves the command's process group survives if it clears its environment or, without
-  `CAP_SYS_PTRACE`, makes itself non-dumpable or runs as another `user`. Without
-  `CAP_KILL`, nothing a command run as another `user` started is killed. Closing an
-  `exec_stdio` stream kills its command, but no process the command started. Make
-  execd mode 111, and give the sandbox neither `CAP_DAC_OVERRIDE` nor
-  `CAP_DAC_READ_SEARCH`, or a process running as execd's user can stand in for it while
-  it starts; with `CAP_SYS_PTRACE` one can at any time.
+  `exec_stdio()` through execd. There, a timed-out `exec()` and its background
+  processes get SIGKILL at once. One that leaves the command's process group survives
+  if it clears its environment or, in a sandbox without `CAP_SYS_PTRACE`, makes itself
+  non-dumpable or runs as another `user`. In a sandbox without `CAP_KILL`, nothing a
+  command run as another `user` started is killed. Closing an `exec_stdio` stream kills
+  its command, but no process the command started. A process running as execd's user
+  can stand in for it unless execd is mode 111, the sandbox has none of
+  `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`, and the node's
+  `fs.suid_dumpable` is not 1.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

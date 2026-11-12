@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import logging
 import os
-import re
 import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
@@ -21,12 +19,11 @@ from k8s_sandbox._pod.error import (
     PodReplacedError,
 )
 from k8s_sandbox._pod.execd import (
-    EXECD_PATH,
-    EXECD_PORT,
     Daemon,
-    DaemonRunning,
     ExecdClient,
     ExecdStream,
+    start_command,
+    started,
 )
 from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
 from k8s_sandbox._pod.executor import PodOpExecutor
@@ -91,18 +88,10 @@ class Pod:
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         key = os.urandom(32)
-        cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
-        cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
-        cmd += ["--replace"] if replace else []
         code, stdout, stderr = await self._run_async(
-            lambda: ExecuteOperation(info).run_argv(cmd)
+            lambda: ExecuteOperation(info).run_argv(start_command(key, replace))
         )
-        if b"address already in use" in stderr:
-            raise DaemonRunning(stderr.decode(errors="replace"))
-        # Exactly the fingerprint execd prints: anything else, cut output too, fails.
-        if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
-            raise PodError("execd did not start", returncode=code, stderr=stderr)
-        return Daemon(pod.ip, stdout.decode().strip(), key)
+        return started(pod.ip, key, code, stdout, stderr)
 
     @property
     def info(self) -> PodInfo:
@@ -216,11 +205,13 @@ class Pod:
         if self._execd is not None:
             self._raise_restart()
             try:
-                return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
+                result = await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
             except ExecResultUnknownError:
                 # As below: a restart explains a lost connection better.
                 await self._diagnose_restart_after_failure()
                 raise
+            self._raise_restart()  # one found while it ran
+            return result
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
@@ -278,7 +269,7 @@ class Pod:
         """
         if self._execd is not None:
             self._raise_restart()
-            return await self._execd.open_stream(cmd, user)
+            return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
         stack, ws_client = await self._run_async(
@@ -326,7 +317,8 @@ class Pod:
         """
         if self._execd is not None:
             self._raise_restart()
-            return await self._execd.write_file(data, dst)
+            await self._execd.write_file(data, dst)
+            return self._raise_restart()  # one found while it ran
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
@@ -346,7 +338,8 @@ class Pod:
         """
         if self._execd is not None:
             self._raise_restart()
-            return await self._execd.read_file(src, dst)
+            await self._execd.read_file(src, dst)
+            return self._raise_restart()  # one found while it ran
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)

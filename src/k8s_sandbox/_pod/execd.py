@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import shlex
 import ssl
 import struct
@@ -51,12 +52,30 @@ class Daemon:
     """A started daemon: where it listens, its certificate and its key."""
 
     ip: str
+    port: int
     fingerprint: str
     key: bytes = field(repr=False)
 
 
 class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
+
+
+def start_command(key: bytes, replace: bool) -> list[str]:
+    """The exec that starts execd; with REPLACE, it first stops one that runs."""
+    cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
+    cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+    return cmd + ["--replace"] if replace else cmd
+
+
+def started(ip: str, key: bytes, code: int, stdout: bytes, stderr: bytes) -> Daemon:
+    """The daemon that a start exec's exit code and output tell of."""
+    if b"address already in use" in stderr:
+        raise DaemonRunning(stderr.decode(errors="replace"))
+    # Exactly the fingerprint execd prints: anything else, cut output too, fails.
+    if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
+        raise PodError("execd did not start", returncode=code, stderr=stderr)
+    return Daemon(ip, EXECD_PORT, stdout.decode().strip(), key)
 
 
 class NotOurDaemon(ConnectionRefusedError):
@@ -85,7 +104,7 @@ class _Conn:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._client = client
+        self.client = client
         self._in, self._out = ssl.MemoryBIO(), ssl.MemoryBIO()
         self.tls = _TLS.wrap_bio(self._in, self._out)
         self._opened = time.monotonic()
@@ -106,22 +125,24 @@ class _Conn:
                 await self._fill()
         await self._flush()
 
-    async def send(self, kind: int, payload: bytes = b"") -> None:
-        if self._client.broken:
-            raise NotExecd(self._client.broken)
+    def write(self, kind: int, payload: bytes = b"") -> None:
+        """Queue a frame, without waiting for the socket to take it."""
         self.tls.write(HEADER.pack(kind, len(payload)) + payload)
-        await self._flush()
+        self._writer.write(self._out.read())
+
+    async def send(self, kind: int, payload: bytes = b"") -> None:
+        self.write(kind, payload)
+        await self._writer.drain()
 
     async def frame(self) -> tuple[int, bytes]:
         """Read the next frame; one execd would not send breaks the client."""
         while True:
-            if self._client.broken:
-                raise NotExecd(self._client.broken)
             await self._hold(HEADER.size)
             kind, n = HEADER.unpack_from(self._plain)
             if n > MOST.get(kind, -1):
                 raise self._broken(f"a frame of type {kind} and {n} bytes")
             await self._hold(HEADER.size + n)
+            self.client.check()  # another connection broke it while this one waited
             payload = bytes(self._plain[HEADER.size : HEADER.size + n])
             del self._plain[: HEADER.size + n]
             self._frames += 1
@@ -130,7 +151,7 @@ class _Conn:
 
     def status(self, payload: bytes) -> dict[str, Any]:
         """Parse an EXIT: {"code": n[, "error": why][, "timeout": true]}."""
-        with contextlib.suppress(ValueError, LookupError, TypeError):
+        with contextlib.suppress(ValueError, LookupError, TypeError, RecursionError):
             status = json.loads(payload)
             if type(status["code"]) is int and type(status.get("error", "")) is str:
                 return status
@@ -185,11 +206,11 @@ class _Conn:
         self.close()
         if not self.pinned:  # anyone can answer on the port: only our daemon is trusted
             return NotOurDaemon(f"the server on the execd port sent {what}")
-        self._client.broken = (
+        self.client.broken = (
             f"The server on the sandbox's execd port is not execd: it sent {what}. "
             "Its sandbox can no longer be used."
         )
-        return NotExecd(self._client.broken)
+        return NotExecd(self.client.broken)
 
     async def _flush(self) -> None:
         self._writer.write(self._out.read())
@@ -203,7 +224,7 @@ async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
     """Open a connection, check it is the daemon's, and send the key."""
 
     async def connect() -> _Conn:
-        reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        reader, writer = await asyncio.open_connection(daemon.ip, daemon.port)
         conn = _Conn(reader, writer, client)
         try:
             await conn.handshake()
@@ -222,7 +243,7 @@ async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
 
 
 async def _upload(conn: _Conn, stdin: bytes) -> None:
-    with contextlib.suppress(OSError, NotExecd):  # the reader sees either
+    with contextlib.suppress(OSError):  # the reader sees it
         for i in range(0, len(stdin), CHUNK):
             await conn.send(STDIN, stdin[i : i + CHUNK])
             await asyncio.sleep(0)  # so other work runs between chunks
@@ -252,9 +273,12 @@ class ExecdClient:
         except (OSError, asyncio.TimeoutError) as e:
             raise ConnectionError(f"execd unreachable: {e!r}") from e
 
-    async def _dial(self, daemon: Daemon) -> _Conn:
+    def check(self) -> None:
         if self.broken:
             raise NotExecd(self.broken)
+
+    async def _dial(self, daemon: Daemon) -> _Conn:
+        self.check()
         return await _connect(daemon, self)
 
     async def _restart(
@@ -262,6 +286,7 @@ class ExecdClient:
     ) -> Daemon:
         """Start a daemon in OLD's place, unless another call already has."""
         async with self._starting:
+            self.check()  # broken while this call connected or waited: no new start
             if self._daemon is old:
                 # Any execd there before this client's first, or that isn't its own.
                 replace = old is None or isinstance(why, NotOurDaemon)
@@ -299,7 +324,8 @@ class ExecdClient:
         conn = await self._open()
         sender: asyncio.Task[None] | None = None
         try:
-            await conn.send(START, json.dumps(request).encode())
+            # Not waited on: a daemon that stops reading is found by the reads below.
+            conn.write(START, json.dumps(request).encode())
             if stdin is not None:
                 sender = asyncio.create_task(_upload(conn, stdin))
             # Only for an execd that doesn't end the command at its timeout.
@@ -335,8 +361,7 @@ class ExecdClient:
     ) -> ExecResult[str]:
         """Pod.exec(), over execd: the same results and errors."""
         data = stdin.encode() if isinstance(stdin, str) else stdin
-        out = {STDOUT: LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)}
-        out[STDERR] = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
+        out = {k: LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE) for k in (STDOUT, STDERR)}
         status: dict[str, Any] = {}
         run = self.run(cmd, env=env, cwd=cwd, user=user, stdin=data, timeout=timeout)
         async with contextlib.aclosing(run) as chunks:
@@ -434,7 +459,12 @@ class ExecdClient:
             )
         dst.flush()
 
-    async def open_stream(self, argv: list[str], user: str | None) -> ExecdStream:
+    async def open_stream(
+        self,
+        argv: list[str],
+        user: str | None,
+        restarted: Callable[[], Exception | None],
+    ) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
         request = {
             "argv": argv,
@@ -445,15 +475,16 @@ class ExecdClient:
             "stream": True,  # when its connection ends, execd kills only the command
         }
         conn = await self._open()
-        await conn.send(START, json.dumps(request).encode())
-        return ExecdStream(conn)
+        conn.write(START, json.dumps(request).encode())
+        return ExecdStream(conn, restarted)
 
 
 class ExecdStream(ByteStream):
     """A command's stdin and stdout over execd; it ends with its connection."""
 
-    def __init__(self, conn: _Conn) -> None:
+    def __init__(self, conn: _Conn, restarted: Callable[[], Exception | None]) -> None:
         self._conn = conn
+        self._restarted = restarted  # the restart found since it opened, if any
         self._stdout = bytearray()
         self._ended: BaseException | None = None
         self._closed = False
@@ -482,6 +513,7 @@ class ExecdStream(ByteStream):
             elif kind == STDERR:
                 self._stderr = (self._stderr + payload)[-_STDERR_TAIL_BYTES:]
             else:  # EXIT
+                self._conn.status(payload)
                 self._ended = anyio.EndOfStream()
                 if not self._wrote:  # it failed to start, as PodStdio reports it
                     log_warn(
@@ -493,6 +525,11 @@ class ExecdStream(ByteStream):
                     log_trace(
                         "An exec_stdio command wrote to stderr.", stderr=self._stderr
                     )
+        # Once its pod can't be used, not even output already read is given out.
+        self._conn.client.check()
+        if (error := self._restarted()) is not None:
+            self._conn.close()
+            raise anyio.BrokenResourceError(repr(error)) from error
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data

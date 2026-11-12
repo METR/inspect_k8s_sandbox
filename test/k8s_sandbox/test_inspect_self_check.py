@@ -71,7 +71,7 @@ async def sandbox_env(
 async def test_annotation_picks_transport(
     transport: str, sandbox_env: K8sSandboxEnvironment
 ) -> None:
-    # execd starts a command itself; Kubernetes exec starts it from a shell.
+    # execd is the command's parent; Kubernetes exec starts it from a shell.
     result = await sandbox_env.exec(["sh", "-c", "cat /proc/$PPID/cmdline"])
     assert result.success, result.stderr
     assert ("execd" in result.stdout) == (transport == "execd"), result.stdout

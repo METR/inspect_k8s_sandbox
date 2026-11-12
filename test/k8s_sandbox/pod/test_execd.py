@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -8,7 +9,7 @@ import ssl
 import subprocess
 import time
 import types
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -18,16 +19,14 @@ import pytest
 from inspect_ai.util import OutputLimitExceededError
 from pytest import MonkeyPatch
 
-from k8s_sandbox._helm import Release, ValuesSource
+from k8s_sandbox._kubernetes_api import _Config
 from k8s_sandbox._pod import execd
-from k8s_sandbox._pod import pod as pod_module
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
     ExecResultUnknownError,
     PodError,
 )
 from k8s_sandbox._pod.pod import Pod
-from k8s_sandbox._pod.snapshot import _parse_pod
 from test.k8s_sandbox.pod.test_check_for_pod_restart import _k8s_pod
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
@@ -75,11 +74,11 @@ def tls(tmp_path_factory: pytest.TempPathFactory) -> Tls:
 class Daemons:
     """Stand-ins for execd, over TLS, which the client starts in turn."""
 
-    def __init__(self, tls: Tls, monkeypatch: MonkeyPatch):
+    def __init__(self, tls: Tls):
         self._context, self._long, self._pin = tls
-        self._monkeypatch = monkeypatch
-        self._unstarted: list[tuple[execd.Daemon, int] | Exception] = []
+        self._unstarted: list[execd.Daemon | Exception] = []
         self.behind: dict[int, int] = {}  # a daemon's port: the proxy's in front of it
+        self.servers: list[asyncio.Server] = []
         self.starts: list[bool] = []  # each start's `replace`
         self.connections = 0  # that sent the key
 
@@ -96,8 +95,11 @@ class Daemons:
 
         context = self._long if long_handshake else self._context
         server = await asyncio.start_server(connection, "127.0.0.1", 0, ssl=context)
-        daemon = execd.Daemon("127.0.0.1", pin or self._pin, b"key")
-        self._unstarted.append((daemon, server.sockets[0].getsockname()[1]))
+        self.servers.append(server)
+        port = server.sockets[0].getsockname()[1]
+        self._unstarted.append(
+            execd.Daemon("127.0.0.1", port, pin or self._pin, b"key")
+        )
         return server
 
     def fail_start(self, error: Exception) -> None:
@@ -111,17 +113,23 @@ class Daemons:
             started = self._unstarted.pop(0)
             if isinstance(started, Exception):
                 raise started
-            daemon, port = started
-            port = self.behind.get(port, port)
-            self._monkeypatch.setattr(execd, "EXECD_PORT", port)
-            return daemon
+            port = self.behind.get(started.port, started.port)
+            return dataclasses.replace(started, port=port)
 
         return execd.ExecdClient(start)
 
 
 @pytest.fixture
-def daemons(tls: Tls, monkeypatch: MonkeyPatch) -> Daemons:
-    return Daemons(tls, monkeypatch)
+async def daemons(tls: Tls, monkeypatch: MonkeyPatch) -> AsyncIterator[Daemons]:
+    def no_cluster() -> None:
+        raise AssertionError("an operation left execd for the Kubernetes API")
+
+    # A bug that takes an operation off execd fails here: it reaches no cluster.
+    monkeypatch.setattr(_Config, "get_instance", no_cluster)
+    stand_ins = Daemons(tls)
+    yield stand_ins
+    for server in stand_ins.servers:
+        server.close()
 
 
 async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -149,28 +157,13 @@ async def run(client: execd.ExecdClient, timeout: int | None = None) -> Any:
     return await client.exec(["true"], None, None, {}, None, timeout)
 
 
-async def test_an_annotated_pod_runs_every_operation_over_execd(
-    daemons: Daemons, monkeypatch: MonkeyPatch
-) -> None:
+async def cat(client: execd.ExecdClient) -> execd.ExecdStream:
+    return await client.open_stream(["cat"], None, lambda: None)
+
+
+async def test_a_pod_with_execd_runs_every_operation_over_it(daemons: Daemons) -> None:
     await daemons.serve(exits)
-    # As in test_helm.py: no cluster config needed.
-    monkeypatch.setattr("k8s_sandbox._helm.get_default_namespace", lambda _: "default")
-    release = Release(__file__, None, ValuesSource.none(), None)
-    release._ready_pods = [
-        _parse_pod(
-            {
-                "metadata": {
-                    "name": "p",
-                    "uid": "u",
-                    "labels": {"inspect/service": "default"},
-                    "annotations": {execd.ANNOTATION: "true"},
-                },
-                "spec": {"containers": [{"name": "default"}]},
-                "status": {"phase": "Running", "podIP": "10.0.0.1"},
-            }
-        )
-    ]
-    pod = (await release.get_sandbox_pods())["default"]
+    pod = Pod("p", "ns", None, "default", "uid", 0, "raise", execd=True)
     assert pod._execd is not None
     pod._execd._start = daemons.client()._start
 
@@ -216,14 +209,56 @@ async def test_a_lost_exec_raises_the_restart_that_explains_it_and_so_do_later_o
     pod._execd._start = daemons.client()._start
 
     with patch("k8s_sandbox._pod.op.k8s_client", autospec=True) as api:
-        restarted = _k8s_pod("uid", "default", restart_count=1)
-        api.return_value.read_namespaced_pod.return_value = restarted
+        read = api.return_value.read_namespaced_pod
+        read.return_value = _k8s_pod("uid", "default", restart_count=0)
+        with pytest.raises(ExecResultUnknownError):  # and not run again another way
+            await pod.exec(["true"], None, None, {}, None, 10)
+        read.return_value = _k8s_pod("uid", "default", restart_count=1)
         with pytest.raises(ContainerRestartedError):
             await pod.exec(["true"], None, None, {}, None, 10)
     with pytest.raises(ContainerRestartedError):
         await pod.write_file(b"x", Path("/tmp/x"))
 
-    assert daemons.connections == 1  # the write reached no daemon
+    assert daemons.connections == 2  # the write reached no daemon
+
+
+async def test_what_ran_when_a_restart_was_found_raises_it_too(
+    daemons: Daemons,
+) -> None:
+    found = asyncio.Event()
+
+    async def answers_once_found(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)
+        await found.wait()
+        w.write(frame(execd.STDOUT, b"late") + EXIT_0)
+
+    await daemons.serve(answers_once_found)
+    pod = Pod("p", "ns", None, "default", "uid", 0, "raise", execd=True)
+    assert pod._execd is not None
+    pod._execd._start = daemons.client()._start
+    stream = await pod.exec_stdio(["cat"], None)
+    receiving = asyncio.create_task(stream.receive())
+    running = [
+        asyncio.create_task(pod.exec(["true"], None, None, {}, None, 10)),
+        asyncio.create_task(pod.write_file(b"x", Path("/tmp/x"))),
+        asyncio.create_task(pod.read_file(Path("/tmp/x"), io.BytesIO())),
+    ]
+    await until(lambda: daemons.connections == 4)
+
+    with patch("k8s_sandbox._pod.op.k8s_client", autospec=True) as api:
+        restarted = _k8s_pod("uid", "default", restart_count=1)
+        api.return_value.read_namespaced_pod.return_value = restarted
+        with pytest.raises(ContainerRestartedError):
+            await pod.check_for_pod_restart()
+    found.set()
+
+    for operation in running:
+        with pytest.raises(ContainerRestartedError):
+            await operation
+    with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
+        await receiving
 
 
 async def test_a_daemon_that_is_gone_is_started_again(daemons: Daemons) -> None:
@@ -316,13 +351,15 @@ async def test_execd_s_word_that_a_command_timed_out_raises(daemons: Daemons) ->
     assert requests[0]["timeout"] == 5  # execd kills it then
 
 
+@pytest.mark.parametrize("unread", ["start", "stdin"])
 async def test_a_command_execd_never_ends_times_out_and_is_dropped(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: MonkeyPatch, unread: str
 ) -> None:
     dropped = asyncio.Event()
 
     async def never_ends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await read_frame(r)  # START, and no stdin after it
+        if unread == "stdin":
+            await read_frame(r)  # START, and no stdin after it
         with contextlib.suppress(ConnectionError):
             while True:  # as execd finds a client gone
                 w.write(frame(execd.PING))
@@ -331,11 +368,12 @@ async def test_a_command_execd_never_ends_times_out_and_is_dropped(
         dropped.set()
 
     await daemons.serve(never_ends)
-    monkeypatch.setattr(execd, "KILL_WAIT", -0.7)  # 0.3 s in all: stdin backs up
-    stdin = b"x" * (64 << 20)  # more than TCP holds: only an abort drops it unsent
+    monkeypatch.setattr(execd, "KILL_WAIT", -0.7)  # 0.3 s in all: what it sent backs up
+    big = "x" * (64 << 20)  # more than TCP holds: only an abort drops it unsent
+    argv, stdin = ([big], None) if unread == "start" else (["cat"], big)
 
     with pytest.raises(TimeoutError, match="Command timed out after 1s"):
-        run = daemons.client().exec(["cat"], stdin, None, {}, None, 1)
+        run = daemons.client().exec(argv, stdin, None, {}, None, 1)
         await asyncio.wait_for(run, 30)
     await asyncio.wait_for(dropped.wait(), 30)  # which makes execd kill the command
 
@@ -363,15 +401,15 @@ async def test_a_daemon_that_goes_silent_is_a_lost_connection(
 
 
 async def test_a_loop_too_busy_to_read_does_not_take_execd_for_silent(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, tls: Tls, monkeypatch: MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "DEAD_AFTER", 0.2)
+    monkeypatch.setattr(tls[0], "num_tickets", 0)  # so only the answer is to be read
 
     async def answers_while_the_loop_is_held(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         await read_frame(r)
-        await asyncio.sleep(0.01)  # the client reads what the handshake left it
         # Holds the client's loop too: its read times out as the answer arrives.
         time.sleep(0.15)
         w.write(EXIT_0)
@@ -472,9 +510,10 @@ def frozen_clock(monkeypatch: MonkeyPatch) -> list[float]:
         frame(execd.EXIT, b"[]"),
         frame(execd.EXIT, b'{"code": "0"}'),
         frame(execd.EXIT, b'{"code": 0, "error": 5}'),
+        frame(execd.EXIT, b"[" * 2000 + b"]" * 2000),
     ],
-    ids=["many-frames", "unknown-type", "large-output"]
-    + ["exit-not-an-object", "exit-code-not-a-number", "exit-error-not-text"],
+    ids=["many-frames", "unknown-type", "large-output", "exit-not-an-object"]
+    + ["exit-code-not-a-number", "exit-error-not-text", "exit-nested-too-deep"],
 )
 async def test_what_execd_never_sends_breaks_its_daemon_for_good(
     daemons: Daemons, monkeypatch: MonkeyPatch, sent: bytes
@@ -514,28 +553,78 @@ async def test_frames_at_execd_s_pace_are_within_its_bounds(
     assert len((await run(daemons.client())).stderr) == 20_000
 
 
-async def test_a_broken_daemon_s_open_stream_stops_too(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+async def test_a_broken_daemon_s_open_stream_and_running_call_stop_too(
+    daemons: Daemons,
 ) -> None:
-    async def not_execd_on_its_second(
+    broke = asyncio.Event()
+
+    async def not_execd_on_its_third(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
+        mine = daemons.connections
         await read_frame(r)
-        if daemons.connections == 2:
+        if mine == 1:
+            w.write(frame(execd.STDOUT, b"held"))
+        elif mine == 2:
+            await broke.wait()
+            w.write(EXIT_0)
+        else:
             w.write(frame(99))
         await gone(r)
 
-    await daemons.serve(not_execd_on_its_second)
+    await daemons.serve(not_execd_on_its_third)
     client = daemons.client()
-    stream = await client.open_stream(["cat"], None)
+    stream = await cat(client)
+    assert await stream.receive(1) == b"h"
+    running = asyncio.create_task(run(client))
+    await until(lambda: daemons.connections == 2)
 
     with pytest.raises(execd.NotExecd):
         await run(client)
+    broke.set()
+
+    with pytest.raises(execd.NotExecd):  # though its exit then came
+        await running
+    with pytest.raises(execd.NotExecd):  # though it holds output
+        await stream.receive()
+    with pytest.raises(execd.NotExecd):
+        await run(client)
+    assert daemons.connections == 3  # a later call reaches nothing
+
+
+async def test_a_client_broken_while_a_call_connects_starts_no_daemon(
+    daemons: Daemons,
+) -> None:
+    server = await daemons.serve(exits)
+    client = daemons.client()
+    await run(client)
+    server.close()  # the daemon is gone: a call would start it again
+    await server.wait_closed()
+    call = asyncio.create_task(run(client))
+    await asyncio.sleep(0)  # it is connecting
+    client.broken = "as another connection found meanwhile"
 
     with pytest.raises(execd.NotExecd):
-        await stream.send(b"to what is not execd")
+        await call
+
+    assert daemons.starts == [True]
+
+
+async def test_a_stream_s_exit_that_is_not_execd_s_breaks_its_daemon(
+    daemons: Daemons,
+) -> None:
+    async def not_a_status(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)
+        w.write(frame(execd.EXIT, b"[]"))
+
+    await daemons.serve(not_a_status)
+    client = daemons.client()
+    stream = await cat(client)
+
     with pytest.raises(execd.NotExecd):
         await stream.receive()
+    with pytest.raises(execd.NotExecd):
+        await run(client)
 
 
 async def test_more_tls_records_than_execd_sends_break_its_daemon(
@@ -586,6 +675,7 @@ async def trickling(daemons: Daemons, monkeypatch: MonkeyPatch, after: int) -> N
         task.cancel()
 
     proxy = await asyncio.start_server(trickle, "127.0.0.1", 0)
+    daemons.servers.append(proxy)
     daemons.behind[daemon_port] = proxy.sockets[0].getsockname()[1]
     frozen_clock(monkeypatch)
 
@@ -646,7 +736,7 @@ async def test_a_stream_carries_stdin_and_stdout_to_the_command_s_exit(
     daemons: Daemons,
 ) -> None:
     await daemons.serve(echoes)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
 
     await stream.send(b"abc")
     assert await stream.receive(2) == b"ab"
@@ -672,7 +762,7 @@ async def test_a_receive_cancelled_partway_through_a_frame_loses_none_of_it(
         w.write(second[8:])
 
     await daemons.serve(in_two_parts)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
     assert await stream.receive() == b"first"
     receiving = asyncio.create_task(stream.receive())
     await asyncio.sleep(0)  # it has the second frame's start, and waits for its rest
@@ -697,7 +787,7 @@ async def test_a_stream_s_start_says_so_and_closing_it_drops_the_connection(
         dropped.set()
 
     await daemons.serve(records)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
     receiving = asyncio.create_task(stream.receive())
     await asyncio.sleep(0)  # it waits for output
 
@@ -715,7 +805,7 @@ async def test_a_stream_whose_connection_is_lost_is_broken(daemons: Daemons) -> 
         w.close()
 
     await daemons.serve(goes_away)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
 
     with pytest.raises(anyio.BrokenResourceError):
         await stream.receive()
@@ -723,7 +813,7 @@ async def test_a_stream_whose_connection_is_lost_is_broken(daemons: Daemons) -> 
 
 async def test_a_closed_stream_gives_no_more_of_what_it_held(daemons: Daemons) -> None:
     await daemons.serve(echoes)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
     await stream.send(b"abc")
     assert await stream.receive(1) == b"a"  # the rest stays with the stream
 
@@ -745,7 +835,7 @@ async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None
             received.extend((await read_frame(r))[1])
 
     await daemons.serve(records_stdin)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
 
     sends = asyncio.gather(stream.send(b"A" * size), stream.send(b"B" * size))
     await until(stream._send_lock.locked)  # a send is under way
@@ -764,7 +854,7 @@ async def test_closing_a_stream_ends_a_send_the_command_is_not_reading(
         await asyncio.sleep(3600)
 
     await daemons.serve(never_reads)
-    stream = await daemons.client().open_stream(["cat"], None)
+    stream = await cat(daemons.client())
     send = asyncio.create_task(stream.send(b"x" * (64 << 20)))  # more than TCP holds
     await until(stream._send_lock.locked)
 
@@ -774,31 +864,19 @@ async def test_closing_a_stream_ends_a_send_the_command_is_not_reading(
         await asyncio.wait_for(send, 30)
 
 
-async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) -> None:
-    printed = b"0" * 64 + b"\n"
+def test_only_one_fingerprint_line_starts_execd() -> None:
+    assert execd.started("ip", b"k", 0, b"0" * 64 + b"\n", b"").fingerprint == "0" * 64
 
-    class Execute:
-        def __init__(self, info: object) -> None:
-            pass
-
-        def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
-            return 0, printed, b""
-
-    async def run(f: Callable[[], object]) -> object:
-        return f()
-
-    async def no_restart() -> None:
-        return None
-
-    monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
-    monkeypatch.setattr(pod_module, "k8s_client", lambda _: None)
-    ip = types.SimpleNamespace(ip="10.0.0.1")
-    monkeypatch.setattr(pod_module, "read_pod", lambda *_: ip)
-    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
-    monkeypatch.setattr(pod, "check_for_pod_restart", no_restart)
-    monkeypatch.setattr(pod, "_run_async", run)
-    assert (await pod._start_execd(False)).fingerprint == "0" * 64
-
-    printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
+    cut = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
     with pytest.raises(PodError, match="execd did not start"):
-        await pod._start_execd(False)
+        execd.started("ip", b"k", 0, cut, b"")
+
+
+def test_a_start_replaces_only_when_asked_and_says_when_the_port_is_taken() -> None:
+    said = b"execd: daemon did not start: listen tcp :24601: bind: "
+
+    with pytest.raises(execd.DaemonRunning):
+        execd.started("ip", b"k", 2, b"", said + b"address already in use\n")
+
+    asked = ["--replace" in execd.start_command(b"k", r) for r in (False, True)]
+    assert asked == [False, True]
