@@ -1133,8 +1133,6 @@ async def test_what_tls_decryption_costs_is_paced(
     tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
 ) -> None:
     context, pin = tls
-    cpu = iter([0.0, 10.0, 10.0, 20.0])  # the first two passes take 10 s each
-    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 20.0))
 
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await read_frame(r)  # AUTH
@@ -1150,9 +1148,32 @@ async def test_what_tls_decryption_costs_is_paced(
     async def start(replace: bool) -> execd.Daemon:
         return execd.Daemon("127.0.0.1", pin, b"key")
 
+    client = execd.ExecdClient(start)
     began = time.monotonic()
-    await execd.ExecdClient(start).exec(["yes"], None, None, {}, None, 30)
+    await client._get()  # opened at full speed: the costs below are the reads'
+    cpu = iter([0.0, 10.0, 10.0, 20.0])  # the first two passes take 10 s each
+    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 20.0))
+
+    await client.exec(["yes"], None, None, {}, None, 30)
 
     # Each is over a second's allowance, so two waits; unpaced, it takes milliseconds.
     assert time.monotonic() - began >= 2
     server.close()
+
+
+async def test_a_handshake_s_decryption_is_paced_too(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    context, pin = tls
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+    cpu = iter([0.0, 5.0])  # the first pass takes 5 s
+    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 5.0))
+    monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
+    pace = execd.Pace()
+
+    pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), pace)
+
+    await pipe.close()
+    server.close()
+    assert pace.tls == 5.0

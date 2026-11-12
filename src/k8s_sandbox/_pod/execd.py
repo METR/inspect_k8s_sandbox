@@ -121,10 +121,12 @@ class _Pipe:
 
     async def handshake(self) -> None:
         while True:
+            began = time.thread_time()
             try:
                 self.tls.do_handshake()
                 break
             except ssl.SSLWantReadError:
+                await self._charge(began)
                 await self._flush()
                 self._in.write(await self._raw())
         await self._flush()
@@ -144,11 +146,14 @@ class _Pipe:
                     if not chunk:
                         raise ConnectionResetError("execd ended the TLS session")
                     self._plain += chunk
-            await self._pace.take(0, frames=0, tls=time.thread_time() - began)
-            await asyncio.sleep(0)  # a pass at a time, so other work runs in between
+            await self._charge(began)
         data = bytes(self._plain[:n])
         del self._plain[:n]
         return data
+
+    async def _charge(self, began: float) -> None:
+        await self._pace.take(0, frames=0, tls=time.thread_time() - began)
+        await asyncio.sleep(0)  # a pass at a time, so other work runs in between
 
     async def _raw(self) -> bytes:
         raw = await self._reader.read(RAW_READ)
