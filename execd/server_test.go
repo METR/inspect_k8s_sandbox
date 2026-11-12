@@ -211,22 +211,24 @@ func TestManySmallWritesMakeFewFrames(t *testing.T) {
 	}
 }
 
-func TestOutputWaitsLongerWhileOtherCallsOutputWaits(t *testing.T) {
-	waiting.Store(7) // seven other calls' output waits to be sent
-	t.Cleanup(func() { waiting.Store(0) })
-	c, frames := recordedConn(t)
-	cl := &call{id: 8, sub: c}
-	cl.room = sync.NewCond(&cl.mu)
+func TestCallsTakeTurnsToSend(t *testing.T) {
+	var sent []<-chan frame
+	for i := range 20 {
+		c, frames := recordedConn(t)
+		cl := &call{id: uint64(10 + i), sub: c}
+		cl.room = sync.NewCond(&cl.mu)
+		cl.output(0, []byte("x")) // each call's first: only the turns hold it
+		sent = append(sent, frames)
+	}
+	began := time.Now()
 
-	cl.output(0, []byte("a")) // sent at once
-	<-frames
-	sent := time.Now()
-	cl.output(0, []byte("b")) // within its interval: waits for the timer
+	for _, frames := range sent {
+		<-frames
+	}
 
-	<-frames
-	// Eight calls each sending every millisecond would be past the client's frame pace.
-	if waited := time.Since(sent); waited < 7*time.Millisecond {
-		t.Fatalf("sent after %v, as if no other call's output waited", waited)
+	// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
+	if took := time.Since(began); took < 6*time.Millisecond {
+		t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
 	}
 }
 

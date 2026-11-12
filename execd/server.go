@@ -516,24 +516,37 @@ func (cl *call) output(stream int, data []byte) {
 	cl.flushSoon()
 }
 
-// Calls whose output waits to be sent: each waits a millisecond more for every one of them.
-var waiting atomic.Int32
+// When the next call may send output: calls take turns, so together they keep within the client's frame pace.
+var slot atomic.Int64
 
-// flushSoon flushes at most once a millisecond, so a stream of small writes makes few frames.
+const slotEvery, slotBurst = 600 * time.Microsecond, 8
+
+// flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
 func (cl *call) flushSoon() {
 	if cl.deferred {
 		return // the waiting flush sends this too
 	}
-	wait := time.Duration(1+waiting.Load())*time.Millisecond - time.Since(cl.flushed)
+	now := time.Now()
+	at := now.UnixNano()
+	if !cl.flushed.IsZero() {
+		at = max(at, cl.flushed.Add(time.Millisecond).UnixNano())
+	}
+	for {
+		taken := slot.Load()
+		send := max(at, taken-int64(slotBurst*slotEvery))
+		if slot.CompareAndSwap(taken, max(taken, send)+int64(slotEvery)) {
+			at = send
+			break
+		}
+	}
+	wait := time.Duration(at - now.UnixNano())
 	if wait <= 0 {
-		cl.flushed = time.Now()
+		cl.flushed = now
 		cl.flush()
 		return
 	}
 	cl.deferred = true
-	waiting.Add(1)
 	time.AfterFunc(wait, func() {
-		waiting.Add(-1)
 		cl.mu.Lock()
 		defer cl.mu.Unlock()
 		cl.deferred = false
