@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-const foregroundEnv = "HN_EXECD_FOREGROUND"
+const foregroundEnv = "EXECD_FOREGROUND"
 
 // As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
 func init() { prctl(prSetDumpable, 0) }

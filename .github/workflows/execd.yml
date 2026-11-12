@@ -14,3 +14,6 @@ jobs:
           cache: false  # no go.sum to key it on
       - run: go vet ./... && go test -race ./...
         working-directory: execd
+      - name: As root, for the tests that change user
+        run: sudo env "PATH=$PATH" go test -race ./...
+        working-directory: execd

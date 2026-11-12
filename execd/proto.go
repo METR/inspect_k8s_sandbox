@@ -1,6 +1,6 @@
 package main
 
-// Frames: a 5-byte big-endian header (type u8, length u32), then the payload. A connection carries one call.
+// A frame: type (u8), length (u32, big-endian), payload. A connection carries one call.
 
 import (
 	"encoding/binary"

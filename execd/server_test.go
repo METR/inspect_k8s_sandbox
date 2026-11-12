@@ -33,7 +33,7 @@ func testServer() *server {
 	return s
 }
 
-// connect gives a server a connection, and returns the client's end and the frames execd sends on it.
+// connect gives a server a connection; it returns the client's end and the frames execd sends.
 func connect(t *testing.T, s *server) (net.Conn, <-chan frame) {
 	client, daemon := net.Pipe()
 	t.Cleanup(func() { client.Close() })
@@ -97,6 +97,25 @@ func exit(t *testing.T, frames <-chan frame) exitStatus {
 }
 
 // until waits for a condition; the budget only bounds a hang.
+// output reads frames up to the exit: each kind's payloads joined, and the count before the exit.
+func output(t *testing.T, frames <-chan frame) (map[byte][]byte, int) {
+	t.Helper()
+	got := map[byte][]byte{}
+	for n, budget := 0, time.After(30*time.Second); ; n++ {
+		select {
+		case f, open := <-frames:
+			if !open {
+				t.Fatal("the connection closed before the exit")
+			}
+			got[f.kind] = append(got[f.kind], f.payload...)
+			if f.kind == fExit {
+				return got, n
+			}
+		case <-budget:
+			t.Fatal("no exit")
+		}
+	}
+}
 func until(t *testing.T, what string, condition func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(30 * time.Second); !condition(); time.Sleep(10 * time.Millisecond) {
@@ -123,11 +142,10 @@ func pids(t *testing.T, frames <-chan frame, n int) []int {
 	return ids
 }
 
-// First: a command run as another user leaves the flag at the host's fs.suid_dumpable.
 func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	const prGetDumpable = 3
 	// init() has run, as it runs before main.
-	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable == 1 {
+	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
 		t.Fatal("dumpable: a same-uid process could reopen the start's stdout through /proc")
 	}
 }
@@ -273,20 +291,14 @@ func TestStdinStdoutAndStderrEachArriveWhole(t *testing.T) {
 	}
 	client.Write(encodeFrame(fStdin, nil)) // its end: cat exits
 
-	got := map[byte][]byte{}
-	for f := range frames {
-		got[f.kind] = append(got[f.kind], f.payload...)
-		if f.kind == fExit {
-			break
-		}
-	}
+	got, _ := output(t, frames)
 	if !bytes.Equal(got[fStdout], stdin) || string(got[fStderr]) != "to stderr\n" || string(got[fExit]) != `{"code":0}` {
 		t.Fatalf("stdout is %d bytes of the %d sent; stderr %q; exit %s", len(got[fStdout]), len(stdin), got[fStderr], got[fExit])
 	}
 }
 
 func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
-	// A child in the command's process group that has dropped its environment, one that left the group, then the command waits on its stdin.
+	// One child in the group has no environment, one has left the group; the command waits on stdin.
 	script := `env -i sh -c 'echo $$; exec sleep 100' & setsid sh -c 'echo $$; exec sleep 100' & echo $$; cat`
 	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script}, Stdin: true})
 	started := pids(t, frames, 3)
@@ -299,7 +311,7 @@ func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
 }
 
 func TestALostConnectionKillsAProcessInsideExecve(t *testing.T) {
-	// Eight that left the group and exec without end: while one does, /proc shows it no environment.
+	// Eight left the group and exec without end: while one does, /proc shows it no environment.
 	script := `for i in 1 2 3 4 5 6 7 8; do setsid sh -c 'echo $$; eval "$AGAIN"' & done; cat`
 	req := startRequest{Argv: []string{"sh", "-c", script}, Env: map[string]string{"AGAIN": `exec sh -c "$AGAIN"`}, Stdin: true}
 	for range 30 {
@@ -314,23 +326,26 @@ func TestALostConnectionKillsAProcessInsideExecve(t *testing.T) {
 	}
 }
 
-func TestATimeoutKillsWhatAProcessOutsideTheGroupForksMeanwhile(t *testing.T) {
+func TestALostConnectionKillsWhatAProcessOutsideTheGroupForksMeanwhile(t *testing.T) {
 	// One that left the group forks without pause, so some start while execd looks through /proc.
-	script := `setsid sh -c 'while :; do sleep 100 >/dev/null 2>&1 & echo $!; done' & cat`
-	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script}, Stdin: true, Timeout: 0.1})
-	var out []byte
-	for f := range frames {
-		if f.kind == fExit {
-			break
-		}
-		out = append(out, f.payload...)
-	}
+	forked := filepath.Join(t.TempDir(), "forked")
+	script := `setsid sh -c 'echo $$; while :; do sleep 100 >/dev/null 2>&1 & echo $! >>"$0"; done' "$1" & cat`
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", forked}, Stdin: true})
+	forker := pids(t, frames, 1)[0]
+	until(t, "the forker forked nothing", func() bool {
+		list, _ := os.ReadFile(forked)
+		return bytes.Count(list, []byte("\n")) >= 20
+	})
 
-	for _, line := range strings.Fields(string(out)) {
+	client.Close()
+
+	until(t, "the forker outlived the call's connection", func() bool { return gone(forker) })
+	list, _ := os.ReadFile(forked)
+	for _, line := range strings.Fields(string(list)) {
 		var pid int
 		fmt.Sscan(line, &pid)
 		t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
-		until(t, "a process forked during the kill outlived the timeout", func() bool { return gone(pid) })
+		until(t, "a process forked during the kill outlived the call's connection", func() bool { return gone(pid) })
 	}
 }
 
@@ -357,7 +372,7 @@ func TestAStreamsEndClosesStdinAndKillsOnlyItsCommand(t *testing.T) {
 	gc := debug.SetGCPercent(-1) // so no finalizer closes a stdin execd left open
 	t.Cleanup(func() { debug.SetGCPercent(gc) })
 	ended := filepath.Join(t.TempDir(), "ended")
-	// A child shares the stream's stdin and process group, as a tools server its command started would.
+	// A child shares the stream's stdin and process group, as a tools server it started would.
 	script := `exec 3<&0; (cat <&3; touch "$1") & echo $$; exec sleep 100`
 	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", ended}, Stdin: true, Stream: true})
 	command := pids(t, frames, 1)[0]
@@ -376,7 +391,7 @@ func TestAClientGoneIsFoundWhileItsCommandLeavesStdinUnread(t *testing.T) {
 	s.pingEvery = 10 * time.Millisecond
 	client, frames := begin(t, s, startRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 100"}, Stdin: true})
 	command := pids(t, frames, 1)[0]
-	// More than the pipe holds: execd waits on the command, reads no more, and so can't see the connection close.
+	// More than the pipe holds: execd waits on the command, so it can't see the connection close.
 	client.Write(encodeFrame(fStdin, make([]byte, chunk)))
 
 	client.Close()
@@ -386,25 +401,34 @@ func TestAClientGoneIsFoundWhileItsCommandLeavesStdinUnread(t *testing.T) {
 
 func TestACwdThatCantBeEnteredFailsTheCallAsCdDoes(t *testing.T) {
 	dir := t.TempDir()
-	made := filepath.Join(t.TempDir(), "made")
+	made := filepath.Join(os.TempDir(), "made-outside-its-cwd") // where any user could make it
+	t.Cleanup(func() { os.Remove(made) })
 	os.WriteFile(filepath.Join(dir, "file"), nil, 0o644)
 	closed := filepath.Join(dir, "closed")
 	os.Mkdir(closed, 0)
 	user := ""
-	if os.Getuid() == 0 { // root enters any directory: run as a user the temporary directory keeps out
+	if os.Getuid() == 0 { // root enters any directory: run as a user this one keeps out
 		user = "nobody"
 	}
 
 	for _, cwd := range []string{closed, filepath.Join(dir, "file"), filepath.Join(dir, "missing")} {
 		_, frames := begin(t, testServer(), startRequest{Argv: []string{"touch", made}, Cwd: cwd, User: user})
 
-		// As sh's cd fails, in the shell that already runs as the user: not as a command that can't start.
+		// As cd fails in the shell, already running as the user: not as a command that can't start.
 		if status := exit(t, frames); status.Code == 0 || status.Code == 126 || status.Error != "" {
 			t.Fatalf("cwd %s: %+v, want cd's failure", cwd, status)
 		}
 	}
 	if _, err := os.Stat(made); err == nil {
 		t.Fatal("the command ran outside its cwd")
+	}
+}
+
+func TestAVariableNameShWouldDropFailsTheCall(t *testing.T) {
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, Env: map[string]string{"a-b": "1"}})
+
+	if status := exit(t, frames); status.Code != 126 || !strings.Contains(status.Error, "a-b") {
+		t.Fatalf("exit %+v, want the name refused", status)
 	}
 }
 
@@ -417,7 +441,7 @@ func TestExecdStaysNonDumpableAfterACommandAsAnotherUser(t *testing.T) {
 
 	exit(t, frames)
 
-	// Its change of user sets the flag to the host's fs.suid_dumpable: 2 on Ubuntu, 1 where anyone may dump.
+	// The change of user sets the flag to the host's fs.suid_dumpable: 2 on Ubuntu.
 	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
 		t.Fatalf("dumpable is %d after a command as another user", dumpable)
 	}
@@ -459,18 +483,12 @@ func TestOutputStillInThePipeAtTheExitArrives(t *testing.T) {
 	// A child keeps stdout open; the command prints while its first line waits unread, then exits.
 	request(client, startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!; sleep 0.1; head -c 50000 /dev/zero"}})
 
-	time.Sleep(400 * time.Millisecond) // past the exit and the grace a child's hold on the pipe gets
+	time.Sleep(400 * time.Millisecond) // past the exit and the grace a held pipe gets
 	frames := received(client)
 
 	child := pids(t, frames, 1)[0]
-	size := 0
-	for f := range frames {
-		if f.kind == fExit {
-			break
-		}
-		size += len(f.payload)
-	}
-	if size != 50000 {
+	got, _ := output(t, frames)
+	if size := len(got[fStdout]); size != 50000 {
 		t.Fatalf("%d of the 50,000 bytes written before the exit arrived (child %d)", size, child)
 	}
 }
@@ -523,16 +541,9 @@ func TestManySmallWritesMakeAtMostAFrameAMillisecond(t *testing.T) {
 	began := time.Now()
 	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", lines}})
 
-	outputs, size := 0, 0
-	for f := range frames {
-		if f.kind == fExit {
-			break
-		}
-		outputs++
-		size += len(f.payload)
-	}
+	got, outputs := output(t, frames)
 
-	if size != 108890 {
+	if size := len(got[fStdout]); size != 108890 {
 		t.Fatalf("%d bytes of output, want the 108,890 the lines make", size)
 	}
 	// The client fails a pod whose execd sends ten times this.

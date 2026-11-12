@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ type server struct {
 	preauth     chan struct{} // a slot per connection not yet authenticated
 	authTimeout time.Duration // for a connection to send its AUTH
 	pingEvery   time.Duration
-	// How long execd reads on after an exit: closing before the client, with stdin unread, could reset the EXIT away.
+	// How long execd reads on after an exit: a close with stdin unread could reset the EXIT away.
 	lingerFor time.Duration
 }
 
@@ -35,6 +36,8 @@ type server struct {
 const maxKey, maxPreauth = 64, 32
 
 const maxStart = 16 << 20 // a START: argv and env as JSON
+
+var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // call is one command and the connection it runs on.
 type call struct {
@@ -64,7 +67,7 @@ func (s *server) serve(l net.Listener) {
 	for {
 		s.preauth <- struct{}{} // past the bound, connections wait in the listen queue
 		nc, err := l.Accept()
-		if err == nil && !fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+		if err == nil && !fromThisPod(nc) { // from this pod, only the sandbox would dial
 			go s.handle(nc)
 			continue
 		}
@@ -160,7 +163,7 @@ func (c *call) send(kind byte, payload []byte) {
 	}
 }
 
-// drop ends a call whose client is gone; it frees serve's read, or its write to a command that isn't reading.
+// drop ends a call whose client is gone, and frees serve's read or its write to an unread stdin.
 func (c *call) drop() {
 	c.nc.Close()
 	c.kill() // before stdin ends, which the command must not take for the end of its input
@@ -184,7 +187,7 @@ func (c *call) writeStdin(data []byte) {
 	w := c.stdin
 	c.mu.Unlock()
 	if w != nil {
-		w.Write(data) // a command that exits without reading its stdin makes this fail; that is not an error
+		w.Write(data) // fails if the command exits without reading its stdin: not an error
 	}
 }
 
@@ -197,7 +200,7 @@ func (c *call) closeStdin() {
 	}
 }
 
-// kill stops a running command: a stream's own process, else its group and every process still carrying its tag.
+// kill stops a running command: a stream's own process, else its group and all that carry its tag.
 func (c *call) kill() {
 	c.mu.Lock()
 	pid := c.pid
@@ -215,6 +218,11 @@ func (c *call) kill() {
 func (c *call) start(req startRequest) error {
 	if req.Env == nil { // "env": null
 		req.Env = map[string]string{}
+	}
+	for name := range req.Env { // sh starts the command, and dash passes on no other name
+		if !shName.MatchString(name) {
+			return fmt.Errorf("bad variable name %s", name)
+		}
 	}
 	if !req.Stream { // nothing looks for a stream's processes
 		tag := make([]byte, 8)
@@ -257,7 +265,7 @@ func (c *call) start(req startRequest) error {
 	outW.Close()
 	errW.Close()
 	if attr.Credential != nil {
-		prctl(prSetDumpable, 0) // the child changed user in memory it shares with execd until its exec, which resets this
+		prctl(prSetDumpable, 0) // the child's change of user reset it, in memory shared until its exec
 	}
 	if err != nil {
 		reaper.mu.Unlock()
@@ -332,7 +340,7 @@ func (c *call) start(req startRequest) error {
 	return nil
 }
 
-// copyOut sends a pipe's output: a full buffer at once, less only a millisecond after the last frame.
+// copyOut sends a pipe's output: a full buffer at once, less only 1 ms after the last frame.
 func (c *call) copyOut(kind byte, r *os.File, read *atomic.Int64) {
 	defer r.Close()
 	buf := make([]byte, chunk)
@@ -428,7 +436,7 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 // killTagged SIGKILLs every process whose environment holds EXECD_CALL=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := "EXECD_CALL=" + tag + "\x00"
-	// One look misses a process inside execve, which shows no environment yet, and one forked meanwhile.
+	// One look misses a process inside execve (it shows no environment) and one forked meanwhile.
 	for range 100 {
 		again := false
 		entries, _ := os.ReadDir("/proc")
