@@ -745,7 +745,7 @@ def test_network_policies_render_by_default(chart_dir: Path) -> None:
 def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> None:
     documents = _run_helm_template(chart_dir, set_str="networkPolicy.enabled=false")
 
-    assert not [doc for doc in documents if doc["apiVersion"].startswith("cilium.io/")]
+    assert not [doc for doc in documents if doc["apiVersion"].split("/")[0] == "cilium.io"]
     assert _get_documents(documents, "StatefulSet")
 
 

@@ -701,8 +701,10 @@ def _tls(
         capture_output=True,
     )
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.minimum_version = ssl.TLSVersion.TLSv1_3
     server_context.load_cert_chain(cert, key)
     client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.minimum_version = ssl.TLSVersion.TLSv1_3
     client_context.check_hostname = False
     client_context.verify_mode = ssl.CERT_NONE
     server = server_context.wrap_socket(
