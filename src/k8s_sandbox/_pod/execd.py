@@ -270,8 +270,9 @@ class ExecdClient:
     ) -> AsyncGenerator[tuple[int, Any], None]:
         """Yield (STDOUT or STDERR, bytes) as they come, then (EXIT, code).
 
-        The code is None if the call timed out (it is killed first). Raises
-        ExecResultUnknownError if the daemon that ran the call is gone.
+        The code is None if the call timed out (it is killed first). Once the START
+        may have been sent, a lost connection or daemon raises ExecResultUnknownError,
+        which is not retried: the command may have run.
         """
         tag = os.urandom(8).hex()
         request: dict[str, Any] = {
@@ -290,57 +291,75 @@ class ExecdClient:
         sender: asyncio.Task[None] | None = None
         finished = False
         try:
-            await link.send(START, call.id, start)
-            sender = asyncio.create_task(self._upload(link, call, stdin, 0))
-            while True:
-                left = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                try:
-                    item = await asyncio.wait_for(call.queue.get(), left)
-                except TimeoutError:
-                    await self._kill(link, call)
-                    finished = True
-                    yield EXIT, None
-                    return
-                if isinstance(item, Dropped):
-                    sender.cancel()
-                    link.calls.pop(call.id, None)
-                    link = await self._get(stale=link)
-                    if link.daemon is not call.daemon:
-                        raise ExecResultUnknownError(
-                            "execd stopped while it ran the command", pod=link.daemon.ip
-                        )
-                    link.calls[call.id] = call
-                    offsets = {"stdout": call.got[0], "stderr": call.got[1]}
-                    await link.send(RESUME, call.id, json.dumps(offsets).encode())
-                    continue
-                assert isinstance(item, tuple)
-                kind, payload = item
-                if kind in (STDOUT, STDERR):
-                    yield kind, payload
-                    await _taken(link, call, kind, len(payload))
-                elif kind == EXIT:
-                    finished = True
-                    with contextlib.suppress(ConnectionError, OSError):
-                        await link.send(RELEASE, call.id)
-                    yield EXIT, int(json.loads(payload)["code"])
-                    return
-                elif kind == RESUMED:  # send whatever stdin the daemon did not get
-                    got = json.loads(payload)
-                    call.stdin_put = max(call.stdin_put, got["put"])
-                    if stdin is not None and not got["eof"]:
-                        sender = asyncio.create_task(
-                            self._upload(link, call, stdin, int(got["stdin"]))
-                        )
-                elif kind == ERROR and payload == b"unknown call" and not any(call.got):
-                    # The same daemon never got the START: nothing ran, so start it.
-                    await link.send(START, call.id, start)
-                    sender = asyncio.create_task(self._upload(link, call, stdin, 0))
-                elif kind == ERROR:
-                    raise ExecResultUnknownError(
-                        f"execd: {payload.decode(errors='replace')}", pod=link.daemon.ip
+            try:
+                await link.send(START, call.id, start)
+                sender = asyncio.create_task(self._upload(link, call, stdin, 0))
+                while True:
+                    left = (
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
                     )
+                    try:
+                        item = await asyncio.wait_for(call.queue.get(), left)
+                    except TimeoutError:
+                        await self._kill(link, call)
+                        finished = True
+                        yield EXIT, None
+                        return
+                    if isinstance(item, Dropped):
+                        sender.cancel()
+                        link.calls.pop(call.id, None)
+                        # Shielded: other calls may wait on the same reconnect.
+                        reconnect = asyncio.shield(self._get(stale=link))
+                        link = await asyncio.wait_for(reconnect, left)
+                        if link.daemon is not call.daemon:
+                            raise ExecResultUnknownError(
+                                "execd stopped while it ran the command",
+                                pod=link.daemon.ip,
+                            )
+                        link.calls[call.id] = call
+                        offsets = {"stdout": call.got[0], "stderr": call.got[1]}
+                        await link.send(RESUME, call.id, json.dumps(offsets).encode())
+                        continue
+                    assert isinstance(item, tuple)
+                    kind, payload = item
+                    if kind in (STDOUT, STDERR):
+                        yield kind, payload
+                        await _taken(link, call, kind, len(payload))
+                    elif kind == EXIT:
+                        finished = True
+                        with contextlib.suppress(ConnectionError, OSError):
+                            await link.send(RELEASE, call.id)
+                        yield EXIT, int(json.loads(payload)["code"])
+                        return
+                    elif kind == RESUMED:  # send whatever stdin the daemon did not get
+                        got = json.loads(payload)
+                        call.stdin_put = max(call.stdin_put, got["put"])
+                        if stdin is not None and not got["eof"]:
+                            sender = asyncio.create_task(
+                                self._upload(link, call, stdin, int(got["stdin"]))
+                            )
+                    elif (
+                        kind == ERROR
+                        and payload == b"unknown call"
+                        and not any(call.got)
+                    ):
+                        # The same daemon never got the START: nothing ran, so start it.
+                        await link.send(START, call.id, start)
+                        sender = asyncio.create_task(self._upload(link, call, stdin, 0))
+                    elif kind == ERROR:
+                        raise ExecResultUnknownError(
+                            f"execd: {payload.decode(errors='replace')}",
+                            pod=link.daemon.ip,
+                        )
+            except TimeoutError:
+                raise
+            except OSError as e:  # ConnectionError too
+                raise ExecResultUnknownError(
+                    f"execd connection lost during the command: {e!r}",
+                    pod=link.daemon.ip,
+                ) from e
         finally:
             if sender is not None:
                 sender.cancel()

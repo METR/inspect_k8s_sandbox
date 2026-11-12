@@ -85,11 +85,18 @@ class Pod:
         operation: either one stops the daemon, so it always comes through here.
         """
         await self.check_for_pod_restart()
+        info = self._info
+        api = k8s_client(info.context_name)
+        # Read first, so a started daemon is never lost to a failed read.
+        pod = await self._run_async(
+            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+        )
+        if pod.ip is None:
+            raise PodError("The pod has no IP address for execd", pod=info.name)
         key = os.urandom(32)
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
         cmd += ["--replace"] if replace else []
-        info = self._info
         result = await self._run_async(
             lambda: ExecuteOperation(info).exec(cmd, None, None, {}, None, 60)
         )
@@ -101,14 +108,7 @@ class Pod:
                 returncode=result.returncode,
                 stderr=result.stderr,
             )
-        fingerprint = result.stdout.split()[1]
-        api = k8s_client(info.context_name)
-        pod = await self._run_async(
-            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
-        )
-        if pod.ip is None:
-            raise PodError("The pod has no IP address for execd", pod=info.name)
-        return Daemon(pod.ip, fingerprint, key)
+        return Daemon(pod.ip, result.stdout.split()[1], key)
 
     @property
     def info(self) -> PodInfo:

@@ -130,6 +130,9 @@ func (s *server) handle(c *conn) {
 			}
 		case fKill:
 			if cl := s.get(f.id); cl != nil {
+				if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
+					syscall.Kill(-cl.pid, syscall.SIGKILL) // its group, even with the tag removed
+				}
 				killTagged(cl.tag)
 			}
 		case fResume:
@@ -229,7 +232,6 @@ func (cl *call) run(req startRequest) error {
 	if req.Tag != "" {
 		req.Env["HAWK_NEXT_EXEC"] = req.Tag
 	}
-	env := childEnv(req.Env)
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	if req.User != "" {
 		cred, home, name, err := lookupUser(req.User)
@@ -238,9 +240,15 @@ func (cl *call) run(req startRequest) error {
 		}
 		if cred != nil {
 			attr.Credential = cred
-			env = append(env, "HOME="+home, "USER="+name, "LOGNAME="+name)
+			// As runuser sets them, unless the caller did.
+			for k, v := range map[string]string{"HOME": home, "USER": name, "LOGNAME": name} {
+				if _, set := req.Env[k]; !set {
+					req.Env[k] = v
+				}
+			}
 		}
 	}
+	env := childEnv(req.Env)
 	argv0, err := lookPath(req.Argv[0], env)
 	if err != nil {
 		return err

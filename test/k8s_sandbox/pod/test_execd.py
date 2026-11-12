@@ -183,3 +183,26 @@ async def test_stdin_in_flight_stays_within_the_window(
 
     assert result.returncode == 0
     assert most_in_flight <= execd.STDIN_WINDOW
+
+
+async def test_connection_lost_after_start_is_not_retryable(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def unreachable(replace: bool) -> execd.Daemon:
+        raise ConnectionError("no route to the pod")
+
+    async def dies_after_start(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)  # START
+        sandbox._start = unreachable  # and no new daemon can be reached
+        server.close()
+        w.close()
+
+    server = await daemons.serve(dies_after_start)
+    sandbox = daemons.client()
+    monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
+
+    # A ConnectionError would be retried, running the command again.
+    with pytest.raises(ExecResultUnknownError):
+        await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
