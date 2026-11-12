@@ -269,7 +269,9 @@ func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
 }
 
 func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
-	charge(100_000) // a minute of turns: calls ending faster than turns come
+	for range 100_000 {
+		charge(3) // calls ending faster than turns come: three minutes of turns
+	}
 	c, frames := recordedConn(t)
 	cl := &call{id: 97, sub: c}
 	cl.room = sync.NewCond(&cl.mu)
@@ -327,5 +329,17 @@ func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
 	case <-frames: // and the waiting flush sends another
 		t.Fatal("sent at once, as well as by the flush that waits")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestAChargeNeverGivesBackTurnsTaken(t *testing.T) {
+	ahead := time.Since(epoch) + 200*time.Millisecond // waiting flushes have taken the turns before this
+	slot.Store(int64(ahead))
+	t.Cleanup(func() { slot.Store(0) })
+
+	charge(1)
+
+	if got := time.Duration(slot.Load()); got < ahead {
+		t.Fatalf("turns moved back %v: flushes waiting for them would send together", ahead-got)
 	}
 }
