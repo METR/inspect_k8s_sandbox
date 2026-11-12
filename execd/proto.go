@@ -60,6 +60,8 @@ type startRequest struct {
 	Tag string `json:"tag"`
 	// Seconds until the call is killed, as KILL does, even if no client is connected; 0: never.
 	Timeout float64 `json:"timeout"`
+	// A stream (exec_stdio) is never resumed: it is killed when its connection drops.
+	Stream bool `json:"stream"`
 }
 
 type resumeRequest struct {

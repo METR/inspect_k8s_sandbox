@@ -39,6 +39,7 @@ from inspect_ai.util import SandboxEnvironmentLimits as limits
 from k8s_sandbox._error import K8sError
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
+from k8s_sandbox._pod.execute import EXEC_USER_URL
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
 
 logger = logging.getLogger(__name__)
@@ -179,8 +180,12 @@ class Link:
 
     async def _read(self) -> None:
         reader = self.pipe.reader
+        frames = 0
         try:
             while True:
+                frames += 1
+                if frames % 256 == 0:  # let callers take what is queued
+                    await asyncio.sleep(0)
                 kind, call_id, n = HEADER.unpack(await reader.readexactly(HEADER.size))
                 if n > (MAX_FRAME if kind in (STDOUT, STDERR) else MAX_CONTROL):
                     return
@@ -244,11 +249,13 @@ class ExecdClient:
         self._start = start
         self._daemon: Daemon | None = None
         self._link: Link | None = None
-        self._lock = asyncio.Lock()
+        self._opening: asyncio.Future[Link] | None = None  # one at a time, shared
 
     async def _open(self, deadline: float) -> Link:
-        delay = 0.2
+        delay = 0.0
         while True:
+            # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
+            await asyncio.sleep(delay)
             link = None
             try:
                 if self._daemon is None:
@@ -263,6 +270,7 @@ class ExecdClient:
                     await link.close()
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
+                delay = min(max(delay * 2, 0.2), 5.0)
                 # Gone (a root agent can kill it, or its container restarted) or out of
                 # reach: a start tells which, as a live daemon keeps its port.
                 # A daemon that isn't ours (one whose start we never heard back from)
@@ -270,22 +278,23 @@ class ExecdClient:
                 not_ours = isinstance(e, NotOurDaemon)
                 try:
                     self._daemon = await self._start(self._link is None or not_ours)
-                    continue
                 except DaemonRunning:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise RuntimeError(
                             f"TCP port {EXECD_PORT} in the sandbox is held by a "
                             "process other than execd"
                         ) from e
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 5.0)
 
     async def _get(self, stale: Link | None = None) -> Link:
-        async with self._lock:
-            if self._link is None or self._link is stale or self._link.closed:
-                wait = FIRST_OPEN_FOR if self._link is None else RECONNECT_FOR
-                self._link = await self._open(time.monotonic() + wait)
-            return self._link
+        link = self._link
+        if link is not None and link is not stale and not link.closed:
+            return link
+        if self._opening is None or self._opening.done():
+            wait = FIRST_OPEN_FOR if link is None else RECONNECT_FOR
+            self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
+        # Shared: every caller waits on the one reconnect, not on a queue of them.
+        self._link = await asyncio.shield(self._opening)
+        return self._link
 
     async def run(
         self,
@@ -383,8 +392,8 @@ class ExecdClient:
                             f"execd: {payload.decode(errors='replace')}",
                             pod=link.daemon.ip,
                         )
-            except asyncio.TimeoutError:
-                raise
+            except asyncio.TimeoutError as e:  # the builtin one, also on Python 3.10
+                raise TimeoutError(f"Command timed out after {timeout}s.") from e
             except (K8sError, ExecResultUnknownError):
                 raise  # a restart found while reconnecting, or already the answer
             except Exception as e:  # a lost connection, or a restart that failed
@@ -466,13 +475,14 @@ class ExecdClient:
         if result.stderr.startswith("execd: unknown user"):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does not appear to "
-                f"exist in the container.\n{result.stderr}"
+                f"exist in the container. Docs: {EXEC_USER_URL}\n{result.stderr}"
             )
         if result.stderr.startswith("execd: cannot run as"):
             logger.warning(
                 "exec(user=%r) failed: the container is not running as root, so it "
-                "cannot switch users.\n%s",
+                "cannot switch users. Docs: %s\n%s",
                 user,
+                EXEC_USER_URL,
                 result.stderr,
             )
         return result
@@ -554,6 +564,7 @@ class ExecdClient:
             "user": user or "",
             "stdin": True,
             "tag": os.urandom(8).hex(),
+            "stream": True,  # never resumed: execd kills it if the connection drops
         }
         try:
             await link.send(START, call.id, json.dumps(request).encode())

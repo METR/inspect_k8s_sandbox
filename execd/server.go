@@ -46,6 +46,7 @@ type call struct {
 	stdinQ   [][]byte
 	stdinGot int  // bytes of stdin received
 	stdinPut int  // bytes of stdin written to the process
+	stream   bool // killed when its connection drops, as nothing resumes it
 	stdinEOF bool // the client closed stdin
 	mu       sync.Mutex
 	out      [2][]byte // stdout, stderr: what the process wrote and the client has not acked
@@ -100,6 +101,10 @@ func (s *server) serve(l net.Listener) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+		if fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+			nc.Close()
+			continue
+		}
 		select {
 		case s.preauth <- struct{}{}:
 			go s.handle(&conn{nc: nc, dead: make(chan struct{})})
@@ -107,6 +112,13 @@ func (s *server) serve(l net.Listener) {
 			nc.Close()
 		}
 	}
+}
+
+// fromThisPod says whether a connection comes from the pod itself: loopback, or its own address.
+func fromThisPod(nc net.Conn) bool {
+	remote, rOK := nc.RemoteAddr().(*net.TCPAddr)
+	local, lOK := nc.LocalAddr().(*net.TCPAddr)
+	return rOK && lOK && (remote.IP.IsLoopback() || remote.IP.Equal(local.IP))
 }
 
 func (s *server) handle(c *conn) {
@@ -176,10 +188,14 @@ func (s *server) detach(c *conn) {
 	s.mu.Unlock()
 	for _, cl := range calls {
 		cl.mu.Lock()
+		orphaned := cl.sub == c && cl.stream
 		if cl.sub == c {
 			cl.sub = nil
 		}
 		cl.mu.Unlock()
+		if orphaned {
+			cl.kill()
+		}
 	}
 }
 
@@ -199,7 +215,7 @@ func (s *server) start(c *conn, f frame) {
 	if req.Env == nil { // "env": null
 		req.Env = map[string]string{}
 	}
-	cl := &call{id: f.id, tag: req.Tag, sub: c}
+	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
 	if _, dup := s.calls[f.id]; dup {
@@ -454,7 +470,10 @@ func (cl *call) ackLocked(req resumeRequest) {
 
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
-	if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
+	cl.mu.Lock()
+	leader := cl.pid > 0 && !cl.exited // after the exit, its id may be another group's
+	cl.mu.Unlock()
+	if leader { // and 0, never started, would be -0: execd's own group
 		syscall.Kill(-cl.pid, syscall.SIGKILL)
 	}
 	killTagged(cl.tag)

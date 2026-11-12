@@ -163,7 +163,7 @@ async def test_stdin_in_flight_stays_within_the_window(
         while True:
             try:
                 kind, _, payload = await asyncio.wait_for(frames.get(), 0.3)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 # The client has stopped sending: all it has sent is in.
                 most_in_flight = max(most_in_flight, received - written)
                 written = received
@@ -376,3 +376,90 @@ async def test_a_daemon_that_is_not_ours_is_replaced(
     await sandbox.exec(["true"], None, None, {}, None, 10)
 
     assert starts == [True, True]
+
+
+async def test_many_small_frames_arrive_without_dropping_the_connection(
+    daemons: Daemons,
+) -> None:
+    lines = 4 * execd.MAX_QUEUED
+
+    async def chatty(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(b"".join(frame(execd.STDOUT, call_id, b"x") for _ in range(lines)))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        while True:
+            await read_frame(r)
+
+    await daemons.serve(chatty)
+    sandbox = daemons.client()
+
+    result = await sandbox.exec(["yes"], None, None, {}, None, 10)
+
+    assert len(result.stdout) == lines
+    assert sandbox._link is not None and not sandbox._link.closed
+
+
+async def test_callers_share_one_reconnect(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    sandbox = daemons.client()
+    await sandbox.exec(["true"], None, None, {}, None, 10)
+    stale = sandbox._link
+    assert stale is not None
+    await stale.close()
+
+    async def refused(daemon: execd.Daemon) -> execd._Pipe:
+        raise ConnectionRefusedError
+
+    async def still_running(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("address already in use")
+
+    monkeypatch.setattr(execd, "_connect", refused)
+    monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
+    sandbox._start = still_running
+    opens = 0
+    open_ = sandbox._open
+
+    async def counted(deadline: float) -> execd.Link:
+        nonlocal opens
+        opens += 1
+        return await open_(deadline)
+
+    sandbox._open = counted  # type: ignore[method-assign]
+
+    results = await asyncio.gather(
+        *(sandbox._get(stale) for _ in range(5)), return_exceptions=True
+    )
+
+    assert all(isinstance(r, ConnectionError) for r in results)
+    assert opens == 1
+
+
+async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    async def refused(daemon: execd.Daemon) -> execd._Pipe:
+        raise ConnectionRefusedError
+
+    starts = 0
+
+    async def start(replace: bool) -> execd.Daemon:
+        nonlocal starts
+        starts += 1
+        return execd.Daemon("127.0.0.1", f"cert-{starts}", b"key")
+
+    monkeypatch.setattr(execd, "_connect", refused)
+    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 1.0)
+
+    with pytest.raises(ConnectionError):
+        await execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+
+    # Paced: a handful in the second, where an unpaced loop runs hundreds.
+    assert starts <= 10
