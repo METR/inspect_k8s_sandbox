@@ -8,13 +8,12 @@
   `exec_stdio()` over TLS to execd instead of Kubernetes exec stdin. There, a timed-out
   `exec()` and its background processes get SIGKILL at once, not SIGTERM. One that
   leaves the command's process group survives if it clears its environment or, without
-  `CAP_SYS_PTRACE`, makes itself non-dumpable or runs as another `user`; without
-  `CAP_KILL`, so does every process of a command run as another `user`. Closing an
+  `CAP_SYS_PTRACE`, makes itself non-dumpable or runs as another `user`. Without
+  `CAP_KILL`, nothing a command run as another `user` started is killed. Closing an
   `exec_stdio` stream kills its command, but no process the command started. Make
   execd mode 111, and give the sandbox neither `CAP_DAC_OVERRIDE` nor
   `CAP_DAC_READ_SEARCH`, or a process running as execd's user can stand in for it while
-  it starts; with `CAP_SYS_PTRACE` one can at any time. If what answers on the port
-  sends what execd never does, every later operation on the pod fails.
+  it starts; with `CAP_SYS_PTRACE` one can at any time.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

@@ -12,7 +12,7 @@ import ssl
 import struct
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
@@ -52,7 +52,7 @@ class Daemon:
 
     ip: str
     fingerprint: str
-    key: bytes
+    key: bytes = field(repr=False)
 
 
 class DaemonRunning(Exception):
@@ -128,6 +128,14 @@ class _Conn:
             if kind != PING:
                 return kind, payload
 
+    def status(self, payload: bytes) -> dict[str, Any]:
+        """Parse an EXIT: {"code": n[, "error": why][, "timeout": true]}."""
+        with contextlib.suppress(ValueError, LookupError, TypeError):
+            status = json.loads(payload)
+            if type(status["code"]) is int and type(status.get("error", "")) is str:
+                return status
+        raise self._broken("an EXIT that is not a status")
+
     async def _hold(self, n: int) -> None:
         """Decrypt until N bytes are held; a wait that is cancelled loses none."""
         while len(self._plain) < n:
@@ -192,24 +200,25 @@ class _Conn:
 
 
 async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
-    async def handshake() -> _Conn:
+    """Open a connection, check it is the daemon's, and send the key."""
+
+    async def connect() -> _Conn:
         reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
         conn = _Conn(reader, writer, client)
         try:
             await conn.handshake()
+            cert = conn.tls.getpeercert(binary_form=True) or b""
+            if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
+                # Not the daemon this client started, so it gets no key: start another.
+                raise NotOurDaemon("the server on the execd port is not our daemon")
+            conn.pinned = True
+            await conn.send(AUTH, daemon.key)
         except BaseException:
             conn.close()
             raise
         return conn
 
-    conn = await asyncio.wait_for(handshake(), CONNECT_TIMEOUT)
-    cert = conn.tls.getpeercert(binary_form=True) or b""
-    if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
-        conn.close()
-        # Not the daemon this client started, so it gets no key: start another.
-        raise NotOurDaemon("the server on the execd port is not our daemon")
-    conn.pinned = True
-    return conn
+    return await asyncio.wait_for(connect(), CONNECT_TIMEOUT)
 
 
 async def _upload(conn: _Conn, stdin: bytes) -> None:
@@ -224,11 +233,10 @@ class ExecdClient:
     """Runs commands through one pod's execd, each on a connection of its own."""
 
     def __init__(self, start: Callable[[bool], Awaitable[Daemon]]) -> None:
-        # start(replace) execs execd; replace stops a daemon this client never reached
+        # start(replace) execs execd; replace stops one that isn't this client's
         self._start = start
         self._daemon: Daemon | None = None
         self._starting = asyncio.Lock()
-        self._reached = False
         self.broken: str | None = None  # why nothing is sent or started again
 
     async def _open(self) -> _Conn:
@@ -247,14 +255,7 @@ class ExecdClient:
     async def _dial(self, daemon: Daemon) -> _Conn:
         if self.broken:
             raise NotExecd(self.broken)
-        conn = await _connect(daemon, self)
-        try:
-            await conn.send(AUTH, daemon.key)
-        except BaseException:
-            conn.close()
-            raise
-        self._reached = True
-        return conn
+        return await _connect(daemon, self)
 
     async def _restart(
         self, old: Daemon | None, why: BaseException | None = None
@@ -262,8 +263,8 @@ class ExecdClient:
         """Start a daemon in OLD's place, unless another call already has."""
         async with self._starting:
             if self._daemon is old:
-                # A daemon this client never reached, or that isn't its own, is stopped.
-                replace = not self._reached or isinstance(why, NotOurDaemon)
+                # Any execd there before this client's first, or that isn't its own.
+                replace = old is None or isinstance(why, NotOurDaemon)
                 try:
                     self._daemon = await self._start(replace)
                 except DaemonRunning as e:
@@ -307,9 +308,7 @@ class ExecdClient:
                 left = None if end is None else max(0.0, end - time.monotonic())
                 kind, payload = await asyncio.wait_for(conn.frame(), left)
                 if kind == EXIT:
-                    status = json.loads(payload)  # {"code": n[, "error"|"timeout"]}
-                    status["code"] = int(status["code"])
-                    yield EXIT, status
+                    yield EXIT, conn.status(payload)
                     return
                 yield kind, payload
         except asyncio.TimeoutError as e:  # the builtin one, also on Python 3.10
@@ -384,20 +383,48 @@ class ExecdClient:
             f"PATH={SYSTEM_PATH}; mkdir -p -- {shlex.quote(dst.parent.as_posix())} "
             f"&& cat > {shlex.quote(dst.as_posix())}"
         )
-        stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = await self._file_op(["/bin/sh", "-c", script], data, None, stderr)
-        if code != 0:
-            raise_for_known_read_write_errors(str(stderr))
+        try:
+            wrote = await self.exec(
+                ["/bin/sh", "-c", script], data, None, {}, None, None
+            )
+        except ExecResultUnknownError as e:
+            raise PodError(str(e)) from e  # unlike a command, it may be run again
+        if not wrote.success:
+            raise_for_known_read_write_errors(wrote.stderr)
             raise PodError(
                 "Unrecognised error writing file to pod.",
-                returncode=code,
-                stderr=str(stderr),
+                returncode=wrote.returncode,
+                stderr=wrote.stderr,
             )
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
-        """Pod.read_file(), over execd: the same command, limit and errors."""
-        stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = await self._file_op(read_command(src), None, dst, stderr)
+        """Pod.read_file(), over execd: the same command, limits and errors."""
+        start, stderr = dst.tell(), LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
+        code = None
+        run = self.run(
+            read_command(src), env={}, cwd=None, user=None, stdin=None, timeout=None
+        )
+        try:
+            async with contextlib.aclosing(run) as chunks:
+                async for kind, payload in chunks:
+                    if kind == EXIT:
+                        code = payload["code"]
+                    elif kind == STDERR:
+                        stderr.append(payload)
+                    else:
+                        dst.write(payload)
+                    if stderr.truncated:  # as exec() does: it could come for ever
+                        raise OutputLimitExceededError(
+                            limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                            truncated_output=None,
+                        )
+                    if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
+                        raise OutputLimitExceededError(
+                            limit_str=limits.MAX_READ_FILE_SIZE_STR,
+                            truncated_output=None,
+                        )
+        except ExecResultUnknownError as e:
+            raise PodError(str(e)) from e  # unlike a command, it may be run again
         if code != 0:
             raise_for_known_read_write_errors(str(stderr))
             raise PodError(
@@ -406,43 +433,6 @@ class ExecdClient:
                 stderr=str(stderr),
             )
         dst.flush()
-
-    async def _file_op(
-        self,
-        cmd: list[str],
-        stdin: bytes | None,
-        dst: IO[bytes] | None,
-        stderr: LimitedBuffer,
-    ) -> int:
-        start = None if dst is None else dst.tell()
-        unread = 0  # a write's stdout
-        try:
-            run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
-            async with contextlib.aclosing(run) as chunks:
-                async for kind, payload in chunks:
-                    if kind == EXIT:
-                        return payload["code"]
-                    if kind == STDERR:
-                        stderr.append(payload)
-                    elif dst is not None and start is not None:
-                        dst.write(payload)
-                        if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
-                            raise OutputLimitExceededError(
-                                limit_str=limits.MAX_READ_FILE_SIZE_STR,
-                                truncated_output=None,
-                            )
-                    else:
-                        unread += len(payload)
-                    # As exec() does: past it, output could arrive for ever.
-                    if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
-                        raise OutputLimitExceededError(
-                            limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
-                            truncated_output=None,
-                        )
-        except ExecResultUnknownError as e:
-            # Unlike a command, a file operation may be run again.
-            raise PodError(str(e)) from e
-        raise PodError("execd ended the file operation without an exit code")
 
     async def open_stream(self, argv: list[str], user: str | None) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
@@ -455,11 +445,7 @@ class ExecdClient:
             "stream": True,  # when its connection ends, execd kills only the command
         }
         conn = await self._open()
-        try:
-            await conn.send(START, json.dumps(request).encode())
-        except BaseException:
-            conn.close()
-            raise
+        await conn.send(START, json.dumps(request).encode())
         return ExecdStream(conn)
 
 

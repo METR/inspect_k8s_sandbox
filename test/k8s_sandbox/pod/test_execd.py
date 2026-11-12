@@ -45,9 +45,12 @@ def frame(kind: int, payload: bytes = b"") -> bytes:
 EXIT_0 = frame(execd.EXIT, b'{"code": 0}')
 
 
+Tls = tuple[ssl.SSLContext, ssl.SSLContext, str]
+
+
 @pytest.fixture(scope="module")
-def tls(tmp_path_factory: pytest.TempPathFactory) -> tuple[ssl.SSLContext, str]:
-    """A server's TLS context, with a self-signed certificate, and the pin for it."""
+def tls(tmp_path_factory: pytest.TempPathFactory) -> Tls:
+    """A server's TLS context, one with a long handshake, and the pin for both."""
     if shutil.which("openssl") is None:
         pytest.skip("needs openssl")
     tmp_path = tmp_path_factory.mktemp("tls")
@@ -61,22 +64,28 @@ def tls(tmp_path_factory: pytest.TempPathFactory) -> tuple[ssl.SSLContext, str]:
     )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
+    chain = tmp_path / "chain.pem"
+    chain.write_text(cert.read_text() * 40)  # 16 KiB of certificates to send
+    long = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    long.load_cert_chain(chain, key)
     der = ssl.PEM_cert_to_DER_cert(cert.read_text())
-    return context, hashlib.sha256(der).hexdigest()
+    return context, long, hashlib.sha256(der).hexdigest()
 
 
 class Daemons:
     """Stand-ins for execd, over TLS, which the client starts in turn."""
 
-    def __init__(self, tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch):
-        self._context, self._pin = tls
+    def __init__(self, tls: Tls, monkeypatch: MonkeyPatch):
+        self._context, self._long, self._pin = tls
         self._monkeypatch = monkeypatch
         self._unstarted: list[tuple[execd.Daemon, int] | Exception] = []
         self.behind: dict[int, int] = {}  # a daemon's port: the proxy's in front of it
         self.starts: list[bool] = []  # each start's `replace`
         self.connections = 0  # that sent the key
 
-    async def serve(self, handler: Handler, pin: str | None = None) -> asyncio.Server:
+    async def serve(
+        self, handler: Handler, pin: str | None = None, long_handshake: bool = False
+    ) -> asyncio.Server:
         """Add one that takes AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -85,9 +94,8 @@ class Daemons:
                 self.connections += 1
                 await handler(r, w)
 
-        server = await asyncio.start_server(
-            connection, "127.0.0.1", 0, ssl=self._context
-        )
+        context = self._long if long_handshake else self._context
+        server = await asyncio.start_server(connection, "127.0.0.1", 0, ssl=context)
         daemon = execd.Daemon("127.0.0.1", pin or self._pin, b"key")
         self._unstarted.append((daemon, server.sockets[0].getsockname()[1]))
         return server
@@ -112,7 +120,7 @@ class Daemons:
 
 
 @pytest.fixture
-def daemons(tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch) -> Daemons:
+def daemons(tls: Tls, monkeypatch: MonkeyPatch) -> Daemons:
     return Daemons(tls, monkeypatch)
 
 
@@ -231,19 +239,17 @@ async def test_a_daemon_that_is_gone_is_started_again(daemons: Daemons) -> None:
     assert daemons.starts == [True, False]  # the second can't stop one that answers
 
 
-async def test_a_daemon_that_cannot_be_reached_fails_the_call_after_one_start(
+async def test_a_daemon_that_cannot_be_reached_is_left_running(
     daemons: Daemons,
 ) -> None:
     server = await daemons.serve(exits)
     daemons.fail_start(execd.DaemonRunning("bind: address already in use"))
-    client = daemons.client()
-    await run(client)
-    server.close()  # as a network that drops the connection would
+    server.close()  # as a network that lets no connection through
     await server.wait_closed()
 
-    # Retryable, and bounded: no loop of starts and connects holds the caller.
+    # Retryable, after one connect and one start that finds it running: not replaced.
     with pytest.raises(ConnectionError, match="execd unreachable"):
-        await run(client)
+        await run(daemons.client())
 
     assert daemons.starts == [True, False]
 
@@ -267,12 +273,23 @@ async def test_a_daemon_that_is_not_ours_gets_no_key_and_is_replaced(
     assert daemons.connections == 1  # the first got no key
 
 
-async def test_a_port_held_by_another_server_fails_at_once(daemons: Daemons) -> None:
-    await daemons.serve(exits, pin="0" * 64)
-    daemons.fail_start(execd.DaemonRunning("bind: address already in use"))
+async def test_a_daemon_reached_before_is_still_replaced_once_it_is_not_ours(
+    daemons: Daemons,
+) -> None:
+    ours = await daemons.serve(exits)
+    await daemons.serve(exits, pin="0" * 64)  # as one whose start's reply was lost
+    await daemons.serve(exits)
+    client = daemons.client()
+    await run(client)
+    ours.close()
+    await ours.wait_closed()
 
-    with pytest.raises(RuntimeError, match="held by a process other than execd"):
-        await run(daemons.client())
+    # The call that starts it fails after its second connect, and may be made again.
+    with pytest.raises(ConnectionError, match="execd unreachable"):
+        await run(client)
+    assert (await run(client)).success
+
+    assert daemons.starts == [True, False, True]
 
 
 async def test_calls_made_together_start_one_daemon(daemons: Daemons) -> None:
@@ -296,7 +313,7 @@ async def test_execd_s_word_that_a_command_timed_out_raises(daemons: Daemons) ->
 
     with pytest.raises(TimeoutError, match="Command timed out after 5s"):
         await run(daemons.client(), timeout=5)
-    assert requests[0]["timeout"] == 5  # execd kills it then, connected or not
+    assert requests[0]["timeout"] == 5  # execd kills it then
 
 
 async def test_a_command_execd_never_ends_times_out_and_is_dropped(
@@ -332,17 +349,6 @@ async def test_a_timeout_of_zero_is_none(
     assert (await run(daemons.client(), timeout=0)).success  # as execd takes it
 
 
-async def test_an_exit_without_a_code_is_a_lost_result(daemons: Daemons) -> None:
-    async def no_code(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await read_frame(r)
-        w.write(frame(execd.EXIT, b"[]"))
-
-    await daemons.serve(no_code)
-
-    with pytest.raises(ExecResultUnknownError):
-        await run(daemons.client())
-
-
 async def test_a_daemon_that_goes_silent_is_a_lost_connection(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
@@ -365,6 +371,7 @@ async def test_a_loop_too_busy_to_read_does_not_take_execd_for_silent(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         await read_frame(r)
+        await asyncio.sleep(0.01)  # the client reads what the handshake left it
         # Holds the client's loop too: its read times out as the answer arrives.
         time.sleep(0.15)
         w.write(EXIT_0)
@@ -372,17 +379,6 @@ async def test_a_loop_too_busy_to_read_does_not_take_execd_for_silent(
     await daemons.serve(answers_while_the_loop_is_held)
 
     assert (await run(daemons.client())).success
-
-
-async def test_pings_are_not_output(daemons: Daemons) -> None:
-    async def pings(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await read_frame(r)
-        ping = frame(execd.PING)
-        w.write(ping + frame(execd.STDOUT, b"out") + ping + EXIT_0)
-
-    await daemons.serve(pings)
-
-    assert (await run(daemons.client())).stdout == "out"
 
 
 async def test_a_write_sends_its_bytes_then_the_end_of_stdin(daemons: Daemons) -> None:
@@ -402,11 +398,19 @@ async def test_a_write_sends_its_bytes_then_the_end_of_stdin(daemons: Daemons) -
     assert bytes(received) == data
 
 
+FILE_OPERATIONS: dict[str, Callable[[execd.ExecdClient], Awaitable[None]]] = {
+    "write": lambda client: client.write_file(b"data", Path("/tmp/f")),
+    "read": lambda client: client.read_file(Path("/tmp/f"), io.BytesIO()),
+}
+
+
+@pytest.mark.parametrize("operation", ["write", "read"])
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
-async def test_a_file_write_stops_at_the_output_limit(
-    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int
+async def test_a_file_operation_stops_at_its_output_limit(
+    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int, operation: str
 ) -> None:
     monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
+    monkeypatch.setattr(execd.limits, "MAX_READ_FILE_SIZE", 1024)
 
     async def chatters(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await read_frame(r)
@@ -415,7 +419,23 @@ async def test_a_file_write_stops_at_the_output_limit(
     await daemons.serve(chatters)
 
     with pytest.raises(OutputLimitExceededError):
-        await daemons.client().write_file(b"data", Path("/tmp/f"))
+        await FILE_OPERATIONS[operation](daemons.client())
+
+
+async def test_a_file_operation_s_lost_connection_may_be_retried(
+    daemons: Daemons,
+) -> None:
+    async def goes_away(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)
+        w.close()
+
+    await daemons.serve(goes_away)
+    client = daemons.client()
+
+    for operation in FILE_OPERATIONS.values():
+        with pytest.raises(PodError) as lost:  # which the sandbox environment retries
+            await operation(client)
+        assert not isinstance(lost.value, ExecResultUnknownError)
 
 
 async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> None:
@@ -436,9 +456,11 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
         await client.exec(["true"], None, None, {}, "nobody2", 30)
 
 
-def frozen_clock(monkeypatch: MonkeyPatch) -> None:
-    """Stop the clock the bounds run on: they then allow for a new connection's age."""
-    monkeypatch.setattr(execd, "time", types.SimpleNamespace(monotonic=lambda: 0.0))
+def frozen_clock(monkeypatch: MonkeyPatch) -> list[float]:
+    """Stop the clock the bounds run on, at a time the test may then set."""
+    now = [0.0]
+    monkeypatch.setattr(execd, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
+    return now
 
 
 @pytest.mark.parametrize(
@@ -447,10 +469,12 @@ def frozen_clock(monkeypatch: MonkeyPatch) -> None:
         frame(execd.STDERR, b"x") * 20_000,  # execd: one a millisecond
         frame(99),
         frame(execd.STDOUT, b"x" * (execd.CHUNK + 1)),
-        frame(execd.EXIT, b" " * 4097),
-        frame(execd.PING, b"x"),
+        frame(execd.EXIT, b"[]"),
+        frame(execd.EXIT, b'{"code": "0"}'),
+        frame(execd.EXIT, b'{"code": 0, "error": 5}'),
     ],
-    ids=["many-frames", "unknown-type", "large-output", "large-exit", "large-ping"],
+    ids=["many-frames", "unknown-type", "large-output"]
+    + ["exit-not-an-object", "exit-code-not-a-number", "exit-error-not-text"],
 )
 async def test_what_execd_never_sends_breaks_its_daemon_for_good(
     daemons: Daemons, monkeypatch: MonkeyPatch, sent: bytes
@@ -471,6 +495,23 @@ async def test_what_execd_never_sends_breaks_its_daemon_for_good(
         await run(client)
 
     assert daemons.starts == [True]  # no daemon was started in its place
+
+
+async def test_frames_at_execd_s_pace_are_within_its_bounds(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    now = frozen_clock(monkeypatch)
+
+    async def a_frame_a_millisecond(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)
+        now[0] = 10.0  # as if for ten seconds
+        w.write(frame(execd.STDERR, b"x") * 20_000 + EXIT_0)
+
+    await daemons.serve(a_frame_a_millisecond)
+
+    assert len((await run(daemons.client())).stderr) == 20_000
 
 
 async def test_a_broken_daemon_s_open_stream_stops_too(
@@ -518,9 +559,11 @@ async def trickling(daemons: Daemons, monkeypatch: MonkeyPatch, after: int) -> N
 
     async def prints(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await read_frame(r)
-        w.write(frame(execd.STDOUT, b"x" * 16384) + EXIT_0)
+        w.write(frame(execd.STDOUT, b"x" * 65536) + EXIT_0)
 
-    daemon_port = (await daemons.serve(prints)).sockets[0].getsockname()[1]
+    # A handshake long enough to pass the bound however its bytes are read.
+    server = await daemons.serve(prints, long_handshake=after == 0)
+    daemon_port = server.sockets[0].getsockname()[1]
 
     async def trickle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         daemon, to_daemon = await asyncio.open_connection("127.0.0.1", daemon_port)
@@ -550,7 +593,7 @@ async def trickling(daemons: Daemons, monkeypatch: MonkeyPatch, after: int) -> N
 async def test_more_tcp_reads_than_execd_makes_break_its_daemon(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
-    await trickling(daemons, monkeypatch, after=8192)  # its handshake, and more
+    await trickling(daemons, monkeypatch, after=8192)  # its handshake, and some
     client = daemons.client()
 
     with pytest.raises(execd.NotExecd, match="TCP reads"):
@@ -664,6 +707,18 @@ async def test_a_stream_s_start_says_so_and_closing_it_drops_the_connection(
     assert requests[0]["stream"]  # so execd kills only the command itself
     with pytest.raises(anyio.ClosedResourceError):
         await receiving
+
+
+async def test_a_stream_whose_connection_is_lost_is_broken(daemons: Daemons) -> None:
+    async def goes_away(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)
+        w.close()
+
+    await daemons.serve(goes_away)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    with pytest.raises(anyio.BrokenResourceError):
+        await stream.receive()
 
 
 async def test_a_closed_stream_gives_no_more_of_what_it_held(daemons: Daemons) -> None:
