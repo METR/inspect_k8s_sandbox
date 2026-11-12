@@ -499,9 +499,8 @@ class ExecdClient:
                     if isinstance(item, Dropped):
                         sender.cancel()
                         link.calls.pop(call.id, None)
-                        # Shielded: other calls may wait on the same reconnect.
-                        reconnect = asyncio.shield(self._get(stale=link))
-                        link = await asyncio.wait_for(reconnect, left)
+                        # No shield: _get waits without cancelling the shared reopen.
+                        link = await asyncio.wait_for(self._get(stale=link), left)
                         if link.daemon is not call.daemon:
                             raise ExecResultUnknownError(
                                 "execd stopped while it ran the command",

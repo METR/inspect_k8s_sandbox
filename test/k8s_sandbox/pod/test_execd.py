@@ -590,8 +590,8 @@ async def test_only_a_resume_waits_out_a_reconnect(
     assert await asyncio.wait_for(resume, 30) is not stale
 
 
-async def test_a_call_cancelled_as_its_connection_opens_starts_nothing(
-    daemons: Daemons,
+async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
+    daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
     started = 0
 
@@ -605,24 +605,27 @@ async def test_a_call_cancelled_as_its_connection_opens_starts_nothing(
 
     await daemons.serve(answers)
     client = daemons.client()
-    start, opened = client._start, asyncio.Event()
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert client._link is not None
+    await client._link.close()
+    connect, reopened = execd._connect, asyncio.Event()
 
-    async def held(replace: bool) -> execd.Daemon:
-        await opened.wait()
-        return await start(replace)
+    async def held(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        await reopened.wait()
+        return await connect(daemon, pace)
 
-    client._start = held
+    monkeypatch.setattr(execd, "_connect", held)
     call = asyncio.create_task(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: client._opening is not None)
+    await until(lambda: client._opening is not None and not client._opening.done())
     assert client._opening is not None
     client._opening.add_done_callback(lambda _: call.cancel())
-    opened.set()
+    reopened.set()
 
     with pytest.raises(asyncio.CancelledError):
         await call
     # Its START follows any the cancelled call sent.
     await client.exec(["true"], None, None, {}, None, 10)
-    assert started == 1
+    assert started == 2
 
 
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
