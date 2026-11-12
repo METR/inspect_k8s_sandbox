@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
@@ -98,7 +99,8 @@ class Pod:
         )
         if b"address already in use" in stderr:
             raise DaemonRunning(stderr.decode(errors="replace"))
-        if code != 0 or len(stdout.split()) != 1:
+        # Exactly the fingerprint execd prints: anything else, cut output too, fails.
+        if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
             raise PodError("execd did not start", returncode=code, stderr=stderr)
         return Daemon(pod.ip, stdout.decode().strip(), key)
 

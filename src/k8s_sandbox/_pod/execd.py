@@ -141,23 +141,40 @@ class Call:
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
     closed: bool = False  # by its caller
     exited: bool = False
+    resuming: bool = False  # a RESUME awaits its one RESUMED
     hold: int = HOLD
     ack_every: int = ACK_EVERY
+
+
+@dataclass
+class Strays:
+    """Frames that report nothing new, per pod: a reconnect doesn't reset the count."""
+
+    since: float = float("-inf")
+    frames: int = 0
+    size: int = 0
+
+    def over(self, n: int) -> bool:
+        now = time.monotonic()
+        if now - self.since > PING_EVERY:
+            self.since, self.frames, self.size = now, 0, 0
+        self.frames += 1
+        self.size += n
+        return self.frames > MAX_STRAY or self.size > MAX_STRAY_BYTES
 
 
 class Link:
     """One authenticated connection; a reader task routes frames to calls by id."""
 
-    def __init__(self, pipe: _Pipe, daemon: Daemon) -> None:
+    def __init__(self, pipe: _Pipe, daemon: Daemon, strays: Strays) -> None:
         self.pipe = pipe
         self.daemon = daemon
+        self.strays = strays
         self.calls: dict[int, Call] = {}
         self.closed = False
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self._last_rx = time.monotonic()
-        self._stray = 0
-        self._stray_bytes = 0
         self._tasks = [
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
@@ -200,7 +217,11 @@ class Link:
                 ):
                     c.stdin_put = put
                     c.stdin_room.set()
-                elif c is not None and kind not in (PONG, STDIN_ACK):
+                elif c is not None and (
+                    kind in (EXIT, ERROR)
+                    or (kind in (STDOUT, STDERR) and n)
+                    or (kind == RESUMED and c.resuming)
+                ):
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
@@ -208,12 +229,13 @@ class Link:
                         if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
                         c.got[kind - STDOUT] += n
+                    if kind == RESUMED:
+                        c.resuming = False
                     c.queue.put_nowait((kind, payload))
-                else:  # a pong, a repeated ack, or a frame for a call that's gone
-                    self._stray += 1
-                    self._stray_bytes += n
-                    if self._stray > MAX_STRAY or self._stray_bytes > MAX_STRAY_BYTES:
-                        return
+                elif self.strays.over(
+                    n
+                ):  # a pong, a repeated ack, anything else unused
+                    return
         except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
         finally:
@@ -222,7 +244,6 @@ class Link:
     async def _ping(self) -> None:
         while not self.closed:
             await asyncio.sleep(PING_EVERY)
-            self._stray = self._stray_bytes = 0
             if time.monotonic() - self._last_rx > DEAD_AFTER:
                 await self.close()
                 return
@@ -258,12 +279,18 @@ class ExecdClient:
         self._daemon: Daemon | None = None
         self._link: Link | None = None
         self._opening: asyncio.Future[Link] | None = None  # one at a time, shared
+        self._strays = Strays()
+        self._opened = float("-inf")
+        self._backoff = 0.0
 
     async def _open(self, deadline: float) -> Link:
-        delay = 0.0
+        # A connection dropped soon after it opened waits as a failed attempt would.
+        recent = time.monotonic() - self._opened < PING_EVERY
+        delay = self._backoff if recent else 0.0
         while True:
             # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
             await asyncio.sleep(delay)
+            delay = min(max(delay * 2, 0.2), 5.0)
             link = None
             try:
                 if self._daemon is None:
@@ -272,16 +299,17 @@ class ExecdClient:
                     except DaemonRunning as e:  # even past --replace: not execd
                         raise _port_held() from e
                 daemon = self._daemon
-                link = Link(await _connect(daemon), daemon)
+                link = Link(await _connect(daemon), daemon, self._strays)
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
+                # Set now: a caller arriving before the waiters wake opens no other.
+                self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 if link is not None:
                     await link.close()
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
-                delay = min(max(delay * 2, 0.2), 5.0)
                 # a start tells gone from unreachable; a daemon not ours is replaced
                 not_ours = isinstance(e, NotOurDaemon)
                 try:
@@ -329,7 +357,6 @@ class ExecdClient:
         link.calls[call.id] = call
         sender: asyncio.Task[None] | None = None
         finished = False
-        resuming = False
         try:
             try:
                 await link.send(START, call.id, start)
@@ -360,8 +387,8 @@ class ExecdClient:
                             )
                         link.calls[call.id] = call
                         offsets = {"stdout": call.got[0], "stderr": call.got[1]}
+                        call.resuming = True  # before the RESUMED can arrive
                         await link.send(RESUME, call.id, json.dumps(offsets).encode())
-                        resuming = True
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item
@@ -374,8 +401,7 @@ class ExecdClient:
                             await link.send(RELEASE, call.id)
                         yield EXIT, json.loads(payload)  # {"code": n[, "error": ...]}
                         return
-                    elif kind == RESUMED and resuming:  # send the stdin it didn't get
-                        resuming = False
+                    elif kind == RESUMED:  # send the stdin it didn't get
                         got = json.loads(payload)
                         call.stdin_put = max(call.stdin_put, got["put"])
                         if stdin is not None and not got["eof"]:
@@ -386,11 +412,11 @@ class ExecdClient:
                     elif (
                         kind == ERROR
                         and payload == b"unknown call"
-                        and resuming
+                        and call.resuming
                         and not any(call.got)
                     ):
                         # The same daemon never got the START: nothing ran, so start it.
-                        resuming = False
+                        call.resuming = False
                         await link.send(START, call.id, start)
                         sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                     elif kind == ERROR:

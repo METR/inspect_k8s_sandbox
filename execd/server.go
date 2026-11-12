@@ -284,8 +284,11 @@ func (s *server) start(c *conn, f frame) {
 		} else if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
 			code = 127
 		}
-		cl.output(1, []byte("execd: "+err.Error()+"\n"))
-		cl.finish(code, err.Error()) // out of band too: the command's own stderr can't fake it
+		msg := err.Error()
+		cl.output(1, []byte("execd: "+msg+"\n"))
+		// Out of band too, so the command's own stderr can't fake it; capped, so even
+		// escaped to JSON it fits the client's 4 KiB control frame.
+		cl.finish(code, msg[:min(len(msg), 512)])
 	}
 }
 

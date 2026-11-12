@@ -6,6 +6,7 @@ import json
 import shutil
 import ssl
 import subprocess
+import time
 import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -16,7 +17,9 @@ from pytest import MonkeyPatch
 
 from k8s_sandbox._helm import Release, ValuesSource
 from k8s_sandbox._pod import execd
+from k8s_sandbox._pod import pod as pod_module
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
+from k8s_sandbox._pod.pod import Pod
 from k8s_sandbox._pod.snapshot import _parse_pod
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
@@ -677,6 +680,114 @@ async def test_stray_bytes_end_the_connection(
     stream = await daemons.client().open_stream(["cat"], None)
 
     await until(lambda: stream._link.closed)
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        (execd.STDOUT, b""),  # nothing new
+        (99, b""),  # no such kind
+        (execd.OK, b""),
+        (execd.RESUMED, b'{"stdin": 0, "eof": false, "put": 0}'),  # unasked
+    ],
+)
+async def test_frames_a_call_does_not_use_count_as_stray(
+    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int, payload: bytes
+) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY", 100)
+
+    async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(kind, call_id, payload) * (execd.MAX_STRAY + 1))
+        await r.read()
+
+    await daemons.serve(floods)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    await until(lambda: stream._link.closed)
+
+
+async def test_the_stray_count_spans_reconnects(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY", 100)
+
+    async def pongs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write(frame(execd.PONG, 0) * 60)
+        await r.read()
+
+    await daemons.serve(pongs)
+    client = daemons.client()
+    first = await client._get()
+    await until(lambda: client._strays.frames == 60)
+    await first.close()
+
+    second = await client._get(first)
+
+    await until(lambda: second.closed)  # 120 in one interval, over two connections
+
+
+async def test_a_daemon_that_drops_each_connection_is_reconnected_with_backoff(
+    daemons: Daemons,
+) -> None:
+    connections = 0
+
+    async def drops(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        await read_frame(r)  # START, then RESUME
+        w.close()
+
+    await daemons.serve(drops)
+
+    with pytest.raises(TimeoutError):
+        await daemons.client().exec(["true"], None, None, {}, None, 1)
+
+    # Paced: a handful in the second, where an unpaced loop makes hundreds.
+    assert connections <= 10
+
+
+async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> None:
+    async def idle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await r.read()
+
+    await daemons.serve(idle)
+    client = daemons.client()
+
+    link = await client._open(time.monotonic() + 10)
+
+    # Before its waiters wake: a caller arriving now must not open a second one.
+    assert client._link is link
+
+
+async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) -> None:
+    printed = b"0" * 64 + b"\n"
+
+    class Execute:
+        def __init__(self, info: object) -> None:
+            pass
+
+        def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
+            return 0, printed, b""
+
+    async def run(f: Callable[[], object]) -> object:
+        return f()
+
+    async def no_restart() -> None:
+        return None
+
+    monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
+    monkeypatch.setattr(pod_module, "k8s_client", lambda _: None)
+    ip = types.SimpleNamespace(ip="10.0.0.1")
+    monkeypatch.setattr(pod_module, "read_pod", lambda *_: ip)
+    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+    monkeypatch.setattr(pod, "check_for_pod_restart", no_restart)
+    monkeypatch.setattr(pod, "_run_async", run)
+    assert (await pod._start_execd(False)).fingerprint == "0" * 64
+
+    printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
+    with pytest.raises(PodError, match="execd did not start"):
+        await pod._start_execd(False)
 
 
 async def test_a_port_held_at_the_first_start_says_so() -> None:

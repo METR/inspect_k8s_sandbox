@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -126,5 +127,55 @@ func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 
 	if code := exitCode(t, s.get(5)); code != 3 {
 		t.Fatalf("exit %d, want 3: the timeout fired at once", code)
+	}
+}
+
+// recordedConn is a connection whose sent frames arrive on the channel.
+func recordedConn(t *testing.T) (*conn, <-chan frame) {
+	a, b := net.Pipe()
+	frames := make(chan frame, 64)
+	go func() {
+		for {
+			f, err := readFrameMax(b, maxPayload)
+			if err != nil {
+				return
+			}
+			frames <- f
+		}
+	}()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	return &conn{nc: a, dead: make(chan struct{})}, frames
+}
+
+func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	cwd := "/" + strings.Repeat("\x01", 5000) // six bytes each, escaped to JSON
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: cwd, Tag: "e"})
+
+	s.dispatch(c, frame{kind: fStart, id: 6, payload: req})
+
+	for {
+		select {
+		case f := <-frames:
+			if f.kind != fExit {
+				continue
+			}
+			if len(f.payload) > 4096 { // the client's MAX_CONTROL: past it, it reconnects for ever
+				t.Fatalf("EXIT is %d bytes", len(f.payload))
+			}
+			return
+		case <-time.After(10 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+}
+
+func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
+	const prGetDumpable = 3
+	// init() has run, as it runs before main.
+	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
+		t.Fatal("dumpable: a same-uid process could reopen the start's stdout through /proc")
 	}
 }

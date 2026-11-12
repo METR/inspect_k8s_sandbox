@@ -23,6 +23,9 @@ import (
 
 const foregroundEnv = "HN_EXECD_FOREGROUND"
 
+// Before main, and so before --replace scans /proc: the sandbox can't reopen its stdout.
+func init() { prctl(prSetDumpable, 0) }
+
 func main() {
 	if len(os.Args) < 2 || os.Args[1] != "listen" {
 		fail("usage: execd listen --port N --key-sha256 HEX")
@@ -56,7 +59,6 @@ func prctl(option, arg uintptr) {
 
 // start re-runs execd in a new session, so it outlives this exec, and relays its status line.
 func start() {
-	prctl(prSetDumpable, 0) // so the sandbox can't write into the stdout the client reads
 	// A socket, not a pipe: /proc/PID/fd can't reopen it, so only the daemon writes its status.
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -89,7 +91,6 @@ func run(port int, keyHash string, replace bool) {
 		status.WriteString(msg + "\n")
 		status.Close()
 	}
-	prctl(prSetDumpable, 0)
 	prctl(prSetChildSubreaper, 1)
 	s, err := newServer(keyHash)
 	if err != nil {
