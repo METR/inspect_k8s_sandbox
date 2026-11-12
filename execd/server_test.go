@@ -268,6 +268,21 @@ func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
 	}
 }
 
+func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
+	charge(100_000) // a minute of turns: calls ending faster than turns come
+	c, frames := recordedConn(t)
+	cl := &call{id: 97, sub: c}
+	cl.room = sync.NewCond(&cl.mu)
+
+	cl.output(0, []byte("x"))
+
+	select {
+	case <-frames:
+	case <-time.After(time.Second):
+		t.Fatal("output held over a second behind exits' turns")
+	}
+}
+
 func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
 	c, frames := recordedConn(t)
 	cl := &call{id: 9, sub: c, deferred: true} // its flush is set, and its time has come

@@ -523,6 +523,8 @@ var epoch = time.Now() // turns are measured from here, on the monotonic clock
 
 const slotEvery, slotBurst = 600 * time.Microsecond, 8
 
+const slotAhead = 100 * time.Millisecond // how long exits' and resumes' turns may hold others' output
+
 // flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
 func (cl *call) flushSoon() {
 	if cl.deferred || cl.sub == nil {
@@ -562,8 +564,9 @@ func (cl *call) flushSoon() {
 // charge takes the turns of frames a flush sent without one: an exit's, or a resume's.
 func charge(frames int) {
 	for frames > 0 {
-		taken := time.Duration(slot.Load())
-		if slot.CompareAndSwap(int64(taken), int64(max(taken, time.Since(epoch))+time.Duration(frames)*slotEvery)) {
+		taken, now := time.Duration(slot.Load()), time.Since(epoch)
+		next := min(max(taken, now)+time.Duration(frames)*slotEvery, now+slotAhead)
+		if next <= taken || slot.CompareAndSwap(int64(taken), int64(next)) {
 			return
 		}
 	}
