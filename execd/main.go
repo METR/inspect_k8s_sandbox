@@ -1,14 +1,16 @@
 // execd: a process daemon in a sandbox container, which k8s_sandbox reaches over the pod network
 // (src/k8s_sandbox/_pod/execd.py speaks its protocol). Adapted from METR/hawk-next's execd.
 //
-//	execd listen --port N --key-sha256 HEX
+//	execd listen --port N --key-sha256 HEX [--replace]
 //
 // starts the daemon in the background, serving TLS 1.3 on port N with a certificate it makes at
 // start, and prints "<pid> <SHA-256 of the certificate>" once it accepts connections. The client
 // pins that certificate, and the first frame on a connection must carry the key whose SHA-256 is
-// HEX. It is a static binary, copied into each Pod by an init container, so task images need no
-// change. Processes are children of execd, not of the connection, so a dropped connection loses
-// nothing: output is buffered until the client acknowledges it.
+// HEX. --replace first stops any execd already listening, which no client can use without its
+// key (a client's first start does this). It is a static binary, copied into each Pod by an init
+// container, so task images need no change. Processes are children of execd, not of the
+// connection, so a dropped connection loses nothing: output is buffered until the client
+// acknowledges it.
 package main
 
 import (
@@ -19,11 +21,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math/big"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,8 +42,12 @@ func main() {
 	fs := flag.NewFlagSet("listen", flag.ExitOnError)
 	port := fs.Int("port", 0, "TCP port")
 	keyHash := fs.String("key-sha256", "", "hex SHA-256 of the session key")
+	replace := fs.Bool("replace", false, "stop any execd already listening")
 	fs.Parse(os.Args[2:])
 	if os.Getenv(foregroundEnv) == "" {
+		if *replace {
+			stopOthers()
+		}
 		start()
 		return
 	}
@@ -104,9 +112,12 @@ func run(port int, keyHash string) {
 		report(err.Error())
 		os.Exit(2)
 	}
-	l, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), &tls.Config{
-		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
-	})
+	config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
+	l, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
+	for i := 0; err != nil && i < 20 && errors.Is(err, syscall.EADDRINUSE); i++ {
+		time.Sleep(100 * time.Millisecond) // a daemon just stopped by --replace
+		l, err = tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
+	}
 	if err != nil {
 		report(err.Error())
 		os.Exit(2)
@@ -114,6 +125,22 @@ func run(port int, keyHash string) {
 	startReaper()
 	report("ok " + fingerprint)
 	s.serve(l)
+}
+
+// stopOthers kills every other process running this binary's listen mode.
+func stopOthers() {
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == os.Getpid() {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		args := strings.Split(string(cmdline), "\x00")
+		if err == nil && len(args) > 1 && args[0] == os.Args[0] && args[1] == "listen" {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
 }
 
 // selfSigned makes the daemon's certificate. Its key never leaves this process's memory; the

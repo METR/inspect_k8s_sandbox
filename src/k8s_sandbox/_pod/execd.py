@@ -220,9 +220,10 @@ class Link:
 class ExecdClient:
     """Runs commands through one pod's execd, on one connection reopened as needed."""
 
-    def __init__(self, start: Callable[[], Awaitable[Daemon]]) -> None:
+    def __init__(self, start: Callable[[bool], Awaitable[Daemon]]) -> None:
         # Starts a daemon (one exec) and says where it is; it also checks the pod for
-        # a restart, which a new daemon would otherwise hide.
+        # a restart, which a new daemon would otherwise hide. Its argument says to
+        # replace any daemon already running: one this client never reached.
         self._start = start
         self._daemon: Daemon | None = None
         self._link: Link | None = None
@@ -233,7 +234,7 @@ class ExecdClient:
         while True:
             try:
                 if self._daemon is None:
-                    self._daemon = await self._start()
+                    self._daemon = await self._start(self._link is None)
                 daemon = self._daemon
                 link = Link(await _connect(daemon), daemon)
                 await link.send(AUTH, 0, daemon.key)
@@ -245,7 +246,7 @@ class ExecdClient:
                 # Gone (a root agent can kill it, or its container restarted) or out of
                 # reach: a start tells which, as a live daemon keeps its port.
                 with contextlib.suppress(DaemonRunning):
-                    self._daemon = await self._start()
+                    self._daemon = await self._start(self._link is None)
                     continue
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 5.0)

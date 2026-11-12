@@ -78,7 +78,7 @@ class Pod:
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
         self._execd = ExecdClient(self._start_execd) if execd else None
 
-    async def _start_execd(self) -> Daemon:
+    async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd in the container with one exec that carries no stdin.
 
         A container restart or pod replacement is checked for here, not before each
@@ -88,6 +88,7 @@ class Pod:
         key = os.urandom(32)
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+        cmd += ["--replace"] if replace else []
         info = self._info
         result = await self._run_async(
             lambda: ExecuteOperation(info).exec(cmd, None, None, {}, None, 60)
