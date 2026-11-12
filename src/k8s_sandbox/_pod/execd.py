@@ -61,8 +61,11 @@ HEADER = struct.Struct(">BQI")
 CHUNK = 1 << 20
 # execd sends at most CHUNK of output per frame; anything larger is not execd.
 MAX_FRAME = 2 * CHUNK
-# execd holds output until acked, and pauses the command past 32 MiB.
+# execd holds output until acked, and pauses the command past 32 MiB per stream.
 ACK_EVERY = 4 << 20
+# Output a call may hold here that its caller hasn't taken: past it, the peer ignores
+# the acks (it isn't execd), and the connection is dropped.
+HOLD = 2 * ((32 << 20) + CHUNK)
 # Stdin a call may have in flight beyond what execd has written to the process, so the
 # daemon's queue (in the sandbox's memory) stays small for any size of input.
 STDIN_WINDOW = 8 << 20
@@ -132,6 +135,7 @@ class Call:
         default_factory=asyncio.Queue
     )
     got: list[int] = field(default_factory=lambda: [0, 0])
+    taken: list[int] = field(default_factory=lambda: [0, 0])  # by the caller
     acked: int = 0
     stdin_put: int = 0  # stdin execd has written to the process
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
@@ -176,11 +180,9 @@ class Link:
                 elif (c := self.calls.get(call_id)) is not None and kind != PONG:
                     if kind in (STDOUT, STDERR):
                         c.got[kind - STDOUT] += len(payload)
+                        if sum(c.got) - sum(c.taken) > HOLD:
+                            return
                     c.queue.put_nowait((kind, payload))
-                    if sum(c.got) - c.acked >= ACK_EVERY:
-                        c.acked = sum(c.got)
-                        offsets = {"stdout": c.got[0], "stderr": c.got[1]}
-                        await self.send(ACK, call_id, json.dumps(offsets).encode())
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
             pass
         finally:
@@ -206,6 +208,7 @@ class Link:
             self.ready.set_exception(Dropped("connection closed before auth"))
         for c in self.calls.values():
             c.queue.put_nowait(Dropped())
+            c.stdin_room.set()  # a sender waiting for room sees the close
         current = asyncio.current_task()
         for t in self._tasks:
             if t is not current:
@@ -315,6 +318,7 @@ class ExecdClient:
                 kind, payload = item
                 if kind in (STDOUT, STDERR):
                     yield kind, payload
+                    await _taken(link, call, kind, len(payload))
                 elif kind == EXIT:
                     finished = True
                     with contextlib.suppress(ConnectionError, OSError):
@@ -353,7 +357,7 @@ class ExecdClient:
             return
         with contextlib.suppress(ConnectionError, OSError):  # the reader sees the drop
             for i in range(offset, len(stdin), CHUNK):
-                await _window(call, i)
+                await _window(link, call, i)
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
@@ -503,11 +507,23 @@ class ExecdClient:
         return ExecdStream(link, call)
 
 
-async def _window(call: Call, sent: int) -> None:
+async def _window(link: Link, call: Call, sent: int) -> None:
     """Wait until the call has room for more stdin in flight."""
     while sent - call.stdin_put >= STDIN_WINDOW:
         call.stdin_room.clear()
+        if link.closed:
+            raise ConnectionError("execd connection closed")
         await call.stdin_room.wait()
+
+
+async def _taken(link: Link, call: Call, kind: int, n: int) -> None:
+    """Count output the caller took, and acknowledge it, so execd sends more."""
+    call.taken[kind - STDOUT] += n
+    if sum(call.taken) - call.acked >= ACK_EVERY:
+        call.acked = sum(call.taken)
+        offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
+        with contextlib.suppress(ConnectionError, OSError):
+            await link.send(ACK, call.id, json.dumps(offsets).encode())
 
 
 class ExecdStream(ByteStream):
@@ -533,8 +549,10 @@ class ExecdStream(ByteStream):
             item = await self._call.queue.get()
             if isinstance(item, Exception):
                 self._ended = anyio.BrokenResourceError("execd connection lost")
-            elif item[0] == STDOUT:
-                self._stdout += item[1]
+            elif item[0] in (STDOUT, STDERR):
+                if item[0] == STDOUT:
+                    self._stdout += item[1]
+                await _taken(self._link, self._call, item[0], len(item[1]))
             elif item[0] == EXIT:
                 self._ended = anyio.EndOfStream()
             elif item[0] == ERROR:
@@ -550,7 +568,7 @@ class ExecdStream(ByteStream):
             raise anyio.ClosedResourceError
         try:
             for i in range(0, len(item), CHUNK):
-                await _window(self._call, self._sent)
+                await _window(self._link, self._call, self._sent)
                 await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
                 self._sent += len(item[i : i + CHUNK])
         except (ConnectionError, OSError) as e:
