@@ -429,9 +429,11 @@ class ExecdClient:
                         got = json.loads(payload)
                         call.stdin_put = max(call.stdin_put, got["put"])
                         if stdin is not None and not got["eof"]:
+                            # Clamped: a stand-in's offset could loop over nothing.
+                            offset = min(max(int(got["stdin"]), 0), len(stdin))
                             sender.cancel()
                             sender = asyncio.create_task(
-                                self._upload(link, call, stdin, int(got["stdin"]))
+                                self._upload(link, call, stdin, offset)
                             )
                     elif (
                         kind == ERROR
@@ -582,6 +584,7 @@ class ExecdClient:
         stderr: LimitedBuffer,
     ) -> int:
         start = None if dst is None else dst.tell()
+        unread = 0  # a write's stdout
         try:
             run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
             async with contextlib.aclosing(run) as chunks:
@@ -597,6 +600,14 @@ class ExecdClient:
                                 limit_str=limits.MAX_READ_FILE_SIZE_STR,
                                 truncated_output=None,
                             )
+                    else:
+                        unread += len(payload)
+                    # As exec() does: past it, output could arrive for ever.
+                    if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
+                        raise OutputLimitExceededError(
+                            limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                            truncated_output=None,
+                        )
         except ExecResultUnknownError as e:
             # Unlike a command, a file operation may be run again.
             raise PodError(str(e)) from e

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import anyio
 import pytest
+from inspect_ai.util import OutputLimitExceededError
 from pytest import MonkeyPatch
 
 from k8s_sandbox._helm import Release, ValuesSource
@@ -813,6 +814,71 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
     printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
     with pytest.raises(PodError, match="execd did not start"):
         await pod._start_execd(False)
+
+
+async def test_a_resumed_offset_out_of_range_sends_stdin_from_its_start(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    offsets: list[int] = []
+    upload = execd.ExecdClient._upload
+
+    async def recorded(
+        client: execd.ExecdClient,
+        link: execd.Link,
+        call: execd.Call,
+        data: bytes | None,
+        offset: int,
+    ) -> None:
+        offsets.append(offset)
+        if offset >= 0:  # below zero, it would hold the loop for ever
+            await upload(client, link, call, data, offset)
+
+    monkeypatch.setattr(execd.ExecdClient, "_upload", recorded)
+    stdin: list[bytes] = []
+    connections = 0
+
+    async def resumes_below_zero(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal connections
+        connections += 1
+        _, call_id, _ = await read_frame(r)  # START, then RESUME
+        if connections == 1:
+            w.close()  # dropped, so the client resumes
+            return
+        got = {"stdin": -(10**30), "eof": False, "put": 0}
+        w.write(frame(execd.RESUMED, call_id, json.dumps(got).encode()))
+        while not stdin or stdin[-1]:  # to the empty frame that closes stdin
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN:
+                stdin.append(payload)
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(resumes_below_zero)
+
+    await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
+
+    assert offsets[-1] == 0
+    assert stdin == [b"abc", b""]
+
+
+@pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
+async def test_a_file_write_stops_at_the_output_limit(
+    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int
+) -> None:
+    monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
+
+    async def chatters(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(kind, call_id, b"x" * 2048))  # past the limit, then done
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(chatters)
+
+    with pytest.raises(OutputLimitExceededError):
+        await daemons.client().write_file(b"data", Path("/tmp/f"))
 
 
 async def test_a_port_held_at_the_first_start_says_so() -> None:
