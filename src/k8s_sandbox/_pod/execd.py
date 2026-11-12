@@ -287,6 +287,7 @@ class Link:
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
         ]
+        self._last: set[asyncio.Task[None]] = set()  # held until sent
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
         async with self._wlock:
@@ -297,6 +298,20 @@ class Link:
                 # a peer that stopped reading must not hold the lock other calls need
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
+
+    async def send_last(self, call_id: int, *kinds: int) -> None:
+        """Send a call's last empty frames, even if the caller is cancelled."""
+
+        async def send() -> None:
+            with contextlib.suppress(OSError):
+                for kind in kinds:
+                    await self.send(kind, call_id)
+
+        # A task of its own: anyio cancels a cancelled caller again at each await.
+        task = asyncio.create_task(send())
+        self._last.add(task)
+        task.add_done_callback(self._last.discard)
+        await asyncio.shield(task)
 
     async def _read(self) -> None:
         reader = self.pipe
@@ -553,12 +568,12 @@ class ExecdClient:
         finally:
             if sender is not None:
                 sender.cancel()
-            if not finished and not link.closed:
-                # Abandoned by the caller (an output limit, a cancel): stop it.
-                with contextlib.suppress(OSError):
-                    await link.send(KILL, call.id)
-                    await link.send(RELEASE, call.id)
-            link.calls.pop(call.id, None)
+            try:
+                if not finished and not link.closed:
+                    # Abandoned by the caller (an output limit, a cancel): stop it.
+                    await link.send_last(call.id, KILL, RELEASE)
+            finally:
+                link.calls.pop(call.id, None)
 
     async def _upload(
         self, link: Link, call: Call, stdin: bytes | None, offset: int
@@ -727,9 +742,7 @@ class ExecdClient:
             await link.send(START, call.id, json.dumps(request).encode())
         except BaseException:
             link.calls.pop(call.id, None)
-            with contextlib.suppress(OSError):  # the START may have gone out
-                await link.send(KILL, call.id)
-                await link.send(RELEASE, call.id)
+            await link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
             raise
         return ExecdStream(link, call)
 
@@ -843,9 +856,5 @@ class ExecdStream(ByteStream):
         self._call.stdin_room.set()  # a send waiting for room sees the close
         self._call.queue.put_nowait(Dropped())  # and so does a receive
         self._link.calls.pop(self._call.id, None)
-        with contextlib.suppress(OSError):
-            await self._link.send(
-                STDIN, self._call.id
-            )  # EOF: the command may end itself
-            await self._link.send(KILL, self._call.id)
-            await self._link.send(RELEASE, self._call.id)
+        # EOF first: the command may end itself
+        await self._link.send_last(self._call.id, STDIN, KILL, RELEASE)

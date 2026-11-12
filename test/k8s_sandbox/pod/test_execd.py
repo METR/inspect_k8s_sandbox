@@ -643,19 +643,89 @@ async def test_a_stream_cancelled_as_it_starts_is_killed(
 
     await daemons.serve(records)
     send = execd.Link.send
+    scope = anyio.CancelScope()
+    writers: list[asyncio.Task[None]] = []
+
+    async def writes(link: execd.Link) -> None:  # another call's
+        async with link._wlock:
+            await asyncio.sleep(0.1)
 
     async def cancelled_after_start(
         link: execd.Link, kind: int, call_id: int, payload: bytes = b""
     ) -> None:
         await send(link, kind, call_id, payload)
         if kind == execd.START:
-            raise asyncio.CancelledError
+            writers.append(asyncio.create_task(writes(link)))
+            scope.cancel()  # anyio cancels again at each await, unlike asyncio
+            await asyncio.sleep(1)
 
     monkeypatch.setattr(execd.Link, "send", cancelled_after_start)
 
-    with pytest.raises(asyncio.CancelledError):
+    with scope:
         await daemons.client().open_stream(["cat"], None)
-    await until(lambda: execd.KILL in got)
+    await writers[0]
+    await until(lambda: execd.RELEASE in got)
+
+    assert scope.cancelled_caught
+    assert got == [execd.START, execd.KILL, execd.RELEASE]
+
+
+async def test_a_call_cancelled_while_another_writes_is_killed(
+    daemons: Daemons,
+) -> None:
+    got: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            got.append((await read_frame(r))[0])
+
+    await daemons.serve(records)
+    client = daemons.client()
+    scope = anyio.CancelScope()
+
+    async def call() -> None:
+        with scope:
+            await client.exec(["sleep", "60"], None, None, {}, None, None)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(call)
+        await until(lambda: execd.START in got)
+        link = client._link
+        assert link is not None
+        async with link._wlock:  # another call's write
+            scope.cancel()  # anyio cancels again at each await, unlike asyncio
+            await asyncio.sleep(0.1)
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.KILL in got
+    assert not link.calls
+
+
+async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> None:
+    got: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            got.append((await read_frame(r))[0])
+
+    await daemons.serve(records)
+    stream = await daemons.client().open_stream(["cat"], None)
+    writing = asyncio.Event()
+
+    async def writes() -> None:  # another call's
+        async with stream._link._wlock:
+            writing.set()
+            await asyncio.sleep(0.1)
+
+    writer = asyncio.create_task(writes())
+    await writing.wait()
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        await stream.aclose()
+    await writer
+    await until(lambda: execd.RELEASE in got)
+
+    assert got[-3:] == [execd.STDIN, execd.KILL, execd.RELEASE]
 
 
 async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
