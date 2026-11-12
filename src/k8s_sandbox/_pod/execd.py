@@ -59,10 +59,12 @@ MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 4 * HOLD  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
-# What a pod delivers per second: past either, reading waits, so a stand-in can't hold
+# What a pod delivers per second: past any, reading waits, so a stand-in can't hold
 # the runner's loop. execd sends output in reads of up to 256 KiB.
 PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
+PACE_OVERHEAD = 512 << 10  # TLS bytes that aren't plaintext: a record costs a decrypt
+RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -101,34 +103,91 @@ class NotOurDaemon(ConnectionRefusedError):
 
 
 class _Pipe:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self.reader = reader
+    """TLS over TCP, decrypted here so that what a peer's records cost is paced."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        context: ssl.SSLContext,
+        pace: Pace,
+    ) -> None:
+        self._reader = reader
         self._writer = writer
+        self._in, self._out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        self.tls = context.wrap_bio(self._in, self._out)
+        self._pace = pace
+        self._plain = bytearray()
+
+    async def handshake(self) -> None:
+        while True:
+            try:
+                self.tls.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                await self._flush()
+                self._in.write(await self._raw())
+        await self._flush()
 
     async def write(self, data: bytes) -> None:
-        self._writer.write(data)
+        self.tls.write(data)
+        await self._flush()
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._plain) < n:
+            raw = await self._raw()
+            self._in.write(raw)
+            had = len(self._plain)
+            with contextlib.suppress(ssl.SSLWantReadError):
+                while True:
+                    chunk = self.tls.read(RAW_READ)  # a record at a time
+                    if not chunk:
+                        raise ConnectionResetError("execd ended the TLS session")
+                    self._plain += chunk
+            overhead = len(raw) - (len(self._plain) - had)
+            await self._pace.take(0, frames=0, overhead=overhead)
+        data = bytes(self._plain[:n])
+        del self._plain[:n]
+        return data
+
+    async def _raw(self) -> bytes:
+        raw = await self._reader.read(RAW_READ)
+        if not raw:
+            raise ConnectionResetError("execd closed the connection")
+        return raw
+
+    async def _flush(self) -> None:
+        self._writer.write(self._out.read())
         await self._writer.drain()
 
     async def close(self) -> None:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
-async def _connect(daemon: Daemon) -> _Pipe:
+async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     # The certificate is self-signed: it is trusted by its fingerprint, below.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     context.minimum_version = ssl.TLSVersion.TLSv1_3
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(daemon.ip, EXECD_PORT, ssl=context, limit=MAX_FRAME),
-        CONNECT_TIMEOUT,
-    )
-    cert = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
+
+    async def handshake() -> _Pipe:
+        reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        pipe = _Pipe(reader, writer, context, pace)
+        try:
+            await pipe.handshake()
+        except BaseException:
+            await pipe.close()
+            raise
+        return pipe
+
+    pipe = await asyncio.wait_for(handshake(), CONNECT_TIMEOUT)
+    cert = pipe.tls.getpeercert(binary_form=True) or b""
     if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
-        writer.close()
+        await pipe.close()
         # Not the daemon this client started, so it gets no key: start another.
         raise NotOurDaemon("the server on the execd port is not our daemon")
-    return _Pipe(reader, writer)
+    return pipe
 
 
 @dataclass
@@ -170,19 +229,25 @@ class Strays:
 
 @dataclass
 class Pace:
-    """Frames a pod delivered for its calls this second, and their bytes."""
+    """What a pod sent this second: frames for its calls, their bytes, TLS overhead."""
 
     since: float = float("-inf")
     frames: int = 0
     size: int = 0
+    overhead: int = 0
 
-    async def take(self, n: int) -> None:
+    async def take(self, n: int, frames: int = 1, overhead: int = 0) -> None:
         now = time.monotonic()
         if now - self.since >= 1.0:
-            self.since, self.frames, self.size = now, 0, 0
-        self.frames += 1
+            self.since, self.frames, self.size, self.overhead = now, 0, 0, 0
+        self.frames += frames
         self.size += n
-        if self.frames > PACE_FRAMES or self.size > PACE_BYTES:
+        self.overhead += overhead
+        if (
+            self.frames > PACE_FRAMES
+            or self.size > PACE_BYTES
+            or self.overhead > PACE_OVERHEAD
+        ):
             await asyncio.sleep(self.since + 1.0 - now)
 
 
@@ -215,7 +280,7 @@ class Link:
                 raise ConnectionError("execd stopped reading") from None
 
     async def _read(self) -> None:
-        reader = self.pipe.reader
+        reader = self.pipe
         frames = 0
         try:
             while True:
@@ -326,7 +391,8 @@ class ExecdClient:
                     except DaemonRunning as e:  # even past --replace: not execd
                         raise _port_held() from e
                 daemon = self._daemon
-                link = Link(await _connect(daemon), daemon, self._strays, self._pace)
+                pipe = await _connect(daemon, self._pace)
+                link = Link(pipe, daemon, self._strays, self._pace)
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.

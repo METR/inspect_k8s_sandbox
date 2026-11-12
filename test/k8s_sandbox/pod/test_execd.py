@@ -63,14 +63,27 @@ class Daemons:
         return execd.ExecdClient(start)
 
 
+class Plain(execd._Pipe):
+    """execd's pipe over plain TCP: these tests are about the protocol, not TLS."""
+
+    def __init__(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        self._reader, self._writer = r, w
+
+    async def readexactly(self, n: int) -> bytes:
+        return await self._reader.readexactly(n)
+
+    async def write(self, data: bytes) -> None:
+        self._writer.write(data)
+        await self._writer.drain()
+
+
 @pytest.fixture
 def daemons(monkeypatch: MonkeyPatch) -> Daemons:
     stand_ins = Daemons()
 
-    async def connect(daemon: execd.Daemon) -> execd._Pipe:
-        # Plain TCP: these tests are about the protocol, not TLS.
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         r, w = await asyncio.open_connection("127.0.0.1", stand_ins.ports[daemon])
-        return execd._Pipe(r, w)
+        return Plain(r, w)
 
     monkeypatch.setattr(execd, "_connect", connect)
     return stand_ins
@@ -381,7 +394,7 @@ async def test_a_failed_restart_after_start_is_not_retryable(
 async def test_a_port_held_by_another_process_fails_at_once(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
-    async def squatted(daemon: execd.Daemon) -> execd._Pipe:
+    async def squatted(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise execd.NotOurDaemon("certificate mismatch")
 
     async def port_taken(replace: bool) -> execd.Daemon:
@@ -478,11 +491,13 @@ async def test_a_daemon_that_is_not_ours_is_replaced(
     await sandbox.exec(["true"], None, None, {}, None, 10)
     first, connect = sandbox._daemon, execd._connect
 
-    async def another_execd_on_first(daemon: execd.Daemon) -> execd._Pipe:
+    async def another_execd_on_first(
+        daemon: execd.Daemon, pace: execd.Pace
+    ) -> execd._Pipe:
         # Our start's reply was lost, and that daemon now holds the port.
         if daemon is first:
             raise execd.NotOurDaemon("certificate mismatch")
-        return await connect(daemon)
+        return await connect(daemon, pace)
 
     monkeypatch.setattr(execd, "_connect", another_execd_on_first)
     assert sandbox._link is not None
@@ -530,7 +545,7 @@ async def test_callers_share_one_reconnect(
     assert stale is not None
     await stale.close()
 
-    async def refused(daemon: execd.Daemon) -> execd._Pipe:
+    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise ConnectionRefusedError
 
     async def still_running(replace: bool) -> execd.Daemon:
@@ -560,7 +575,7 @@ async def test_callers_share_one_reconnect(
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    async def refused(daemon: execd.Daemon) -> execd._Pipe:
+    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise ConnectionRefusedError
 
     starts = 0
@@ -1101,10 +1116,11 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
-@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
-async def test_only_the_pinned_certificate_is_trusted(
-    tmp_path: Path, monkeypatch: MonkeyPatch
-) -> None:
+@pytest.fixture
+def tls(tmp_path: Path) -> tuple[ssl.SSLContext, str]:
+    """A server's TLS context, with a self-signed certificate, and the pin for it."""
+    if shutil.which("openssl") is None:
+        pytest.skip("needs openssl")
     key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt"]
@@ -1115,11 +1131,49 @@ async def test_only_the_pinned_certificate_is_trusted(
     )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
+    der = ssl.PEM_cert_to_DER_cert(cert.read_text())
+    return context, hashlib.sha256(der).hexdigest()
+
+
+async def test_only_the_pinned_certificate_is_trusted(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    context, pin = tls
     server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
-    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
 
     with pytest.raises(execd.NotOurDaemon):
-        await execd._connect(execd.Daemon("127.0.0.1", "0" * 64, b"key"))
-    await (await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"))).close()
+        await execd._connect(execd.Daemon("127.0.0.1", "0" * 64, b"key"), execd.Pace())
+    pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
+    await pipe.close()
+    server.close()
+
+
+async def test_what_tls_records_cost_is_paced(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    context, pin = tls
+    monkeypatch.setattr(execd, "PACE_OVERHEAD", 2048)
+    monkeypatch.setattr(execd, "RAW_READ", 512)  # so no batch is near the allowance
+
+    async def tiny_records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        out = frame(execd.STDOUT, call_id, b"x" * 200)
+        for byte in out + frame(execd.EXIT, call_id, b'{"code": 0}'):
+            w.write(bytes([byte]))  # a record each: 22 bytes that aren't plaintext
+        await r.read()
+
+    server = await asyncio.start_server(tiny_records, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    began = time.monotonic()
+    await execd.ExecdClient(start).exec(["yes"], None, None, {}, None, 30)
+
+    # Over twice the second's allowance, so two waits; unpaced, it takes milliseconds.
+    assert time.monotonic() - began >= 2
     server.close()
