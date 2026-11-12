@@ -35,6 +35,7 @@ from k8s_sandbox._logger import (
     log_trace,
 )
 from k8s_sandbox._pod import Pod
+from k8s_sandbox._pod.execd import ANNOTATION as EXECD_ANNOTATION
 from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
@@ -328,6 +329,7 @@ class Release:
                 pod.uid,
                 pod.restart_count_for(default_container_name),
                 self.restarted_container_behavior,
+                execd=pod.annotations.get(EXECD_ANNOTATION) == "true",
             )
         return sandboxes
 

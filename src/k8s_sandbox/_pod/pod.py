@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import os
 import threading
@@ -10,6 +11,7 @@ from typing import IO, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
+from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
     ContainerStoppedError,
@@ -17,10 +19,19 @@ from k8s_sandbox._pod.error import (
     PodError,
     PodReplacedError,
 )
+from k8s_sandbox._pod.execd import (
+    EXECD_PATH,
+    EXECD_PORT,
+    Daemon,
+    DaemonRunning,
+    ExecdClient,
+    ExecdStream,
+)
 from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
 from k8s_sandbox._pod.executor import PodOpExecutor
-from k8s_sandbox._pod.op import PodInfo, check_for_pod_restart
+from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
+from k8s_sandbox._pod.snapshot import read_pod
 from k8s_sandbox._pod.write import WriteFileOperation
 
 T = TypeVar("T")
@@ -47,6 +58,7 @@ class Pod:
         uid: str,
         initial_restart_count: int,
         restarted_container_behavior: Literal["warn", "raise"],
+        execd: bool = False,
     ) -> None:
         self._info = PodInfo(
             name,
@@ -63,6 +75,39 @@ class Pod:
         # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
         self._restart_lock = threading.Lock()
+        # Operations go over the pod network to execd, if the pod has it (see execd.py).
+        self._execd = ExecdClient(self._start_execd) if execd else None
+
+    async def _start_execd(self) -> Daemon:
+        """Start execd in the container with one exec that carries no stdin.
+
+        A container restart or pod replacement is checked for here, not before each
+        operation: either one stops the daemon, so it always comes through here.
+        """
+        await self.check_for_pod_restart()
+        key = os.urandom(32)
+        cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
+        cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+        info = self._info
+        result = await self._run_async(
+            lambda: ExecuteOperation(info).exec(cmd, None, None, {}, None, 60)
+        )
+        if "address already in use" in result.stderr:
+            raise DaemonRunning(result.stderr)
+        if not result.success or len(result.stdout.split()) != 2:
+            raise PodError(
+                "execd did not start",
+                returncode=result.returncode,
+                stderr=result.stderr,
+            )
+        fingerprint = result.stdout.split()[1]
+        api = k8s_client(info.context_name)
+        pod = await self._run_async(
+            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+        )
+        if pod.ip is None:
+            raise PodError("The pod has no IP address for execd", pod=info.name)
+        return Daemon(pod.ip, fingerprint, key)
 
     @property
     def info(self) -> PodInfo:
@@ -170,6 +215,8 @@ class Pod:
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd.
         """
+        if self._execd is not None:
+            return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
@@ -209,7 +256,9 @@ class Pod:
             await self._diagnose_restart_after_failure()
         return result
 
-    async def exec_stdio(self, cmd: list[str], user: str | None) -> PodStdio:
+    async def exec_stdio(
+        self, cmd: list[str], user: str | None
+    ) -> PodStdio | ExecdStream:
         """Start a command as exec() would, and join a stream to its stdin and stdout.
 
         Closing the stream ends the command's stdin and stdout. Until then the stream
@@ -222,6 +271,8 @@ class Pod:
         not exit 255 itself once it has written. A stream open when a restart is found
         drops, as one whose connection was lost.
         """
+        if self._execd is not None:
+            return await self._execd.open_stream(cmd, user)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
         stack, ws_client = await self._run_async(
@@ -267,6 +318,8 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
+        if self._execd is not None:
+            return await self._execd.write_file(data, dst)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
@@ -284,6 +337,8 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
+        if self._execd is not None:
+            return await self._execd.read_file(src, dst)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)

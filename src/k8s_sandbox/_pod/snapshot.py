@@ -22,7 +22,7 @@ snake_case attributes on the generated model classes.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from kubernetes import client  # type: ignore
@@ -61,6 +61,9 @@ class PodSnapshot:
     """``status.phase``: Pending, Running, Succeeded, Failed or Unknown."""
     ready: bool = False
     """``status.conditions[type=Ready]`` is True, which is what Helm's wait checks."""
+    ip: str | None = None
+    """``status.podIP``."""
+    annotations: dict[str, str] = field(default_factory=dict)
 
     def status_for(self, container_name: str) -> ContainerStatus | None:
         if self.container_statuses is None:
@@ -156,6 +159,8 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
         ready=any(
             c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         ),
+        ip=status.get("podIP"),
+        annotations=metadata.get("annotations") or {},
     )
 
 
