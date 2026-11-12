@@ -65,8 +65,7 @@ PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
 PACE_TLS = 0.1  # CPU seconds in TLS: tiny records and messages cost more than bytes
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
-SMALL_READ = 16 << 10  # each read under it spends a token: trickles can't spin the loop
-SMALL_READS = 8  # tokens, and one more each millisecond
+SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -169,7 +168,7 @@ class _Pipe:
             self._transport.pause_reading()
         if not raw:
             raise ConnectionResetError("execd closed the connection")
-        if len(raw) < SMALL_READ:
+        if len(raw) < RAW_READ:  # bytes come slower than they're read: wait for more
             burst = time.monotonic() - SMALL_READS / 1000
             self._small_at = max(self._small_at, burst) + 0.001
         return raw

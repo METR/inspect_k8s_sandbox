@@ -1112,10 +1112,10 @@ async def test_a_trickle_of_small_reads_waits_its_turn() -> None:
         pause_reading=lambda: reading.append(False),
     )
 
-    class Trickle:  # a peer sending a byte at a time
+    class Trickle:  # a peer sending less than a read takes
         async def read(self, n: int) -> bytes:
             assert reading[-1], "read while paused"
-            return b"x"
+            return b"x" * (n // 2)
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
