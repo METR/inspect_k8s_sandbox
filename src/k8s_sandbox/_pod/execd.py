@@ -59,12 +59,6 @@ class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
 
 
-def _port_held() -> RuntimeError:
-    return RuntimeError(
-        f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
-    )
-
-
 class NotOurDaemon(ConnectionRefusedError):
     """The server on the port isn't the daemon this client started."""
 
@@ -99,6 +93,8 @@ class _Conn:
         self._reads = self._records = self._frames = 0
         self._header = b""  # the start of a TLS record's header, cut by a read's end
         self._body = 0  # how much of a TLS record the next reads hold
+        self.pinned = False  # whether its certificate is the daemon's
+        self._plain = bytearray()  # decrypted, and not yet a whole frame
 
     async def handshake(self) -> None:
         while True:
@@ -111,37 +107,42 @@ class _Conn:
         await self._flush()
 
     async def send(self, kind: int, payload: bytes = b"") -> None:
+        if self._client.broken:
+            raise NotExecd(self._client.broken)
         self.tls.write(HEADER.pack(kind, len(payload)) + payload)
         await self._flush()
 
     async def frame(self) -> tuple[int, bytes]:
         """Read the next frame; one execd would not send breaks the client."""
         while True:
-            kind, n = HEADER.unpack(await self._read(HEADER.size))
-            self._frames += 1
+            if self._client.broken:
+                raise NotExecd(self._client.broken)
+            await self._hold(HEADER.size)
+            kind, n = HEADER.unpack_from(self._plain)
             if n > MOST.get(kind, -1):
                 raise self._broken(f"a frame of type {kind} and {n} bytes")
-            payload = await self._read(n)
+            await self._hold(HEADER.size + n)
+            payload = bytes(self._plain[HEADER.size : HEADER.size + n])
+            del self._plain[: HEADER.size + n]
+            self._frames += 1
             if kind != PING:
                 return kind, payload
 
-    async def _read(self, n: int) -> bytes:
-        data = bytearray()
-        while len(data) < n:
+    async def _hold(self, n: int) -> None:
+        """Decrypt until N bytes are held; a wait that is cancelled loses none."""
+        while len(self._plain) < n:
             try:
-                piece = self.tls.read(n - len(data))  # a record at a time
+                piece = self.tls.read(n - len(self._plain))  # a record at a time
             except ssl.SSLWantReadError:
                 await self._fill()
                 continue
             if not piece:
                 raise ConnectionResetError("execd ended the TLS session")
-            data += piece
-        return bytes(data)
+            self._plain += piece
 
     async def _fill(self) -> None:
         """Give TLS more of what the peer sent, if it is still within execd's bounds."""
-        # A stream sends a full frame, or one a millisecond; a frame is a TLS record, or
-        # one per 16 KiB, and as many reads. Ten times that is not execd.
+        # Ten times execd's most: two frames a millisecond, and what full ones carry.
         spare = 10 * (64 + 2000 * (time.monotonic() - self._opened))
         for count, unit, what in (
             (self._frames, CHUNK, "frames"),
@@ -172,8 +173,10 @@ class _Conn:
         self._in.write(raw)
         await asyncio.sleep(0)  # so other work runs between reads
 
-    def _broken(self, what: str) -> NotExecd:
+    def _broken(self, what: str) -> Exception:
         self.close()
+        if not self.pinned:  # anyone can answer on the port: only our daemon is trusted
+            return NotOurDaemon(f"the server on the execd port sent {what}")
         self._client.broken = (
             f"The server on the sandbox's execd port is not execd: it sent {what}. "
             "Its sandbox can no longer be used."
@@ -205,13 +208,12 @@ async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
         conn.close()
         # Not the daemon this client started, so it gets no key: start another.
         raise NotOurDaemon("the server on the execd port is not our daemon")
+    conn.pinned = True
     return conn
 
 
-async def _upload(conn: _Conn, stdin: bytes | None) -> None:
-    if stdin is None:
-        return
-    with contextlib.suppress(OSError):  # the reader sees a lost connection
+async def _upload(conn: _Conn, stdin: bytes) -> None:
+    with contextlib.suppress(OSError, NotExecd):  # the reader sees either
         for i in range(0, len(stdin), CHUNK):
             await conn.send(STDIN, stdin[i : i + CHUNK])
             await asyncio.sleep(0)  # so other work runs between chunks
@@ -266,7 +268,10 @@ class ExecdClient:
                     self._daemon = await self._start(replace)
                 except DaemonRunning as e:
                     if replace:  # even past --replace: not execd
-                        raise _port_held() from e
+                        raise RuntimeError(
+                            f"TCP port {EXECD_PORT} in the sandbox is held by a "
+                            "process other than execd"
+                        ) from e
                     raise ConnectionError(f"execd unreachable: {why!r}") from e
             assert self._daemon is not None
             return self._daemon
@@ -294,14 +299,17 @@ class ExecdClient:
         sender: asyncio.Task[None] | None = None
         try:
             await conn.send(START, json.dumps(request).encode())
-            sender = asyncio.create_task(_upload(conn, stdin))
+            if stdin is not None:
+                sender = asyncio.create_task(_upload(conn, stdin))
             # Only for an execd that doesn't end the command at its timeout.
-            end = None if timeout is None else time.monotonic() + timeout + KILL_WAIT
+            end = time.monotonic() + timeout + KILL_WAIT if timeout else None
             while True:
                 left = None if end is None else max(0.0, end - time.monotonic())
                 kind, payload = await asyncio.wait_for(conn.frame(), left)
                 if kind == EXIT:
-                    yield EXIT, json.loads(payload)  # {"code": n[, "error"|"timeout"]}
+                    status = json.loads(payload)  # {"code": n[, "error"|"timeout"]}
+                    status["code"] = int(status["code"])
+                    yield EXIT, status
                     return
                 yield kind, payload
         except asyncio.TimeoutError as e:  # the builtin one, also on Python 3.10
@@ -345,7 +353,7 @@ class ExecdClient:
                     )
         if status.get("timeout"):
             raise TimeoutError(f"Command timed out after {timeout}s.")
-        code = int(status["code"])
+        code = status["code"]
         result = ExecResult(
             success=code == 0,
             returncode=code,
@@ -413,7 +421,7 @@ class ExecdClient:
             async with contextlib.aclosing(run) as chunks:
                 async for kind, payload in chunks:
                     if kind == EXIT:
-                        return int(payload["code"])
+                        return payload["code"]
                     if kind == STDERR:
                         stderr.append(payload)
                     elif dst is not None and start is not None:
@@ -470,8 +478,10 @@ class ExecdStream(ByteStream):
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
+        if self._closed:
+            raise anyio.ClosedResourceError
         while not self._stdout:
-            if self._closed:
+            if self._closed:  # while it waited
                 raise anyio.ClosedResourceError
             if self._ended is not None:
                 raise self._ended

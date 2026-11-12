@@ -209,10 +209,12 @@ class Pod:
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd. On a pod with execd, cmd's
-            process group gets SIGKILL instead, as does a process that left the group
-            but runs as execd's user with the environment cmd gave it.
+            process group gets SIGKILL instead. A process that left the group gets it
+            too, unless it cleared its environment or execd can't read it: it runs as
+            another user, or made itself non-dumpable.
         """
         if self._execd is not None:
+            self._raise_restart()
             try:
                 return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
             except ExecResultUnknownError:
@@ -275,6 +277,7 @@ class Pod:
         drops, as one whose connection was lost.
         """
         if self._execd is not None:
+            self._raise_restart()
             return await self._execd.open_stream(cmd, user)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
@@ -322,6 +325,7 @@ class Pod:
             resolved relative to the pod's default working directory.
         """
         if self._execd is not None:
+            self._raise_restart()
             return await self._execd.write_file(data, dst)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
@@ -341,6 +345,7 @@ class Pod:
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
         if self._execd is not None:
+            self._raise_restart()
             return await self._execd.read_file(src, dst)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
