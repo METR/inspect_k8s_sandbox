@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, cast
 
 import anyio
 from anyio.abc import ByteStream
@@ -63,8 +63,10 @@ STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # the runner's loop. execd sends output in reads of up to 256 KiB.
 PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
-PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes
+PACE_TLS = 0.1  # CPU seconds in TLS: tiny records and messages cost more than bytes
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
+SMALL_READ = 16 << 10  # each read under it spends a token: trickles can't spin the loop
+SMALL_READS = 8  # tokens, and one more each millisecond
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -118,6 +120,9 @@ class _Pipe:
         self.tls = context.wrap_bio(self._in, self._out)
         self._pace = pace
         self._plain = bytearray()
+        self._small_at = float("-inf")  # when the next small read may start
+        self._transport = cast(asyncio.Transport, writer.transport)  # TCP: it reads too
+        self._transport.pause_reading()  # read only while a pass waits for bytes
 
     async def handshake(self) -> None:
         while True:
@@ -153,12 +158,20 @@ class _Pipe:
 
     async def _charge(self, began: float) -> None:
         await self._pace.take(0, frames=0, tls=time.thread_time() - began)
-        await asyncio.sleep(0)  # a pass at a time, so other work runs in between
 
     async def _raw(self) -> bytes:
-        raw = await self._reader.read(RAW_READ)
+        if (wait := self._small_at - time.monotonic()) > 0:
+            await asyncio.sleep(wait)
+        self._transport.resume_reading()
+        try:
+            raw = await self._reader.read(RAW_READ)
+        finally:
+            self._transport.pause_reading()
         if not raw:
             raise ConnectionResetError("execd closed the connection")
+        if len(raw) < SMALL_READ:
+            burst = time.monotonic() - SMALL_READS / 1000
+            self._small_at = max(self._small_at, burst) + 0.001
         return raw
 
     async def _flush(self) -> None:
@@ -250,6 +263,8 @@ class Pace:
         self.tls += tls
         if self.frames > PACE_FRAMES or self.size > PACE_BYTES or self.tls > PACE_TLS:
             await asyncio.sleep(self.since + 1.0 - now)
+        else:
+            await asyncio.sleep(0)  # so other work runs between passes
 
 
 class Link:

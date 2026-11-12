@@ -1096,6 +1096,44 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
+async def test_pacing_lets_other_work_run() -> None:
+    ran = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ran.set)
+
+    await execd.Pace().take(1)
+
+    assert ran.is_set()  # under its allowance too: a pass at a time
+
+
+async def test_a_trickle_of_small_reads_waits_its_turn() -> None:
+    reading: list[bool] = []
+    transport = types.SimpleNamespace(
+        resume_reading=lambda: reading.append(True),
+        pause_reading=lambda: reading.append(False),
+    )
+
+    class Trickle:  # a peer sending a byte at a time
+        async def read(self, n: int) -> bytes:
+            assert reading[-1], "read while paused"
+            return b"x"
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    pipe = execd._Pipe(
+        Trickle(),  # type: ignore[arg-type]
+        types.SimpleNamespace(transport=transport),  # type: ignore[arg-type]
+        context,
+        execd.Pace(),
+    )
+    began = time.monotonic()
+
+    for _ in range(execd.SMALL_READS + 20):
+        await pipe._raw()
+
+    assert time.monotonic() - began >= 0.015  # past the burst, one a millisecond
+    assert not reading[-1]  # between reads, bytes wait in the kernel
+
+
 @pytest.fixture
 def tls(tmp_path: Path) -> tuple[ssl.SSLContext, str]:
     """A server's TLS context, with a self-signed certificate, and the pin for it."""
