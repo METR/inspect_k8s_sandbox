@@ -298,6 +298,42 @@ func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
 	}
 }
 
+func TestALostConnectionKillsAProcessInsideExecve(t *testing.T) {
+	// Eight that left the group and exec without end: while one does, /proc shows it no environment.
+	script := `for i in 1 2 3 4 5 6 7 8; do setsid sh -c 'echo $$; eval "$AGAIN"' & done; cat`
+	req := startRequest{Argv: []string{"sh", "-c", script}, Env: map[string]string{"AGAIN": `exec sh -c "$AGAIN"`}, Stdin: true}
+	for range 30 {
+		client, frames := begin(t, testServer(), req)
+		started := pids(t, frames, 8)
+
+		client.Close()
+
+		for _, pid := range started {
+			until(t, "a process inside execve outlived the call's connection", func() bool { return gone(pid) })
+		}
+	}
+}
+
+func TestATimeoutKillsWhatAProcessOutsideTheGroupForksMeanwhile(t *testing.T) {
+	// One that left the group forks without pause, so some start while execd looks through /proc.
+	script := `setsid sh -c 'while :; do sleep 100 >/dev/null 2>&1 & echo $!; done' & cat`
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script}, Stdin: true, Timeout: 0.1})
+	var out []byte
+	for f := range frames {
+		if f.kind == fExit {
+			break
+		}
+		out = append(out, f.payload...)
+	}
+
+	for _, line := range strings.Fields(string(out)) {
+		var pid int
+		fmt.Sscan(line, &pid)
+		t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+		until(t, "a process forked during the kill outlived the timeout", func() bool { return gone(pid) })
+	}
+}
+
 func TestStdinACommandDoesNotReadWaitsInTheConnection(t *testing.T) {
 	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 100"}, Stdin: true})
 	pids(t, frames, 1)

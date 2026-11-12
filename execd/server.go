@@ -427,17 +427,32 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 
 // killTagged SIGKILLs every process whose environment holds EXECD_CALL=<tag>, even after setsid.
 func killTagged(tag string) {
-	needle := []byte("EXECD_CALL=" + tag + "\x00")
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
+	needle := "EXECD_CALL=" + tag + "\x00"
+	// One look misses a process inside execve, which shows no environment yet, and one forked meanwhile.
+	for range 100 {
+		again := false
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == os.Getpid() {
+				continue
+			}
+			data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
+			if err != nil {
+				continue
+			}
+			if len(data) == 0 {
+				_, err := os.Readlink("/proc/" + e.Name() + "/exe") // a zombie has none
+				again = again || err == nil
+			} else if strings.Contains(string(data)+"\x00", needle) {
+				syscall.Kill(pid, syscall.SIGKILL)
+				again = true
+			}
 		}
-		data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
-		if err == nil && strings.Contains(string(data)+"\x00", string(needle)) {
-			syscall.Kill(pid, syscall.SIGKILL)
+		if !again {
+			return
 		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
