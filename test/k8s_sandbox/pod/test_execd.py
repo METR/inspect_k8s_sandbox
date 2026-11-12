@@ -759,21 +759,46 @@ async def test_a_command_times_out_while_its_daemon_is_restarted(
 
 
 async def test_stdin_acks_that_report_progress_keep_the_connection(
-    daemons: Daemons,
+    daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
-    async def acks(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY", 100)
+
+    async def acks_each(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        for put in range(1, execd.MAX_STRAY + 2):
+        got = 0
+        while True:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN:
+                got += len(payload)
+                put = json.dumps({"stdin": got}).encode()
+                w.write(frame(execd.STDIN_ACK, call_id, put))
+
+    await daemons.serve(acks_each)
+    stream = await daemons.client().open_stream(["cat"], None)
+    for _ in range(execd.MAX_STRAY + 1):
+        await stream.send(b"x")
+    await until(lambda: stream._call.stdin_put == execd.MAX_STRAY + 1)
+
+    assert not stream._link.closed
+
+
+async def test_stdin_acks_beyond_what_was_sent_count_as_stray(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY", 100)
+
+    async def overclaims(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        for put in range(1, execd.MAX_STRAY + 2):  # nothing was sent
             w.write(
                 frame(execd.STDIN_ACK, call_id, json.dumps({"stdin": put}).encode())
             )
         await r.read()
 
-    await daemons.serve(acks)
+    await daemons.serve(overclaims)
     stream = await daemons.client().open_stream(["cat"], None)
-    await until(lambda: stream._call.stdin_put == execd.MAX_STRAY + 1)
 
-    assert not stream._link.closed
+    await until(lambda: stream._link.closed)
 
 
 async def test_a_stream_refuses_input_once_its_command_exits(daemons: Daemons) -> None:

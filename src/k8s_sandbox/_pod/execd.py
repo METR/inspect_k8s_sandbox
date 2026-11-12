@@ -130,6 +130,7 @@ class Call:
     taken: list[int] = field(default_factory=lambda: [0, 0])  # by the caller
     acked: int = 0
     stdin_put: int = 0  # stdin execd has written to the process
+    stdin_sent: int = 0  # stdin sent to execd: more can't have been written
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
     closed: bool = False  # by its caller
     exited: bool = False
@@ -184,7 +185,11 @@ class Link:
                 put = json.loads(payload)["stdin"] if kind == STDIN_ACK else 0
                 if kind == OK and not self.ready.done():
                     self.ready.set_result(None)
-                elif kind == STDIN_ACK and c is not None and put > c.stdin_put:
+                elif (
+                    kind == STDIN_ACK
+                    and c is not None
+                    and c.stdin_put < put <= c.stdin_sent
+                ):
                     c.stdin_put = put
                     c.stdin_room.set()
                 elif c is not None and kind not in (PONG, STDIN_ACK):
@@ -412,6 +417,7 @@ class ExecdClient:
             for i in range(offset, len(stdin), CHUNK):
                 await _window(link, call, i)
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
+                call.stdin_sent = max(call.stdin_sent, i + len(stdin[i : i + CHUNK]))
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
     async def _kill(self, link: Link, call: Call) -> None:
@@ -660,6 +666,7 @@ class ExecdStream(ByteStream):
                     await _window(self._link, self._call, self._sent)
                     await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
                     self._sent += len(item[i : i + CHUNK])
+                    self._call.stdin_sent = self._sent
             except OSError as e:
                 raise anyio.BrokenResourceError(repr(e)) from e
 
