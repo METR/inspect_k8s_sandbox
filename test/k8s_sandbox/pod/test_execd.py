@@ -1158,10 +1158,12 @@ async def test_what_a_pass_delivers_pays_for_its_decryption(
     monkeypatch.setattr(execd.time, "thread_time", lambda: 1.0)
     monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
 
-    await pipe._charge(0.0, delivered=2 * 10**9)  # a second of CPU: plain decryption
+    # Plain decryption, finishing a record the last pass began: no credit carried over.
+    await pipe._charge(0.0, delivered=2 * 10**9, used=10**9)
     await pipe._charge(0.0)  # a second of CPU for nothing delivered
+    await pipe._charge(1.0, used=10**9)  # no CPU, but a GB of padding
 
-    assert pace.tls == 1.0
+    assert pace.tls == 2.0
 
 
 @pytest.fixture

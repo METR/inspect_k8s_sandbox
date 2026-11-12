@@ -126,12 +126,12 @@ class _Pipe:
 
     async def handshake(self) -> None:
         while True:
-            began = time.thread_time()
+            began, held = time.thread_time(), self._in.pending
             try:
                 self.tls.do_handshake()
                 break
             except ssl.SSLWantReadError:
-                await self._charge(began)
+                await self._charge(began, used=held - self._in.pending)
                 await self._flush()
                 self._in.write(await self._raw())
         await self._flush()
@@ -143,7 +143,7 @@ class _Pipe:
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
             raw = await self._raw()
-            began, had = time.thread_time(), len(self._plain)
+            began, had, held = time.thread_time(), len(self._plain), self._in.pending
             self._in.write(raw)
             with contextlib.suppress(ssl.SSLWantReadError):
                 while True:
@@ -151,14 +151,16 @@ class _Pipe:
                     if not chunk:
                         raise ConnectionResetError("execd ended the TLS session")
                     self._plain += chunk
-            await self._charge(began, len(self._plain) - had)
+            used = held + len(raw) - self._in.pending  # TCP bytes this pass took
+            await self._charge(began, len(self._plain) - had, used)
         data = bytes(self._plain[:n])
         del self._plain[:n]
         return data
 
-    async def _charge(self, began: float, delivered: int = 0) -> None:
+    async def _charge(self, began: float, delivered: int = 0, used: int = 0) -> None:
         spent = time.thread_time() - began - delivered * TLS_PER_BYTE
-        await self._pace.take(0, frames=0, tls=max(spent, 0.0))
+        padding = (used - delivered) * TLS_PER_BYTE  # bytes that delivered nothing
+        await self._pace.take(0, frames=0, tls=max(spent, padding, 0.0))
 
     async def _raw(self) -> bytes:
         if (wait := self._small_at - time.monotonic()) > 0:
