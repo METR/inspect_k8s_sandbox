@@ -23,7 +23,7 @@ import (
 
 const foregroundEnv = "HN_EXECD_FOREGROUND"
 
-// Before main, and so before --replace scans /proc: the sandbox can't reopen its stdout.
+// As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
 func init() { prctl(prSetDumpable, 0) }
 
 func main() {

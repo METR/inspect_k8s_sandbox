@@ -6,8 +6,12 @@
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
   TLS to execd instead of Kubernetes exec stdin. There, a timed-out `exec()` and its
-  background processes get SIGKILL at once, not SIGTERM. Without `CAP_SYS_PTRACE`, a
-  command run as another `user` keeps those it moved to a new session.
+  background processes get SIGKILL at once, not SIGTERM. One that leaves the command's
+  process group survives if it clears its environment or, without `CAP_SYS_PTRACE`,
+  runs as another `user`. Make execd mode 111, and give the sandbox neither
+  `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`, or a process running as execd's user
+  can stand in for it while it starts. What a pod's execd sends is paced at 4,096
+  frames and 128 MiB a second.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

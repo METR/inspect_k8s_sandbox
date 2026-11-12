@@ -707,6 +707,31 @@ async def test_frames_a_call_does_not_use_count_as_stray(
     await until(lambda: stream._link.closed)
 
 
+@pytest.mark.parametrize(
+    ("limit", "value", "payload"),
+    [("PACE_FRAMES", 50, b"x"), ("PACE_BYTES", 50 << 10, b"x" * (1 << 10))],
+    ids=["frames", "bytes"],
+)
+async def test_what_a_pod_delivers_is_paced(
+    daemons: Daemons, monkeypatch: MonkeyPatch, limit: str, value: int, payload: bytes
+) -> None:
+    monkeypatch.setattr(execd, limit, value)
+
+    async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, payload) * 150)
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(floods)
+    start = time.monotonic()
+
+    await daemons.client().exec(["yes"], None, None, {}, None, 30)
+
+    # Three times the second's allowance, so two waits; unpaced, it takes milliseconds.
+    assert time.monotonic() - start >= 2
+
+
 async def test_the_stray_count_spans_reconnects(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:

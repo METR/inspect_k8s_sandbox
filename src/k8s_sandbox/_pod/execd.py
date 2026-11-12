@@ -58,6 +58,10 @@ MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 4 * HOLD  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
+# What a pod delivers per second: past either, reading waits, so a stand-in can't hold
+# the runner's loop. execd sends output in reads of up to 256 KiB.
+PACE_FRAMES = 4096
+PACE_BYTES = 128 << 20
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -163,13 +167,32 @@ class Strays:
         return self.frames > MAX_STRAY or self.size > MAX_STRAY_BYTES
 
 
+@dataclass
+class Pace:
+    """Frames a pod delivered for its calls this second, and their bytes."""
+
+    since: float = float("-inf")
+    frames: int = 0
+    size: int = 0
+
+    async def take(self, n: int) -> None:
+        now = time.monotonic()
+        if now - self.since >= 1.0:
+            self.since, self.frames, self.size = now, 0, 0
+        self.frames += 1
+        self.size += n
+        if self.frames > PACE_FRAMES or self.size > PACE_BYTES:
+            await asyncio.sleep(self.since + 1.0 - now)
+
+
 class Link:
     """One authenticated connection; a reader task routes frames to calls by id."""
 
-    def __init__(self, pipe: _Pipe, daemon: Daemon, strays: Strays) -> None:
+    def __init__(self, pipe: _Pipe, daemon: Daemon, strays: Strays, pace: Pace) -> None:
         self.pipe = pipe
         self.daemon = daemon
         self.strays = strays
+        self.pace = pace
         self.calls: dict[int, Call] = {}
         self.closed = False
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -215,6 +238,7 @@ class Link:
                     and c is not None
                     and c.stdin_put < put <= c.stdin_sent
                 ):
+                    await self.pace.take(n)
                     c.stdin_put = put
                     c.stdin_room.set()
                 elif c is not None and (
@@ -222,6 +246,7 @@ class Link:
                     or (kind in (STDOUT, STDERR) and n)
                     or (kind == RESUMED and c.resuming)
                 ):
+                    await self.pace.take(n)
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
@@ -232,9 +257,7 @@ class Link:
                     if kind == RESUMED:
                         c.resuming = False
                     c.queue.put_nowait((kind, payload))
-                elif self.strays.over(
-                    n
-                ):  # a pong, a repeated ack, anything else unused
+                elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
         except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
@@ -280,6 +303,7 @@ class ExecdClient:
         self._link: Link | None = None
         self._opening: asyncio.Future[Link] | None = None  # one at a time, shared
         self._strays = Strays()
+        self._pace = Pace()
         self._opened = float("-inf")
         self._backoff = 0.0
 
@@ -299,7 +323,7 @@ class ExecdClient:
                     except DaemonRunning as e:  # even past --replace: not execd
                         raise _port_held() from e
                 daemon = self._daemon
-                link = Link(await _connect(daemon), daemon, self._strays)
+                link = Link(await _connect(daemon), daemon, self._strays, self._pace)
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
