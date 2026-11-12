@@ -105,8 +105,33 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
     await asyncio.wait_for(flooded.wait(), 30)
     await until(lambda: stream._link.closed)
 
-    assert held(stream) <= execd.HOLD
+    assert held(stream) <= 2 * (execd.STREAM_WINDOW + execd.CHUNK)
     assert stream._link.closed
+
+
+async def test_a_stream_acks_what_its_reader_takes(daemons: Daemons) -> None:
+    acked = asyncio.Event()
+
+    async def waits_for_an_ack(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        piece = frame(execd.STDOUT, call_id, b"x" * (64 << 10))
+        w.write(
+            piece * (execd.STREAM_WINDOW // (64 << 10))
+        )  # execd's window, then it waits
+        while (await read_frame(r))[0] != execd.ACK:
+            pass
+        acked.set()
+        await r.read()
+
+    await daemons.serve(waits_for_an_ack)
+    stream = await daemons.client().open_stream(["cat"], None)
+    got = 0
+    while got < execd.STREAM_WINDOW:
+        got += len(await stream.receive())
+
+    await asyncio.wait_for(acked.wait(), 10)
 
 
 async def test_send_waiting_for_room_fails_when_the_connection_closes(
@@ -556,6 +581,59 @@ async def test_a_stream_cancelled_as_it_starts_is_killed(
     with pytest.raises(asyncio.CancelledError):
         await daemons.client().open_stream(["cat"], None)
     await until(lambda: execd.KILL in got)
+
+
+async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
+    async def pongs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write(frame(execd.PONG, 0) * (execd.MAX_STRAY + 1))
+        await r.read()
+
+    await daemons.serve(pongs)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    await until(lambda: stream._link.closed)
+
+
+async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind != execd.START:
+                continue
+            w.write(frame(execd.STDERR, call_id, b"execd: unknown user nobody2\n"))
+            if json.loads(payload)["user"]:  # execd couldn't start it
+                status = b'{"code": 126, "error": "unknown user nobody2"}'
+            else:  # a command printing the same
+                status = b'{"code": 0}'
+            w.write(frame(execd.EXIT, call_id, status))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+
+    assert (await client.exec(["sh"], None, None, {}, None, 30)).success
+    with pytest.raises(RuntimeError, match="does not appear to exist"):
+        await client.exec(["true"], None, None, {}, "nobody2", 30)
+
+
+async def test_the_timeout_runs_from_the_start_of_the_command(
+    daemons: Daemons,
+) -> None:
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(exits)
+    client = daemons.client()
+    start = client._start
+
+    async def slow_start(replace: bool) -> execd.Daemon:
+        await asyncio.sleep(1.5)
+        return await start(replace)
+
+    client._start = slow_start
+
+    assert (await client.exec(["true"], None, None, {}, None, 1)).success
 
 
 async def test_unasked_unknown_call_errors_start_nothing_again(

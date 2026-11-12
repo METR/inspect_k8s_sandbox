@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -54,7 +55,8 @@ type call struct {
 	gone     bool // released: drop any further output
 	exited   bool
 	code     int
-	sub      *conn // the connection streaming this call, if any
+	startErr string // why the command never started, if it didn't
+	sub      *conn  // the connection streaming this call, if any
 }
 
 type conn struct {
@@ -112,11 +114,19 @@ func (s *server) serve(l net.Listener) {
 	}
 }
 
-// fromThisPod says whether a connection comes from the pod itself: loopback, or its own address.
+// fromThisPod says whether a connection comes from the pod itself: from loopback or any of its addresses.
 func fromThisPod(nc net.Conn) bool {
-	remote, rOK := nc.RemoteAddr().(*net.TCPAddr)
-	local, lOK := nc.LocalAddr().(*net.TCPAddr)
-	return rOK && lOK && (remote.IP.IsLoopback() || remote.IP.Equal(local.IP))
+	remote, ok := nc.RemoteAddr().(*net.TCPAddr)
+	if !ok || remote.IP.IsLoopback() {
+		return ok
+	}
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(remote.IP) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) handle(c *conn) {
@@ -241,11 +251,13 @@ func (s *server) start(c *conn, f frame) {
 	if err := cl.run(req); err != nil {
 		// Report like a shell would: the message on stderr and 126 or 127 as the exit code.
 		code := 126
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+		if strings.HasPrefix(err.Error(), "cd: ") {
+			code = 1
+		} else if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
 			code = 127
 		}
 		cl.output(1, []byte("execd: "+err.Error()+"\n"))
-		cl.finish(code)
+		cl.finish(code, err.Error()) // out of band too: the command's own stderr can't fake it
 	}
 }
 
@@ -285,6 +297,9 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
+	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
+		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
+	}
 	env := childEnv(req.Env)
 	argv0, err := lookPath(req.Argv[0], env, req.Cwd)
 	if err != nil {
@@ -314,7 +329,9 @@ func (cl *call) run(req startRequest) error {
 	}
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
+	cl.mu.Lock()
 	cl.pid = p.Pid // before Release, which sets it to -1
+	cl.mu.Unlock()
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 {
@@ -346,6 +363,9 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		code := <-exited
+		cl.mu.Lock()
+		cl.pid = 0 // reaped: its id may now be another group's
+		cl.mu.Unlock()
 		if deadline != nil {
 			deadline.Stop()
 		}
@@ -361,7 +381,7 @@ func (cl *call) run(req startRequest) error {
 		for {
 			select {
 			case <-done:
-				cl.finish(code)
+				cl.finish(code, "")
 				return
 			case <-time.After(10 * time.Millisecond):
 			}
@@ -373,7 +393,7 @@ func (cl *call) run(req startRequest) error {
 				outR.SetReadDeadline(time.Now())
 				errR.SetReadDeadline(time.Now())
 				<-done
-				cl.finish(code)
+				cl.finish(code, "")
 				return
 			}
 		}
@@ -443,13 +463,18 @@ func (cl *call) feedStdin(w *os.File) {
 	}
 }
 
-// maxUnacked bounds one stream's unacked output; past it, reading the pipe waits for acks.
-const maxUnacked = 32 << 20
+// Unacked output per stdout or stderr; past it, reading the pipe waits for acks. A
+// stream's is small: its reader takes output only as it needs it.
+const maxUnacked, streamUnacked = 32 << 20, 1 << 20
 
 func (cl *call) output(stream int, data []byte) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	for len(cl.out[stream]) > maxUnacked && !cl.gone {
+	limit := maxUnacked
+	if cl.stream {
+		limit = streamUnacked
+	}
+	for len(cl.out[stream]) > limit && !cl.gone {
 		cl.room.Wait()
 	}
 	if cl.gone {
@@ -479,18 +504,18 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
 	cl.mu.Lock()
-	leader := cl.pid > 0 && !cl.exited // after the exit, its id may be another group's
+	pid := cl.pid
 	cl.mu.Unlock()
-	if leader { // and 0, never started, would be -0: execd's own group
-		syscall.Kill(-cl.pid, syscall.SIGKILL)
+	if pid > 0 { // 0, not started or reaped, would be -0: execd's own group
+		syscall.Kill(-pid, syscall.SIGKILL)
 	}
 	killTagged(cl.tag)
 }
 
-func (cl *call) finish(code int) {
+func (cl *call) finish(code int, startErr string) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	cl.exited, cl.code = true, code
+	cl.exited, cl.code, cl.startErr = true, code, startErr
 	cl.room.Broadcast()
 	cl.flush()
 }
@@ -509,7 +534,10 @@ func (cl *call) flush() {
 		}
 	}
 	if cl.exited {
-		b, _ := json.Marshal(map[string]int{"code": cl.code})
+		b, _ := json.Marshal(struct {
+			Code  int    `json:"code"`
+			Error string `json:"error,omitempty"`
+		}{cl.code, cl.startErr})
 		cl.sub.send(fExit, cl.id, b)
 	}
 }

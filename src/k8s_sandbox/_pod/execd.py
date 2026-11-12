@@ -23,9 +23,10 @@ from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 
 from k8s_sandbox._error import K8sError
+from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
-from k8s_sandbox._pod.execute import EXEC_USER_URL
+from k8s_sandbox._pod.execute import _STDERR_TAIL_BYTES, EXEC_USER_URL
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
 from k8s_sandbox._pod.read import read_command
 
@@ -54,6 +55,8 @@ MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
 ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
 HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
+MAX_STRAY = 1 << 16  # frames for no queue (pongs, stdin acks, a gone call's) per link
+STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -130,6 +133,8 @@ class Call:
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
     closed: bool = False  # by its caller
     exited: bool = False
+    hold: int = HOLD
+    ack_every: int = ACK_EVERY
 
 
 class Link:
@@ -143,6 +148,7 @@ class Link:
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self._last_rx = time.monotonic()
+        self._stray = 0
         self._tasks = [
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
@@ -176,18 +182,25 @@ class Link:
                     c.stdin_room.set()  # a send waiting for room sees the exit
                 if kind == OK and not self.ready.done():
                     self.ready.set_result(None)
-                elif (c := self.calls.get(call_id)) is not None and kind == STDIN_ACK:
-                    c.stdin_put = max(c.stdin_put, json.loads(payload)["stdin"])
-                    c.stdin_room.set()
-                elif (c := self.calls.get(call_id)) is not None and kind != PONG:
+                elif (c := self.calls.get(call_id)) is not None and kind not in (
+                    PONG,
+                    STDIN_ACK,
+                ):
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
                     if kind in (STDOUT, STDERR):
-                        if sum(c.got) + n - sum(c.taken) > HOLD:
+                        if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
                         c.got[kind - STDOUT] += n
                     c.queue.put_nowait((kind, payload))
+                else:
+                    self._stray += 1  # bounded too: each costs the event loop a turn
+                    if self._stray > MAX_STRAY:
+                        return
+                    if c is not None and kind == STDIN_ACK:
+                        c.stdin_put = max(c.stdin_put, json.loads(payload)["stdin"])
+                        c.stdin_room.set()
         except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
         finally:
@@ -296,8 +309,8 @@ class ExecdClient:
             "timeout": timeout or 0,  # execd kills it then, even if we're cut off
         }
         start = json.dumps(request).encode()
-        deadline = None if timeout is None else time.monotonic() + timeout
         link = await self._get()
+        deadline = None if timeout is None else time.monotonic() + timeout
         call = Call(int.from_bytes(os.urandom(8), "big") >> 1, link.daemon)
         link.calls[call.id] = call
         sender: asyncio.Task[None] | None = None
@@ -314,7 +327,7 @@ class ExecdClient:
                         else max(0.0, deadline - time.monotonic())
                     )
                     try:
-                        item = await asyncio.wait_for(call.queue.get(), left)
+                        item = await _next(call.queue, left)
                     except asyncio.TimeoutError:
                         await self._kill(link, call)
                         finished = True
@@ -345,7 +358,7 @@ class ExecdClient:
                         finished = True
                         with contextlib.suppress(OSError):
                             await link.send(RELEASE, call.id)
-                        yield EXIT, int(json.loads(payload)["code"])
+                        yield EXIT, json.loads(payload)  # {"code": n[, "error": ...]}
                         return
                     elif kind == RESUMED and resuming:  # send the stdin it didn't get
                         resuming = False
@@ -407,7 +420,7 @@ class ExecdClient:
             await link.send(KILL, call.id)
             end = time.monotonic() + KILL_WAIT
             while time.monotonic() < end:
-                item = await asyncio.wait_for(call.queue.get(), end - time.monotonic())
+                item = await _next(call.queue, end - time.monotonic())
                 if isinstance(item, tuple) and item[0] == EXIT:
                     break
             await link.send(RELEASE, call.id)
@@ -427,12 +440,12 @@ class ExecdClient:
         data = stdin.encode() if isinstance(stdin, str) else stdin
         out = {STDOUT: LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)}
         out[STDERR] = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = None
+        status = None
         run = self.run(cmd, env=env, cwd=cwd, user=user, stdin=data, timeout=timeout)
         async with contextlib.aclosing(run) as chunks:
             async for kind, payload in chunks:
                 if kind == EXIT:
-                    code = payload
+                    status = payload
                     break
                 out[kind].append(payload)
                 if out[kind].truncated:
@@ -440,23 +453,24 @@ class ExecdClient:
                         limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                         truncated_output=str(out[STDOUT]) + str(out[STDERR]),
                     )
-        if code is None:
+        if status is None:
             raise TimeoutError(f"Command timed out after {timeout}s.")
+        code = int(status["code"])
         result = ExecResult(
             success=code == 0,
             returncode=code,
             stdout=str(out[STDOUT]),
             stderr=str(out[STDERR]),
         )
-        # execd's own errors start "execd: " (it reports them as a shell would).
         if code == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
-        if result.stderr.startswith("execd: unknown user"):
+        error = status.get("error", "")  # execd's, only if the command never started
+        if error.startswith("unknown user"):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does not appear to "
                 f"exist in the container. Docs: {EXEC_USER_URL}\n{result.stderr}"
             )
-        if result.stderr.startswith("execd: cannot run as"):
+        if error.startswith("cannot run as"):
             logger.warning(
                 "exec(user=%r) failed: the container is not running as root, so it "
                 "cannot switch users. Docs: %s\n%s",
@@ -508,7 +522,7 @@ class ExecdClient:
             async with contextlib.aclosing(run) as chunks:
                 async for kind, payload in chunks:
                     if kind == EXIT:
-                        return payload
+                        return int(payload["code"])
                     if kind == STDERR:
                         stderr.append(payload)
                     elif dst is not None and start is not None:
@@ -526,7 +540,12 @@ class ExecdClient:
     async def open_stream(self, argv: list[str], user: str | None) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
         link = await self._get()
-        call = Call(int.from_bytes(os.urandom(8), "big") >> 1, link.daemon)
+        call = Call(
+            int.from_bytes(os.urandom(8), "big") >> 1,
+            link.daemon,
+            hold=2 * (STREAM_WINDOW + CHUNK),
+            ack_every=STREAM_WINDOW // 4,
+        )
         link.calls[call.id] = call
         request = {
             "argv": argv,
@@ -548,6 +567,15 @@ class ExecdClient:
         return ExecdStream(link, call)
 
 
+async def _next(
+    queue: asyncio.Queue[tuple[int, bytes] | Exception], timeout: float | None
+) -> tuple[int, bytes] | Exception:
+    """queue.get() within timeout; before 3.12 wait_for costs a loop turn per item."""
+    if timeout != 0 and not queue.empty():
+        return queue.get_nowait()
+    return await asyncio.wait_for(queue.get(), timeout)
+
+
 async def _window(link: Link, call: Call, sent: int) -> None:
     """Wait until the call has room for more stdin in flight."""
     while sent - call.stdin_put >= STDIN_WINDOW:
@@ -560,7 +588,7 @@ async def _window(link: Link, call: Call, sent: int) -> None:
 async def _taken(link: Link, call: Call, kind: int, n: int) -> None:
     """Count output the caller took, and acknowledge it, so execd sends more."""
     call.taken[kind - STDOUT] += n
-    if sum(call.taken) - call.acked >= ACK_EVERY:
+    if sum(call.taken) - call.acked >= call.ack_every:
         call.acked = sum(call.taken)
         offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
         with contextlib.suppress(OSError):
@@ -578,6 +606,8 @@ class ExecdStream(ByteStream):
         self._closed = False
         self._sent = 0
         self._send_lock = asyncio.Lock()  # one item's chunks at a time
+        self._wrote = False
+        self._stderr = b""
 
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
@@ -595,9 +625,22 @@ class ExecdStream(ByteStream):
             elif item[0] in (STDOUT, STDERR):
                 if item[0] == STDOUT:
                     self._stdout += item[1]
+                    self._wrote = True
+                else:
+                    self._stderr = (self._stderr + item[1])[-_STDERR_TAIL_BYTES:]
                 await _taken(self._link, self._call, item[0], len(item[1]))
             elif item[0] == EXIT:
                 self._ended = anyio.EndOfStream()
+                if not self._wrote:  # it failed to start, as PodStdio reports it
+                    log_warn(
+                        "An exec_stdio command ended before writing to stdout.",
+                        status=item[1].decode(errors="replace"),
+                        stderr=self._stderr,
+                    )
+                elif self._stderr:
+                    log_trace(
+                        "An exec_stdio command wrote to stderr.", stderr=self._stderr
+                    )
             elif item[0] == ERROR:
                 self._ended = anyio.BrokenResourceError(
                     item[1].decode(errors="replace")

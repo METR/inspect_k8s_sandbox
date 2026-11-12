@@ -39,7 +39,7 @@ func main() {
 		start()
 		return
 	}
-	run(*port, *keyHash)
+	run(*port, *keyHash, *replace)
 }
 
 func fail(msg string) {
@@ -57,10 +57,12 @@ func prctl(option, arg uintptr) {
 // start re-runs execd in a new session, so it outlives this exec, and relays its status line.
 func start() {
 	prctl(prSetDumpable, 0) // so the sandbox can't write into the stdout the client reads
-	r, w, err := os.Pipe()
+	// A socket, not a pipe: /proc/PID/fd can't reopen it, so only the daemon writes its status.
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		fail(err.Error())
 	}
+	r, w := os.NewFile(uintptr(fds[0]), "status"), os.NewFile(uintptr(fds[1]), "status")
 	devnull, _ := os.Open(os.DevNull)
 	_, err = os.StartProcess("/proc/self/exe", os.Args, &os.ProcAttr{
 		Env:   append(os.Environ(), foregroundEnv+"=1"),
@@ -80,7 +82,7 @@ func start() {
 	fmt.Println(fingerprint)
 }
 
-func run(port int, keyHash string) {
+func run(port int, keyHash string, replace bool) {
 	os.Unsetenv(foregroundEnv)
 	status := os.NewFile(3, "status")
 	report := func(msg string) {
@@ -101,8 +103,8 @@ func run(port int, keyHash string) {
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
 	l, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
-	for i := 0; err != nil && i < 20 && errors.Is(err, syscall.EADDRINUSE); i++ {
-		time.Sleep(100 * time.Millisecond) // a daemon just stopped by --replace
+	for i := 0; replace && err != nil && i < 20 && errors.Is(err, syscall.EADDRINUSE); i++ {
+		time.Sleep(100 * time.Millisecond) // the daemon --replace stopped may still hold the port
 		l, err = tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
 	}
 	if err != nil {
