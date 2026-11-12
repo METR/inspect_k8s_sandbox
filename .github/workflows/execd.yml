@@ -3,6 +3,9 @@ name: Test execd using Go
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   go:
     runs-on: ubuntu-latest
