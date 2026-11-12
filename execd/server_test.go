@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -179,6 +181,17 @@ func TestAConnectionThatSendsNoAuthIsClosed(t *testing.T) {
 	until(t, "its slot was never freed", func() bool { return len(s.preauth) == 0 })
 }
 
+func TestACommandOutlivesTheTimeToAuthenticate(t *testing.T) {
+	s := testServer()
+	s.authTimeout = 50 * time.Millisecond
+
+	_, frames := begin(t, s, startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}})
+
+	if status := exit(t, frames); status.Code != 3 {
+		t.Fatalf("exit %+v, want 3: the connection's first deadline still stood", status)
+	}
+}
+
 type listener chan net.Conn
 
 func (l listener) Accept() (net.Conn, error) { return <-l, nil }
@@ -187,6 +200,7 @@ func (l listener) Addr() net.Addr            { return nil }
 
 func TestConnectionsPastTheBoundWaitForASlot(t *testing.T) {
 	s, l := testServer(), make(listener)
+	s.authTimeout = time.Hour // so only a closed connection frees a slot
 	go s.serve(l)
 	var unauthenticated []net.Conn
 	for range maxPreauth {
@@ -272,10 +286,9 @@ func TestStdinStdoutAndStderrEachArriveWhole(t *testing.T) {
 }
 
 func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
-	finished := filepath.Join(t.TempDir(), "finished")
 	// A child in the command's process group that has dropped its environment, one that left the group, then the command waits on its stdin.
-	script := `env -i sh -c 'echo $$; exec sleep 100' & setsid sh -c 'echo $$; exec sleep 100' & echo $$; cat; touch "$1"`
-	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", finished}, Stdin: true})
+	script := `env -i sh -c 'echo $$; exec sleep 100' & setsid sh -c 'echo $$; exec sleep 100' & echo $$; cat`
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script}, Stdin: true})
 	started := pids(t, frames, 3)
 
 	client.Close()
@@ -283,12 +296,30 @@ func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
 	for _, pid := range started {
 		until(t, "a process outlived the call's connection", func() bool { return gone(pid) })
 	}
-	if _, err := os.Stat(finished); err == nil {
-		t.Fatal("the command took its lost connection for the end of its stdin")
+}
+
+func TestStdinACommandDoesNotReadWaitsInTheConnection(t *testing.T) {
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 100"}, Stdin: true})
+	pids(t, frames, 1)
+	var taken atomic.Int32
+	go func() {
+		for range 8 {
+			client.Write(encodeFrame(fStdin, make([]byte, chunk))) // returns once execd has read it
+			taken.Add(1)
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond) // long enough for execd to take them all, if it would
+
+	// One fills the command's pipe and is held; the next waits where TCP would hold it back.
+	if n := taken.Load(); n > 2 {
+		t.Fatalf("execd took %d frames of stdin its command has not read", n)
 	}
 }
 
 func TestAStreamsEndClosesStdinAndKillsOnlyItsCommand(t *testing.T) {
+	gc := debug.SetGCPercent(-1) // so no finalizer closes a stdin execd left open
+	t.Cleanup(func() { debug.SetGCPercent(gc) })
 	ended := filepath.Join(t.TempDir(), "ended")
 	// A child shares the stream's stdin and process group, as a tools server its command started would.
 	script := `exec 3<&0; (cat <&3; touch "$1") & echo $$; exec sleep 100`
@@ -341,6 +372,21 @@ func TestACwdThatCantBeEnteredFailsTheCallAsCdDoes(t *testing.T) {
 	}
 }
 
+func TestExecdStaysNonDumpableAfterACommandAsAnotherUser(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root can run a command as another user")
+	}
+	const prGetDumpable = 3
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, User: "nobody"})
+
+	exit(t, frames)
+
+	// Its change of user sets the flag to the host's fs.suid_dumpable: 2 on Ubuntu, 1 where anyone may dump.
+	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
+		t.Fatalf("dumpable is %d after a command as another user", dumpable)
+	}
+}
+
 func TestATimeoutKillsTheCommandAndSaysSo(t *testing.T) {
 	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sleep", "100"}, Timeout: 0.05})
 
@@ -365,6 +411,31 @@ func TestOutputWrittenBeforeTheExitArrivesThoughAChildHoldsThePipe(t *testing.T)
 	pids(t, frames, 1) // the child's, which keeps stdout open: the exit must not wait for it
 	if status := exit(t, frames); status.Code != 0 {
 		t.Fatalf("exit %+v", status)
+	}
+}
+
+func TestOutputStillInThePipeAtTheExitArrives(t *testing.T) {
+	client, daemon := net.Pipe()
+	t.Cleanup(func() { client.Close() })
+	s := testServer()
+	s.preauth <- struct{}{}
+	go s.handle(daemon)
+	// A child keeps stdout open; the command prints while its first line waits unread, then exits.
+	request(client, startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!; sleep 0.1; head -c 50000 /dev/zero"}})
+
+	time.Sleep(400 * time.Millisecond) // past the exit and the grace a child's hold on the pipe gets
+	frames := received(client)
+
+	child := pids(t, frames, 1)[0]
+	size := 0
+	for f := range frames {
+		if f.kind == fExit {
+			break
+		}
+		size += len(f.payload)
+	}
+	if size != 50000 {
+		t.Fatalf("%d of the 50,000 bytes written before the exit arrived (child %d)", size, child)
 	}
 }
 
@@ -406,7 +477,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 
 	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, User: user})
 
-	if n := len(next(t, frames, fExit).payload); n > 4096 { // the client's MAX_CONTROL
+	if n := len(next(t, frames, fExit).payload); n > 4096 { // the most the client takes in an EXIT
 		t.Fatalf("EXIT is %d bytes", n)
 	}
 }

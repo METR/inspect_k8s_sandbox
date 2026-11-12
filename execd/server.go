@@ -27,7 +27,7 @@ type server struct {
 	preauth     chan struct{} // a slot per connection not yet authenticated
 	authTimeout time.Duration // for a connection to send its AUTH
 	pingEvery   time.Duration
-	// After an exit execd reads on this long for the client to close: closing first, with stdin unread, would reset the connection under the EXIT.
+	// How long execd reads on after an exit: closing before the client, with stdin unread, could reset the EXIT away.
 	lingerFor time.Duration
 }
 
@@ -197,7 +197,7 @@ func (c *call) closeStdin() {
 	}
 }
 
-// kill stops a running command: a stream's own process, else its process group and every process still carrying its tag.
+// kill stops a running command: a stream's own process, else its group and every process still carrying its tag.
 func (c *call) kill() {
 	c.mu.Lock()
 	pid := c.pid
@@ -220,7 +220,7 @@ func (c *call) start(req startRequest) error {
 		tag := make([]byte, 8)
 		rand.Read(tag)
 		c.tag = hex.EncodeToString(tag)
-		req.Env["HAWK_NEXT_EXEC"] = c.tag
+		req.Env["EXECD_CALL"] = c.tag
 	}
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	if req.User != "" {
@@ -256,6 +256,9 @@ func (c *call) start(req startRequest) error {
 	stdinR.Close()
 	outW.Close()
 	errW.Close()
+	if attr.Credential != nil {
+		prctl(prSetDumpable, 0) // the child changed user in memory it shares with execd until its exec, which resets this
+	}
 	if err != nil {
 		reaper.mu.Unlock()
 		outR.Close()
@@ -329,7 +332,7 @@ func (c *call) start(req startRequest) error {
 	return nil
 }
 
-// copyOut sends a pipe's output: a full buffer at once, less only a millisecond after the last, so small writes make few frames.
+// copyOut sends a pipe's output: a full buffer at once, less only a millisecond after the last frame.
 func (c *call) copyOut(kind byte, r *os.File, read *atomic.Int64) {
 	defer r.Close()
 	buf := make([]byte, chunk)
@@ -422,9 +425,9 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
-// killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
+// killTagged SIGKILLs every process whose environment holds EXECD_CALL=<tag>, even after setsid.
 func killTagged(tag string) {
-	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
+	needle := []byte("EXECD_CALL=" + tag + "\x00")
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
@@ -438,7 +441,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper reaps every child, orphans included; it waits on mu until run() registers the PID.
+// The reaper reaps every child, orphans included; it waits on mu until start() registers the PID.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int
