@@ -140,10 +140,7 @@ func (s *server) handle(c *conn) {
 			}
 		case fKill:
 			if cl := s.get(f.id); cl != nil {
-				if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
-					syscall.Kill(-cl.pid, syscall.SIGKILL) // its group, even with the tag removed
-				}
-				killTagged(cl.tag)
+				cl.kill()
 			}
 		case fResume:
 			s.resume(c, f)
@@ -292,6 +289,10 @@ func (cl *call) run(req startRequest) error {
 	reaper.mu.Unlock()
 	p.Release()
 	cl.pid = p.Pid
+	var deadline *time.Timer
+	if req.Timeout > 0 {
+		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
+	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
 	}
@@ -318,6 +319,9 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		code := <-exited
+		if deadline != nil {
+			deadline.Stop()
+		}
 		// All the command wrote before it exited is in the pipes: read it, however slowly the
 		// client takes it. Then, 100 ms on, stop reading, so a background child that keeps a
 		// pipe open can't hold the call open forever.
@@ -446,6 +450,14 @@ func (cl *call) ackLocked(req resumeRequest) {
 		cl.sent[i] = max(cl.sent[i], cl.base[i])
 	}
 	cl.room.Broadcast()
+}
+
+// kill stops the call's process group, and every process still carrying its tag.
+func (cl *call) kill() {
+	if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
+		syscall.Kill(-cl.pid, syscall.SIGKILL)
+	}
+	killTagged(cl.tag)
 }
 
 func (cl *call) finish(code int) {

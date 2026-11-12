@@ -268,3 +268,20 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     # PodError is retried too, which would run the command again.
     with pytest.raises(ExecResultUnknownError):
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+
+
+async def test_a_port_held_by_another_process_fails_at_once(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def squatted(daemon: execd.Daemon) -> execd._Pipe:
+        raise execd.NotOurDaemon("certificate mismatch")
+
+    async def port_taken(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("address already in use")
+
+    monkeypatch.setattr(execd, "_connect", squatted)
+    sandbox = execd.ExecdClient(port_taken)
+    sandbox._daemon = execd.Daemon("127.0.0.1", "ours", b"key")
+
+    with pytest.raises(RuntimeError, match="held by a process other than execd"):
+        await asyncio.wait_for(sandbox.exec(["true"], None, None, {}, None, None), 5)

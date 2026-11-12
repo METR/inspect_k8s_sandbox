@@ -58,6 +58,8 @@ type startRequest struct {
 	Stdin bool              `json:"stdin"`
 	// The value of HAWK_NEXT_EXEC in Env: KILL stops every process carrying it.
 	Tag string `json:"tag"`
+	// Seconds until the call is killed, as KILL does, even if no client is connected; 0: never.
+	Timeout float64 `json:"timeout"`
 }
 
 type resumeRequest struct {

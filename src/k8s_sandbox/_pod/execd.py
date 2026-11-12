@@ -97,6 +97,10 @@ class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
 
 
+class NotOurDaemon(ConnectionRefusedError):
+    """The server on the port isn't the daemon this client started."""
+
+
 class _Pipe:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
@@ -124,7 +128,7 @@ async def _connect(daemon: Daemon) -> _Pipe:
     if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
         writer.close()
         # Not the daemon this client started, so it gets no key: start another.
-        raise ConnectionRefusedError("the server on the execd port is not our daemon")
+        raise NotOurDaemon("the server on the execd port is not our daemon")
     return _Pipe(reader, writer)
 
 
@@ -261,6 +265,12 @@ class ExecdClient:
                 with contextlib.suppress(DaemonRunning):
                     self._daemon = await self._start(self._link is None)
                     continue
+                if isinstance(e, NotOurDaemon):
+                    # Something else holds the port, and keeps it: waiting won't help.
+                    raise RuntimeError(
+                        f"TCP port {EXECD_PORT} in the sandbox is held by a process "
+                        "other than execd"
+                    ) from e
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 5.0)
 
@@ -295,6 +305,7 @@ class ExecdClient:
             "user": user or "",
             "stdin": stdin is not None,
             "tag": tag,
+            "timeout": timeout or 0,  # execd kills it then, even if we're cut off
         }
         start = json.dumps(request).encode()
         deadline = None if timeout is None else time.monotonic() + timeout
