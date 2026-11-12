@@ -214,6 +214,7 @@ func TestManySmallWritesMakeFewFrames(t *testing.T) {
 
 func TestCallsTakeTurnsToSend(t *testing.T) {
 	var sent []<-chan frame
+	began := time.Now()
 	for i := range 20 {
 		c, frames := recordedConn(t)
 		cl := &call{id: uint64(10 + i), sub: c}
@@ -221,7 +222,6 @@ func TestCallsTakeTurnsToSend(t *testing.T) {
 		cl.output(0, []byte("x")) // each call's first: only the turns hold it
 		sent = append(sent, frames)
 	}
-	began := time.Now()
 
 	for _, frames := range sent {
 		<-frames
@@ -230,6 +230,25 @@ func TestCallsTakeTurnsToSend(t *testing.T) {
 	// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
 	if took := time.Since(began); took < 6*time.Millisecond {
 		t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
+	}
+}
+
+func TestCallsWithNoConnectionTakeNoTurns(t *testing.T) {
+	for i := range 200 {
+		cl := &call{id: uint64(100 + i)} // its connection dropped: the resume sends what it has
+		cl.room = sync.NewCond(&cl.mu)
+		cl.output(0, []byte("x"))
+	}
+	c, frames := recordedConn(t)
+	cl := &call{id: 99, sub: c}
+	cl.room = sync.NewCond(&cl.mu)
+	began := time.Now()
+
+	cl.output(0, []byte("x"))
+
+	<-frames
+	if took := time.Since(began); took > 30*time.Millisecond {
+		t.Fatalf("a live call waited %v behind calls with nowhere to send", took)
 	}
 }
 

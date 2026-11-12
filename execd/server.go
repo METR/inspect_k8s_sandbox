@@ -525,8 +525,8 @@ const slotEvery, slotBurst = 600 * time.Microsecond, 8
 
 // flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
 func (cl *call) flushSoon() {
-	if cl.deferred {
-		return // the waiting flush sends this too
+	if cl.deferred || cl.sub == nil {
+		return // the waiting flush sends this too, or the resume does
 	}
 	now := time.Now()
 	at := now.Sub(epoch)
