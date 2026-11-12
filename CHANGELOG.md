@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
+  mounted read-only at `/opt/execd/execd` and TCP port 24601 open to the client, runs
+  `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over the pod network
+  instead of Kubernetes exec stdin, which AWS Nitro Sandboxes reorder above 32 KiB.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
