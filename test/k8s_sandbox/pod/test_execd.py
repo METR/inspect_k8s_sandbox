@@ -1181,7 +1181,7 @@ async def test_what_a_pass_delivers_pays_for_its_decryption(
     await pipe._charge(0.0)  # a second of CPU for nothing delivered
     await pipe._charge(1.0, used=10**9)  # no CPU, but a GB of padding
 
-    assert pace.tls == 1.5
+    assert pace.tls == 1.7
 
 
 @pytest.fixture
