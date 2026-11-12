@@ -646,6 +646,30 @@ async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
     await until(lambda: stream._link.closed)
 
 
+async def test_stray_frames_are_counted_per_ping_interval(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY", 100)
+    monkeypatch.setattr(execd, "PING_EVERY", 0.01)
+
+    async def pongs_across_pings(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.PONG, 0) * execd.MAX_STRAY)
+        for _ in range(2):  # the count restarts with each interval
+            while (await read_frame(r))[0] != execd.PING:
+                pass
+        w.write(frame(execd.PONG, 0) * execd.MAX_STRAY)
+        w.write(frame(execd.STDOUT, call_id, b"still here"))
+        await r.read()
+
+    await daemons.serve(pongs_across_pings)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    assert await asyncio.wait_for(stream.receive(), 30) == b"still here"
+
+
 async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
