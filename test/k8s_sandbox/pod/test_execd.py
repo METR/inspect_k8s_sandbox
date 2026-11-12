@@ -552,6 +552,37 @@ async def test_callers_share_one_reconnect(
     assert opens == 1
 
 
+async def test_a_new_call_waits_for_a_reconnect_only_as_long_as_a_first_open(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert client._link is not None
+    await client._link.close()
+
+    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        raise ConnectionRefusedError
+
+    async def still_running(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("address already in use")
+
+    monkeypatch.setattr(execd, "_connect", refused)
+    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 0.2)
+    client._start = still_running
+
+    with pytest.raises(ConnectionError):  # not the 300 s a resume may wait
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    assert client._opening is not None
+    client._opening.cancel()
+
+
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch: MonkeyPatch,
 ) -> None:

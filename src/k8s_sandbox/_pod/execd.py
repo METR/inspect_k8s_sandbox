@@ -437,8 +437,13 @@ class ExecdClient:
         if self._opening is None or self._opening.done():
             wait = FIRST_OPEN_FOR if link is None else RECONNECT_FOR
             self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
-        # Shared: every caller waits on the one reconnect, not on a queue of them.
-        self._link = await asyncio.shield(self._opening)
+        # Shared: callers wait on one reconnect; only a resume waits out its window.
+        try:
+            self._link = await asyncio.wait_for(
+                asyncio.shield(self._opening), None if stale else FIRST_OPEN_FOR
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError("execd unreachable") from None
         return self._link
 
     async def run(
