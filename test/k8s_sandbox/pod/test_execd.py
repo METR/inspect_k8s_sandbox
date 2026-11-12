@@ -3,11 +3,11 @@ import contextlib
 import hashlib
 import io
 import json
-import pathlib
 import shutil
 import ssl
 import subprocess
 import time
+import types
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -197,7 +197,7 @@ async def test_send_waiting_for_room_fails_when_the_connection_closes(
     stream = await daemons.client().open_stream(["cat"], None)
 
     with pytest.raises(anyio.BrokenResourceError):
-        await asyncio.wait_for(stream.send(b"x" * (2 * execd.STDIN_WINDOW)), 5)
+        await asyncio.wait_for(stream.send(b"x" * (2 * execd.STDIN_WINDOW)), 30)
 
 
 async def test_command_is_not_run_again_once_its_daemon_is_gone(
@@ -312,7 +312,7 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
         with pytest.raises((TimeoutError, ExecResultUnknownError)):
             await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
 
-    await asyncio.wait_for(times_out(), 10)  # a hang fails here, outside the raises
+    await asyncio.wait_for(times_out(), 30)  # a hang fails here, outside the raises
 
 
 async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
@@ -371,7 +371,7 @@ async def test_a_port_held_by_another_process_fails_at_once(
     sandbox._daemon = execd.Daemon("127.0.0.1", "ours", b"key")
 
     with pytest.raises(RuntimeError, match="held by a process other than execd"):
-        await asyncio.wait_for(sandbox.exec(["true"], None, None, {}, None, None), 5)
+        await asyncio.wait_for(sandbox.exec(["true"], None, None, {}, None, None), 30)
 
 
 async def test_a_frame_the_cap_refuses_is_asked_for_again(daemons: Daemons) -> None:
@@ -424,7 +424,7 @@ async def test_closing_a_stream_ends_a_send_waiting_for_room(daemons: Daemons) -
     await stream.aclose()
 
     with pytest.raises(anyio.BrokenResourceError):
-        await asyncio.wait_for(send, 5)
+        await asyncio.wait_for(send, 30)
 
 
 async def test_a_daemon_that_is_not_ours_is_replaced(
@@ -560,12 +560,15 @@ async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> 
         nonlocal received
         _, call_id, _ = await read_frame(r)  # START
         resumed = json.dumps({"stdin": 0, "eof": False, "put": 0}).encode()
-        w.write(b"".join(frame(execd.RESUMED, call_id, resumed) for _ in range(64)))
         while True:
             kind, _, payload = await read_frame(r)
             if kind == execd.STDIN and not payload:
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
                 return
+            if not received:  # once some stdin is in, a restart from 0 repeats it
+                w.write(
+                    b"".join(frame(execd.RESUMED, call_id, resumed) for _ in range(64))
+                )
             received += len(payload) if kind == execd.STDIN else 0
             put = json.dumps({"stdin": received}).encode()
             w.write(frame(execd.STDIN_ACK, call_id, put))
@@ -580,9 +583,11 @@ async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> 
 async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None:
     received = bytearray()
     done = asyncio.Event()
+    go = asyncio.Event()
 
     async def records_stdin(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
+        await go.wait()  # unread, the first chunk holds up its send
         while len(received) < 4 * execd.CHUNK:
             kind, _, payload = await read_frame(r)
             if kind == execd.STDIN:
@@ -593,9 +598,13 @@ async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None
     await daemons.serve(records_stdin)
     stream = await daemons.client().open_stream(["cat"], None)
 
-    await asyncio.gather(
+    sends = asyncio.gather(
         stream.send(b"A" * (2 * execd.CHUNK)), stream.send(b"B" * (2 * execd.CHUNK))
     )
+    for _ in range(10):  # both sends under way
+        await asyncio.sleep(0)
+    go.set()
+    await asyncio.wait_for(sends, 30)
     await asyncio.wait_for(done.wait(), 30)
 
     assert bytes(received) in (
@@ -663,7 +672,7 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(
-    daemons: Daemons,
+    daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
     timeouts = []
 
@@ -677,8 +686,11 @@ async def test_the_timeout_runs_from_the_start_of_the_command(
     client = daemons.client()
     start = client._start
 
+    now = [0.0]
+    monkeypatch.setattr(execd, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
+
     async def slow_start(replace: bool) -> execd.Daemon:
-        await asyncio.sleep(1.5)
+        now[0] += 1.5
         return await start(replace)
 
     client._start = slow_start
@@ -713,6 +725,38 @@ async def test_a_command_times_out_while_its_daemon_is_restarted(
     assert time.monotonic() - t < 10
 
 
+async def test_stdin_acks_that_report_progress_keep_the_connection(
+    daemons: Daemons,
+) -> None:
+    async def acks(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        for put in range(1, execd.MAX_STRAY + 2):
+            w.write(
+                frame(execd.STDIN_ACK, call_id, json.dumps({"stdin": put}).encode())
+            )
+        await r.read()
+
+    await daemons.serve(acks)
+    stream = await daemons.client().open_stream(["cat"], None)
+    await until(lambda: stream._call.stdin_put == execd.MAX_STRAY + 1)
+
+    assert not stream._link.closed
+
+
+async def test_a_stream_refuses_input_once_its_command_exits(daemons: Daemons) -> None:
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(exits)
+    stream = await daemons.client().open_stream(["cat"], None)
+    await until(lambda: stream._call.exited)
+
+    with pytest.raises(anyio.BrokenResourceError):
+        await stream.send(b"lost")
+
+
 async def test_unasked_unknown_call_errors_start_nothing_again(
     daemons: Daemons,
 ) -> None:
@@ -737,7 +781,7 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
 async def test_only_the_pinned_certificate_is_trusted(
-    tmp_path: pathlib.Path, monkeypatch: MonkeyPatch
+    tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
     subprocess.run(

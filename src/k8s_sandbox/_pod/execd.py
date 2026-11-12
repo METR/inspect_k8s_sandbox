@@ -55,7 +55,7 @@ MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
 ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
 HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
-MAX_STRAY = 1 << 16  # frames for no queue (pongs, stdin acks, a gone call's) per link
+MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
@@ -177,15 +177,17 @@ class Link:
                     return
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
-                if kind == EXIT and (c := self.calls.get(call_id)) is not None:
+                c = self.calls.get(call_id)
+                if kind == EXIT and c is not None:
                     c.exited = True
                     c.stdin_room.set()  # a send waiting for room sees the exit
+                put = json.loads(payload)["stdin"] if kind == STDIN_ACK else 0
                 if kind == OK and not self.ready.done():
                     self.ready.set_result(None)
-                elif (c := self.calls.get(call_id)) is not None and kind not in (
-                    PONG,
-                    STDIN_ACK,
-                ):
+                elif kind == STDIN_ACK and c is not None and put > c.stdin_put:
+                    c.stdin_put = put
+                    c.stdin_room.set()
+                elif c is not None and kind not in (PONG, STDIN_ACK):
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
@@ -194,13 +196,10 @@ class Link:
                             return
                         c.got[kind - STDOUT] += n
                     c.queue.put_nowait((kind, payload))
-                else:
-                    self._stray += 1  # bounded too: each costs the event loop a turn
+                else:  # a pong, a repeated ack, or a frame for a call that's gone
+                    self._stray += 1
                     if self._stray > MAX_STRAY:
                         return
-                    if c is not None and kind == STDIN_ACK:
-                        c.stdin_put = max(c.stdin_put, json.loads(payload)["stdin"])
-                        c.stdin_room.set()
         except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
         finally:
@@ -209,6 +208,7 @@ class Link:
     async def _ping(self) -> None:
         while not self.closed:
             await asyncio.sleep(PING_EVERY)
+            self._stray = 0
             if time.monotonic() - self._last_rx > DEAD_AFTER:
                 await self.close()
                 return
@@ -297,7 +297,7 @@ class ExecdClient:
         stdin: bytes | None,
         timeout: float | None,
     ) -> AsyncGenerator[tuple[int, Any], None]:
-        """Yield (STDOUT or STDERR, bytes), then (EXIT, code), None if it timed out."""
+        """Yield (STDOUT|STDERR, bytes), then (EXIT, status), None if it timed out."""
         tag = os.urandom(8).hex()
         request: dict[str, Any] = {
             "argv": argv,
@@ -578,10 +578,12 @@ async def _next(
 
 async def _window(link: Link, call: Call, sent: int) -> None:
     """Wait until the call has room for more stdin in flight."""
-    while sent - call.stdin_put >= STDIN_WINDOW:
-        call.stdin_room.clear()
+    while True:
         if link.closed or call.closed or call.exited:
             raise ConnectionError("execd connection closed, or the command exited")
+        if sent - call.stdin_put < STDIN_WINDOW:
+            return
+        call.stdin_room.clear()
         await call.stdin_room.wait()
 
 

@@ -31,8 +31,8 @@ type server struct {
 
 const idleTimeout = 60 * time.Second
 
-// abandonAfter outlasts the client's reconnect window (5 minutes).
-const abandonAfter = 6 * time.Minute
+// abandonAfter outlasts the client's reconnect window (5 minutes); a var for tests.
+var abandonAfter = 6 * time.Minute
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -46,6 +46,7 @@ type call struct {
 	stdinGot int  // bytes of stdin received
 	stdinPut int  // bytes of stdin written to the process
 	stream   bool // killed when its connection drops, as nothing resumes it
+	detached int  // times its connection dropped
 	stdinEOF bool // the client closed stdin
 	mu       sync.Mutex
 	out      [2][]byte // stdout, stderr: what the process wrote and the client has not acked
@@ -189,7 +190,9 @@ func (s *server) detach(c *conn) {
 		mine := cl.sub == c
 		if mine {
 			cl.sub = nil
+			cl.detached++
 		}
+		detached := cl.detached
 		cl.mu.Unlock()
 		switch {
 		case mine && cl.stream: // nothing resumes a stream
@@ -198,7 +201,7 @@ func (s *server) detach(c *conn) {
 		case mine: // a client that hasn't resumed it by then has given up
 			time.AfterFunc(abandonAfter, func() {
 				cl.mu.Lock()
-				orphaned := cl.sub == nil
+				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
 				cl.mu.Unlock()
 				if orphaned {
 					cl.kill()
@@ -463,8 +466,7 @@ func (cl *call) feedStdin(w *os.File) {
 	}
 }
 
-// Unacked output per stdout or stderr; past it, reading the pipe waits for acks. A
-// stream's is small: its reader takes output only as it needs it.
+// Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
 const maxUnacked, streamUnacked = 32 << 20, 1 << 20
 
 func (cl *call) output(stream int, data []byte) {
@@ -573,7 +575,7 @@ func lookPath(name string, env []string, cwd string) (string, error) {
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(cwd, dir)
 		}
-		p := filepath.Join(dir, name)
+		p, _ := filepath.Abs(filepath.Join(dir, name)) // absolute: the child starts in cwd
 		st, err := os.Stat(p)
 		if err != nil || st.IsDir() {
 			continue
@@ -626,9 +628,6 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
-	if tag == "" {
-		return
-	}
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {

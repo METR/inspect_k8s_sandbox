@@ -1,0 +1,15 @@
+name: Test execd using Go
+
+on:
+  workflow_call:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go vet ./... && go test ./...
+        working-directory: execd

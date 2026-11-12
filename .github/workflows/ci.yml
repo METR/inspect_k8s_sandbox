@@ -19,3 +19,5 @@ jobs:
     uses: ./.github/workflows/test.yml
   pre-commit:
     uses: ./.github/workflows/pre-commit.yml
+  execd:
+    uses: ./.github/workflows/execd.yml
