@@ -523,7 +523,7 @@ var epoch = time.Now() // turns are measured from here, on the monotonic clock
 
 const slotEvery, slotBurst = 600 * time.Microsecond, 8
 
-const slotAhead = 100 * time.Millisecond // how long exits' and resumes' turns may hold others' output
+const slotAhead = slotBurst * slotEvery // how long exits' and resumes' turns may hold others' output
 
 // flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
 func (cl *call) flushSoon() {

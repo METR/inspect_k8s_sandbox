@@ -253,6 +253,7 @@ func TestCallsWithNoConnectionTakeNoTurns(t *testing.T) {
 }
 
 func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
+	slot.Store(0) // turns other tests took could leave less than two to take
 	c, frames := recordedConn(t)
 	cl := &call{id: 12, sub: c, out: [2][]byte{[]byte("out"), nil}}
 	cl.room = sync.NewCond(&cl.mu)
@@ -280,8 +281,8 @@ func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
 
 	select {
 	case <-frames:
-	case <-time.After(time.Second):
-		t.Fatal("output held over a second behind exits' turns")
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("output held over 50 ms behind exits' turns")
 	}
 }
 
@@ -301,6 +302,7 @@ func TestCallsThatEndBeforeTheirTurnHoldOthersOutputBackOnlySoLong(t *testing.T)
 }
 
 func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
+	slot.Store(0) // turns other tests took could leave less than two to take
 	s, _ := newServer(strings.Repeat("00", 32))
 	s.calls[13] = &call{id: 13, out: [2][]byte{[]byte("out"), []byte("err")}}
 	s.calls[13].room = sync.NewCond(&s.calls[13].mu)
