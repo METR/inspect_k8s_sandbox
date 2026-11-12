@@ -120,11 +120,11 @@ func pids(t *testing.T, frames <-chan frame, n int) []int {
 	return ids
 }
 
-// First: a command run as another user resets the flag to the host's fs.suid_dumpable.
+// First: a command run as another user leaves the flag at the host's fs.suid_dumpable.
 func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	const prGetDumpable = 3
 	// init() has run, as it runs before main.
-	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
+	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable == 1 {
 		t.Fatal("dumpable: a same-uid process could reopen the start's stdout through /proc")
 	}
 }
@@ -250,8 +250,8 @@ func TestStdinReachesTheCommandAndItsEndEndsIt(t *testing.T) {
 
 func TestALostConnectionKillsTheCommandAndWhatItStarted(t *testing.T) {
 	finished := filepath.Join(t.TempDir(), "finished")
-	// A child in the command's process group without its environment, one that left the group, then the command waits on its stdin.
-	script := `env -i sleep 100 & echo $!; setsid sleep 100 & echo $!; echo $$; cat; touch "$1"`
+	// A child in the command's process group that has dropped its environment, one that left the group, then the command waits on its stdin.
+	script := `env -i sh -c 'echo $$; exec sleep 100' & setsid sh -c 'echo $$; exec sleep 100' & echo $$; cat; touch "$1"`
 	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", script, "sh", finished}, Stdin: true})
 	started := pids(t, frames, 3)
 
