@@ -12,6 +12,7 @@ from k8s_sandbox._pod.get_returncode import (
     raise_if_stopped_before_lost,
 )
 from k8s_sandbox._pod.op import (
+    STDIN_UNCHECKED_SIZE,
     SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
@@ -20,9 +21,33 @@ from k8s_sandbox._pod.op import (
 
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
+        if len(data) > STDIN_UNCHECKED_SIZE:
+            directory = self._stage(
+                data, lambda command: command, raise_for_known_read_write_errors
+            )
+            with self._start_join_command(directory, dst) as ws_client:
+                self._handle_stream_output(ws_client)
+            return
         with self._start_write_command(dst, len(data)) as ws_client:
             self._write_stdin_chunked(ws_client, data)
             self._handle_stream_output(ws_client)
+
+    @contextmanager
+    def _start_join_command(
+        self, directory: str, dst: Path
+    ) -> Generator[WSClient, None, None]:
+        staged = shlex.quote(directory)
+        command = [
+            "/bin/sh",
+            "-c",
+            f"PATH={SYSTEM_PATH}; "
+            f"mkdir -p -- {shlex.quote(dst.parent.as_posix())} "
+            f"&& cat -- {staged}/data > {shlex.quote(dst.as_posix())}; "
+            f'returncode=$?; rm -rf -- {staged}; exit "$returncode"',
+        ]
+        yield from self.create_websocket_client_for_exec(
+            command=command, stderr=True, stdin=True, stdout=True, binary=False
+        )
 
     @contextmanager
     def _start_write_command(
