@@ -87,6 +87,7 @@ def held(stream: execd.ExecdStream) -> int:
     return sum(len(item[1]) for item in queued if isinstance(item, tuple))
 
 
+@pytest.mark.req_k8s  # the release reads the cluster config
 async def test_an_annotated_pod_runs_every_operation_over_execd(
     daemons: Daemons,
 ) -> None:
