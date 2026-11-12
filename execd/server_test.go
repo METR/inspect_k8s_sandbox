@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -137,7 +138,13 @@ func TestOnlyTheKeyStartsACommand(t *testing.T) {
 	client.Write(encodeFrame(fAuth, []byte("not the key")))
 	client.Write(encodeFrame(fStart, req))
 
-	for range frames { // until execd closes the connection
+	select {
+	case f, open := <-frames:
+		if open {
+			t.Fatalf("execd answered a connection without the key: a frame of kind %d", f.kind)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("execd kept a connection without the key")
 	}
 	if _, err := os.Stat(made); err == nil {
 		t.Fatal("a connection without the key ran a command")
@@ -213,12 +220,20 @@ func TestConnectionsPastTheBoundWaitForASlot(t *testing.T) {
 func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
 	s := testServer()
 	s.authTimeout = time.Hour // so only the refusal closes a connection
-	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	l, _ := net.Listen("tcp", ":0")
 	t.Cleanup(func() { l.Close() })
 	go s.serve(l)
+	port := l.Addr().(*net.TCPAddr).Port
+	own := []string{"127.0.0.1"}
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLoopback() {
+			own = append(own, n.IP.String()) // a connection to it comes from it
+		}
+	}
 
-	for range maxPreauth + 1 { // more than the slots: a refusal must not keep one
-		client, err := net.Dial("tcp", l.Addr().String())
+	for i := range maxPreauth + len(own) { // more than the slots: a refusal must not keep one
+		client, err := net.Dial("tcp", net.JoinHostPort(own[i%len(own)], fmt.Sprint(port)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -227,24 +242,32 @@ func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
 		select {
 		case <-received(client):
 		case <-time.After(30 * time.Second):
-			t.Fatal("a connection from loopback was not refused")
+			t.Fatalf("a connection from %s was not refused", own[i%len(own)])
 		}
 	}
 }
 
-func TestStdinReachesTheCommandAndItsEndEndsIt(t *testing.T) {
-	client, frames := begin(t, testServer(), startRequest{Argv: []string{"wc", "-c"}, Stdin: true})
-
-	for range 4 { // more than a pipe holds
-		client.Write(encodeFrame(fStdin, make([]byte, chunk)))
+func TestStdinStdoutAndStderrEachArriveWhole(t *testing.T) {
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "cat; echo to stderr >&2"}, Stdin: true})
+	stdin := make([]byte, 4*chunk) // more than a pipe holds
+	for i := range stdin {
+		stdin[i] = byte(i % 251)
 	}
-	client.Write(encodeFrame(fStdin, nil))
 
-	if counted := strings.TrimSpace(string(next(t, frames, fStdout).payload)); counted != "1048576" {
-		t.Fatalf("the command read %s bytes of stdin, want 1048576", counted)
+	for i := 0; i < len(stdin); i += chunk {
+		client.Write(encodeFrame(fStdin, stdin[i:i+chunk]))
 	}
-	if status := exit(t, frames); status.Code != 0 {
-		t.Fatalf("exit %+v", status)
+	client.Write(encodeFrame(fStdin, nil)) // its end: cat exits
+
+	got := map[byte][]byte{}
+	for f := range frames {
+		got[f.kind] = append(got[f.kind], f.payload...)
+		if f.kind == fExit {
+			break
+		}
+	}
+	if !bytes.Equal(got[fStdout], stdin) || string(got[fStderr]) != "to stderr\n" || string(got[fExit]) != `{"code":0}` {
+		t.Fatalf("stdout is %d bytes of the %d sent; stderr %q; exit %s", len(got[fStdout]), len(stdin), got[fStderr], got[fExit])
 	}
 }
 
@@ -294,27 +317,27 @@ func TestAClientGoneIsFoundWhileItsCommandLeavesStdinUnread(t *testing.T) {
 	until(t, "the command outlived its client", func() bool { return gone(command) })
 }
 
-func TestACwdThatCantBeEnteredFailsAsCdDoes(t *testing.T) {
+func TestACwdThatCantBeEnteredFailsTheCallAsCdDoes(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "data"), nil, 0o644)
+	made := filepath.Join(t.TempDir(), "made")
+	os.WriteFile(filepath.Join(dir, "file"), nil, 0o644)
+	closed := filepath.Join(dir, "closed")
+	os.Mkdir(closed, 0)
 	user := ""
-	if os.Getuid() == 0 { // root enters any directory: run as a user the temporary directory's parent keeps out
+	if os.Getuid() == 0 { // root enters any directory: run as a user the temporary directory keeps out
 		user = "nobody"
 	}
 
-	// A file that can't be run fails the same way in the kernel, and must stay a 126.
-	_, frames := begin(t, testServer(), startRequest{Argv: []string{"./data"}, Cwd: dir})
-	denied := exit(t, frames)
-	os.Chmod(dir, 0)
-	t.Cleanup(func() { os.Chmod(dir, 0o755) })
-	_, frames = begin(t, testServer(), startRequest{Argv: []string{"true"}, Cwd: dir, User: user})
-	entered := exit(t, frames)
+	for _, cwd := range []string{closed, filepath.Join(dir, "file"), filepath.Join(dir, "missing")} {
+		_, frames := begin(t, testServer(), startRequest{Argv: []string{"touch", made}, Cwd: cwd, User: user})
 
-	if denied.Code != 126 {
-		t.Fatalf("a file that can't be run: %+v, want 126", denied)
+		// As sh's cd fails, in the shell that already runs as the user: not as a command that can't start.
+		if status := exit(t, frames); status.Code == 0 || status.Code == 126 || status.Error != "" {
+			t.Fatalf("cwd %s: %+v, want cd's failure", cwd, status)
+		}
 	}
-	if entered.Code != 1 || !strings.HasPrefix(entered.Error, "cd: ") {
-		t.Fatalf("a cwd that can't be entered: %+v, want cd's failure", entered)
+	if _, err := os.Stat(made); err == nil {
+		t.Fatal("the command ran outside its cwd")
 	}
 }
 
@@ -379,9 +402,9 @@ func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
 }
 
 func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
-	cwd := "/" + strings.Repeat("\x01", 5000) // six bytes each, escaped to JSON
+	user := strings.Repeat("\x01", 5000) // six bytes each, escaped to JSON
 
-	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, Cwd: cwd})
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, User: user})
 
 	if n := len(next(t, frames, fExit).payload); n > 4096 { // the client's MAX_CONTROL
 		t.Fatalf("EXIT is %d bytes", n)

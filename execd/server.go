@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,17 +120,13 @@ func (c *call) serve(req startRequest) {
 	if err := c.start(req); err != nil {
 		// Report like a shell would: the message on stderr and 126 or 127 as the exit code.
 		code := 126
-		if strings.HasPrefix(err.Error(), "cd: ") {
-			code = 1
-		} else if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+		if os.IsNotExist(err) {
 			code = 127
 		}
 		msg := err.Error()
-		stderr := "execd: " + msg + "\n"
-		c.send(fStderr, []byte(stderr[max(0, len(stderr)-chunk):])) // its end says why
-		// Out of band too, so the command's own stderr can't fake it; capped, so even
-		// escaped to JSON it fits the client's 4 KiB control frame.
-		c.finish(exitStatus{Code: code, Error: msg[:min(len(msg), 512)]})
+		msg = msg[:min(len(msg), 512)] // so that even escaped to JSON it fits the client's 4 KiB
+		c.send(fStderr, []byte("execd: "+msg+"\n"))
+		c.finish(exitStatus{Code: code, Error: msg}) // out of band too, so stderr can't fake it
 	}
 	done := make(chan struct{})
 	defer close(done)
@@ -243,13 +238,10 @@ func (c *call) start(req startRequest) error {
 			}
 		}
 	}
-	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
-		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
-	}
-	env := childEnv(req.Env)
-	argv0, err := lookPath(req.Argv[0], env, req.Cwd)
-	if err != nil {
-		return err
+	// As Kubernetes exec runs it: sh finds the command, and its cd fails as the user's does.
+	script, args := `exec "$@"`, req.Argv
+	if req.Cwd != "" {
+		script, args = `CDPATH= cd -- "$1" && shift && exec "$@"`, append([]string{req.Cwd}, req.Argv...)
 	}
 	stdinR, stdinW, err := stdinPipe(req.Stdin)
 	if err != nil {
@@ -258,8 +250,8 @@ func (c *call) start(req startRequest) error {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
-	p, err := os.StartProcess(argv0, req.Argv, &os.ProcAttr{
-		Dir: req.Cwd, Env: env, Files: []*os.File{stdinR, outW, errW}, Sys: attr,
+	p, err := os.StartProcess("/bin/sh", append([]string{"sh", "-c", script, "sh"}, args...), &os.ProcAttr{
+		Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
 	})
 	stdinR.Close()
 	outW.Close()
@@ -270,9 +262,6 @@ func (c *call) start(req startRequest) error {
 		errR.Close()
 		if stdinW != nil {
 			stdinW.Close()
-		}
-		if errors.Is(err, syscall.EACCES) && req.Cwd != "" && !entered(req.Cwd, attr) {
-			return fmt.Errorf("cd: %s: %w", req.Cwd, syscall.EACCES)
 		}
 		return err
 	}
@@ -340,12 +329,6 @@ func (c *call) start(req startRequest) error {
 	return nil
 }
 
-// entered says whether a start with these credentials gets into dir: its exec of nothing fails only after the chdir.
-func entered(dir string, sys *syscall.SysProcAttr) bool {
-	_, err := os.StartProcess("", []string{""}, &os.ProcAttr{Dir: dir, Sys: sys})
-	return errors.Is(err, syscall.ENOENT)
-}
-
 // copyOut sends a pipe's output: a full buffer at once, less only a millisecond after the last, so small writes make few frames.
 func (c *call) copyOut(kind byte, r *os.File, read *atomic.Int64) {
 	defer r.Close()
@@ -404,40 +387,6 @@ func childEnv(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
-}
-
-// lookPath resolves as a shell would: relative PATH entries from cwd; a non-executable match is 126.
-func lookPath(name string, env []string, cwd string) (string, error) {
-	if strings.Contains(name, "/") {
-		return name, nil
-	}
-	path := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
-		}
-	}
-	denied := ""
-	for _, dir := range filepath.SplitList(path) {
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(cwd, dir)
-		}
-		p, _ := filepath.Abs(filepath.Join(dir, name)) // absolute: the child starts in cwd
-		st, err := os.Stat(p)
-		if err != nil || st.IsDir() {
-			continue
-		}
-		if st.Mode()&0o111 != 0 {
-			return p, nil
-		}
-		if denied == "" {
-			denied = p
-		}
-	}
-	if denied != "" {
-		return "", &os.PathError{Op: "exec", Path: denied, Err: syscall.EACCES}
-	}
-	return "", fmt.Errorf("%s: not found", name)
 }
 
 // lookupUser resolves a name or uid in /etc/passwd; a nil credential means execd's own user.
