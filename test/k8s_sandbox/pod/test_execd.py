@@ -1105,33 +1105,63 @@ async def test_pacing_lets_other_work_run() -> None:
     assert ran.is_set()  # under its allowance too: a pass at a time
 
 
-async def test_a_trickle_of_small_reads_waits_its_turn() -> None:
-    reading: list[bool] = []
+def stub_pipe(
+    fraction: float, reading: list[bool], pace: execd.Pace | None = None
+) -> execd._Pipe:
+    """A pipe whose peer sends that fraction of what each read takes."""
+
+    async def read(n: int) -> bytes:
+        assert reading[-1], "read while paused"
+        return b"x" * int(n * fraction)
+
     transport = types.SimpleNamespace(
         resume_reading=lambda: reading.append(True),
         pause_reading=lambda: reading.append(False),
     )
-
-    class Trickle:  # a peer sending less than a read takes
-        async def read(self, n: int) -> bytes:
-            assert reading[-1], "read while paused"
-            return b"x" * (n // 2)
-
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
-    pipe = execd._Pipe(
-        Trickle(),  # type: ignore[arg-type]
+    return execd._Pipe(
+        types.SimpleNamespace(read=read),  # type: ignore[arg-type]
         types.SimpleNamespace(transport=transport),  # type: ignore[arg-type]
         context,
-        execd.Pace(),
+        pace or execd.Pace(),
     )
+
+
+async def test_a_trickle_of_short_reads_waits_its_turn() -> None:
+    reading: list[bool] = []
+    pipe = stub_pipe(0.5, reading)
     began = time.monotonic()
 
     for _ in range(execd.SMALL_READS + 20):
         await pipe._raw()
 
-    assert time.monotonic() - began >= 0.015  # past the burst, one a millisecond
+    # Past the burst, about one a millisecond.
+    assert 0.015 <= time.monotonic() - began < 0.15
     assert not reading[-1]  # between reads, bytes wait in the kernel
+
+
+async def test_full_reads_spend_no_turns() -> None:
+    pipe = stub_pipe(1.0, [])
+
+    for _ in range(execd.SMALL_READS + 1):
+        await pipe._raw()
+
+    assert pipe._small_at == float("-inf")  # a stream at full speed doesn't wait
+
+
+async def test_what_a_pass_delivers_pays_for_its_decryption(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    pace = execd.Pace()
+    pipe = stub_pipe(1.0, [], pace)
+    monkeypatch.setattr(execd.time, "thread_time", lambda: 1.0)
+    monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
+
+    await pipe._charge(0.0, delivered=2 * 10**9)  # a second of CPU: plain decryption
+    await pipe._charge(0.0)  # a second of CPU for nothing delivered
+
+    assert pace.tls == 1.0
 
 
 @pytest.fixture

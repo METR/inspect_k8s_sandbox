@@ -63,7 +63,8 @@ STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # the runner's loop. execd sends output in reads of up to 256 KiB.
 PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
-PACE_TLS = 0.1  # CPU seconds in TLS: tiny records and messages cost more than bytes
+PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes
+TLS_PER_BYTE = 1e-9  # CPU seconds of TLS each byte delivered excuses: plain decryption
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
@@ -142,7 +143,7 @@ class _Pipe:
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
             raw = await self._raw()
-            began = time.thread_time()
+            began, had = time.thread_time(), len(self._plain)
             self._in.write(raw)
             with contextlib.suppress(ssl.SSLWantReadError):
                 while True:
@@ -150,13 +151,14 @@ class _Pipe:
                     if not chunk:
                         raise ConnectionResetError("execd ended the TLS session")
                     self._plain += chunk
-            await self._charge(began)
+            await self._charge(began, len(self._plain) - had)
         data = bytes(self._plain[:n])
         del self._plain[:n]
         return data
 
-    async def _charge(self, began: float) -> None:
-        await self._pace.take(0, frames=0, tls=time.thread_time() - began)
+    async def _charge(self, began: float, delivered: int = 0) -> None:
+        spent = time.thread_time() - began - delivered * TLS_PER_BYTE
+        await self._pace.take(0, frames=0, tls=max(spent, 0.0))
 
     async def _raw(self) -> bytes:
         if (wait := self._small_at - time.monotonic()) > 0:
