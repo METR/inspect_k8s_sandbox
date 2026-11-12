@@ -4,7 +4,7 @@
 //	execd listen --port N --key-sha256 HEX [--replace]
 //
 // starts the daemon in the background, serving TLS 1.3 on port N with a certificate it makes at
-// start, and prints "<pid> <SHA-256 of the certificate>" once it accepts connections. The client
+// start, and prints the SHA-256 of that certificate once it accepts connections. The client
 // pins that certificate, and the first frame on a connection must carry the key whose SHA-256 is
 // HEX. --replace first stops any execd already listening, which no client can use without its
 // key (a client's first start does this). It is a static binary, copied into each Pod by an init
@@ -75,7 +75,7 @@ func start() {
 		fail(err.Error())
 	}
 	devnull, _ := os.Open(os.DevNull)
-	p, err := os.StartProcess("/proc/self/exe", os.Args, &os.ProcAttr{
+	_, err = os.StartProcess("/proc/self/exe", os.Args, &os.ProcAttr{
 		Env:   append(os.Environ(), foregroundEnv+"=1"),
 		Files: []*os.File{devnull, devnull, devnull, w},
 		Sys:   &syscall.SysProcAttr{Setsid: true},
@@ -90,7 +90,7 @@ func start() {
 	if !ok {
 		fail("daemon did not start: " + msg)
 	}
-	fmt.Printf("%d %s\n", p.Pid, fingerprint)
+	fmt.Println(fingerprint)
 }
 
 func run(port int, keyHash string) {

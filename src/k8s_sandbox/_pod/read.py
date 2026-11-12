@@ -20,6 +20,23 @@ from k8s_sandbox._pod.op import (
 )
 
 
+def read_command(src: Path) -> list[str]:
+    """The command that prints a file, read_file() on either transport."""
+    # Limit number of bytes read (-c) to 1 byte over the limit (to detect if the
+    # file is too large). A shell finds `head` in the system directories: started
+    # directly, it would be found through the image's PATH. It execs `head`, so
+    # the errors and exit status are head's own. str() because kubernetes>=37
+    # validates each element as a string and rejects the call before sending it.
+    return [
+        "/bin/sh",
+        "-c",
+        f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
+        "sh",
+        str(limits.MAX_READ_FILE_SIZE + 1),
+        src.as_posix(),
+    ]
+
+
 class ReadFileOperation(PodOperation):
     def read_file(self, src: Path, dst: IO[bytes]) -> None:
         with self._start_read_command(src) as ws_client:
@@ -27,21 +44,8 @@ class ReadFileOperation(PodOperation):
 
     @contextmanager
     def _start_read_command(self, src: Path) -> Generator[WSClient, None, None]:
-        # Limit number of bytes read (-c) to 1 byte over the limit (to detect if the
-        # file is too large). A shell finds `head` in the system directories: started
-        # directly, it would be found through the image's PATH. It execs `head`, so
-        # the errors and exit status are head's own. str() because kubernetes>=37
-        # validates each element as a string and rejects the call before sending it.
-        command = [
-            "/bin/sh",
-            "-c",
-            f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
-            "sh",
-            str(limits.MAX_READ_FILE_SIZE + 1),
-            src.as_posix(),
-        ]
         yield from self.create_websocket_client_for_exec(
-            command=command,
+            command=read_command(src),
             stderr=True,
             # Without stdin, kubelet closes the exec's input as soon as the stream
             # opens, which races the stdout read in Kata Containers' Go shim and hangs

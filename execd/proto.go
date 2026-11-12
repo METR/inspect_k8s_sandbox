@@ -69,10 +69,6 @@ type resumeRequest struct {
 	Stderr int `json:"stderr"`
 }
 
-func readFrame(r io.Reader) (frame, error) {
-	return readFrameMax(r, maxPayload)
-}
-
 // readFrameMax refuses a payload over limit before allocating it.
 func readFrameMax(r io.Reader, limit uint32) (frame, error) {
 	var h [headerLen]byte

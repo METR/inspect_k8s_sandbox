@@ -102,9 +102,9 @@ class Pod:
         )
         if b"address already in use" in stderr:
             raise DaemonRunning(stderr.decode(errors="replace"))
-        if code != 0 or len(stdout.split()) != 2:
+        if code != 0 or len(stdout.split()) != 1:
             raise PodError("execd did not start", returncode=code, stderr=stderr)
-        return Daemon(pod.ip, stdout.split()[1].decode(), key)
+        return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
     def info(self) -> PodInfo:

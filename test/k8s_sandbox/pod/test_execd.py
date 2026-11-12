@@ -34,7 +34,7 @@ class Daemons:
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
             await read_frame(r)  # AUTH
-            w.write(frame(execd.OK, 0, b'{"pid": 1}'))
+            w.write(frame(execd.OK, 0))
             await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)

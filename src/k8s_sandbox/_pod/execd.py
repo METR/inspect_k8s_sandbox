@@ -41,6 +41,7 @@ from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
 from k8s_sandbox._pod.execute import EXEC_USER_URL
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
+from k8s_sandbox._pod.read import read_command
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class Call:
     stdin_put: int = 0  # stdin execd has written to the process
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
     closed: bool = False  # by its caller
+    exited: bool = False
 
 
 class Link:
@@ -157,9 +159,7 @@ class Link:
         self.daemon = daemon
         self.calls: dict[int, Call] = {}
         self.closed = False
-        self.ready: asyncio.Future[dict[str, Any]] = (
-            asyncio.get_running_loop().create_future()
-        )
+        self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self._last_rx = time.monotonic()
         self._tasks = [
@@ -191,8 +191,11 @@ class Link:
                     return
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
+                if kind == EXIT and (c := self.calls.get(call_id)) is not None:
+                    c.exited = True
+                    c.stdin_room.set()  # a send waiting for room sees the exit
                 if kind == OK and not self.ready.done():
-                    self.ready.set_result(json.loads(payload))
+                    self.ready.set_result(None)
                 elif (c := self.calls.get(call_id)) is not None and kind == STDIN_ACK:
                     c.stdin_put = max(c.stdin_put, json.loads(payload)["stdin"])
                     c.stdin_room.set()
@@ -205,7 +208,7 @@ class Link:
                             return
                         c.got[kind - STDOUT] += n
                     c.queue.put_nowait((kind, payload))
-        except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+        except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
         finally:
             await self.close()
@@ -218,7 +221,7 @@ class Link:
                 return
             try:
                 await self.send(PING, 0)
-            except (ConnectionError, OSError):
+            except OSError:
                 await self.close()
                 return
 
@@ -265,7 +268,7 @@ class ExecdClient:
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 return link
-            except (Dropped, ConnectionError, OSError, asyncio.TimeoutError) as e:
+            except (Dropped, OSError, asyncio.TimeoutError) as e:
                 if link is not None:
                     await link.close()
                 if time.monotonic() > deadline:
@@ -368,7 +371,7 @@ class ExecdClient:
                         await _taken(link, call, kind, len(payload))
                     elif kind == EXIT:
                         finished = True
-                        with contextlib.suppress(ConnectionError, OSError):
+                        with contextlib.suppress(OSError):
                             await link.send(RELEASE, call.id)
                         yield EXIT, int(json.loads(payload)["code"])
                         return
@@ -406,7 +409,7 @@ class ExecdClient:
                 sender.cancel()
             if not finished and not link.closed:
                 # Abandoned by the caller (an output limit, a cancel): stop it.
-                with contextlib.suppress(ConnectionError, OSError):
+                with contextlib.suppress(OSError):
                     await link.send(KILL, call.id)
                     await link.send(RELEASE, call.id)
             link.calls.pop(call.id, None)
@@ -416,7 +419,7 @@ class ExecdClient:
     ) -> None:
         if stdin is None:
             return
-        with contextlib.suppress(ConnectionError, OSError):  # the reader sees the drop
+        with contextlib.suppress(OSError):  # the reader sees the drop
             for i in range(offset, len(stdin), CHUNK):
                 await _window(link, call, i)
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
@@ -432,7 +435,7 @@ class ExecdClient:
                 if isinstance(item, tuple) and item[0] == EXIT:
                     break
             await link.send(RELEASE, call.id)
-        except (ConnectionError, OSError, asyncio.TimeoutError):
+        except (OSError, asyncio.TimeoutError):
             pass
 
     async def exec(
@@ -505,16 +508,8 @@ class ExecdClient:
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
         """Pod.read_file(), over execd: the same command, limit and errors."""
-        cmd = [
-            "/bin/sh",
-            "-c",
-            f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
-            "sh",
-            str(limits.MAX_READ_FILE_SIZE + 1),
-            src.as_posix(),
-        ]
         stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = await self._file_op(cmd, None, dst, stderr)
+        code = await self._file_op(read_command(src), None, dst, stderr)
         if code != 0:
             raise_for_known_read_write_errors(str(stderr))
             raise PodError(
@@ -578,8 +573,8 @@ async def _window(link: Link, call: Call, sent: int) -> None:
     """Wait until the call has room for more stdin in flight."""
     while sent - call.stdin_put >= STDIN_WINDOW:
         call.stdin_room.clear()
-        if link.closed or call.closed:
-            raise ConnectionError("execd connection closed")
+        if link.closed or call.closed or call.exited:
+            raise ConnectionError("execd connection closed, or the command exited")
         await call.stdin_room.wait()
 
 
@@ -589,7 +584,7 @@ async def _taken(link: Link, call: Call, kind: int, n: int) -> None:
     if sum(call.taken) - call.acked >= ACK_EVERY:
         call.acked = sum(call.taken)
         offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
-        with contextlib.suppress(ConnectionError, OSError):
+        with contextlib.suppress(OSError):
             await link.send(ACK, call.id, json.dumps(offsets).encode())
 
 
@@ -638,11 +633,11 @@ class ExecdStream(ByteStream):
                 await _window(self._link, self._call, self._sent)
                 await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
                 self._sent += len(item[i : i + CHUNK])
-        except (ConnectionError, OSError) as e:
+        except OSError as e:
             raise anyio.BrokenResourceError(repr(e)) from e
 
     async def send_eof(self) -> None:
-        with contextlib.suppress(ConnectionError, OSError):
+        with contextlib.suppress(OSError):
             await self._link.send(STDIN, self._call.id)
 
     async def aclose(self) -> None:
@@ -651,8 +646,9 @@ class ExecdStream(ByteStream):
         self._closed = True
         self._call.closed = True
         self._call.stdin_room.set()  # a send waiting for room sees the close
+        self._call.queue.put_nowait(Dropped())  # and so does a receive
         self._link.calls.pop(self._call.id, None)
-        with contextlib.suppress(ConnectionError, OSError):
+        with contextlib.suppress(OSError):
             await self._link.send(
                 STDIN, self._call.id
             )  # EOF: the command may end itself

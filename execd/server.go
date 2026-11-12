@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -32,6 +31,9 @@ type server struct {
 }
 
 const idleTimeout = 60 * time.Second
+
+// abandonAfter outlasts the client's reconnect window (5 minutes).
+const abandonAfter = 6 * time.Minute
 
 // authTimeout bounds the TLS handshake and the AUTH frame; maxKey bounds AUTH's payload;
 // maxPreauth bounds the connections doing either at once.
@@ -135,11 +137,10 @@ func (s *server) handle(c *conn) {
 	if subtle.ConstantTimeCompare(got[:], s.keyHash) != 1 {
 		return
 	}
-	ok, _ := json.Marshal(map[string]int{"pid": os.Getpid()})
-	c.send(fOK, 0, ok)
+	c.send(fOK, 0, nil)
 	for {
 		c.nc.SetReadDeadline(time.Now().Add(idleTimeout)) // clients ping every 15 s
-		f, err := readFrame(c.nc)
+		f, err := readFrameMax(c.nc, maxPayload)
 		if err != nil {
 			return
 		}
@@ -162,16 +163,7 @@ func (s *server) handle(c *conn) {
 				cl.ack(req)
 			}
 		case fRelease:
-			s.mu.Lock()
-			cl := s.calls[f.id]
-			delete(s.calls, f.id)
-			s.mu.Unlock()
-			if cl != nil {
-				cl.mu.Lock()
-				cl.gone, cl.out = true, [2][]byte{}
-				cl.room.Broadcast()
-				cl.mu.Unlock()
-			}
+			s.release(f.id)
 		case fPing:
 			c.send(fPong, f.id, nil)
 		}
@@ -188,14 +180,40 @@ func (s *server) detach(c *conn) {
 	s.mu.Unlock()
 	for _, cl := range calls {
 		cl.mu.Lock()
-		orphaned := cl.sub == c && cl.stream
-		if cl.sub == c {
+		mine := cl.sub == c
+		if mine {
 			cl.sub = nil
 		}
 		cl.mu.Unlock()
-		if orphaned {
+		switch {
+		case mine && cl.stream: // nothing resumes a stream
 			cl.kill()
+			s.release(cl.id)
+		case mine: // a client that hasn't resumed it by then has given up
+			time.AfterFunc(abandonAfter, func() {
+				cl.mu.Lock()
+				orphaned := cl.sub == nil
+				cl.mu.Unlock()
+				if orphaned {
+					cl.kill()
+					s.release(cl.id)
+				}
+			})
 		}
+	}
+}
+
+// release forgets a call and frees its buffered output.
+func (s *server) release(id uint64) {
+	s.mu.Lock()
+	cl := s.calls[id]
+	delete(s.calls, id)
+	s.mu.Unlock()
+	if cl != nil {
+		cl.mu.Lock()
+		cl.gone, cl.out = true, [2][]byte{}
+		cl.room.Broadcast()
+		cl.mu.Unlock()
 	}
 }
 
@@ -207,7 +225,6 @@ func (s *server) get(id uint64) *call {
 
 func (s *server) start(c *conn, f frame) {
 	var req startRequest
-	req.Env = map[string]string{}
 	if err := json.Unmarshal(f.payload, &req); err != nil || len(req.Argv) == 0 {
 		c.send(fError, f.id, []byte("bad start request"))
 		return
@@ -255,9 +272,7 @@ func (s *server) resume(c *conn, f frame) {
 }
 
 func (cl *call) run(req startRequest) error {
-	if req.Tag != "" {
-		req.Env["HAWK_NEXT_EXEC"] = req.Tag
-	}
+	req.Env["HAWK_NEXT_EXEC"] = req.Tag
 	attr := &syscall.SysProcAttr{Setpgid: true}
 	if req.User != "" {
 		cred, home, name, err := lookupUser(req.User)
@@ -275,7 +290,7 @@ func (cl *call) run(req startRequest) error {
 		}
 	}
 	env := childEnv(req.Env)
-	argv0, err := lookPath(req.Argv[0], env)
+	argv0, err := lookPath(req.Argv[0], env, req.Cwd)
 	if err != nil {
 		return err
 	}
@@ -394,7 +409,7 @@ func stdinPipe(wanted bool) (*os.File, *os.File, error) {
 func (cl *call) writeStdin(data []byte) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	if cl.stdinEOF {
+	if cl.stdinEOF || cl.exited {
 		return
 	}
 	if len(data) == 0 {
@@ -507,12 +522,12 @@ func (cl *call) flush() {
 	}
 }
 
-// childEnv is execd's own environment without its HN_EXECD_ settings, plus the call's.
+// childEnv is execd's own environment, plus the call's.
 func childEnv(extra map[string]string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
-		if _, over := extra[k]; !strings.HasPrefix(k, "HN_EXECD_") && !over {
+		if _, over := extra[k]; !over {
 			env = append(env, kv)
 		}
 	}
@@ -522,7 +537,9 @@ func childEnv(extra map[string]string) []string {
 	return env
 }
 
-func lookPath(name string, env []string) (string, error) {
+// lookPath finds a command as a shell would: relative PATH entries from the call's directory,
+// and a match that isn't executable is "permission denied" (126), not "not found" (127).
+func lookPath(name string, env []string, cwd string) (string, error) {
 	if strings.Contains(name, "/") {
 		return name, nil
 	}
@@ -532,11 +549,25 @@ func lookPath(name string, env []string) (string, error) {
 			path = v
 		}
 	}
+	denied := ""
 	for _, dir := range filepath.SplitList(path) {
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(cwd, dir)
+		}
 		p := filepath.Join(dir, name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+		st, err := os.Stat(p)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		if st.Mode()&0o111 != 0 {
 			return p, nil
 		}
+		if denied == "" {
+			denied = p
+		}
+	}
+	if denied != "" {
+		return "", &os.PathError{Op: "exec", Path: denied, Err: syscall.EACCES}
 	}
 	return "", fmt.Errorf("%s: not found", name)
 }
@@ -546,23 +577,8 @@ func lookPath(name string, env []string) (string, error) {
 func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var u *user.User
 	var err error
-	if uidPart, gidPart, ok := strings.Cut(name, ":"); ok { // "uid:gid", as a spec may give
-		gid, err := strconv.ParseUint(gidPart, 10, 32)
-		if err != nil {
-			return nil, "", "", fmt.Errorf("unknown user %s", name)
-		}
-		cred, home, uname, err := lookupUser(uidPart)
-		if err != nil || (cred == nil && uint32(gid) == uint32(os.Getgid())) {
-			return cred, home, uname, err
-		}
-		if cred == nil { // execd's own uid, another group
-			if os.Getuid() != 0 {
-				return nil, "", "", fmt.Errorf("cannot run as %s: execd is not root", name)
-			}
-			cred = &syscall.Credential{Uid: uint32(os.Getuid())}
-		}
-		cred.Gid, cred.Groups = uint32(gid), nil
-		return cred, home, uname, nil
+	if name == "root" { // uid 0, whatever the image's passwd says
+		name = "0"
 	}
 	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil { // no uid wraps to 0
 		if u, err = user.LookupId(name); err != nil {
@@ -651,9 +667,4 @@ func startReaper() {
 			}
 		}
 	}()
-}
-
-func copyClose(dst io.WriteCloser, src io.Reader) {
-	io.Copy(dst, src)
-	dst.Close()
 }
