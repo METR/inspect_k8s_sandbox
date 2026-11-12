@@ -63,7 +63,7 @@ STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # the runner's loop. execd sends output in reads of up to 256 KiB.
 PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
-PACE_OVERHEAD = 512 << 10  # TLS bytes that aren't plaintext: a record costs a decrypt
+PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
@@ -136,16 +136,16 @@ class _Pipe:
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
             raw = await self._raw()
+            began = time.thread_time()
             self._in.write(raw)
-            had = len(self._plain)
             with contextlib.suppress(ssl.SSLWantReadError):
                 while True:
                     chunk = self.tls.read(RAW_READ)  # a record at a time
                     if not chunk:
                         raise ConnectionResetError("execd ended the TLS session")
                     self._plain += chunk
-            overhead = len(raw) - (len(self._plain) - had)
-            await self._pace.take(0, frames=0, overhead=overhead)
+            await self._pace.take(0, frames=0, tls=time.thread_time() - began)
+            await asyncio.sleep(0)  # a pass at a time, so other work runs in between
         data = bytes(self._plain[:n])
         del self._plain[:n]
         return data
@@ -229,25 +229,21 @@ class Strays:
 
 @dataclass
 class Pace:
-    """What a pod sent this second: frames for its calls, their bytes, TLS overhead."""
+    """What a pod sent this second: frames for its calls, their bytes, TLS's cost."""
 
     since: float = float("-inf")
     frames: int = 0
     size: int = 0
-    overhead: int = 0
+    tls: float = 0.0
 
-    async def take(self, n: int, frames: int = 1, overhead: int = 0) -> None:
+    async def take(self, n: int, frames: int = 1, tls: float = 0.0) -> None:
         now = time.monotonic()
         if now - self.since >= 1.0:
-            self.since, self.frames, self.size, self.overhead = now, 0, 0, 0
+            self.since, self.frames, self.size, self.tls = now, 0, 0, 0.0
         self.frames += frames
         self.size += n
-        self.overhead += overhead
-        if (
-            self.frames > PACE_FRAMES
-            or self.size > PACE_BYTES
-            or self.overhead > PACE_OVERHEAD
-        ):
+        self.tls += tls
+        if self.frames > PACE_FRAMES or self.size > PACE_BYTES or self.tls > PACE_TLS:
             await asyncio.sleep(self.since + 1.0 - now)
 
 

@@ -1129,23 +1129,22 @@ async def test_only_the_pinned_certificate_is_trusted(
     server.close()
 
 
-async def test_what_tls_records_cost_is_paced(
+async def test_what_tls_decryption_costs_is_paced(
     tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
 ) -> None:
     context, pin = tls
-    monkeypatch.setattr(execd, "PACE_OVERHEAD", 2048)
-    monkeypatch.setattr(execd, "RAW_READ", 512)  # so no batch is near the allowance
+    cpu = iter([0.0, 10.0, 10.0, 20.0])  # the first two passes take 10 s each
+    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 20.0))
 
-    async def tiny_records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await read_frame(r)  # AUTH
         w.write(frame(execd.OK, 0))
         _, call_id, _ = await read_frame(r)  # START
-        out = frame(execd.STDOUT, call_id, b"x" * 200)
-        for byte in out + frame(execd.EXIT, call_id, b'{"code": 0}'):
-            w.write(bytes([byte]))  # a record each: 22 bytes that aren't plaintext
+        w.write(frame(execd.STDOUT, call_id, b"x" * (256 << 10)))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         await r.read()
 
-    server = await asyncio.start_server(tiny_records, "127.0.0.1", 0, ssl=context)
+    server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
 
     async def start(replace: bool) -> execd.Daemon:
@@ -1154,6 +1153,6 @@ async def test_what_tls_records_cost_is_paced(
     began = time.monotonic()
     await execd.ExecdClient(start).exec(["yes"], None, None, {}, None, 30)
 
-    # Over twice the second's allowance, so two waits; unpaced, it takes milliseconds.
+    # Each is over a second's allowance, so two waits; unpaced, it takes milliseconds.
     assert time.monotonic() - began >= 2
     server.close()
