@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -207,5 +208,38 @@ func TestManySmallWritesMakeFewFrames(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Fatal("no EXIT")
 		}
+	}
+}
+
+func TestOutputWaitsLongerWhileOtherCallsOutputWaits(t *testing.T) {
+	waiting.Store(7) // seven other calls' output waits to be sent
+	t.Cleanup(func() { waiting.Store(0) })
+	c, frames := recordedConn(t)
+	cl := &call{id: 8, sub: c}
+	cl.room = sync.NewCond(&cl.mu)
+
+	cl.output(0, []byte("a")) // sent at once
+	<-frames
+	sent := time.Now()
+	cl.output(0, []byte("b")) // within its interval: waits for the timer
+
+	<-frames
+	// Eight calls each sending every millisecond would be past the client's frame pace.
+	if waited := time.Since(sent); waited < 7*time.Millisecond {
+		t.Fatalf("sent after %v, as if no other call's output waited", waited)
+	}
+}
+
+func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
+	c, frames := recordedConn(t)
+	cl := &call{id: 9, sub: c, deferred: true} // its flush is set, and its time has come
+	cl.room = sync.NewCond(&cl.mu)
+
+	cl.output(0, []byte("x"))
+
+	select {
+	case <-frames: // and the waiting flush sends another
+		t.Fatal("sent at once, as well as by the flush that waits")
+	case <-time.After(50 * time.Millisecond):
 	}
 }

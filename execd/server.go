@@ -516,26 +516,32 @@ func (cl *call) output(stream int, data []byte) {
 	cl.flushSoon()
 }
 
+// Calls whose output waits to be sent: each waits a millisecond more for every one of them.
+var waiting atomic.Int32
+
 // flushSoon flushes at most once a millisecond, so a stream of small writes makes few frames.
 func (cl *call) flushSoon() {
-	wait := time.Millisecond - time.Since(cl.flushed)
+	if cl.deferred {
+		return // the waiting flush sends this too
+	}
+	wait := time.Duration(1+waiting.Load())*time.Millisecond - time.Since(cl.flushed)
 	if wait <= 0 {
 		cl.flushed = time.Now()
 		cl.flush()
 		return
 	}
-	if !cl.deferred {
-		cl.deferred = true
-		time.AfterFunc(wait, func() {
-			cl.mu.Lock()
-			defer cl.mu.Unlock()
-			cl.deferred = false
-			if !cl.gone && !cl.exited { // finish flushed it all, with the exit
-				cl.flushed = time.Now()
-				cl.flush()
-			}
-		})
-	}
+	cl.deferred = true
+	waiting.Add(1)
+	time.AfterFunc(wait, func() {
+		waiting.Add(-1)
+		cl.mu.Lock()
+		defer cl.mu.Unlock()
+		cl.deferred = false
+		if !cl.gone && !cl.exited { // finish flushed it all, with the exit
+			cl.flushed = time.Now()
+			cl.flush()
+		}
+	})
 }
 
 func (cl *call) ack(req resumeRequest) {
