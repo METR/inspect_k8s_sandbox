@@ -3,7 +3,7 @@
 ## Unreleased
 
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
-  mounted read-only at `/opt/execd/execd` and TCP port 24601 reachable from the client
+  mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
   TLS to execd instead of Kubernetes exec stdin. There, a timed-out `exec()` and its
   background processes get SIGKILL at once, not SIGTERM.

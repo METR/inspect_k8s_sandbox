@@ -33,7 +33,7 @@ from k8s_sandbox._pod.read import read_command
 logger = logging.getLogger(__name__)
 
 ANNOTATION = "inspect-k8s-sandbox/execd"
-EXECD_PATH = "/opt/execd/execd"
+EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
 EXECD_PORT = 24601
 
 AUTH, START, STDIN, KILL, RESUME, RELEASE, PING, ACK = 1, 2, 3, 4, 5, 6, 7, 8
@@ -56,6 +56,7 @@ ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
 HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
+MAX_STRAY_BYTES = 4 * HOLD  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
@@ -82,6 +83,12 @@ class Dropped(Exception):
 
 class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
+
+
+def _port_held() -> RuntimeError:
+    return RuntimeError(
+        f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
+    )
 
 
 class NotOurDaemon(ConnectionRefusedError):
@@ -150,6 +157,7 @@ class Link:
         self._wlock = asyncio.Lock()
         self._last_rx = time.monotonic()
         self._stray = 0
+        self._stray_bytes = 0
         self._tasks = [
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
@@ -203,7 +211,8 @@ class Link:
                     c.queue.put_nowait((kind, payload))
                 else:  # a pong, a repeated ack, or a frame for a call that's gone
                     self._stray += 1
-                    if self._stray > MAX_STRAY:
+                    self._stray_bytes += n
+                    if self._stray > MAX_STRAY or self._stray_bytes > MAX_STRAY_BYTES:
                         return
         except (asyncio.IncompleteReadError, OSError, ValueError):
             pass
@@ -213,7 +222,7 @@ class Link:
     async def _ping(self) -> None:
         while not self.closed:
             await asyncio.sleep(PING_EVERY)
-            self._stray = 0
+            self._stray = self._stray_bytes = 0
             if time.monotonic() - self._last_rx > DEAD_AFTER:
                 await self.close()
                 return
@@ -258,7 +267,10 @@ class ExecdClient:
             link = None
             try:
                 if self._daemon is None:
-                    self._daemon = await self._start(self._link is None)
+                    try:
+                        self._daemon = await self._start(self._link is None)
+                    except DaemonRunning as e:  # even past --replace: not execd
+                        raise _port_held() from e
                 daemon = self._daemon
                 link = Link(await _connect(daemon), daemon)
                 await link.send(AUTH, 0, daemon.key)
@@ -276,10 +288,7 @@ class ExecdClient:
                     self._daemon = await self._start(self._link is None or not_ours)
                 except DaemonRunning:
                     if not_ours:  # what holds the port isn't execd: it won't let go
-                        raise RuntimeError(
-                            f"TCP port {EXECD_PORT} in the sandbox is held by a "
-                            "process other than execd"
-                        ) from e
+                        raise _port_held() from e
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link

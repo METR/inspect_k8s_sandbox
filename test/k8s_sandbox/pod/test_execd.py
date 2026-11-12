@@ -663,6 +663,30 @@ async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
     await until(lambda: stream._link.closed)
 
 
+async def test_stray_bytes_end_the_connection(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "MAX_STRAY_BYTES", execd.CHUNK)
+
+    async def big_strays(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, 12345, b"x" * execd.CHUNK) * 2)  # nobody's call
+        await r.read()
+
+    await daemons.serve(big_strays)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    await until(lambda: stream._link.closed)
+
+
+async def test_a_port_held_at_the_first_start_says_so() -> None:
+    async def held(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("bind: address already in use")  # even with --replace
+
+    with pytest.raises(RuntimeError, match="held by a process other than execd"):
+        await execd.ExecdClient(held).exec(["true"], None, None, {}, None, 10)
+
+
 async def test_stray_frames_are_counted_per_ping_interval(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:

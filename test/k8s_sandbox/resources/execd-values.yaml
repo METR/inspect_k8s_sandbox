@@ -26,7 +26,7 @@ services:
           sizeLimit: 32Mi
     volumeMounts: &volumeMounts
       - name: execd
-        mountPath: /opt/execd
+        mountPath: /execd
         readOnly: true
   # ubuntu:24.04 has a `ubuntu` user with UID 1000.
   nonroot:

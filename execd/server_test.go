@@ -59,17 +59,72 @@ func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
 	s.start(testConn(t), frame{kind: fStart, id: 2, payload: req})
 
 	// As a shell finds it: work/bin/hello, run in work.
-	cl := s.get(2)
+	if code := exitCode(t, s.get(2)); code != 7 {
+		t.Fatalf("exit %d, want hello's 7", code)
+	}
+}
+
+func exitCode(t *testing.T, cl *call) int {
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		cl.mu.Lock()
 		exited, code := cl.exited, cl.code
 		cl.mu.Unlock()
 		if exited {
-			if code != 7 {
-				t.Fatalf("exit %d, want hello's 7", code)
-			}
-			return
+			return code
 		}
 	}
-	t.Fatal("hello never exited")
+	t.Fatal("the command never exited")
+	return 0
+}
+
+func TestStdinFromADroppedConnectionIsNotWrittenAgain(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	out := filepath.Join(t.TempDir(), "stdin")
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "cat > " + out}, Env: map[string]string{}, Stdin: true, Tag: "s"})
+	first := testConn(t)
+	s.authenticated(first)
+	s.dispatch(first, frame{kind: fStart, id: 3, payload: req})
+	s.dispatch(first, frame{kind: fStdin, id: 3, payload: []byte("AAAA")})
+	again := testConn(t)
+	s.authenticated(again)
+	s.detach(first)
+	s.dispatch(again, frame{kind: fResume, id: 3, payload: []byte(`{"stdout":0,"stderr":0}`)})
+
+	s.get(3).writeStdin(first, []byte("BBBB"))                             // still in flight on the dropped connection
+	s.dispatch(again, frame{kind: fStdin, id: 3, payload: []byte("BBBB")}) // resent from RESUMED's count
+	s.dispatch(again, frame{kind: fStdin, id: 3})
+
+	exitCode(t, s.get(3))
+	if got, _ := os.ReadFile(out); string(got) != "AAAABBBB" {
+		t.Fatalf("stdin was %q", got)
+	}
+}
+
+func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "r"})
+	first := testConn(t)
+	s.authenticated(first)
+	s.authenticated(testConn(t))
+
+	s.dispatch(first, frame{kind: fStart, id: 4, payload: req}) // its call may have run and been released
+
+	if s.get(4) != nil {
+		t.Fatal("a START from a replaced connection ran")
+	}
+}
+
+func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}, Env: map[string]string{}, Tag: "h", Timeout: 1e18})
+	c := testConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fStart, id: 5, payload: req})
+
+	if code := exitCode(t, s.get(5)); code != 3 {
+		t.Fatalf("exit %d, want 3: the timeout fired at once", code)
+	}
 }

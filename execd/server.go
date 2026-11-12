@@ -27,6 +27,7 @@ type server struct {
 	mu      sync.Mutex
 	calls   map[uint64]*call
 	preauth chan struct{} // a slot per connection not yet authenticated
+	current *conn         // the newest authenticated connection: the client's only live one
 }
 
 const idleTimeout = 60 * time.Second
@@ -146,6 +147,7 @@ func (s *server) handle(c *conn) {
 	if subtle.ConstantTimeCompare(got[:], s.keyHash) != 1 {
 		return
 	}
+	s.authenticated(c)
 	c.send(fOK, 0, nil)
 	for {
 		c.nc.SetReadDeadline(time.Now().Add(idleTimeout)) // clients ping every 15 s
@@ -153,29 +155,50 @@ func (s *server) handle(c *conn) {
 		if err != nil {
 			return
 		}
-		switch f.kind {
-		case fStart:
-			s.start(c, f)
-		case fStdin:
-			if cl := s.get(f.id); cl != nil {
-				cl.writeStdin(f.payload)
-			}
-		case fKill:
-			if cl := s.get(f.id); cl != nil {
-				cl.kill()
-			}
-		case fResume:
-			s.resume(c, f)
-		case fAck:
-			var req resumeRequest
-			if cl := s.get(f.id); cl != nil && json.Unmarshal(f.payload, &req) == nil {
-				cl.ack(req)
-			}
-		case fRelease:
-			s.release(f.id)
-		case fPing:
-			c.send(fPong, f.id, nil)
+		s.dispatch(c, f)
+	}
+}
+
+// authenticated makes c the client's connection and closes the one it replaces.
+func (s *server) authenticated(c *conn) {
+	s.mu.Lock()
+	old := s.current
+	s.current = c
+	s.mu.Unlock()
+	if old != nil {
+		old.close()
+	}
+}
+
+func (s *server) dispatch(c *conn, f frame) {
+	s.mu.Lock()
+	stale := s.current != c
+	s.mu.Unlock()
+	if stale { // a late frame from a replaced connection: a START would run its command again
+		return
+	}
+	switch f.kind {
+	case fStart:
+		s.start(c, f)
+	case fStdin:
+		if cl := s.get(f.id); cl != nil {
+			cl.writeStdin(c, f.payload)
 		}
+	case fKill:
+		if cl := s.get(f.id); cl != nil {
+			cl.kill()
+		}
+	case fResume:
+		s.resume(c, f)
+	case fAck:
+		var req resumeRequest
+		if cl := s.get(f.id); cl != nil && json.Unmarshal(f.payload, &req) == nil {
+			cl.ack(req)
+		}
+	case fRelease:
+		s.release(f.id)
+	case fPing:
+		c.send(fPong, f.id, nil)
 	}
 }
 
@@ -339,7 +362,7 @@ func (cl *call) run(req startRequest) error {
 	cl.mu.Unlock()
 	p.Release()
 	var deadline *time.Timer
-	if req.Timeout > 0 {
+	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
 		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
 	}
 	if stdinW != nil {
@@ -425,10 +448,10 @@ func stdinPipe(wanted bool) (*os.File, *os.File, error) {
 	return os.Pipe()
 }
 
-func (cl *call) writeStdin(data []byte) {
+func (cl *call) writeStdin(c *conn, data []byte) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	if cl.stdinEOF || cl.exited {
+	if cl.sub != c || cl.stdinEOF || cl.exited { // a dropped connection's: its RESUME counted what came
 		return
 	}
 	if len(data) == 0 {
