@@ -481,7 +481,7 @@ class ExecdClient:
         return result
 
     async def write_file(self, data: bytes, dst: Path) -> None:
-        """Pod.write_file(), over execd: the same command and errors."""
+        """Pod.write_file(), over execd: cat, which gets EOF here; the same errors."""
         script = (
             f"PATH={SYSTEM_PATH}; mkdir -p -- {shlex.quote(dst.parent.as_posix())} "
             f"&& cat > {shlex.quote(dst.as_posix())}"

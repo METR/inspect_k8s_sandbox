@@ -1,19 +1,23 @@
 import asyncio
 import contextlib
 import hashlib
+import io
 import json
 import pathlib
 import shutil
 import ssl
 import subprocess
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import anyio
 import pytest
 from pytest import MonkeyPatch
 
+from k8s_sandbox._helm import Release, ValuesSource
 from k8s_sandbox._pod import execd
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
+from k8s_sandbox._pod.snapshot import _parse_pod
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
@@ -81,6 +85,47 @@ async def until(condition: Callable[[], bool]) -> None:
 def held(stream: execd.ExecdStream) -> int:
     queued = list(stream._call.queue._queue)  # type: ignore[attr-defined]
     return sum(len(item[1]) for item in queued if isinstance(item, tuple))
+
+
+async def test_an_annotated_pod_runs_every_operation_over_execd(
+    daemons: Daemons,
+) -> None:
+    starts = 0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(exits)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._ready_pods = [
+        _parse_pod(
+            {
+                "metadata": {
+                    "name": "p",
+                    "uid": "u",
+                    "labels": {"inspect/service": "default"},
+                    "annotations": {execd.ANNOTATION: "true"},
+                },
+                "spec": {"containers": [{"name": "default"}]},
+                "status": {"phase": "Running", "podIP": "10.0.0.1"},
+            }
+        )
+    ]
+    pod = (await release.get_sandbox_pods())["default"]
+    assert pod._execd is not None
+    pod._execd._start = daemons.client()._start
+
+    await pod.exec(["true"], None, None, {}, None, 10)
+    await pod.write_file(b"x", Path("/tmp/x"))
+    await pod.read_file(Path("/tmp/x"), io.BytesIO())
+    await (await pod.exec_stdio(["cat"], None)).aclose()
+
+    await until(lambda: starts == 4)
 
 
 async def test_output_the_caller_has_not_taken_stays_bounded(
