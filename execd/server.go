@@ -605,6 +605,9 @@ func (cl *call) finish(code int, startErr string) {
 	defer cl.mu.Unlock()
 	cl.exited, cl.code, cl.startErr = true, code, startErr
 	cl.room.Broadcast()
+	if cl.deferred { // the turn its waiting flush took goes unused: this flush sends its output
+		slot.Add(-int64(slotEvery))
+	}
 	charge(cl.flush())
 }
 

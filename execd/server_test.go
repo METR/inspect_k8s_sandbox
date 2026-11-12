@@ -283,6 +283,21 @@ func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
 	}
 }
 
+func TestCallsThatEndBeforeTheirTurnHoldOthersOutputBackOnlySoLong(t *testing.T) {
+	charge(100_000)                     // exits already hold the turns 100 ms ahead
+	t.Cleanup(func() { slot.Store(0) }) // the turns are shared: leave none taken
+	for i := range 1000 {
+		cl := &call{id: uint64(1000 + i), sub: testConn(t)}
+		cl.room = sync.NewCond(&cl.mu)
+		cl.output(0, []byte("x")) // its flush waits for a turn
+		cl.finish(0, "")          // and it ends before the turn comes
+	}
+
+	if ahead := time.Duration(slot.Load()) - time.Since(epoch); ahead > 2*slotAhead {
+		t.Fatalf("turns run %v ahead after 1,000 short calls", ahead)
+	}
+}
+
 func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	s.calls[13] = &call{id: 13, out: [2][]byte{[]byte("out"), []byte("err")}}
