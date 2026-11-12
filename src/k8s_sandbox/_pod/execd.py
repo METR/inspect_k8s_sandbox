@@ -577,13 +577,21 @@ class ExecdClient:
         try:
             await link.send(KILL, call.id)
             end = time.monotonic() + KILL_WAIT
+            drained = 0
             while time.monotonic() < end:
                 item = await _next(call.queue, end - time.monotonic())
                 if isinstance(item, tuple) and item[0] == EXIT:
                     break
-            await link.send(RELEASE, call.id)
+                # execd exits only once its window has room; past HOLD it isn't execd
+                if isinstance(item, tuple) and item[0] in (STDOUT, STDERR):
+                    if drained < call.hold:
+                        drained += len(item[1])
+                        await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
+        # Even with no exit: it frees what execd holds for the call.
+        with contextlib.suppress(OSError):
+            await link.send(RELEASE, call.id)
 
     async def exec(
         self,

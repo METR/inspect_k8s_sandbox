@@ -349,6 +349,55 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     await task
 
 
+async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None:
+    released = asyncio.Event()
+
+    async def full_after_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        while True:
+            kind, _, _ = await read_frame(r)
+            if kind == execd.KILL:  # the killed command's last output fills the window
+                for _ in range(4):
+                    w.write(frame(execd.STDOUT, call_id, b"x" * execd.CHUNK))
+            elif kind == execd.ACK:  # room for the rest of it: the call exits
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
+            elif kind == execd.RELEASE:
+                released.set()
+
+    await daemons.serve(full_after_kill)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["yes"], None, None, {}, None, 0.2), 5
+        )
+    await asyncio.wait_for(released.wait(), 5)
+
+
+async def test_a_timed_out_call_takes_no_more_than_its_hold(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 1.0)
+    acked = 0
+
+    async def floods_after_kill(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal acked
+        _, call_id, _ = await read_frame(r)  # START
+        while True:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.ACK:
+                acked = max(acked, sum(json.loads(payload).values()))
+            elif kind == execd.KILL:  # a stand-in that never exits, sending all it can
+                for _ in range(3 * execd.HOLD // execd.CHUNK):
+                    w.write(frame(execd.STDOUT, call_id, b"x" * execd.CHUNK))
+                    await w.drain()
+
+    await daemons.serve(floods_after_kill)
+    with pytest.raises(TimeoutError):
+        await daemons.client().exec(["yes"], None, None, {}, None, 0.2)
+    assert acked <= execd.HOLD + execd.ACK_EVERY
+
+
 async def test_a_failed_restart_after_start_is_not_retryable(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
