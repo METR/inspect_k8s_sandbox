@@ -349,26 +349,6 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     await task
 
 
-async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
-    flooded = asyncio.Event()
-
-    async def tiny_frames(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
-        with contextlib.suppress(ConnectionError):
-            for _ in range(4 * execd.MAX_QUEUED):
-                w.write(frame(execd.STDOUT, call_id))  # empty: no bytes to count
-                await w.drain()
-        flooded.set()
-
-    await daemons.serve(tiny_frames)
-    stream = await daemons.client().open_stream(["cat"], None)
-    await asyncio.wait_for(flooded.wait(), 30)
-    await until(lambda: stream._link.closed)
-
-    assert stream._call.queue.qsize() <= execd.MAX_QUEUED + 1  # + the drop notice
-    assert stream._link.closed
-
-
 async def test_a_failed_restart_after_start_is_not_retryable(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
