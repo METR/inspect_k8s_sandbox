@@ -189,6 +189,7 @@ func TestManySmallWritesMakeFewFrames(t *testing.T) {
 	lines := "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done"
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", lines}, Env: map[string]string{}, Tag: "w"})
 
+	began := time.Now()
 	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
 
 	outputs := 0
@@ -200,8 +201,8 @@ func TestManySmallWritesMakeFewFrames(t *testing.T) {
 				outputs++
 			case fExit:
 				// The client paces frames at 4,096 a second: a frame a line would crawl.
-				if outputs > 2000 {
-					t.Fatalf("%d frames for 20,000 lines", outputs)
+				if took := time.Since(began); outputs > int(took/time.Millisecond)+2 {
+					t.Fatalf("%d frames for 20,000 lines in %v: more than one a millisecond", outputs, took)
 				}
 				return
 			}
@@ -229,6 +230,22 @@ func TestCallsTakeTurnsToSend(t *testing.T) {
 	// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
 	if took := time.Since(began); took < 6*time.Millisecond {
 		t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
+	}
+}
+
+func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
+	c, frames := recordedConn(t)
+	cl := &call{id: 12, sub: c, out: [2][]byte{[]byte("out"), nil}}
+	cl.room = sync.NewCond(&cl.mu)
+	before := max(time.Duration(slot.Load()), time.Since(epoch))
+
+	cl.finish(0, "")
+
+	<-frames
+	<-frames // the output, then the exit
+	// Exits sent without turns, many calls ending at once, would pass the client's frame pace.
+	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
+		t.Fatalf("turns moved %v for the two frames an exit sent", moved)
 	}
 }
 

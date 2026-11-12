@@ -309,7 +309,7 @@ func (s *server) resume(c *conn, f frame) {
 	c.send(fResumed, f.id, got)
 	cl.ackLocked(req) // the client has everything before the offsets it resumes from
 	cl.sent = [2]int{cl.base[0], cl.base[1]}
-	cl.flush()
+	charge(cl.flush())
 }
 
 func (cl *call) run(req startRequest) error {
@@ -516,8 +516,10 @@ func (cl *call) output(stream int, data []byte) {
 	cl.flushSoon()
 }
 
-// When the next call may send output: calls take turns, so together they keep within the client's frame pace.
+// When the next call may send output, since start: calls take turns, so together they keep within the client's frame pace.
 var slot atomic.Int64
+
+var epoch = time.Now() // turns are measured from here, on the monotonic clock
 
 const slotEvery, slotBurst = 600 * time.Microsecond, 8
 
@@ -527,19 +529,19 @@ func (cl *call) flushSoon() {
 		return // the waiting flush sends this too
 	}
 	now := time.Now()
-	at := now.UnixNano()
+	at := now.Sub(epoch)
 	if !cl.flushed.IsZero() {
-		at = max(at, cl.flushed.Add(time.Millisecond).UnixNano())
+		at = max(at, cl.flushed.Add(time.Millisecond).Sub(epoch))
 	}
 	for {
-		taken := slot.Load()
-		send := max(at, taken-int64(slotBurst*slotEvery))
-		if slot.CompareAndSwap(taken, max(taken, send)+int64(slotEvery)) {
+		taken := time.Duration(slot.Load())
+		send := max(at, taken-slotBurst*slotEvery)
+		if slot.CompareAndSwap(int64(taken), int64(max(taken, send)+slotEvery)) {
 			at = send
 			break
 		}
 	}
-	wait := time.Duration(at - now.UnixNano())
+	wait := at - now.Sub(epoch)
 	if wait <= 0 {
 		cl.flushed = now
 		cl.flush()
@@ -555,6 +557,16 @@ func (cl *call) flushSoon() {
 			cl.flush()
 		}
 	})
+}
+
+// charge takes the turns of frames a flush sent without one: an exit's, or a resume's.
+func charge(frames int) {
+	for frames > 0 {
+		taken := time.Duration(slot.Load())
+		if slot.CompareAndSwap(int64(taken), int64(max(taken, time.Since(epoch))+time.Duration(frames)*slotEvery)) {
+			return
+		}
+	}
 }
 
 func (cl *call) ack(req resumeRequest) {
@@ -590,13 +602,13 @@ func (cl *call) finish(code int, startErr string) {
 	defer cl.mu.Unlock()
 	cl.exited, cl.code, cl.startErr = true, code, startErr
 	cl.room.Broadcast()
-	cl.flush()
+	charge(cl.flush())
 }
 
 // flush sends what the subscriber hasn't seen, then the exit; holding cl.mu keeps them in order.
-func (cl *call) flush() {
+func (cl *call) flush() (frames int) {
 	if cl.sub == nil {
-		return
+		return 0
 	}
 	for i, kind := range []byte{fStdout, fStderr} {
 		end := cl.base[i] + len(cl.out[i])
@@ -604,6 +616,7 @@ func (cl *call) flush() {
 			next := min(end, cl.sent[i]+1<<20)
 			cl.sub.send(kind, cl.id, cl.out[i][cl.sent[i]-cl.base[i]:next-cl.base[i]])
 			cl.sent[i] = next
+			frames++
 		}
 	}
 	if cl.exited {
@@ -612,7 +625,9 @@ func (cl *call) flush() {
 			Error string `json:"error,omitempty"`
 		}{cl.code, cl.startErr})
 		cl.sub.send(fExit, cl.id, b)
+		frames++
 	}
+	return frames
 }
 
 // childEnv is execd's own environment, plus the call's.
