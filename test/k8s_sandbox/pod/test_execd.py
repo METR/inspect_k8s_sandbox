@@ -1,6 +1,11 @@
 import asyncio
 import contextlib
+import hashlib
 import json
+import pathlib
+import shutil
+import ssl
+import subprocess
 from collections.abc import Awaitable, Callable
 
 import anyio
@@ -63,6 +68,16 @@ def daemons(monkeypatch: MonkeyPatch) -> Daemons:
     return stand_ins
 
 
+async def until(condition: Callable[[], bool]) -> None:
+    """Wait for a condition; the budget only bounds a hang."""
+
+    async def poll() -> None:
+        while not condition():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), 30)
+
+
 def held(stream: execd.ExecdStream) -> int:
     queued = list(stream._call.queue._queue)  # type: ignore[attr-defined]
     return sum(len(item[1]) for item in queued if isinstance(item, tuple))
@@ -87,8 +102,8 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
 
     await daemons.serve(flood)
     stream = await daemons.client().open_stream(["cat"], None)
-    await asyncio.wait_for(flooded.wait(), 10)
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(flooded.wait(), 30)
+    await until(lambda: stream._link.closed)
 
     assert held(stream) <= execd.HOLD
     assert stream._link.closed
@@ -241,8 +256,8 @@ async def test_a_flood_of_small_frames_stays_bounded(daemons: Daemons) -> None:
 
     await daemons.serve(tiny_frames)
     stream = await daemons.client().open_stream(["cat"], None)
-    await asyncio.wait_for(flooded.wait(), 10)
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(flooded.wait(), 30)
+    await until(lambda: stream._link.closed)
 
     assert stream._call.queue.qsize() <= execd.MAX_QUEUED + 1  # + the drop notice
     assert stream._link.closed
@@ -300,8 +315,8 @@ async def test_a_frame_the_cap_refuses_is_asked_for_again(daemons: Daemons) -> N
 
     await daemons.serve(one_too_many)
     stream = await daemons.client().open_stream(["cat"], None)
-    await asyncio.wait_for(flooded.wait(), 10)
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(flooded.wait(), 30)
+    await until(lambda: stream._link.closed)
 
     assert stream._link.closed
     # What a resume would ask for: the refused byte is not counted as received.
@@ -316,7 +331,7 @@ async def test_a_large_control_frame_drops_the_connection(daemons: Daemons) -> N
 
     await daemons.serve(large_error)
     stream = await daemons.client().open_stream(["cat"], None)
-    await asyncio.sleep(0.2)
+    await until(lambda: stream._link.closed)
 
     assert stream._link.closed
     assert held(stream) == 0
@@ -332,7 +347,7 @@ async def test_closing_a_stream_ends_a_send_waiting_for_room(daemons: Daemons) -
     await daemons.serve(never_acks_stdin)
     stream = await daemons.client().open_stream(["cat"], None)
     send = asyncio.create_task(stream.send(b"x" * (2 * execd.STDIN_WINDOW)))
-    await asyncio.sleep(0.2)
+    await until(lambda: stream._sent >= execd.STDIN_WINDOW)
 
     await stream.aclose()
 
@@ -463,3 +478,127 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
 
     # Paced: a handful in the second, where an unpaced loop runs hundreds.
     assert starts <= 10
+
+
+async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> None:
+    stdin = b"x" * (3 * execd.CHUNK)
+    received = 0
+
+    async def floods_resumed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal received
+        _, call_id, _ = await read_frame(r)  # START
+        resumed = json.dumps({"stdin": 0, "eof": False, "put": 0}).encode()
+        w.write(b"".join(frame(execd.RESUMED, call_id, resumed) for _ in range(64)))
+        while True:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN and not payload:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                return
+            received += len(payload) if kind == execd.STDIN else 0
+            put = json.dumps({"stdin": received}).encode()
+            w.write(frame(execd.STDIN_ACK, call_id, put))
+
+    await daemons.serve(floods_resumed)
+
+    await daemons.client().exec(["cat"], stdin, None, {}, None, 30)
+
+    assert received == len(stdin)
+
+
+async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None:
+    received = bytearray()
+    done = asyncio.Event()
+
+    async def records_stdin(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        while len(received) < 4 * execd.CHUNK:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN:
+                received.extend(payload)
+                w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 0}'))
+        done.set()
+
+    await daemons.serve(records_stdin)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    await asyncio.gather(
+        stream.send(b"A" * (2 * execd.CHUNK)), stream.send(b"B" * (2 * execd.CHUNK))
+    )
+    await asyncio.wait_for(done.wait(), 30)
+
+    assert bytes(received) in (
+        b"A" * (2 * execd.CHUNK) + b"B" * (2 * execd.CHUNK),
+        b"B" * (2 * execd.CHUNK) + b"A" * (2 * execd.CHUNK),
+    )
+
+
+async def test_a_stream_cancelled_as_it_starts_is_killed(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    got: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            got.append((await read_frame(r))[0])
+
+    await daemons.serve(records)
+    send = execd.Link.send
+
+    async def cancelled_after_start(
+        link: execd.Link, kind: int, call_id: int, payload: bytes = b""
+    ) -> None:
+        await send(link, kind, call_id, payload)
+        if kind == execd.START:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(execd.Link, "send", cancelled_after_start)
+
+    with pytest.raises(asyncio.CancelledError):
+        await daemons.client().open_stream(["cat"], None)
+    await until(lambda: execd.KILL in got)
+
+
+async def test_unasked_unknown_call_errors_start_nothing_again(
+    daemons: Daemons,
+) -> None:
+    starts = 0
+
+    async def denies_every_call(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+            w.write(frame(execd.ERROR, call_id, b"unknown call"))
+
+    await daemons.serve(denies_every_call)
+
+    with pytest.raises(ExecResultUnknownError):
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 5)
+    assert starts == 1
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
+async def test_only_the_pinned_certificate_is_trusted(
+    tmp_path: pathlib.Path, monkeypatch: MonkeyPatch
+) -> None:
+    key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt"]
+        + ["ec_paramgen_curve:P-256", "-nodes", "-days", "1", "-subj", "/CN=x"]
+        + ["-keyout", str(key), "-out", str(cert)],
+        check=True,
+        capture_output=True,
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+    pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+
+    with pytest.raises(execd.NotOurDaemon):
+        await execd._connect(execd.Daemon("127.0.0.1", "0" * 64, b"key"))
+    await (await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"))).close()
+    server.close()

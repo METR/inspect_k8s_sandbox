@@ -209,28 +209,7 @@ class ExecuteOperation(PodOperation):
             f"if {_RUNUSER} -u {quoted} -- /bin/sh -c : 2>/dev/null; then exit 1; fi; "
             "exit 2"
         )
-        with self._interactive_shell(["/bin/sh", "-c", probe]) as ws_client:
-            deadline = time.monotonic() + API_TIMEOUT
-            # The answer is in with the status; the server's close needn't follow.
-            while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
-                wait = deadline - time.monotonic()
-                if wait <= 0:
-                    raise PodError(f"Probing exec(user={user!r}) timed out")
-                # Also times out a read that stalls partway through a frame, within
-                # about twice the deadline (a frame still trickling in can take longer).
-                ws_client.sock.settimeout(wait)
-                try:
-                    _update(ws_client, wait)
-                except websocket.WebSocketTimeoutException:
-                    continue  # The deadline has passed.
-                except (OSError, websocket.WebSocketException):
-                    if ERROR_CHANNEL not in ws_client._channels:
-                        raise
-                # The probe prints nothing, so keep nothing `id` or `runuser` might.
-                ws_client._channels.pop(STDOUT_CHANNEL, None)
-                ws_client._channels.pop(STDERR_CHANNEL, None)
-            ws_client.close()
-            returncode = get_returncode(ws_client)
+        returncode, _, _ = self.run_argv(["/bin/sh", "-c", probe])
         # The probe exits 0, 1 or 2: 255 is Kata's status for a stopped container.
         if returncode == 255:
             raise ContainerStoppedError(
@@ -241,11 +220,7 @@ class ExecuteOperation(PodOperation):
         return returncode == 1
 
     def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
-        """Run `cmd`, as the container's user, with nothing on its stdin.
-
-        Its argv travels in the exec request. Returns its exit status, stdout and stderr
-        (for short output).
-        """
+        """Run `cmd` with nothing on its stdin; return its status, stdout and stderr."""
         out = {STDOUT_CHANNEL: b"", STDERR_CHANNEL: b""}
         with self._interactive_shell(cmd) as ws_client:
             deadline = time.monotonic() + API_TIMEOUT
@@ -261,8 +236,10 @@ class ExecuteOperation(PodOperation):
                 except (OSError, websocket.WebSocketException):
                     if ERROR_CHANNEL not in ws_client._channels:
                         raise
-                for channel in out:
-                    out[channel] += ws_client._channels.pop(channel, b"")
+                for channel in out:  # capped: callers want a line or a status
+                    out[channel] = (
+                        out[channel] + ws_client._channels.pop(channel, b"")
+                    )[:4096]
             ws_client.close()
             returncode = get_returncode(ws_client)
         return returncode, out[STDOUT_CHANNEL], out[STDERR_CHANNEL]

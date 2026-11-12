@@ -1,16 +1,4 @@
-// execd: a process daemon in a sandbox container, which k8s_sandbox reaches over the pod network
-// (src/k8s_sandbox/_pod/execd.py speaks its protocol). Adapted from METR/hawk-next's execd.
-//
-//	execd listen --port N --key-sha256 HEX [--replace]
-//
-// starts the daemon in the background, serving TLS 1.3 on port N with a certificate it makes at
-// start, and prints the SHA-256 of that certificate once it accepts connections. The client
-// pins that certificate, and the first frame on a connection must carry the key whose SHA-256 is
-// HEX. --replace first stops any execd already listening, which no client can use without its
-// key (a client's first start does this). It is a static binary, copied into each Pod by an init
-// container, so task images need no change. Processes are children of execd, not of the
-// connection, so a dropped connection loses nothing: output is buffered until the client
-// acknowledges it.
+// execd runs k8s_sandbox's commands in the sandbox, over pinned TLS (see src/k8s_sandbox/_pod/execd.py).
 package main
 
 import (
@@ -59,17 +47,16 @@ func fail(msg string) {
 	os.Exit(2)
 }
 
-// prctl options: a non-dumpable process's /proc files (environ, mem, fd) are closed to
-// other processes of the same uid, and a subreaper inherits its descendants' orphans.
+// Non-dumpable: same-uid processes can't open its /proc files. Subreaper: it reaps orphans.
 const prSetDumpable, prSetChildSubreaper = 4, 36
 
 func prctl(option, arg uintptr) {
 	syscall.RawSyscall(syscall.SYS_PRCTL, option, arg, 0)
 }
 
-// start re-runs execd in a new session, so the daemon outlives the exec that started it, and
-// relays the line the daemon writes on fd 3 once it listens: its fingerprint, or its error.
+// start re-runs execd in a new session, so it outlives this exec, and relays its status line.
 func start() {
+	prctl(prSetDumpable, 0) // so the sandbox can't write into the stdout the client reads
 	r, w, err := os.Pipe()
 	if err != nil {
 		fail(err.Error())
@@ -143,8 +130,7 @@ func stopOthers() {
 	}
 }
 
-// selfSigned makes the daemon's certificate. Its key never leaves this process's memory; the
-// client trusts the certificate by the fingerprint the start exec printed.
+// selfSigned makes the certificate clients pin by fingerprint; its key stays in memory.
 func selfSigned() (tls.Certificate, string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

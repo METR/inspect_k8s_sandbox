@@ -20,9 +20,7 @@ import (
 	"unsafe"
 )
 
-// server owns every process started through it. A call outlives the connection that
-// started it: its output is buffered until the client releases it, so a client that lost
-// its connection can resume the call on a new one from the offsets it already has.
+// server owns every process; a call outlives its connection, so a client can resume it.
 type server struct {
 	keyHash []byte
 	mu      sync.Mutex
@@ -35,16 +33,14 @@ const idleTimeout = 60 * time.Second
 // abandonAfter outlasts the client's reconnect window (5 minutes).
 const abandonAfter = 6 * time.Minute
 
-// authTimeout bounds the TLS handshake and the AUTH frame; maxKey bounds AUTH's payload;
-// maxPreauth bounds the connections doing either at once.
+// Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 
 type call struct {
 	id  uint64
 	tag string
 	pid int
-	// stdin frames wait in stdinQ for a writer goroutine, so a command that does not read
-	// its stdin cannot stall the connection other calls share.
+	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
 	stdinGot int  // bytes of stdin received
 	stdinPut int  // bytes of stdin written to the process
@@ -353,9 +349,7 @@ func (cl *call) run(req startRequest) error {
 		if deadline != nil {
 			deadline.Stop()
 		}
-		// All the command wrote before it exited is in the pipes: read it, however slowly the
-		// client takes it. Then, 100 ms on, stop reading, so a background child that keeps a
-		// pipe open can't hold the call open forever.
+		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
 			want[i] = buffered(r) // before the count, so want can't fall short
@@ -449,8 +443,7 @@ func (cl *call) feedStdin(w *os.File) {
 	}
 }
 
-// maxUnacked bounds the output execd holds for one stream of a call; past it, reading the
-// process's pipe waits for acks, so a disconnected client pauses the writer, not memory.
+// maxUnacked bounds one stream's unacked output; past it, reading the pipe waits for acks.
 const maxUnacked = 32 << 20
 
 func (cl *call) output(stream int, data []byte) {
@@ -502,8 +495,7 @@ func (cl *call) finish(code int) {
 	cl.flush()
 }
 
-// flush sends the subscriber whatever it has not seen yet, then the exit. Holding cl.mu
-// while sending keeps the frames in order.
+// flush sends what the subscriber hasn't seen, then the exit; holding cl.mu keeps them in order.
 func (cl *call) flush() {
 	if cl.sub == nil {
 		return
@@ -537,8 +529,7 @@ func childEnv(extra map[string]string) []string {
 	return env
 }
 
-// lookPath finds a command as a shell would: relative PATH entries from the call's directory,
-// and a match that isn't executable is "permission denied" (126), not "not found" (127).
+// lookPath resolves as a shell would: relative PATH entries from cwd; a non-executable match is 126.
 func lookPath(name string, env []string, cwd string) (string, error) {
 	if strings.Contains(name, "/") {
 		return name, nil
@@ -572,8 +563,7 @@ func lookPath(name string, env []string, cwd string) (string, error) {
 	return "", fmt.Errorf("%s: not found", name)
 }
 
-// lookupUser resolves a name or numeric uid from the container's /etc/passwd. It returns a
-// nil credential when the user is the one execd already runs as.
+// lookupUser resolves a name or uid in /etc/passwd; a nil credential means execd's own user.
 func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var u *user.User
 	var err error
@@ -606,8 +596,7 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
-// killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, which
-// finds a command's whole tree even after setsid or a double fork.
+// killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	if tag == "" {
 		return
@@ -626,9 +615,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper collects every child that exits, including orphans reparented to execd (it is
-// a subreaper), and hands exit codes to whoever registered the PID. Wait4 can reap
-// a child before run() registers it; the reaper then blocks on mu until it has.
+// The reaper reaps every child, orphans included; it waits on mu until run() registers the PID.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int

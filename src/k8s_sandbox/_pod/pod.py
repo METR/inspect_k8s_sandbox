@@ -79,11 +79,7 @@ class Pod:
         self._execd = ExecdClient(self._start_execd) if execd else None
 
     async def _start_execd(self, replace: bool) -> Daemon:
-        """Start execd in the container with one exec that carries no stdin.
-
-        A container restart or pod replacement is checked for here, not before each
-        operation: either one stops the daemon, so it always comes through here.
-        """
+        """Start execd; restarts are checked here, since a restart stops the daemon."""
         await self.check_for_pod_restart()
         info = self._info
         api = k8s_client(info.context_name)
