@@ -140,10 +140,7 @@ func (s *server) handle(c *conn) {
 			}
 		case fKill:
 			if cl := s.get(f.id); cl != nil {
-				if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
-					syscall.Kill(-cl.pid, syscall.SIGKILL) // its group, even with the tag removed
-				}
-				killTagged(cl.tag)
+				cl.kill()
 			}
 		case fResume:
 			s.resume(c, f)
@@ -290,8 +287,12 @@ func (cl *call) run(req startRequest) error {
 	}
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
+	cl.pid = p.Pid // before Release, which sets it to -1
 	p.Release()
-	cl.pid = p.Pid
+	var deadline *time.Timer
+	if req.Timeout > 0 {
+		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
+	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
 	}
@@ -318,6 +319,9 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		code := <-exited
+		if deadline != nil {
+			deadline.Stop()
+		}
 		// All the command wrote before it exited is in the pipes: read it, however slowly the
 		// client takes it. Then, 100 ms on, stop reading, so a background child that keeps a
 		// pipe open can't hold the call open forever.
@@ -448,6 +452,14 @@ func (cl *call) ackLocked(req resumeRequest) {
 	cl.room.Broadcast()
 }
 
+// kill stops the call's process group, and every process still carrying its tag.
+func (cl *call) kill() {
+	if cl.pid > 0 { // 0: it never started, and -0 would be execd's own group
+		syscall.Kill(-cl.pid, syscall.SIGKILL)
+	}
+	killTagged(cl.tag)
+}
+
 func (cl *call) finish(code int) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -516,11 +528,22 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var u *user.User
 	var err error
 	if uidPart, gidPart, ok := strings.Cut(name, ":"); ok { // "uid:gid", as a spec may give
-		cred, home, uname, err := lookupUser(uidPart)
-		if gid, gErr := strconv.ParseUint(gidPart, 10, 32); err == nil && cred != nil && gErr == nil {
-			cred.Gid, cred.Groups = uint32(gid), nil
+		gid, err := strconv.ParseUint(gidPart, 10, 32)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("unknown user %s", name)
 		}
-		return cred, home, uname, err
+		cred, home, uname, err := lookupUser(uidPart)
+		if err != nil || (cred == nil && uint32(gid) == uint32(os.Getgid())) {
+			return cred, home, uname, err
+		}
+		if cred == nil { // execd's own uid, another group
+			if os.Getuid() != 0 {
+				return nil, "", "", fmt.Errorf("cannot run as %s: execd is not root", name)
+			}
+			cred = &syscall.Credential{Uid: uint32(os.Getuid())}
+		}
+		cred.Gid, cred.Groups = uint32(gid), nil
+		return cred, home, uname, nil
 	}
 	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil { // no uid wraps to 0
 		if u, err = user.LookupId(name); err != nil {
