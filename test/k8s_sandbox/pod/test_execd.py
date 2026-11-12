@@ -583,6 +583,41 @@ async def test_a_new_call_waits_for_a_reconnect_only_as_long_as_a_first_open(
     client._opening.cancel()
 
 
+async def test_a_call_cancelled_as_its_connection_opens_starts_nothing(
+    daemons: Daemons,
+) -> None:
+    started = 0
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal started
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                started += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    start, opened = client._start, asyncio.Event()
+
+    async def held(replace: bool) -> execd.Daemon:
+        await opened.wait()
+        return await start(replace)
+
+    client._start = held
+    call = asyncio.create_task(client.exec(["true"], None, None, {}, None, None))
+    await until(lambda: client._opening is not None)
+    assert client._opening is not None
+    client._opening.add_done_callback(lambda _: call.cancel())
+    opened.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    # Its START follows any the cancelled call sent.
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert started == 1
+
+
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch: MonkeyPatch,
 ) -> None:
