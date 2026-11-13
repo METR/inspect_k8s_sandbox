@@ -3,6 +3,7 @@ import contextlib
 import dataclasses
 import hashlib
 import io
+import itertools
 import json
 import shutil
 import ssl
@@ -16,7 +17,7 @@ from unittest.mock import patch
 
 import anyio
 import pytest
-from inspect_ai.util import OutputLimitExceededError
+from inspect_ai.util import OutputLimitExceededError, override_sandbox_output_limit
 from pytest import MonkeyPatch
 
 from k8s_sandbox._kubernetes_api import _Config
@@ -134,7 +135,7 @@ async def daemons(tls: Tls, monkeypatch: MonkeyPatch) -> AsyncIterator[Daemons]:
 
 async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
     await read_frame(r)  # START
-    w.write(EXIT_0)
+    w.write(frame(execd.PING) + EXIT_0)  # as execd pings while a command runs
 
 
 async def gone(r: asyncio.StreamReader) -> None:
@@ -216,10 +217,17 @@ async def test_a_lost_exec_raises_the_restart_that_explains_it_and_so_do_later_o
         read.return_value = _k8s_pod("uid", "default", restart_count=1)
         with pytest.raises(ContainerRestartedError):
             await pod.exec(["true"], None, None, {}, None, 10)
-    with pytest.raises(ContainerRestartedError):
-        await pod.write_file(b"x", Path("/tmp/x"))
+    later = [
+        pod.exec(["true"], None, None, {}, None, 10),
+        pod.write_file(b"x", Path("/tmp/x")),
+        pod.read_file(Path("/tmp/x"), io.BytesIO()),
+        pod.exec_stdio(["cat"], None),
+    ]
+    for operation in later:
+        with pytest.raises(ContainerRestartedError):
+            await operation
 
-    assert daemons.connections == 2  # the write reached no daemon
+    assert daemons.connections == 2  # none of them reached a daemon
 
 
 async def test_what_ran_when_a_restart_was_found_raises_it_too(
@@ -232,7 +240,7 @@ async def test_what_ran_when_a_restart_was_found_raises_it_too(
     ) -> None:
         await read_frame(r)
         await found.wait()
-        w.write(frame(execd.STDOUT, b"late") + EXIT_0)
+        w.write(frame(execd.STDOUT, b"late") + frame(execd.EXIT, b'{"code": 1}'))
 
     await daemons.serve(answers_once_found)
     pod = Pod("p", "ns", None, "default", "uid", 0, "raise", execd=True)
@@ -259,6 +267,8 @@ async def test_what_ran_when_a_restart_was_found_raises_it_too(
             await operation
     with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
         await receiving
+    with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
+        await stream.send(b"to a container that is gone")
 
 
 async def test_a_daemon_that_is_gone_is_started_again(daemons: Daemons) -> None:
@@ -368,7 +378,7 @@ async def test_a_command_execd_never_ends_times_out_and_is_dropped(
         dropped.set()
 
     await daemons.serve(never_ends)
-    monkeypatch.setattr(execd, "KILL_WAIT", -0.7)  # 0.3 s in all: what it sent backs up
+    passing_clock(monkeypatch)  # past the timeout and the wait for execd's word
     big = "x" * (64 << 20)  # more than TCP holds: only an abort drops it unsent
     argv, stdin = ([big], None) if unread == "start" else (["cat"], big)
 
@@ -382,7 +392,7 @@ async def test_a_timeout_of_zero_is_none(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
     await daemons.serve(exits)
-    monkeypatch.setattr(execd, "KILL_WAIT", -1)  # any deadline would have passed
+    passing_clock(monkeypatch)  # any deadline would have passed
 
     assert (await run(daemons.client(), timeout=0)).success  # as execd takes it
 
@@ -445,18 +455,15 @@ FILE_OPERATIONS: dict[str, Callable[[execd.ExecdClient], Awaitable[None]]] = {
 @pytest.mark.parametrize("operation", ["write", "read"])
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
 async def test_a_file_operation_stops_at_its_output_limit(
-    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int, operation: str
+    daemons: Daemons, kind: int, operation: str
 ) -> None:
-    monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
-    monkeypatch.setattr(execd.limits, "MAX_READ_FILE_SIZE", 1024)
-
     async def chatters(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         await read_frame(r)
         w.write(frame(kind, b"x" * 2048) + EXIT_0)  # past the limit, then done
 
     await daemons.serve(chatters)
 
-    with pytest.raises(OutputLimitExceededError):
+    with override_sandbox_output_limit(1024), pytest.raises(OutputLimitExceededError):
         await FILE_OPERATIONS[operation](daemons.client())
 
 
@@ -492,6 +499,12 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
     assert (await client.exec(["sh"], None, None, {}, None, 30)).success
     with pytest.raises(RuntimeError, match="does not appear to exist"):
         await client.exec(["true"], None, None, {}, "nobody2", 30)
+
+
+def passing_clock(monkeypatch: MonkeyPatch) -> None:
+    """Make every look at the clock the calls' deadlines run on find 100 s gone."""
+    clock = types.SimpleNamespace(monotonic=itertools.count(0, 100).__next__)
+    monkeypatch.setattr(execd, "time", clock)
 
 
 def frozen_clock(monkeypatch: MonkeyPatch) -> list[float]:
@@ -572,7 +585,7 @@ async def test_a_broken_daemon_s_open_stream_and_running_call_stop_too(
             w.write(frame(99))
         await gone(r)
 
-    await daemons.serve(not_execd_on_its_third)
+    server = await daemons.serve(not_execd_on_its_third)
     client = daemons.client()
     stream = await cat(client)
     assert await stream.receive(1) == b"h"
@@ -585,24 +598,56 @@ async def test_a_broken_daemon_s_open_stream_and_running_call_stop_too(
 
     with pytest.raises(execd.NotExecd):  # though its exit then came
         await running
+    with pytest.raises(execd.NotExecd):
+        await stream.send(b"to what is not execd")
     with pytest.raises(execd.NotExecd):  # though it holds output
         await stream.receive()
+    port = server.sockets[0].getsockname()[1]
+    server.close()
+    dialled = []
+
+    async def counts(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        dialled.append(w)
+        w.close()
+
+    plain = await asyncio.start_server(counts, "127.0.0.1", port)
+    daemons.servers.append(plain)
     with pytest.raises(execd.NotExecd):
         await run(client)
-    assert daemons.connections == 3  # a later call reaches nothing
+    assert not dialled  # a later call opens no connection
 
 
 async def test_a_client_broken_while_a_call_connects_starts_no_daemon(
     daemons: Daemons,
 ) -> None:
-    server = await daemons.serve(exits)
+    told, hung_up = asyncio.Event(), asyncio.Event()
+
+    async def not_execd_when_told(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)
+        await told.wait()
+        w.write(frame(99))
+        await gone(r)
+
+    async def hangs_up_when_told(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await hung_up.wait()
+        w.close()
+
+    server = await daemons.serve(not_execd_when_told)
     client = daemons.client()
-    await run(client)
-    server.close()  # the daemon is gone: a call would start it again
-    await server.wait_closed()
-    call = asyncio.create_task(run(client))
-    await asyncio.sleep(0)  # it is connecting
-    client.broken = "as another connection found meanwhile"
+    stream = await cat(client)
+    port = server.sockets[0].getsockname()[1]
+    server.close()  # the daemon listens no more, as one that is gone; the stream stays
+    plain = await asyncio.start_server(hangs_up_when_told, "127.0.0.1", port)
+    daemons.servers.append(plain)
+    call = asyncio.create_task(run(client))  # which waits in a handshake none answers
+    told.set()
+    with pytest.raises(execd.NotExecd):
+        await stream.receive()
+    hung_up.set()
 
     with pytest.raises(execd.NotExecd):
         await call

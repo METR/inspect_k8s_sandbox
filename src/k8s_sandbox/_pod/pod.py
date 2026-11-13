@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import IO, Callable, Literal, TypeVar
+from typing import IO, Awaitable, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
@@ -198,20 +198,17 @@ class Pod:
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd. On a pod with execd, cmd's
-            process group gets SIGKILL instead. A process that left the group gets it
-            too, unless it cleared its environment or execd can't read it: it runs as
-            another user, or made itself non-dumpable.
+            process group gets SIGKILL instead.
         """
         if self._execd is not None:
-            self._raise_restart()
             try:
-                result = await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
+                return await self._over_execd(
+                    lambda execd: execd.exec(cmd, stdin, cwd, env, user, timeout)
+                )
             except ExecResultUnknownError:
                 # As below: a restart explains a lost connection better.
                 await self._diagnose_restart_after_failure()
                 raise
-            self._raise_restart()  # one found while it ran
-            return result
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
@@ -316,9 +313,7 @@ class Pod:
             resolved relative to the pod's default working directory.
         """
         if self._execd is not None:
-            self._raise_restart()
-            await self._execd.write_file(data, dst)
-            return self._raise_restart()  # one found while it ran
+            return await self._over_execd(lambda e: e.write_file(data, dst))
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
@@ -337,13 +332,23 @@ class Pod:
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
         if self._execd is not None:
-            self._raise_restart()
-            await self._execd.read_file(src, dst)
-            return self._raise_restart()  # one found while it ran
+            return await self._over_execd(lambda e: e.read_file(src, dst))
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
         await self._after_failure_check(lambda: reader.read_file(src, dst))
+
+    async def _over_execd(self, run: Callable[[ExecdClient], Awaitable[T]]) -> T:
+        """Run an operation over execd, raising a restart found before or meanwhile."""
+        assert self._execd is not None
+        self._raise_restart()
+        try:
+            result = await run(self._execd)
+        except Exception:
+            self._raise_restart()  # as _run_async: it explains the failure better
+            raise
+        self._raise_restart()
+        return result
 
     async def _after_failure_check(self, callable: Callable[[], None]) -> None:
         """Run a file operation, and in "raise" mode check for a restart if it fails.

@@ -41,7 +41,7 @@ STDOUT, STDERR, EXIT, PING = 17, 18, 19, 20
 HEADER = struct.Struct(">BI")
 CHUNK = 256 << 10  # the most output execd puts in a frame, and stdin the client does
 MOST = {STDOUT: CHUNK, STDERR: CHUNK, EXIT: 4096, PING: 0}  # a frame's payload
-RAW_READ = 64 << 10  # TCP bytes decrypted before other work gets a turn
+RAW_READ = 64 << 10  # TCP bytes taken at a time
 DEAD_AFTER = 45.0  # execd pings every 15 s: this long without a byte, it is gone
 CONNECT_TIMEOUT = 10.0
 KILL_WAIT = 10.0  # past a call's timeout, for execd to say it killed the command
@@ -127,6 +127,7 @@ class _Conn:
 
     def write(self, kind: int, payload: bytes = b"") -> None:
         """Queue a frame, without waiting for the socket to take it."""
+        self.client.check()
         self.tls.write(HEADER.pack(kind, len(payload)) + payload)
         self._writer.write(self._out.read())
 
@@ -200,7 +201,6 @@ class _Conn:
             at += 5 + int.from_bytes(records[at + 3 : at + 5], "big")
         self._header, self._body = records[at:], max(0, at - len(records))
         self._in.write(raw)
-        await asyncio.sleep(0)  # so other work runs between reads
 
     def _broken(self, what: str) -> Exception:
         self.close()
@@ -220,8 +220,8 @@ class _Conn:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
-async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
-    """Open a connection, check it is the daemon's, and send the key."""
+async def _connect(daemon: Daemon, client: ExecdClient, start: bytes) -> _Conn:
+    """Open a connection, check it is the daemon's, send the key and queue START."""
 
     async def connect() -> _Conn:
         reader, writer = await asyncio.open_connection(daemon.ip, daemon.port)
@@ -234,6 +234,8 @@ async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
                 raise NotOurDaemon("the server on the execd port is not our daemon")
             conn.pinned = True
             await conn.send(AUTH, daemon.key)
+            # Not waited on: the call's reads find a daemon that stops reading.
+            conn.write(START, start)
         except BaseException:
             conn.close()
             raise
@@ -243,7 +245,7 @@ async def _connect(daemon: Daemon, client: ExecdClient) -> _Conn:
 
 
 async def _upload(conn: _Conn, stdin: bytes) -> None:
-    with contextlib.suppress(OSError):  # the reader sees it
+    with contextlib.suppress(OSError, NotExecd):  # the reader sees either
         for i in range(0, len(stdin), CHUNK):
             await conn.send(STDIN, stdin[i : i + CHUNK])
             await asyncio.sleep(0)  # so other work runs between chunks
@@ -260,16 +262,17 @@ class ExecdClient:
         self._starting = asyncio.Lock()
         self.broken: str | None = None  # why nothing is sent or started again
 
-    async def _open(self) -> _Conn:
-        """Connect for a new call; nothing was sent to a command if this raises."""
+    async def _open(self, request: dict[str, Any]) -> _Conn:
+        """Connect and start a call; nothing was sent to a command if this raises."""
+        start = json.dumps(request).encode()
         daemon = self._daemon or await self._restart(None)
         try:
-            return await self._dial(daemon)
+            return await self._dial(daemon, start)
         except (OSError, asyncio.TimeoutError) as e:
             # A start tells a daemon that is gone from one that can't be reached.
             daemon = await self._restart(daemon, e)
         try:
-            return await self._dial(daemon)
+            return await self._dial(daemon, start)
         except (OSError, asyncio.TimeoutError) as e:
             raise ConnectionError(f"execd unreachable: {e!r}") from e
 
@@ -277,9 +280,9 @@ class ExecdClient:
         if self.broken:
             raise NotExecd(self.broken)
 
-    async def _dial(self, daemon: Daemon) -> _Conn:
+    async def _dial(self, daemon: Daemon, start: bytes) -> _Conn:
         self.check()
-        return await _connect(daemon, self)
+        return await _connect(daemon, self, start)
 
     async def _restart(
         self, old: Daemon | None, why: BaseException | None = None
@@ -321,11 +324,9 @@ class ExecdClient:
             "stdin": stdin is not None,
             "timeout": timeout or 0,  # execd kills it then, and says so
         }
-        conn = await self._open()
+        conn = await self._open(request)
         sender: asyncio.Task[None] | None = None
         try:
-            # Not waited on: a daemon that stops reading is found by the reads below.
-            conn.write(START, json.dumps(request).encode())
             if stdin is not None:
                 sender = asyncio.create_task(_upload(conn, stdin))
             # Only for an execd that doesn't end the command at its timeout.
@@ -468,15 +469,11 @@ class ExecdClient:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
         request = {
             "argv": argv,
-            "env": {},
-            "cwd": "",
             "user": user or "",
             "stdin": True,
             "stream": True,  # when its connection ends, execd kills only the command
         }
-        conn = await self._open()
-        conn.write(START, json.dumps(request).encode())
-        return ExecdStream(conn, restarted)
+        return ExecdStream(await self._open(request), restarted)
 
 
 class ExecdStream(ByteStream):
@@ -527,16 +524,21 @@ class ExecdStream(ByteStream):
                     )
         # Once its pod can't be used, not even output already read is given out.
         self._conn.client.check()
-        if (error := self._restarted()) is not None:
-            self._conn.close()
-            raise anyio.BrokenResourceError(repr(error)) from error
+        self._drop_if_restarted()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
 
+    def _drop_if_restarted(self) -> None:
+        """End the stream if a restart was found since it opened, as PodStdio does."""
+        if (error := self._restarted()) is not None:
+            self._conn.close()
+            raise anyio.BrokenResourceError(repr(error)) from error
+
     async def send(self, item: bytes) -> None:
         if self._closed:
             raise anyio.ClosedResourceError
+        self._drop_if_restarted()
         if self._ended is not None:
             raise anyio.BrokenResourceError("the command has ended")
         async with self._send_lock:
