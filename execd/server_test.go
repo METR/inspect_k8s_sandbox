@@ -462,9 +462,10 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	t.Setenv("RAW", "\xff") // execd's own environment, which a command inherits, need not be text
-	// GODEBUG has a Go program trace its start on stderr; BIG is as long as the kernel lets a variable be.
-	env := map[string]string{"GODEBUG": "inittrace=1", "BIG": strings.Repeat("x", 128<<10-len("BIG=")-1)}
-	script := "id -u; id -g; id -G; echo $GODEBUG ${#BIG} $RAW; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
+	// GODEBUG has a Go program trace its start on stderr, and execd sets a GOMAXPROCS of its own for its start as
+	// another user; BIG is as long as the kernel lets a variable be.
+	env := map[string]string{"GODEBUG": "inittrace=1", "GOMAXPROCS": "7", "BIG": strings.Repeat("x", 128<<10-len("BIG=")-1)}
+	script := "id -u; id -g; id -G; echo $GODEBUG $GOMAXPROCS ${#BIG} $RAW; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: env, User: "65534", Tag: "e"})
 
 	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
@@ -481,7 +482,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 				continue
 			}
 			// execd, a Go program, becomes the user itself: none of root's groups stay, and the environment isn't its own to read or to mark.
-			if string(out) != "65534\n65534\n65534\ninittrace=1 131067 \xff\n" {
+			if string(out) != "65534\n65534\n65534\ninittrace=1 7 131067 \xff\n" {
 				t.Fatalf("the command's output was %q", out)
 			}
 			return

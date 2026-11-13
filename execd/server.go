@@ -366,7 +366,7 @@ func (cl *call) run(req startRequest) error {
 		}
 		go func() { json.NewEncoder(envW).Encode(raw); envW.Close() }()
 		defer envR.Close()
-		env, files = []string{}, append(files, envR)
+		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // the launcher's: each thread it starts takes a PID of the pod's
 	}
 	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
 	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
