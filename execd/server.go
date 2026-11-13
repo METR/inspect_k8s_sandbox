@@ -715,6 +715,11 @@ func childEnv(extra map[string]string) []string {
 	for k, v := range extra {
 		env = append(env, k+"="+v)
 	}
+	if _, given := extra["PATH"]; !given {
+		if _, inherited := os.LookupEnv("PATH"); !inherited { // or the shell's own applies, and bash's ends in the working directory
+			env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+		}
+	}
 	return env
 }
 

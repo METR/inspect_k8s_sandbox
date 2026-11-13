@@ -136,6 +136,24 @@ func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
 	}
 }
 
+func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
+	path := os.Getenv("PATH")
+	os.Unsetenv("PATH")
+	t.Cleanup(func() { os.Setenv("PATH", path) })
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	out := filepath.Join(t.TempDir(), "env")
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `env >"$0"`, out}, Env: map[string]string{}, Tag: "p"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 31, payload: req})
+
+	exitCode(t, s.get(31))
+	// Left to itself the shell searches its own list, and bash's ends in the working directory.
+	if env, _ := os.ReadFile(out); !strings.Contains("\n"+string(env), "\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n") {
+		t.Fatalf("the command's environment was %q", env)
+	}
+}
+
 func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
