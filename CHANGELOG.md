@@ -6,18 +6,19 @@
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
   TLS to execd instead of Kubernetes exec stdin, each command started by the image's
-  `/bin/sh` as its user: where that is bash, it reads a `SHELLOPTS` in the command's
-  environment, and a command name that starts with `-`, as its own. There, a timed-out
+  `/bin/sh` as its user: a command name that starts with `-` is not found, and a bash
+  there reads a `SHELLOPTS` in the command's environment as its own. There, a timed-out
   `exec()` whose command is still running gets SIGKILL at once, not SIGTERM, and so do
-  its background processes. One that leaves the command's process group survives if it
+  its background processes; those of a command that has ended are left running, by a
+  closed `exec_stdio()` too. One that leaves the command's process group survives if it
   keeps starting new processes, clears its environment or pads it past 8 MiB or, without
   `CAP_SYS_PTRACE`, makes itself non-dumpable or changes user; on gVisor it also survives
-  if its command ran as another `user`, whose other processes can't open that command's
-  `/proc/PID/fd`. A pod with no PID to spare can end execd itself, and a command run as
-  another `user` needs up to four to start. Make execd mode 111, and give the sandbox
-  neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`, or a process running as execd's
-  user can stand in for it while it starts. What a pod's execd sends is paced at 4,096
-  frames and 128 MiB a second.
+  if its command ran as another `user`. On gVisor that user's other processes can't open
+  such a command's `/proc/PID/fd`. A pod with no PID to spare can end execd itself, and a
+  command run as another `user` needs up to four to start. Make execd mode 111, and give
+  the sandbox neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`, or a process running
+  as execd's user can stand in for it while it starts. What a pod's execd sends is paced
+  at 4,096 frames and 128 MiB a second.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
