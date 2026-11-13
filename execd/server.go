@@ -313,7 +313,7 @@ func (s *server) resume(c *conn, f frame) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	if cl.abandoned {
-		c.send(fError, f.id, []byte("call abandoned: killed after 6 minutes with no client"))
+		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
 	}
 	cl.sub = c

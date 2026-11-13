@@ -517,15 +517,16 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	timers[0]() // six minutes with no client: killed and forgotten
 	late, frames := recordedConn(t)
 
-	s.resume(late, frame{kind: fResume, id: 23, payload: []byte(`{"stdout":0,"stderr":0}`)})
-
-	select {
-	case f := <-frames:
-		// The client sends the START of an "unknown call" again: the command would run twice.
-		if f.kind != fError || string(f.payload) == "unknown call" {
-			t.Fatalf("a late RESUME got frame %d %q", f.kind, f.payload)
+	// The client sends the START of an "unknown call" again: right for 99, which never came; 23 would run twice.
+	for id, unknown := range map[uint64]bool{99: true, 23: false} {
+		s.resume(late, frame{kind: fResume, id: id, payload: []byte(`{"stdout":0,"stderr":0}`)})
+		select {
+		case f := <-frames:
+			if f.kind != fError || (string(f.payload) == "unknown call") != unknown {
+				t.Fatalf("a RESUME of call %d got frame %d %q", id, f.kind, f.payload)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("a RESUME of call %d got no answer", id)
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("a late RESUME got no answer")
 	}
 }
