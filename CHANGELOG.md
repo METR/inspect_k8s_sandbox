@@ -12,8 +12,8 @@
   environment or pads it past 8 MiB or, without `CAP_SYS_PTRACE`, makes itself
   non-dumpable or changes user; on gVisor it also survives if its command ran as another
   `user`, whose other processes can't open that command's `/proc/PID/fd`. A pod with no
-  PID to spare can end execd itself, and a command run as another `user` needs three to
-  start. Make execd mode 111, and give the sandbox neither `CAP_DAC_OVERRIDE` nor
+  PID to spare can end execd itself, and a command run as another `user` needs up to four
+  to start. Make execd mode 111, and give the sandbox neither `CAP_DAC_OVERRIDE` nor
   `CAP_DAC_READ_SEARCH`, or a process running as execd's user can stand in for it while
   it starts. What a pod's execd sends is paced at 4,096 frames and 128 MiB a second.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
