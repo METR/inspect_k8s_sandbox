@@ -564,6 +564,13 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 			}
 		}
 	}
+	var searched sync.WaitGroup
+	for range 200 { // many more searches, each with a collection under way: that moves a goroutine not held to its thread
+		searched.Add(1)
+		go func() { defer searched.Done(); searches <- search{"none", &syscall.Credential{Uid: 65534, Gid: 65534}} }()
+		runtime.GC()
+	}
+	searched.Wait()
 	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable.
 	if dumpable() {
 		t.Fatal("dumpable once it has killed a command run as another user")
