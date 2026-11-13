@@ -360,7 +360,11 @@ func (cl *call) run(req startRequest) error {
 	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
 	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it (GODEBUG)
 		envR, envW, _ := os.Pipe()
-		go func(env []string) { json.NewEncoder(envW).Encode(env); envW.Close() }(env)
+		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
+		for i, kv := range env {
+			raw[i] = []byte(kv)
+		}
+		go func() { json.NewEncoder(envW).Encode(raw); envW.Close() }()
 		defer envR.Close()
 		env, files = []string{}, append(files, envR)
 	}

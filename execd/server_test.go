@@ -461,9 +461,10 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
+	t.Setenv("RAW", "\xff") // execd's own environment, which a command inherits, need not be text
 	// GODEBUG has a Go program trace its start on stderr; BIG is as long as the kernel lets a variable be.
 	env := map[string]string{"GODEBUG": "inittrace=1", "BIG": strings.Repeat("x", 128<<10-len("BIG=")-1)}
-	script := "id -u; id -g; id -G; echo $GODEBUG ${#BIG}; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
+	script := "id -u; id -g; id -G; echo $GODEBUG ${#BIG} $RAW; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: env, User: "65534", Tag: "e"})
 
 	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
@@ -480,7 +481,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 				continue
 			}
 			// execd, a Go program, becomes the user itself: none of root's groups stay, and the environment isn't its own to read or to mark.
-			if string(out) != "65534\n65534\n65534\ninittrace=1 131067\n" {
+			if string(out) != "65534\n65534\n65534\ninittrace=1 131067 \xff\n" {
 				t.Fatalf("the command's output was %q", out)
 			}
 			return

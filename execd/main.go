@@ -72,13 +72,17 @@ func become(cwd string, ids, argv []string) {
 			err, code = fmt.Errorf("cd: %s: %w", cwd, errors.Unwrap(err)), 1
 		}
 	}
-	var env []string
+	var raw [][]byte
 	if err == nil {
 		pipe := os.NewFile(3, "environment") // run()'s
-		err = json.NewDecoder(pipe).Decode(&env)
+		err = json.NewDecoder(pipe).Decode(&raw)
 		pipe.Close()
 	}
 	if err == nil {
+		env := make([]string, len(raw))
+		for i, kv := range raw {
+			env[i] = string(kv)
+		}
 		if err = syscall.Exec(argv[0], argv, env); errors.Is(err, syscall.ENOENT) {
 			code = 127
 		}
