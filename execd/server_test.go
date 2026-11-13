@@ -158,9 +158,10 @@ func TestALateResumeOnAReplacedConnectionLeavesTheCallToTheNewOne(t *testing.T) 
 }
 
 func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
-	path := os.Getenv("PATH")
-	os.Unsetenv("PATH")
-	t.Cleanup(func() { os.Setenv("PATH", path) })
+	if path, set := os.LookupEnv("PATH"); set {
+		os.Unsetenv("PATH")
+		t.Cleanup(func() { os.Setenv("PATH", path) })
+	}
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	out := filepath.Join(t.TempDir(), "env")
