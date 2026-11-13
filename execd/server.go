@@ -68,6 +68,7 @@ type call struct {
 	sub      *conn  // the connection streaming this call, if any
 	// killed for want of a client, and kept so a RESUME can be told so
 	abandoned bool
+	killed    bool // asked to stop: a start still under way sees to it
 }
 
 type conn struct {
@@ -235,13 +236,15 @@ func (s *server) detach(c *conn) {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
 				if orphaned {
-					// Not forgotten: "unknown call" would have the client send its START again.
-					cl.abandoned, cl.gone, cl.out, cl.stdinQ = true, true, [2][]byte{}, nil
-					cl.room.Broadcast()
+					cl.abandoned = true // not forgotten: "unknown call" would have the client send its START again
 				}
 				cl.mu.Unlock()
 				if orphaned {
-					cl.kill()
+					cl.kill() // before its output is let go: a command that ended on that would leave what it started
+					cl.mu.Lock()
+					cl.gone, cl.out, cl.stdinQ = true, [2][]byte{}, nil
+					cl.room.Broadcast()
+					cl.mu.Unlock()
 				}
 			})
 		}
@@ -388,8 +391,12 @@ func (cl *call) run(req startRequest) error {
 	reaper.mu.Unlock()
 	cl.mu.Lock()
 	cl.pid, cl.as = p.Pid, as // before Release, which sets it to -1
+	killed := cl.killed
 	cl.mu.Unlock()
 	p.Release()
+	if killed {
+		cl.kill()
+	}
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
 		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
@@ -616,6 +623,7 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
 	cl.mu.Lock()
+	cl.killed = true
 	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
 	if pid <= 0 { // not started, or ended: what it left running is not the call's to kill, and -0 is execd's own group

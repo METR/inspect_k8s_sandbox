@@ -84,16 +84,17 @@ func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
 }
 
 func exitCode(t *testing.T, cl *call) int {
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		cl.mu.Lock()
 		exited, code := cl.exited, cl.code
 		cl.mu.Unlock()
 		if exited {
 			return code
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never exited")
+		}
 	}
-	t.Fatal("the command never exited")
-	return 0
 }
 
 func TestStdinFromADroppedConnectionIsNotWrittenAgain(t *testing.T) {
@@ -605,6 +606,23 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if took := (after.TotalAlloc - before.TotalAlloc) >> 20; took > 64 {
 		t.Fatalf("took %d MiB to read an environment of 1 GiB", took)
+	}
+}
+
+func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
+	startReaper()
+	t.Cleanup(func() { killTagged("early") })
+	cl := &call{id: 30, tag: "early"}
+	cl.room = sync.NewCond(&cl.mu)
+	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"} // it never ends by itself
+
+	cl.kill() // from another connection, while this one's START is still at work
+	if err := cl.run(req); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := exitCode(t, cl); code != 137 {
+		t.Fatalf("exit %d: the kill was lost", code)
 	}
 }
 
