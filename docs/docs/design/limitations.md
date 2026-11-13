@@ -160,10 +160,9 @@ the `hostAliases` field in the Pod spec
 Transient network or infrastructure errors during `exec()`, `read_file()`, and `write_file()` are automatically retried (up to 5 times). These are typically caused by issues such as a node becoming unhealthy, a Pod being rescheduled, or the Kubernetes control plane being overloaded.
 
 Retries cannot guarantee idempotency: an `exec()` whose connection is lost once its
-command was sent raises `ExecResultUnknownError` and is retried, so the command may run a
-second time. If the container restarted or was replaced meanwhile, `exec()` raises that
-error instead and is not retried. A Pod with execd resumes the command instead, and never
-runs it a second time.
+command was sent is retried, so the command may run a second time. It is not retried if
+the container restarted or was replaced meanwhile. A Pod with execd resumes the command
+instead, and never runs it a second time.
 
 ## Must run as root to use the `user` parameter in `exec()` { #exec-user }
 

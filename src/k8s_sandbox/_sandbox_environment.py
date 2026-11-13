@@ -78,9 +78,7 @@ _TRANSIENT_TYPES = (
 # but are listed defensively: if _TRANSIENT_TYPES ever gains a parent class they
 # inherit from, these entries prevent accidental retries of permanent failures.
 # PermissionError and TimeoutError are OSError subclasses and MUST be excluded.
-# ContainerStoppedError is a PodError and MUST be excluded: a retry would reach the
-# container that replaces it. So is ExecdResultUnknownError: execd resumes a call by its
-# id, and one it could not resume may have run.
+# A retry would reach a replaced container, or re-run what execd couldn't resume.
 _PERMANENT_TYPES = (
     ExecutableNotFoundError,
     RuntimeError,
