@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
+  runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over

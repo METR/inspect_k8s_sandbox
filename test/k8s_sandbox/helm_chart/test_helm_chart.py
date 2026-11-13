@@ -207,6 +207,28 @@ def test_pod_annotations_reach_only_their_service_pod(
     }
 
 
+def test_termination_grace_period_is_set_per_service(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "services.graceful.image=nginx,"
+        "services.graceful.terminationGracePeriodSeconds=1",
+    )
+
+    assert {
+        stateful_set["metadata"]["name"]: stateful_set["spec"]["template"]["spec"][
+            "terminationGracePeriodSeconds"
+        ]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    } == {
+        "agent-env-my-release-default": 0,
+        "agent-env-my-release-server": 0,
+        "agent-env-my-release-graceful": 1,
+    }
+
+
 def test_pod_annotations_must_be_strings(chart_dir: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(chart_dir, set_str="services.default.podAnnotations.n=1")
