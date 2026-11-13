@@ -8,7 +8,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import IO, Callable, Literal, TypeVar
+from typing import IO, Awaitable, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
 
@@ -211,8 +211,10 @@ class Pod:
             terminate background processes started by cmd. On a pod with execd, cmd and
             every process it started get SIGKILL instead.
         """
-        if self._execd is not None:
-            return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
+        if (execd := self._execd) is not None:
+            return await self._over_execd(
+                lambda: execd.exec(cmd, stdin, cwd, env, user, timeout)
+            )
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
@@ -314,8 +316,8 @@ class Pod:
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
         """
-        if self._execd is not None:
-            return await self._execd.write_file(data, dst)
+        if (execd := self._execd) is not None:
+            return await self._over_execd(lambda: execd.write_file(data, dst))
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         writer = WriteFileOperation(self._info)
@@ -333,8 +335,8 @@ class Pod:
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
         """
-        if self._execd is not None:
-            return await self._execd.read_file(src, dst)
+        if (execd := self._execd) is not None:
+            return await self._over_execd(lambda: execd.read_file(src, dst))
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
         reader = ReadFileOperation(self._info)
@@ -413,6 +415,19 @@ class Pod:
                 # Not on the event loop: closing a connection can wait on the server.
                 threading.Thread(target=discard, args=(result,), daemon=True).start()
             raise
+        return result
+
+    async def _over_execd(self, operation: Callable[[], Awaitable[T]]) -> T:
+        """Run an operation over execd, raising a kept restart as _run_async() does."""
+        if self._restart_error is not None:
+            await asyncio.sleep(0)
+            self._raise_restart()
+        try:
+            result = await operation()
+        except Exception:
+            self._raise_restart()
+            raise
+        self._raise_restart()
         return result
 
     def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:

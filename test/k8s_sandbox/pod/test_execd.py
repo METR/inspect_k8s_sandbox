@@ -17,7 +17,7 @@ from inspect_ai.util import OutputLimitExceededError
 from pytest import MonkeyPatch
 
 from k8s_sandbox._helm import Release, ValuesSource
-from k8s_sandbox._pod import execd
+from k8s_sandbox._pod import error, execd, op
 from k8s_sandbox._pod import pod as pod_module
 from k8s_sandbox._pod.error import ExecdResultUnknownError, PodError
 from k8s_sandbox._pod.pod import Pod
@@ -145,6 +145,77 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
     await (await pod.exec_stdio(["cat"], None)).aclose()
 
     await until(lambda: starts == 4)
+
+
+class Cluster:
+    """What Kubernetes shows of pod p: running, its container restarted this often."""
+
+    restarts = 0
+
+    def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
+        container = {
+            "name": "default",
+            "restartCount": self.restarts,
+            "state": {"running": {}},
+        }
+        pod = {
+            "metadata": {"name": "p", "uid": "u"},
+            "status": {"containerStatuses": [container]},
+        }
+        return types.SimpleNamespace(data=json.dumps(pod))
+
+
+@pytest.fixture
+def cluster(monkeypatch: MonkeyPatch) -> Cluster:
+    shown = Cluster()
+    monkeypatch.setattr(op, "k8s_client", lambda _: shown)
+    return shown
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda p: p.exec(["true"], None, None, {}, None, None), id="exec"),
+        pytest.param(lambda p: p.write_file(b"x", Path("/tmp/x")), id="write_file"),
+        pytest.param(lambda p: p.read_file(Path("/x"), io.BytesIO()), id="read_file"),
+    ],
+)
+async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
+    daemons: Daemons, cluster: Cluster, operation: Callable[[Pod], Awaitable[object]]
+) -> None:
+    """Regression: a cached connection kept serving a restarted container's sample."""
+    starts = 0
+    found = asyncio.Event()
+
+    async def exits_once_found(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                await found.wait()
+                # Exit 1: exec() returns it, a file operation raises.
+                w.write(frame(execd.EXIT, call_id, b'{"code": 1}'))
+
+    await daemons.serve(exits_once_found)
+    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod._execd = daemons.client()
+    running = asyncio.ensure_future(operation(pod))
+    await until(lambda: starts == 1)
+    cluster.restarts = 1
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.check_for_pod_restart()
+    found.set()
+
+    with pytest.raises(error.ContainerRestartedError):  # found while it ran
+        await running
+    others_ran: list[bool] = []
+    asyncio.get_running_loop().call_soon(others_ran.append, True)
+    with pytest.raises(error.ContainerRestartedError):  # found before it ran
+        await operation(pod)
+    assert (starts, others_ran) == (1, [True])
 
 
 async def test_output_the_caller_has_not_taken_stays_bounded(
