@@ -1,5 +1,8 @@
+import os
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Iterator
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import anyio
 import pytest
@@ -8,18 +11,32 @@ from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
+import k8s_sandbox._pod.execute as execute_module
 from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
+    ExecRecordUnfinishedError,
     ExecResultUnknownError,
+    ExecStreamLostError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
     PodReplacedError,
 )
+from k8s_sandbox._pod.execute import ExecuteOperation
 from k8s_sandbox._sandbox_environment import (
     K8sError,
     K8sSandboxEnvironment,
+)
+from test.k8s_sandbox.pod.test_check_for_pod_restart import _k8s_pod, _make_pod
+from test.k8s_sandbox.pod.test_execute import (
+    _SHELLS,
+    STDERR,
+    STDOUT,
+    _FakeWSClient,
+    _run_script,
+    _stand_in_for_cat,
+    _status,
 )
 
 
@@ -217,6 +234,201 @@ class TestExecRetryExhausted:
             await sandbox.exec(["echo", "hello"])
 
         assert mock_exec.call_count == 5
+
+    @pytest.mark.parametrize(
+        "then",
+        [
+            pytest.param(ExecStreamLostError("lost", pod="test-pod"), id="lost-again"),
+            pytest.param(ApiException(status=503, reason="Unavailable"), id="503"),
+        ],
+    )
+    async def test_retries_exhausted_after_a_lost_connection_leave_the_result_unknown(
+        self, then: Exception
+    ) -> None:
+        """No attempt reached the record of a command that may have run."""
+        sandbox, mock_exec = _make_sandbox_with_mock_pod()
+        lost = ExecStreamLostError("lost", pod="test-pod")
+        mock_exec.side_effect = [lost, then, then, then, then]
+
+        with pytest.raises(K8sError) as raised:
+            await sandbox.exec(["echo", "hello"])
+
+        assert mock_exec.call_count == 5
+        assert isinstance(raised.value.__cause__, ExecResultUnknownError)
+
+    async def test_a_timeout_after_a_lost_connection_is_still_a_timeout(self) -> None:
+        sandbox, mock_exec = _make_sandbox_with_mock_pod()
+        mock_exec.side_effect = [
+            ExecStreamLostError("lost", pod="test-pod"),
+            TimeoutError("Command timed out after 30s."),
+        ]
+
+        with pytest.raises(TimeoutError):
+            await sandbox.exec(["echo", "hello"], timeout=30)
+
+        assert mock_exec.call_count == 2
+
+
+class TestExecRetryById:
+    """A retry asks for the same exec again, so it cannot run the command twice."""
+
+    async def test_attempts_share_an_id_that_the_next_exec_does_not(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        mock_pod.exec = AsyncMock(
+            side_effect=[
+                ApiException(status=503, reason="Service Unavailable"),
+                ExecStreamLostError("lost", pod="test-pod"),
+                _success_result(),
+                ExecRecordUnfinishedError("unfinished", pod="test-pod"),
+                _success_result(),
+            ]
+        )
+
+        await sandbox.exec(["echo", "hello"])
+        await sandbox.exec(["echo", "hello"])
+
+        ids, resent, started = zip(*(c.args[6:] for c in mock_pod.exec.call_args_list))
+        # Only a lost connection may have sent the command: the 503 sent nothing.
+        assert resent == (False, False, True, False, True)
+        # Only a record that was sent says the command has started.
+        assert started == (False, False, False, False, True)
+        assert ids[0] == ids[1] == ids[2] != ids[3] == ids[4]
+        # A lost attempt may yet reach the pod, and must find its record there.
+        assert mock_pod.exec_finished.call_args_list == [call(None, ids[3])]
+
+
+class _ShellWSClient(_FakeWSClient):
+    """An exec in a pod that is this machine: `shell` runs the script written to it."""
+
+    def __init__(self, shell: list[str], scripts: list[str]) -> None:
+        super().__init__([])
+        self._shell = shell
+        self._scripts = scripts
+        self._script = ""
+
+    def write_stdin(self, data: str) -> None:
+        self._script += data
+        if data == "}\n":  # The closing line: the shell has it all, and runs it.
+            self._scripts.append(self._script)
+            result = _run_script(self._shell, self._script)
+            self._frames = [
+                (STDOUT, result.stdout),
+                (STDERR, result.stderr),
+                _status(result.returncode),
+            ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+@pytest.mark.parametrize("shell", _SHELLS)
+class TestExecInAShell:
+    """exec() from end to end, with a shell here for the pod's."""
+
+    @pytest.fixture
+    def scripts(
+        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> list[str]:
+        """The scripts exec() sends: `shell` runs each, its record in `tmp_path`."""
+        scripts: list[str] = []
+
+        @contextmanager
+        def shell_here(
+            self: ExecuteOperation, command: list[str]
+        ) -> Iterator[_ShellWSClient]:
+            yield _ShellWSClient(shell, scripts)
+
+        monkeypatch.setattr(ExecuteOperation, "_interactive_shell", shell_here)
+        (tmp_path / "tmp").mkdir()
+        (tmp_path / "tmp").chmod(0o1777)  # Sticky, as a pod's /tmp is.
+        monkeypatch.setattr(
+            execute_module, "RECORD_PREFIX", str(tmp_path / "tmp" / "exec-")
+        )
+        return scripts
+
+    @pytest.fixture
+    def sandbox(self, scripts: list[str]) -> Iterator[K8sSandboxEnvironment]:
+        sandbox, _ = _make_sandbox()
+        sandbox._pod = _make_pod()
+        with patch("k8s_sandbox._pod.op.k8s_client") as client:
+            client.return_value.read_namespaced_pod.return_value = _k8s_pod(
+                uid="uid-OLD", container_name="default", restart_count=0
+            )
+            yield sandbox
+
+    @pytest.fixture
+    def stand_in(self, shell: list[str]) -> None:
+        """For a test that stands in for `cat`."""
+        if shell[0] == "busybox":
+            pytest.skip("busybox sh runs its own cat, whatever the PATH")
+
+    async def test_a_record_sent_before_its_end_is_asked_for_again(
+        self,
+        stand_in: None,
+        sandbox: K8sSandboxEnvironment,
+        scripts: list[str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Its relays were slow: here they copy nothing until a record has been sent."""
+        sent = tmp_path / "sent"
+        _stand_in_for_cat(
+            tmp_path,
+            monkeypatch,
+            relay=f"until [ -e {sent} ]; do sleep 0.05; done\nexec $CAT",
+            sender=f'$CAT "$@"\n: > {sent}',
+        )
+        runs = tmp_path / "runs"
+        cmd = ["sh", "-c", f"echo run >> {runs}; echo out; echo err >&2; exit 3"]
+
+        result = await sandbox.exec(cmd)
+
+        assert (result.returncode, result.stdout, result.stderr) == (
+            3,
+            "out\n",
+            "err\n",
+        )
+        assert (len(scripts), runs.read_text()) == (2, "run\n")
+
+    async def test_a_command_that_has_started_is_not_started_again(
+        self,
+        stand_in: None,
+        sandbox: K8sSandboxEnvironment,
+        scripts: list[str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A record was sent, not complete, and the command moved its record away."""
+        sent = tmp_path / "sent"
+        _stand_in_for_cat(
+            tmp_path,
+            monkeypatch,
+            relay=f"until [ -e {sent} ]; do sleep 0.05; done\nexec $CAT",
+            sender=f'$CAT "$@"\n: > {sent}',
+        )
+        runs = tmp_path / "runs"
+        moves = f"mv {tmp_path}/tmp/exec-* {tmp_path}/moved"
+
+        with pytest.raises(K8sError) as raised:
+            await sandbox.exec(["sh", "-c", f"echo run >> {runs}; {moves}; echo out"])
+
+        assert isinstance(raised.value.__cause__, ExecResultUnknownError)
+        assert (len(scripts), runs.read_text()) == (2, "run\n")
+
+    async def test_a_record_that_never_gets_its_end_leaves_the_result_unknown(
+        self,
+        stand_in: None,
+        sandbox: K8sSandboxEnvironment,
+        scripts: list[str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Its relays lost the output: no attempt may pass off what there is as all."""
+        _stand_in_for_cat(tmp_path, monkeypatch, relay="exec $CAT >/dev/null")
+
+        with pytest.raises(K8sError) as raised:
+            await sandbox.exec(["sh", "-c", "echo out; exit 3"])
+
+        assert isinstance(raised.value.__cause__, ExecResultUnknownError)
+        assert len(scripts) == 5
 
 
 # -- read_file retry tests --

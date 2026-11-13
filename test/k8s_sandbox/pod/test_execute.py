@@ -11,8 +11,10 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -44,11 +46,19 @@ import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
+    ExecNeverRecordedError,
+    ExecRecordUnfinishedError,
     ExecResultUnknownError,
-    GetReturncodeError,
+    ExecStreamLostError,
+    ExecUnrecordedError,
     PodError,
 )
-from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio, _shell_command
+from k8s_sandbox._pod.execute import (
+    ExecuteOperation,
+    PodStdio,
+    _shell_command,
+    record_path,
+)
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.pod import Pod
 
@@ -57,6 +67,21 @@ MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
 
 def _marker(returncode: int) -> bytes:
     return f"{MARKER}{returncode}>".encode()
+
+
+# What ends a record as a script sends it, after the command's own markers.
+_SENT = _marker(999)
+
+
+_NOT_STARTED = json.dumps(
+    {
+        "status": "Failure",
+        "message": "Internal error occurred: error executing command in container: "
+        "failed to exec in container: failed to load task: context deadline exceeded",
+        "reason": "InternalError",
+        "code": 500,
+    }
+).encode()
 
 
 def _status(returncode: int) -> tuple[int, bytes]:
@@ -126,14 +151,28 @@ class _FakeWSClient(WSClient):
 
 
 def _handle(
-    ws: WSClient, user: str | None = None, timeout: int | None = None
+    ws: WSClient,
+    user: str | None = None,
+    timeout: int | None = None,
+    recorded: bool = False,
 ) -> ExecResult[str]:
-    return ExecuteOperation(MagicMock())._handle_shell_output(ws, user, timeout, MARKER)
+    return ExecuteOperation(MagicMock())._handle_shell_output(
+        ws, user, timeout, MARKER, recorded
+    )
 
 
 @pytest.fixture
 def short_grace(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(execute_module, "STREAM_END_GRACE_SECONDS", 0.01)
+
+
+@pytest.fixture
+def pod_tmp(tmp_path: Path) -> Path:
+    """Where the tests keep records: a sticky directory, as a pod's /tmp is."""
+    pod_tmp = tmp_path / "tmp"
+    pod_tmp.mkdir()
+    pod_tmp.chmod(0o1777)
+    return pod_tmp
 
 
 class TestCompletion:
@@ -285,7 +324,57 @@ class TestCompletion:
         """The shell writes both markers before it can exit 0."""
         ws = _FakeWSClient([(STDOUT, b"the start of the output"), _status(0)])
 
-        with pytest.raises(ExecResultUnknownError, match="end of the command's output"):
+        with pytest.raises(
+            ExecRecordUnfinishedError, match="end of the command's output"
+        ):
+            _handle(ws)
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            pytest.param(b"part" + _SENT, id="neither-stream-complete"),
+            pytest.param(b"out" + _marker(3) + _SENT, id="one-stream-complete"),
+        ],
+    )
+    def test_a_record_sent_before_it_was_complete_is_asked_for_again(
+        self, stdout: bytes
+    ) -> None:
+        """A stream that had not the command's own marker yet ends in the sender's."""
+        ws = _FakeWSClient([(STDOUT, stdout), (STDERR, b"part" + _SENT), _status(0)])
+
+        with pytest.raises(ExecRecordUnfinishedError, match="before it was complete"):
+            _handle(ws, recorded=True)
+
+    @pytest.mark.parametrize(
+        ("returncode", "stderr", "error"),
+        [
+            (124, b"", TimeoutError),
+            (126, b"sh: 1: ./tool: Permission denied\n", PermissionError),
+        ],
+    )
+    def test_a_recorded_commands_timeout_or_refusal_is_raised_as_itself(
+        self, returncode: int, stderr: bytes, error: type[Exception]
+    ) -> None:
+        """Its shell exits 0: the markers have the code."""
+        ws = _FakeWSClient(
+            [
+                (STDOUT, _marker(returncode) + _SENT),
+                (STDERR, stderr + _marker(returncode) + _SENT),
+                _status(0),
+            ]
+        )
+
+        with pytest.raises(error):
+            _handle(ws, timeout=30, recorded=True)
+
+    def test_an_error_on_the_connection_once_the_script_is_sent_means_it_was_lost(
+        self,
+    ) -> None:
+        """Whatever raised it: retried as anything else, the command could run twice."""
+        ws = _FakeWSClient([(STDOUT, _marker(0)), (STDERR, _marker(0))])
+        ws.sock.settimeout = MagicMock(side_effect=OSError("Bad file descriptor"))
+
+        with pytest.raises(ExecStreamLostError):
             _handle(ws)
 
     @pytest.mark.parametrize(
@@ -372,9 +461,126 @@ def _run_script(
         os.close(write_end)
 
 
-def _script(cmd: list[str], stdin: str | bytes | None = None) -> str:
+@contextmanager
+def _start_script(
+    shell: list[str], script: str
+) -> Generator[subprocess.Popen[bytes], None, None]:
+    """Start an exec's script in a process group of its own, to read or to kill."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, script.encode())
+    try:
+        with subprocess.Popen(
+            [shutil.which(shell[0]) or shell[0], *shell[1:]],
+            stdin=read_end,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ) as process:
+            yield process
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
+def _wait_until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 30
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def _read_until(process: subprocess.Popen[bytes], end: bytes) -> list[bytes]:
+    """What a script still running wrote to stdout and to stderr, each up to `end`.
+
+    Or what it had written five seconds on.
+    """
+    deadline = time.monotonic() + 5
+    written = []
+    for stream in (process.stdout, process.stderr):
+        assert stream is not None
+        data = b""
+        while not data.endswith(end):
+            wait = max(0, deadline - time.monotonic())
+            if not select.select([stream], [], [], wait)[0]:
+                break
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            data += chunk
+        written.append(data)
+    return written
+
+
+def _script(
+    cmd: list[str],
+    stdin: str | bytes | None = None,
+    record: str | None = None,
+    resent: bool = False,
+    started: bool = False,
+    done: Sequence[str] = (),
+) -> str:
     return ExecuteOperation(MagicMock())._build_shell_script(
-        cmd, stdin, None, {}, None, MARKER
+        cmd,
+        stdin,
+        None,
+        {},
+        None,
+        MARKER,
+        record=record,
+        resent=resent,
+        started=started,
+        done=done,
+    )
+
+
+def _attempts(command: str, pod_tmp: Path, holds: str | None) -> list[str]:
+    """The scripts of a first and a resent attempt, reading a stand-in for /proc.
+
+    There the command's own shell is process 7, and `holds` is the file it has open
+    as descriptor 7 (None: there is no such process).
+    """
+    proc = pod_tmp / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "stat").write_text("7 (sh) R 1 7 7\n")
+    if holds is not None:
+        (proc / "7" / "fd").mkdir(parents=True)
+        (proc / "7" / "fd" / "7").symlink_to(pod_tmp / holds)
+    scripts = [
+        _script(["sh", "-c", command], record=str(pod_tmp / "rec"), resent=resent)
+        for resent in (False, True)
+    ]
+    assert all(script.count("/proc/") == 3 for script in scripts)
+    return [script.replace("/proc/", f"{proc}/") for script in scripts]
+
+
+def _stand_in_for_cat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relay: str,
+    sender: str = 'exec $CAT "$@"',
+) -> None:
+    """Have the scripts built from now on run these where they run `cat`.
+
+    `relay` where it copies a command's output into the record, `sender` where it
+    sends a record; `$CAT` is the real one.
+    """
+    system = tmp_path / "system"
+    system.mkdir()
+    for name in ("mkdir", "sleep", "rm"):
+        (system / name).symlink_to(shutil.which(name) or f"/bin/{name}")
+    cat = system / "cat"
+    cat.write_text(
+        f"#!/bin/sh\nCAT={shutil.which('cat')}\n"
+        f"if [ $# = 0 ] && [ -p /dev/stdin ]; then\n{relay}\nelse\n{sender}\nfi\n"
+    )
+    cat.chmod(0o755)
+    monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+
+
+def _as_exec(result: subprocess.CompletedProcess[bytes]) -> _FakeWSClient:
+    """The exec whose shell ran a script: its output, then the shell's exit status."""
+    return _FakeWSClient(
+        [(STDOUT, result.stdout), (STDERR, result.stderr), _status(result.returncode)]
     )
 
 
@@ -391,12 +597,407 @@ class TestScriptInAShell:
         assert result.stderr == b"err\n" + _marker(3)
 
     @pytest.mark.parametrize(
+        "resent",
+        [
+            pytest.param(False, id="first-attempt"),
+            # The first attempt's shell never started, or never got all its script.
+            pytest.param(True, id="retry-of-a-command-that-never-started"),
+        ],
+    )
+    def test_a_record_is_sent_with_the_commands_markers_then_the_senders(
+        self, shell: list[str], pod_tmp: Path, resent: bool
+    ) -> None:
+        """Its shell exits 0: the first marker on a stream has the exit code."""
+        script = _script(
+            ["sh", "-c", "echo out; echo err >&2; exit 3"],
+            record=str(pod_tmp / "rec"),
+            resent=resent,
+        )
+
+        result = _run_script(shell, script)
+
+        assert result.returncode == 0
+        assert result.stdout == b"out\n" + _marker(3) + _SENT
+        assert result.stderr == b"err\n" + _marker(3) + _SENT
+
+    def test_a_retry_reads_the_result_again_without_running_the_command(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path
+    ) -> None:
+        """As when the result was lost on its way from a command that had ended."""
+        runs = tmp_path / "runs"
+        cmd = ["sh", "-c", f"echo run >> {runs}; echo out; echo err >&2; exit 3"]
+
+        results = [
+            _run_script(shell, _script(cmd, record=str(pod_tmp / "rec"), resent=resent))
+            for resent in (False, True)
+        ]
+
+        assert [(r.returncode, r.stdout, r.stderr) for r in results] == [
+            (0, b"out\n" + _marker(3) + _SENT, b"err\n" + _marker(3) + _SENT)
+        ] * 2
+        assert runs.read_text() == "run\n"
+
+    def test_a_retry_waits_for_a_command_whose_shell_was_killed(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path
+    ) -> None:
+        """The first attempt's shell is killed; the command it started runs on."""
+        runs = tmp_path / "runs"
+        command = f"echo run >> {runs}; sleep 1; echo out; echo err >&2; exit 3"
+        first, retry = _attempts(command, pod_tmp, holds="rec/out")
+
+        with _start_script(shell, first) as process:
+            _wait_until(runs.exists)
+            process.kill()
+        result = _run_script(shell, retry)
+
+        assert result.stdout == b"out\n" + _marker(3) + _SENT
+        assert result.stderr == b"err\n" + _marker(3) + _SENT
+        assert runs.read_text() == "run\n"
+
+    @pytest.mark.parametrize(
+        "holds", [None, "proc/self/stat"], ids=["gone", "another-process"]
+    )
+    def test_a_retry_does_not_wait_for_a_command_whose_shell_is_gone(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path, holds: str | None
+    ) -> None:
+        """It sends what there is, as a record that is not complete."""
+        started = tmp_path / "started"
+        command = f"echo before; sleep 0.1; : > {started}; exec sleep 30"
+        first, retry = _attempts(command, pod_tmp, holds)
+
+        with _start_script(shell, first) as process:
+            _wait_until(started.exists)
+            os.killpg(process.pid, signal.SIGKILL)
+        result = _run_script(shell, retry)
+
+        assert (result.returncode, result.stdout, result.stderr) == (
+            0,
+            b"before\n" + _SENT,
+            _SENT,
+        )
+
+    @pytest.mark.parametrize("left", [[], ["out"]], ids=["no-record-yet", "no-pid"])
+    def test_a_retry_that_finds_no_result_to_wait_for_cannot_tell(
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        left: list[str],
+    ) -> None:
+        """The directory's maker never started the command, or never said who it is."""
+        system = tmp_path / "system"
+        system.mkdir()
+        for name in ("mkdir", "cat", "rm"):
+            (system / name).symlink_to(shutil.which(name) or f"/bin/{name}")
+        # Twenty polls for the maker's `pid`, without their ten seconds.
+        (system / "sleep").write_text("#!/bin/sh\n")
+        (system / "sleep").chmod(0o755)
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        record = pod_tmp / "rec"
+        record.mkdir()
+        for name in left:
+            (record / name).touch()
+        ran = tmp_path / "ran"
+        script = _script(["touch", str(ran)], record=str(record), resent=True)
+
+        result = _run_script(shell, script)
+
+        assert not ran.exists()
+        with pytest.raises(ExecResultUnknownError, match="no record"):
+            _handle(_as_exec(result), recorded=True)
+
+    @pytest.mark.parametrize(
+        ("parent", "missing"),
+        [
+            # Where another user could replace the record, or none can be made.
+            pytest.param("plain", None, id="directory-not-sticky"),
+            pytest.param("link", None, id="directory-a-symlink-to-a-sticky-one"),
+            pytest.param("unwritable", None, id="directory-not-writable"),
+            # Without them a command would lose its output, or leave its record.
+            pytest.param("tmp", "cat", id="no-cat"),
+            pytest.param("tmp", "sleep", id="no-sleep"),
+            pytest.param("tmp", "rm", id="no-rm"),
+        ],
+    )
+    def test_a_container_that_can_keep_no_record_safely_keeps_none(
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        parent: str,
+        missing: str | None,
+    ) -> None:
+        """Nothing runs, and the client is told that no exec can keep one."""
+        ran = tmp_path / "ran"
+        (tmp_path / "plain").mkdir()
+        (tmp_path / "link").symlink_to(pod_tmp)
+        (tmp_path / "unwritable").mkdir()
+        (tmp_path / "unwritable").chmod(0o1555)
+        system = tmp_path / "system"
+        system.mkdir()
+        for name in {"mkdir", "cat", "sleep", "rm"} - {missing}:
+            (system / name).symlink_to(shutil.which(name) or f"/bin/{name}")
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        record = tmp_path / parent / "rec"
+        script = _script(["touch", str(ran)], record=str(record))
+
+        result = _run_script(shell, script)
+
+        assert not ran.exists()
+        assert not record.exists()
+        with pytest.raises(ExecNeverRecordedError):
+            _handle(_as_exec(result), recorded=True)
+
+    @pytest.mark.parametrize(
+        ("uids", "status", "sent"),
+        [
+            # Real, effective, saved and filesystem uid: the effective one counts.
+            pytest.param("1000\t0\t0\t0", 121, b"", id="root"),
+            pytest.param(None, 121, b"", id="uid-not-readable"),
+            pytest.param("0\t1000\t1000\t1000", 0, _marker(0) + _SENT, id="not-root"),
+        ],
+    )
+    def test_only_root_needs_to_own_the_directory_its_record_is_kept_in(
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        uids: str | None,
+        status: int,
+        sent: bytes,
+    ) -> None:
+        """A sticky directory's owner can replace what others keep in it."""
+        shared = [
+            directory
+            for directory in ("/tmp", "/private/tmp")
+            if os.path.isdir(directory)
+            and not os.path.islink(directory)
+            and os.stat(directory).st_mode & stat.S_ISVTX
+            and os.stat(directory).st_uid != os.getuid()
+            and os.access(directory, os.W_OK)
+        ]
+        if not shared:
+            pytest.skip("Needs a sticky directory of another user's to write to")
+        record = Path(shared[0]) / f"test-exec-record-{os.urandom(8).hex()}"
+        proc_status = tmp_path / "status"
+        if uids is not None:
+            proc_status.write_text(_proc_status(uids))
+        script = _script(["true"], record=str(record))
+        assert script.count("/proc/self/status") == 1
+        script = script.replace("/proc/self/status", str(proc_status))
+
+        try:
+            result = _run_script(shell, script)
+        finally:
+            shutil.rmtree(record, ignore_errors=True)
+
+        assert (result.returncode, result.stdout) == (status, sent)
+
+    def test_an_attempt_at_a_command_that_has_started_cannot_start_it(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path
+    ) -> None:
+        """Not even where its record is gone: moved away by the command, say."""
+        ran = tmp_path / "ran"
+        record = pod_tmp / "rec"
+        script = _script(
+            ["touch", str(ran)], record=str(record), resent=True, started=True
+        )
+
+        result = _run_script(shell, script)
+
+        assert not ran.exists()
+        assert not record.exists()
+        with pytest.raises(ExecUnrecordedError):
+            _handle(_as_exec(result), recorded=True)
+
+    def test_a_shell_that_cannot_write_its_record_runs_nothing(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path
+    ) -> None:
+        """As on a full disk, where a later exec may be able to keep one."""
+        ran = tmp_path / "ran"
+        script = "trap '' XFSZ\nulimit -f 0\n" + _script(
+            ["touch", str(ran)], record=str(pod_tmp / "rec")
+        )
+
+        result = _run_script(shell, script)
+
+        assert not ran.exists()
+        with pytest.raises(ExecUnrecordedError) as refused:
+            _handle(_as_exec(result), recorded=True)
+        assert refused.type is ExecUnrecordedError
+
+    @pytest.mark.parametrize(
+        ("name", "resent"),
+        [
+            pytest.param("made", False, id="first-attempt"),
+            # Anyone can put a link there, to a directory with a result of their own.
+            pytest.param("link", True, id="through-a-symlink"),
+        ],
+    )
+    def test_a_record_is_read_only_by_a_resent_attempt_at_its_own_name(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path, name: str, resent: bool
+    ) -> None:
+        runs = tmp_path / "runs"
+        cmd = ["sh", "-c", f"echo run >> {runs}; echo out"]
+        _run_script(shell, _script(cmd, record=str(pod_tmp / "made")))
+        (pod_tmp / "link").symlink_to(pod_tmp / "made")
+        script = _script(cmd, record=str(pod_tmp / name), resent=resent)
+
+        result = _run_script(shell, script)
+
+        assert runs.read_text() == "run\n"
+        with pytest.raises(ExecUnrecordedError):
+            _handle(_as_exec(result), recorded=True)
+
+    def test_a_command_that_removes_its_record_still_returns_its_result(
+        self, shell: list[str], pod_tmp: Path
+    ) -> None:
+        """A clean-up of /tmp, say."""
+        record = pod_tmp / "rec"
+        command = f"rm -rf {record}; echo out; echo err >&2; exit 3"
+
+        result = _run_script(shell, _script(["sh", "-c", command], record=str(record)))
+
+        assert result.stdout == b"out\n" + _marker(3) + _SENT
+        assert result.stderr == b"err\n" + _marker(3) + _SENT
+
+    @pytest.mark.parametrize(
+        ("to", "file"), [("", "out"), (" >&2", "err")], ids=["stdout", "stderr"]
+    )
+    def test_output_past_the_limit_is_cut_off_in_the_pod(
+        self,
+        shell: list[str],
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        to: str,
+        file: str,
+    ) -> None:
+        """A command that keeps writing must not fill the pod's disk."""
+        monkeypatch.setattr(execute_module.limits, "MAX_EXEC_OUTPUT_SIZE", 8)
+        record = pod_tmp / "rec"
+        script = _script(
+            ["sh", "-c", f"head -c 100000 /dev/zero{to}"], record=str(record)
+        )
+
+        result = _run_script(shell, script)
+
+        # Two blocks, which are of 512 bytes or of 1024 by the shell.
+        assert (record / file).stat().st_size <= 2048
+        with pytest.raises(OutputLimitExceededError):
+            _handle(_as_exec(result), recorded=True)
+
+    def test_output_at_the_limit_is_returned(
+        self, shell: list[str], pod_tmp: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its record holds the end marker too, wherever the limit's last block ends."""
+        monkeypatch.setattr(execute_module.limits, "MAX_EXEC_OUTPUT_SIZE", 1023)
+        script = _script(
+            ["sh", "-c", "head -c 1023 /dev/zero"], record=str(pod_tmp / "rec")
+        )
+
+        result = _handle(_as_exec(_run_script(shell, script)), recorded=True)
+
+        assert len(result.stdout) == 1023
+
+    def test_a_background_process_holding_the_output_does_not_hold_the_result(
+        self, shell: list[str], pod_tmp: Path
+    ) -> None:
+        """The exec's shell waits for the process; the output and its markers do not."""
+        script = _script(
+            ["sh", "-c", "sleep 30 & echo out"], record=str(pod_tmp / "rec")
+        )
+
+        with _start_script(shell, script) as process:
+            written = _read_until(process, _SENT)
+            os.killpg(process.pid, signal.SIGKILL)
+
+        assert written == [b"out\n" + _marker(0) + _SENT, _marker(0) + _SENT]
+
+    def test_a_command_killed_with_its_shell_ends_the_exec_with_137(
+        self, shell: list[str], tmp_path: Path, pod_tmp: Path
+    ) -> None:
+        """As for any command killed, after what the command had written."""
+        pids = tmp_path / "pids"
+        command = (
+            f"echo before; echo $PPID $$ > {pids}.new; mv {pids}.new {pids}; "
+            "exec sleep 30"
+        )
+        script = _script(["sh", "-c", command], record=str(pod_tmp / "rec"))
+
+        with _start_script(shell, script) as process:
+            _wait_until(pids.exists)
+            for pid in pids.read_text().split():
+                os.kill(int(pid), signal.SIGKILL)
+            stdout, stderr = process.communicate(timeout=30)
+
+        assert stdout == b"before\n" + _marker(137) + _SENT
+        assert stderr == _marker(137) + _SENT
+
+    def test_sigint_does_to_the_command_what_it_does_to_a_joined_one(
+        self, shell: list[str], pod_tmp: Path
+    ) -> None:
+        """A shell that runs it in the background has it ignore SIGINT and SIGQUIT."""
+        cmd = ["sh", "-c", "kill -INT $$; echo survived"]
+
+        joined = _run_script(shell, _script(cmd))
+        recorded = _run_script(shell, _script(cmd, record=str(pod_tmp / "rec")))
+
+        assert recorded.stdout == joined.stdout + _SENT
+
+    def test_no_process_of_an_exec_outlives_its_shell(
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Its shell waits for them all, so the container's first process reaps none."""
+        # A relay that takes a while to end, so that one not waited for is still there.
+        _stand_in_for_cat(tmp_path, monkeypatch, relay="$CAT\nsleep 0.3")
+        script = _script(["true"], record=str(pod_tmp / "rec"))
+
+        with _start_script(shell, script) as process:
+            process.wait()
+
+        with pytest.raises(ProcessLookupError):
+            os.killpg(process.pid, 0)
+
+    def test_only_the_users_own_finished_records_are_removed(
+        self, shell: list[str], pod_tmp: Path
+    ) -> None:
+        """A finished record's name may by then be another user's link or directory."""
+        own, elsewhere, link = (pod_tmp / name for name in ("own", "elsewhere", "link"))
+        for directory in (own, elsewhere):
+            directory.mkdir()
+            (directory / "out").write_text("output")
+        link.symlink_to(elsewhere)
+        script = _script(
+            ["true"], record=str(pod_tmp / "rec"), done=[str(own), str(link)]
+        )
+
+        _run_script(shell, script)
+
+        assert not own.exists()
+        assert link.is_symlink() and (elsewhere / "out").exists()
+
+    def test_only_the_execs_user_can_read_its_record(
+        self, shell: list[str], pod_tmp: Path
+    ) -> None:
+        """Anyone in the pod can list /tmp, where a root exec's output is kept too."""
+        record = pod_tmp / "rec"
+
+        _run_script(shell, _script(["true"], record=str(record)))
+
+        assert stat.S_IMODE(record.stat().st_mode) == 0o700
+
+    @pytest.mark.parametrize(
         "stdin",
         [
             pytest.param(
                 bytes(range(256)) * 2 + b"'%s%%\\0\\n\x001\n7", id="every-byte"
             ),
-            pytest.param("caf\u00e9 'quoted' \"double\" %d \\\n\u03bb", id="text"),
+            pytest.param("café 'quoted' \"double\" %d \\\nλ", id="text"),
             pytest.param("", id="empty"),
             pytest.param("-hello", id="leading-hyphen"),
             pytest.param("--", id="double-hyphen"),
@@ -404,14 +1005,14 @@ class TestScriptInAShell:
         ],
     )
     def test_input_reaches_the_command_byte_for_byte(
-        self, shell: list[str], stdin: str | bytes
+        self, shell: list[str], pod_tmp: Path, stdin: str | bytes
     ) -> None:
-        script = _script(["cat"], stdin)
+        script = _script(["cat"], stdin, record=str(pod_tmp / "rec"))
 
         result = _run_script(shell, script)
 
         expected = stdin if isinstance(stdin, bytes) else stdin.encode()
-        assert result.stdout == expected + _marker(0)
+        assert result.stdout == expected + _marker(0) + _SENT
 
     @pytest.mark.parametrize(
         ("cmd", "returncode"),
@@ -463,7 +1064,10 @@ class TestScriptInAShell:
     def test_the_command_cannot_read_the_marker_from_stdin(
         self, shell: list[str]
     ) -> None:
-        """Bash reads its script a byte at a time, so it must still read all of it."""
+        """Bash reads its script a byte at a time, so it must still read all of it.
+
+        Without a record: only then is the command's stdin the shell's.
+        """
         echo_pending_stdin = (
             "import os, select\n"
             "if select.select([0], [], [], 0.5)[0]:\n"
@@ -475,8 +1079,12 @@ class TestScriptInAShell:
 
         assert result.stdout == _marker(0)
 
-    def test_base64_and_timeout_are_not_found_through_the_path(
-        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_the_tools_it_runs_are_not_found_through_the_path(
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """They run as the container's user; the command still gets the PATH."""
         # The real ones stand in for /usr/bin and /bin: macOS has no /usr/bin/timeout.
@@ -485,7 +1093,7 @@ class TestScriptInAShell:
         system.mkdir()
         stubs.mkdir()
         ran = tmp_path / "ran"
-        for name in ("base64", "timeout"):
+        for name in ("base64", "timeout", "rm", "mkdir", "cat", "sleep"):
             real = shutil.which(name)
             if real is None:
                 pytest.skip(f"Requires {name}")
@@ -493,19 +1101,40 @@ class TestScriptInAShell:
             stub = stubs / name
             stub.write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
             stub.chmod(0o755)
-        monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
+        # The first system directory has none of them, as /usr/bin on Alpine.
+        monkeypatch.setattr(execute_module, "SYSTEM_PATH", f"{system}-none:{system}")
         path = f"{stubs}:{os.environ['PATH']}"
+        (pod_tmp / "done").mkdir()
         script = ExecuteOperation(MagicMock())._build_shell_script(
-            ["sh", "-c", 'cat; printf %s "$PATH"'], "input", None, {}, 30, MARKER
+            ["sh", "-c", 'read -r input; printf %s "$input$PATH"'],
+            "input",
+            None,
+            {},
+            30,
+            MARKER,
+            record=str(pod_tmp / "rec"),
+            done=[str(pod_tmp / "done")],
         )
 
         result = _run_script(shell, script, env={**os.environ, "PATH": path})
 
         assert not ran.exists()
-        assert result.stdout == f"input{path}".encode() + _marker(0)
+        assert result.stdout == f"input{path}".encode() + _marker(0) + _SENT
 
+    @pytest.mark.parametrize(
+        ("record", "resent", "sent"),
+        [("rec", False, _SENT), ("rec", True, _SENT), (None, False, b"")],
+        ids=["recorded", "resent", "joined"],
+    )
     def test_printf_is_not_found_through_the_path(
-        self, shell: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        shell: list[str],
+        tmp_path: Path,
+        pod_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        record: str | None,
+        resent: bool,
+        sent: bytes,
     ) -> None:
         """Where the shell has no printf builtin: bash with its builtin turned off."""
         if shell[0] != "bash":
@@ -515,20 +1144,23 @@ class TestScriptInAShell:
         system.mkdir()
         stubs.mkdir()
         ran = tmp_path / "ran"
-        (system / "printf").symlink_to(shutil.which("printf") or "/usr/bin/printf")
+        for name in ("printf", "mkdir", "cat", "sleep", "rm"):
+            (system / name).symlink_to(shutil.which(name) or f"/usr/bin/{name}")
         stub = stubs / "printf"
         stub.write_text(f"#!/bin/sh\necho printf >> {ran}\n")
         stub.chmod(0o755)
         monkeypatch.setattr(execute_module, "SYSTEM_PATH", str(system))
-        script = "enable -n printf\n" + ExecuteOperation(
-            MagicMock()
-        )._build_shell_script(["true"], None, None, {}, None, MARKER)
+        if resent:  # The record it reads.
+            _run_script(shell, _script(["true"], record=str(pod_tmp / "rec")))
+        script = "enable -n printf\n" + _script(
+            ["true"], record=record and str(pod_tmp / record), resent=resent
+        )
         path = f"{stubs}:{os.environ['PATH']}"
 
         result = _run_script(shell, script, env={**os.environ, "PATH": path})
 
         assert not ran.exists()
-        assert result.stdout == _marker(0)
+        assert result.stdout == _marker(0) + sent
 
 
 def _proc_status(uids: str, gids: str = "1000\t1000\t1000\t1000") -> str:
@@ -630,11 +1262,23 @@ def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
 @pytest.mark.parametrize("shell", _SHELLS)
-def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> None:
-    """A connection lost while sending the script leaves nothing run to repeat."""
+def test_a_script_cut_short_runs_nothing(
+    shell: list[str], tmp_path: Path, pod_tmp: Path
+) -> None:
+    """A connection lost while sending the script leaves nothing run to repeat.
+
+    Nor a record without its command, which a retry would wait for.
+    """
     ran = tmp_path / "ran"
+    record = pod_tmp / "rec"
     script = ExecuteOperation(MagicMock())._build_shell_script(
-        ["touch", str(ran)], None, str(tmp_path), {"K": "V"}, None, MARKER
+        ["touch", str(ran)],
+        None,
+        str(tmp_path),
+        {"K": "V"},
+        None,
+        MARKER,
+        record=str(record),
     )
     # Cut after each line but the last, as a dropped connection might: the shell then
     # reads end of input.
@@ -644,6 +1288,7 @@ def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> No
         result = subprocess.run(shell, input=script[:cut].encode(), capture_output=True)
 
         assert not ran.exists(), f"ran after a cut at {cut}: {script[:cut]!r}"
+        assert not record.exists(), f"recorded after a cut at {cut}: {script[:cut]!r}"
         assert result.stdout == b""
 
 
@@ -1041,7 +1686,7 @@ class TestStatusReceivedBeforeTheConnectionWasLost:
 
 
 class TestResultLostAfterTheScriptWasSent:
-    """Once the script is sent the command may run, so a lost result isn't retried."""
+    """Once the script is sent the command may run: its result is asked for again."""
 
     @pytest.mark.parametrize(
         "error",
@@ -1055,7 +1700,7 @@ class TestResultLostAfterTheScriptWasSent:
     def test_connection_lost_before_the_markers(self, error: Exception) -> None:
         ws = _FakeWSClient([(STDOUT, b"partial")], error=error)
 
-        with pytest.raises(ExecResultUnknownError, match="WebSocket connection lost"):
+        with pytest.raises(ExecStreamLostError, match="WebSocket connection lost"):
             _handle(ws)
 
     def test_connection_lost_between_the_markers(self) -> None:
@@ -1065,17 +1710,28 @@ class TestResultLostAfterTheScriptWasSent:
             error=ConnectionResetError("connection reset"),
         )
 
-        with pytest.raises(ExecResultUnknownError):
+        with pytest.raises(ExecStreamLostError):
             _handle(ws)
 
-    def test_exec_ending_without_a_status(self) -> None:
-        """Still a GetReturncodeError, so callers that match one still do."""
-        ws = _FakeWSClient([(STDOUT, b"partial")])
+    @pytest.mark.parametrize(
+        "frames",
+        [
+            pytest.param([(STDOUT, b"partial")], id="no-status"),
+            # What containerd 2.3.7 sends for an exec it could not start.
+            pytest.param([(ERROR_CHANNEL, _NOT_STARTED)], id="not-started"),
+        ],
+    )
+    def test_exec_ending_without_an_exit_code(
+        self, frames: list[tuple[int, bytes]]
+    ) -> None:
+        ws = _FakeWSClient(frames)
 
-        with pytest.raises(GetReturncodeError) as raised:
+        with pytest.raises(
+            ExecStreamLostError, match="without the command's exit"
+        ) as lost:
             _handle(ws)
-
-        assert isinstance(raised.value, ExecResultUnknownError)
+        # Nothing says its command started: the next attempt may start it.
+        assert lost.type is ExecStreamLostError
 
 
 class TestNonUtf8Output:
@@ -1189,7 +1845,13 @@ class TestExecChunksStdin:
         )
 
         expected_script = op._build_shell_script(
-            ["cat"], b"x" * 100, None, {}, None, MARKER
+            ["cat"],
+            b"x" * 100,
+            None,
+            {},
+            None,
+            MARKER,
+            record=record_path(MARKER.split("-")[-2]),
         )
         written = "".join(call.args[0] for call in ws.write_stdin.call_args_list)
         assert written == expected_script
@@ -1223,7 +1885,9 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
 
     opened.assert_called_once_with(shell)
     check = execute_module._ROOT_CHECK if checked else ""
-    assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
+    assert "".join(writes).startswith(
+        f"{{\n{check}__inspect_exec__() {{\n(\ncd /w || exit $?\nexport K=v\n"
+    )
 
 
 def _exec_writing_to(
@@ -1261,7 +1925,7 @@ class TestClosingLine:
         op.exec(["cat"], stdin=b"x" * 100, cwd=None, env={}, user=None, timeout=None)
 
         assert writes[-1] == "}\n"
-        assert "".join(writes).endswith('exit "$returncode"\n}\n')
+        assert "".join(writes).endswith("\nexit 122\n}\n")
 
     def test_a_failure_before_it_is_left_to_the_caller_to_retry(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1271,14 +1935,22 @@ class TestClosingLine:
         with pytest.raises(BrokenPipeError):
             op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
 
+    @pytest.mark.parametrize(
+        ("recorded", "error"),
+        [(True, ExecStreamLostError), (False, ExecResultUnknownError)],
+        ids=["recorded", "unrecorded"],
+    )
     def test_a_failure_sending_it_may_have_run_the_command(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, recorded: bool, error: type[Exception]
     ) -> None:
-        """Over plain ws://, the `}` alone can arrive from a frame cut off."""
+        """Over plain ws://, the `}` alone can arrive from a frame cut off.
+
+        Only a command with a record can be asked for again.
+        """
         writes, op = _exec_writing_to(monkeypatch, fails=lambda data: data == "}\n")
 
-        with pytest.raises(ExecResultUnknownError):
-            op.exec(["cat"], stdin=None, cwd=None, env={}, user=None, timeout=None)
+        with pytest.raises(error):
+            op.exec(["cat"], None, None, {}, None, None, recorded=recorded)
 
 
 class TestFreshMarker:
@@ -1298,7 +1970,9 @@ class TestFreshMarker:
         handled: list[str] = []
         done = ExecResult(success=True, returncode=0, stdout="", stderr="")
 
-        def handle(ws: WSClient, user: object, timeout: object, marker: str) -> object:
+        def handle(
+            ws: WSClient, user: object, timeout: object, marker: str, recorded: bool
+        ) -> object:
             handled.append(marker)
             return done
 
@@ -1311,8 +1985,64 @@ class TestFreshMarker:
         assert handled[0] != handled[1]
         for marker in handled:
             assert re.fullmatch(r"<completed-sentinel-value-[0-9a-f]{32}-", marker)
-        for marker in handled:
-            assert scripts.count(f"printf '{marker}%d>'") == 2
+        # Each script writes the marker its output is read with, and no other.
+        assert set(re.findall(r"printf '(<[^%]*)%d>'", scripts)) == set(handled)
+
+    @pytest.mark.parametrize(
+        ("resent", "started", "recorded"),
+        [(True, False, True), (True, True, True), (False, False, False)],
+        ids=["resent", "started", "joined"],
+    )
+    def test_every_attempt_at_an_exec_has_its_marker_and_its_record(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        resent: bool,
+        started: bool,
+        recorded: bool,
+    ) -> None:
+        """A retry reads the record, marker included, that the first attempt made."""
+        writes, op = _exec_writing_to(monkeypatch)
+        handle = MagicMock(
+            return_value=ExecResult(success=True, returncode=0, stdout="", stderr="")
+        )
+        monkeypatch.setattr(op, "_handle_shell_output", handle)
+        exec_id = MARKER.split("-")[-2]
+        record = record_path(exec_id) if recorded else None
+
+        op.exec(
+            ["true"],
+            None,
+            None,
+            {},
+            None,
+            None,
+            False,
+            exec_id,
+            resent,
+            started,
+            recorded,
+            ["/d"],
+        )
+
+        assert "".join(writes) == op._build_shell_script(
+            ["true"],
+            None,
+            None,
+            {},
+            None,
+            MARKER,
+            record=record,
+            resent=resent,
+            started=started,
+            done=["/d"],
+        )
+        assert handle.call_args.args[3:] == (MARKER, recorded)
+
+    def test_a_records_name_does_not_give_the_marker_away(self) -> None:
+        """Anyone in the pod can list /tmp, and a marker in the output ends it."""
+        exec_id = MARKER.split("-")[-2]
+
+        assert exec_id not in record_path(exec_id)
 
 
 class TestShellCommand:

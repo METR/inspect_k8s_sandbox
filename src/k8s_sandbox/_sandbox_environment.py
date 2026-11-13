@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -48,7 +49,9 @@ from k8s_sandbox._manager import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.error import (
+    ExecRecordUnfinishedError,
     ExecResultUnknownError,
+    ExecStreamLostError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
@@ -306,12 +309,44 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             user = self._config.default_user
 
         op = "K8s execute command in Pod"
+        # One id for every attempt, so that a retry cannot run the command again.
+        exec_id = secrets.token_hex(16)
+        # Whether an attempt's connection was lost (it may yet reach the pod), and
+        # whether one found the command started (then no other may start it).
+        lost = started = False
         with self._log_op(op, expected_exceptions, **log_kwargs):
-            async for attempt in _retry():
-                with attempt:
-                    result = await self._pod.exec(
-                        cmd, input, cwd, env or {}, user, timeout
-                    )
+            try:
+                async for attempt in _retry():
+                    with attempt:
+                        try:
+                            result = await self._pod.exec(
+                                cmd,
+                                input,
+                                cwd,
+                                env or {},
+                                user,
+                                timeout,
+                                exec_id,
+                                lost or started,
+                                started,
+                            )
+                        except ExecRecordUnfinishedError:
+                            started = True
+                            raise
+                        except ExecStreamLostError:
+                            lost = True
+                            raise
+            except _TRANSIENT_TYPES as e:
+                if not (lost or started) or isinstance(e, _PERMANENT_TYPES):
+                    raise
+                # No attempt after the lost one reached the command's record: it may
+                # have run.
+                raise ExecResultUnknownError(str(e)) from e
+            finally:
+                # An attempt whose connection was lost may yet reach the pod, and
+                # must find the record there.
+                if not lost:
+                    self._pod.exec_finished(user, exec_id)
             log_trace(f"Completed: {op}.", **(log_kwargs | {"result": result}))
             return result
 

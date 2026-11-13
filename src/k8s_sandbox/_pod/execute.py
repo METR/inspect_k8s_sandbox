@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import hashlib
 import logging
 import re
 import secrets
@@ -27,7 +28,11 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
+    ExecNeverRecordedError,
+    ExecRecordUnfinishedError,
     ExecResultUnknownError,
+    ExecStreamLostError,
+    ExecUnrecordedError,
     GetReturncodeError,
     PodError,
 )
@@ -75,6 +80,19 @@ _ROOT_CHECK = (
 # not found through the image's PATH either (see SYSTEM_PATH): it is at this path
 # wherever util-linux provides it (Debian, Ubuntu, RHEL and its rebuilds, Alpine).
 _RUNUSER = "/sbin/runuser"
+# Where an exec keeps its command's output and exit status in the pod, by the exec's id.
+RECORD_PREFIX = "/tmp/.inspect-exec-"
+# An attempt's exit status when it finds no record of a command that may have run.
+_NO_RECORD = 123
+# An attempt's exit status when it could keep no record, and so ran nothing.
+_REFUSED = 122
+# The same, where no exec in the container can keep one.
+_NEVER_RECORDED = 121
+# The programs a recorded exec starts besides `mkdir`, from the system directories.
+_RECORD_TOOLS = ("cat", "sleep", "rm")
+# The returncode in the markers that end a sent record: the first on a stream counts,
+# so these only count for a record sent before the command's own were in it.
+_UNFINISHED = 999
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +151,11 @@ def _runs_as(user: str) -> str:
     return f'[ "$(PATH={SYSTEM_PATH}; {current} 2>/dev/null)" = {shlex.quote(user)} ]'
 
 
+def record_path(exec_id: str) -> str:
+    """Where an exec's script keeps its record: not the id, which the marker holds."""
+    return RECORD_PREFIX + hashlib.sha256(exec_id.encode()).hexdigest()[:32]
+
+
 class ExecuteOperation(PodOperation):
     def exec(
         self,
@@ -143,32 +166,55 @@ class ExecuteOperation(PodOperation):
         user: str | None,
         timeout: int | None,
         switch: bool = False,
+        exec_id: str | None = None,
+        resent: bool = False,
+        started: bool = False,
+        recorded: bool = True,
+        done: Sequence[str] = (),
     ) -> ExecResult[str]:
-        # The shell ends the command's output with this marker. It holds a random value
-        # made up for this exec, so nothing the command prints can be taken for it.
-        marker = f"<{COMPLETED_SENTINEL}-{secrets.token_hex(16)}-"
+        # The marker holds the exec's id, shared by its attempts: output can't forge it.
+        exec_id = exec_id or secrets.token_hex(16)
+        marker = f"<{COMPLETED_SENTINEL}-{exec_id}-"
         root = user in ROOT_USERS
         shell_script = self._build_shell_script(
-            cmd, stdin, cwd, env, timeout, marker, root=root
+            cmd,
+            stdin,
+            cwd,
+            env,
+            timeout,
+            marker,
+            root=root,
+            record=record_path(exec_id) if recorded else None,
+            resent=resent,
+            started=started,
+            done=done,
         )
         shell = ["/bin/sh"] if root else _shell_command(user, switch)
-        with self._interactive_shell(shell) as ws_client:
-            # Write the script to the shell's stdin rather than passing it as a command
-            # argument (-c) to better support potentially long commands. Nothing runs
-            # until the group's closing `}` arrives, so a failure before then may be
-            # retried. A shell that got the `}` runs the group even without the
-            # newline after it, and over plain ws:// part of a frame cut off by a lost
-            # connection can still arrive: once that line is being sent, it may run.
-            self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
-            try:
-                ws_client.write_stdin(_CLOSE_GROUP)
-            except (OSError, websocket.WebSocketException) as e:
-                raise ExecResultUnknownError(
-                    "WebSocket connection lost during exec",
-                    pod=self._pod.name,
-                ) from e
-            result = self._handle_shell_output(ws_client, user, timeout, marker)
-        return result
+        try:
+            with self._interactive_shell(shell) as ws_client:
+                # Write the script to the shell's stdin rather than passing it as a
+                # command argument (-c) to better support potentially long commands.
+                # Nothing runs until the group's closing `}` arrives, so a failure
+                # before then may be retried. A shell that got the `}` runs the group
+                # even without the newline after it, and over plain ws:// part of a
+                # frame cut off by a lost connection can still arrive: once that line
+                # is being sent, it may run.
+                self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
+                try:
+                    ws_client.write_stdin(_CLOSE_GROUP)
+                except (OSError, websocket.WebSocketException) as e:
+                    raise ExecStreamLostError(
+                        "WebSocket connection lost during exec",
+                        pod=self._pod.name,
+                    ) from e
+                return self._handle_shell_output(
+                    ws_client, user, timeout, marker, recorded
+                )
+        except ExecStreamLostError as e:
+            if recorded:
+                raise
+            # Nothing in the pod can say whether an unrecorded command ran.
+            raise ExecResultUnknownError(str(e)) from e
 
     def open_stdio(
         self, cmd: list[str], user: str | None
@@ -271,34 +317,157 @@ class ExecuteOperation(PodOperation):
         timeout: int | None,
         marker: str,
         root: bool = False,
+        record: str | None = None,
+        resent: bool = False,
+        started: bool = False,
+        done: Sequence[str] = (),
     ) -> str:
+        """The script an exec's shell runs.
+
+        With a `record` directory, the shell that makes it starts the command apart
+        from the connection, its output kept there, then sends that record and exits
+        0. A `resent` attempt, which follows a lost connection, sends the record its
+        user's earlier attempt made instead of running the command again; once an
+        attempt has sent a record the command has `started`, and later ones only
+        read. A shell that can do neither runs nothing. Without `record` the command
+        runs joined to the connection.
+        """
+        tools = f"PATH={SYSTEM_PATH}; exec"
+        # `cat` writes at once, where `head` buffers; the limit has room for the marker.
+        blocks = limits.MAX_EXEC_OUTPUT_SIZE // 512 + 2
+        keep = f"{{ trap '' XFSZ; ulimit -f {blocks}; {tools} cat; }}"
+        grace = f"({tools} sleep {STREAM_END_GRACE_SECONDS})\n"
+        # End both streams with the marker and the returncode: a record sent without
+        # them is not complete. Joined, the exec's status channel reports the
+        # returncode when the shell exits; the markers are for when a background
+        # process keeps stdout or stderr, and so the exec, open.
+        markers = (
+            f"printf '{marker}%d>' \"$ie_c\" 2>/dev/null\n"
+            f"printf '{marker}%d>' \"$ie_c\" >&2 2>/dev/null\n"
+        )
+        sent = f"ie_c={_UNFINISHED}\n{markers}exit 0\n"
+
         def generate() -> Generator[str, None, None]:
             # A group is read in full before any of it runs, so the command cannot
             # read the rest of the script, marker included, from the shell's stdin.
             yield "{\n"
             if root:
                 yield _ROOT_CHECK
+            # Run the command in a subshell, so that one which exits or execs this
+            # shell doesn't end it before it writes the markers.
+            yield "__inspect_exec__() {\n(\n"
             if cwd is not None:
                 yield f"cd {shlex.quote(cwd)} || exit $?\n"
             for key, value in env.items():
                 yield f"export {shlex.quote(key)}={shlex.quote(value)}\n"
-            # Run the command in a subshell, so that one which exits or execs this
-            # shell doesn't end it before it writes the markers.
             pipe = "" if stdin is None else self._pipe_user_input(stdin)
-            yield f"({pipe}{self._prefix_timeout(timeout)}{shlex.join(command)})\n"
-            # Store the returncode so that the `printf` below doesn't overwrite it.
-            yield "returncode=$?\n"
-            # `printf` is a builtin in dash, bash and busybox, but not every shell.
+            yield f"{pipe}{self._prefix_timeout(timeout)}{shlex.join(command)}\n"
+            # The subshell closes what its shell keeps open on the record.
+            yield ")\n}\n" if record is None else ") 3>&- 4>&- 7<&-\n}\n"
+            if record is None:
+                # Store the returncode so that the `printf` below doesn't overwrite it.
+                # `printf` is a builtin in dash, bash and busybox, but not every shell.
+                yield f"__inspect_exec__\nie_c=$?\nPATH={SYSTEM_PATH}\n"
+                yield markers
+                # Exit the shell. This won't actually close the websocket connection
+                # until stdout and stderr (which have been inherited by the user
+                # command) are closed.
+                yield 'exit "$ie_c"\n'
+                yield _CLOSE_GROUP
+                return
+            yield f"ie_r={shlex.quote(record)}\nie_m=\n"
+            # Records are kept only where others cannot replace them (a sticky
+            # directory, itself no symlink), and one is trusted, or removed, only as
+            # this user's own directory at its own name: another user can take the
+            # name first.
+            mine = '[ "$PWD" = "{}" ] && [ -O . ]'
+            parent = shlex.quote(record.rsplit("/", 1)[0] or "/")
+            safe = f"[ -k {parent} ] && [ ! -L {parent} ] && [ -w {parent} ]"
+            # What keeps and sends a record must be there too (`mkdir` says for itself).
+            for tool in _RECORD_TOOLS:
+                found = " || ".join(
+                    f"[ -x {d}/{tool} ]" for d in SYSTEM_PATH.split(":")
+                )
+                safe += f" && {{ {found}; }}"
+            yield f"{safe} || exit {_NEVER_RECORDED}\n"
+            # Its owner can replace entries even so: root keeps none in another's.
+            yield (
+                "ie_u=\n{ while read -r ie_a ie_b ie_u ie_j; do"
+                ' [ "$ie_a" = Uid: ] && break; ie_u=; done </proc/self/status; }'
+                " 2>/dev/null\n"
+            )
+            yield f'[ "${{ie_u:-0}}" != 0 ] || [ -O {parent} ]'
+            yield f" || exit {_NEVER_RECORDED}\n"
+            if done:
+                # The records of earlier execs whose results arrived.
+                yield f"(PATH={SYSTEM_PATH}; for ie_p in {shlex.join(done)}; do\n"
+                yield f'cd -P "$ie_p" && {mine.format("$ie_p")} && cd /'
+                yield ' && rm -rf -- "$ie_p"\ndone) 2>/dev/null\n'
+            # Only the directory's maker may start the command, and only recorded;
+            # once it has started, nobody may.
+            yield "if false; then :\n"
+            if not started:
+                yield f'elif (umask 077; {tools} mkdir "$ie_r") 2>/dev/null; then\n'
+                yield '{ echo >"$ie_r/err" && echo >"$ie_r/out"; } 2>/dev/null'
+                yield " && ie_m=keep\n"
+            if resent or started:
+                yield f'elif cd -P "$ie_r" 2>/dev/null && {mine.format("$ie_r")}'
+                yield "; then\nie_m=read\n"
+            yield "fi\n"
+            yield 'case "$ie_m" in\nkeep)\n'
+            # The left side waits for the command and its `cat`s: PID 1 reaps nothing.
+            yield "{\n{\nexec 4>&1 >/dev/null 2>&1 </dev/null 5<&- 6<&-\n{\n{\n"
+            # While the command runs its shell holds the record open (7): `pid` names
+            # no other process, and a later attempt can tell when it is gone.
+            yield (
+                "{\n{ IFS=' ' read -r ie_j _ </proc/self/stat"
+                ' && echo "$ie_j" >"$ie_r/pid"; } 2>/dev/null\n'
+            )
+            yield "__inspect_exec__\n"
+            yield f"ie_c=$?\nPATH={SYSTEM_PATH}\n"
+            # A stream past its limit is closed: writing its marker must not end this.
+            yield "trap '' PIPE\n"
+            yield '{ echo "$ie_c" >"$ie_r/rc"; } 2>/dev/null\n:\n'
+            yield '} 7<"$ie_r/out" || ie_c=$?\n'
+            yield markers
+            yield 'exec >&- 2>&- 3>&-\necho "$ie_c" >&4\n'
+            # Not in the background, where dash and busybox ignore SIGINT and SIGQUIT.
+            yield f'}} 2>&3 | {keep} >"$ie_r/out" 2>/dev/null 3>&- 4>&-\n'
+            yield f'}} 3>&1 | {keep} >"$ie_r/err" 2>/dev/null 4>&-\n'
+            # Both have ended, so the files hold all the output: say so.
+            yield ': >"$ie_r/d"\n'
+            # End of input with no returncode means the command's shell was killed.
+            yield f"}} | {{\nPATH={SYSTEM_PATH}\nie_k=\nIFS= read -r ie_c || ie_k=1\n"
+            # shortcut: polls for the files (sh has no timed wait), then the grace; a
+            # record sent too early ends in `sent`'s markers: the client asks again.
+            yield 'ie_i=0\nuntil [ -e "$ie_r/d" ] || [ "$ie_i" -ge 5000 ]; do\n'
+            yield "ie_i=$((ie_i + 1))\ndone\n"
+            yield f'[ -e "$ie_r/d" ] || {grace}'
+            # By descriptors opened before the command, which may remove the record.
+            yield f"({tools} cat <&5)\n({tools} cat <&6) >&2\n"
+            # A killed shell wrote no markers: end the streams here, as it would have.
+            yield 'if [ -n "$ie_k" ]; then\nie_c=137\n'
+            yield markers
+            yield f"fi\n{sent}"
+            yield '}\n} 5<"$ie_r/out" 6<"$ie_r/err"\nexit $?\n;;\nread)\n'
             yield f"PATH={SYSTEM_PATH}\n"
-            # End both streams with the marker and the returncode. The exec's status
-            # channel reports the returncode when the shell exits; the markers are for
-            # when a background process keeps stdout or stderr, and so the exec, open.
-            yield f"printf '{marker}%d>' \"$returncode\"\n"
-            yield f"printf '{marker}%d>' \"$returncode\" >&2\n"
-            # Exit the shell. This won't actually close the websocket connection until
-            # stdout and stderr (which have been inherited by the user command) are
-            # closed.
-            yield 'exit "$returncode"\n'
+            # In the directory another attempt made; with no record there, it cannot
+            # tell.
+            yield f"[ -e out ] || {grace}"
+            yield f"[ -e out ] || exit {_NO_RECORD}\n"
+            # Until the command ends, its shell or the record is gone, or the shell
+            # never said who it is.
+            yield "ie_n=0\nuntil [ -e rc ]; do\n"
+            yield f"[ -e out ] || exit {_NO_RECORD}\nie_j=\n"
+            yield "{ IFS= read -r ie_j <pid; } 2>/dev/null\n"
+            yield 'if [ -n "$ie_j" ]; then\n'
+            yield '[ "/proc/$ie_j/fd/7" -ef out ] || break\n'
+            yield f'elif [ "$ie_n" -ge 20 ]; then\nexit {_NO_RECORD}\nfi\n'
+            yield f"ie_n=$((ie_n + 1))\n({tools} sleep 0.5)\ndone\n"
+            yield f"[ -e d ] || {grace}"
+            yield f"({tools} cat out)\n({tools} cat err) >&2\n"
+            yield f"{sent};;\nesac\n"
+            yield f"exit {_REFUSED}\n"
             yield _CLOSE_GROUP
 
         return "".join(generate())
@@ -330,7 +499,12 @@ class ExecuteOperation(PodOperation):
         return f'"$({find})" -k 5s {timeout}s '
 
     def _handle_shell_output(
-        self, ws_client: WSClient, user: str | None, timeout: int | None, marker: str
+        self,
+        ws_client: WSClient,
+        user: str | None,
+        timeout: int | None,
+        marker: str,
+        recorded: bool = False,
     ) -> ExecResult[str]:
         def stream_output() -> tuple[ExecResult[str], bool]:
             stdout = _MarkedStream(marker)
@@ -365,7 +539,7 @@ class ExecuteOperation(PodOperation):
                     ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
                 if lost is not None:
                     if deadline is None and ERROR_CHANNEL not in ws_client._channels:
-                        raise ExecResultUnknownError(
+                        raise ExecStreamLostError(
                             "WebSocket connection lost during exec",
                             pod=self._pod.name,
                         ) from lost
@@ -382,18 +556,40 @@ class ExecuteOperation(PodOperation):
                     returncode = get_returncode(ws_client)
                 except GetReturncodeError as e:
                     if deadline is None:
-                        raise ExecResultUnknownError(
+                        raise ExecStreamLostError(
                             "The exec ended without the command's exit code",
                             pod=self._pod.name,
                         ) from e
                     returncode = self._marked_returncode(stdout, stderr)
-                # The shell can only exit 0 once it has written both markers, so a
-                # missing one means the end of the output was lost on the way.
-                if returncode == 0 and None in (stdout.returncode, stderr.returncode):
+                unmarked = None in (stdout.returncode, stderr.returncode)
+                if recorded and unmarked and returncode == _NO_RECORD:
                     raise ExecResultUnknownError(
+                        "The exec's connection was lost and the pod has no record of "
+                        "the command, which may have run",
+                        pod=self._pod.name,
+                    )
+                if recorded and unmarked and returncode == _REFUSED:
+                    raise ExecUnrecordedError(
+                        "The pod could keep no record of the command",
+                        pod=self._pod.name,
+                    )
+                if recorded and unmarked and returncode == _NEVER_RECORDED:
+                    raise ExecNeverRecordedError(
+                        "The container has nowhere to keep a command's record",
+                        pod=self._pod.name,
+                    )
+                # The shell can only exit 0 once it has written both markers, so a
+                # missing one means the end of the output was lost on the way, or had
+                # not reached the record yet.
+                if returncode == 0 and unmarked:
+                    # A script only exits 0 once the command has run.
+                    raise ExecRecordUnfinishedError(
                         "The exec ended without the end of the command's output",
                         pod=self._pod.name,
                     )
+                if returncode == 0 and recorded:
+                    # A shell that sent a record exits 0: the markers have the code.
+                    returncode = self._marked_returncode(stdout, stderr)
                 # 255 unless both say so is Kata's status for a command whose VM
                 # stopped under its shell.
                 if returncode == 255 and (stdout.returncode, stderr.returncode) != (
@@ -420,7 +616,13 @@ class ExecuteOperation(PodOperation):
                 stdout.returncode is not None,
             )
 
-        result, saw_completed_sentinel = stream_output()
+        try:
+            result, saw_completed_sentinel = stream_output()
+        except (OSError, websocket.WebSocketException) as e:
+            # Whatever it was, the command has been sent.
+            raise ExecStreamLostError(
+                "WebSocket connection lost during exec", pod=self._pod.name
+            ) from e
         # 124 is the exit code for the `timeout` command.
         if timeout is not None and result.returncode == 124:
             raise TimeoutError(f"Command timed out after {timeout}s. {result}")
@@ -489,6 +691,11 @@ class ExecuteOperation(PodOperation):
     def _marked_returncode(
         self, stdout: "_MarkedStream", stderr: "_MarkedStream"
     ) -> int:
+        if _UNFINISHED in (stdout.returncode, stderr.returncode):
+            raise ExecRecordUnfinishedError(
+                "The record of the command's output was sent before it was complete",
+                pod=self._pod.name,
+            )
         # The markers disagree only if something besides the shell wrote one: code the
         # command runs can read its own stdout back through /proc and so learn it.
         if stdout.returncode is None or stdout.returncode != stderr.returncode:

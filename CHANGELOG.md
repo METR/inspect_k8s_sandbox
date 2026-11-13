@@ -50,10 +50,17 @@
   second after the command exits, rather than at once.
 - `exec()` no longer runs a command a second time when its connection to the pod is
   lost while the command runs, and no longer returns a successful result whose output
-  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
-  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
-  run; or, if the container restarted or was replaced meanwhile, that error. A
-  connection lost before the command was sent is still retried.
+  lost its end on the way. The command keeps running in the pod, and `exec()` returns
+  its result once it ends; one that never started is started. This needs a `/tmp`
+  with the sticky bit that the command's user can write to, and `mkdir`, `cat`,
+  `sleep` and `rm` in `/usr/bin` or `/bin`: each command keeps a directory
+  `/tmp/.inspect-exec-*` there until the user's next `exec()`. Without them the lost
+  connection raises `ExecResultUnknownError` (as the cause of a `K8sError`), a
+  `GetReturncodeError` that is not retried, since the command may have run. If the
+  container restarted or was replaced meanwhile, that error is raised instead. A
+  command's stdin is `/dev/null` unless `input` is given; before, a command that read
+  it waited for its timeout. "Transient errors are automatically retried" in the
+  limitations lists what else changes for a command.
 - `exec()` runs fewer programs in the container per call, which makes it faster
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).

@@ -159,10 +159,33 @@ the `hostAliases` field in the Pod spec
 
 Transient network or infrastructure errors during `exec()`, `read_file()`, and `write_file()` are automatically retried (up to 5 times). These are typically caused by issues such as a node becoming unhealthy, a Pod being rescheduled, or the Kubernetes control plane being overloaded.
 
-`exec()` is only retried when the error came before the command was sent to the Pod. Once
-the command may have run, a lost connection raises `ExecResultUnknownError` (the cause of
-the `K8sError` raised) rather than running the command again, or the container's restart or
-replacement error if that is what happened.
+A retried `exec()` does not run its command again. The command runs apart from the
+connection and keeps its output in a directory `/tmp/.inspect-exec-*` in the container, so
+a retry after a lost connection waits for the command that is already running and returns
+its result. The user's next `exec()` removes the directory; after a lost connection it
+stays until the Pod is deleted. A command that removes its own record and then loses its
+connection is the exception: the retry cannot tell it from one that never started, and
+runs it again.
+
+This needs a `/tmp` with the sticky bit that the command's user can write to (an `emptyDir`
+mounted at `/tmp` has none; for root, `/tmp` must also be root's own), and `mkdir`, `cat`,
+`sleep` and `rm` in `/usr/bin` or `/bin`. Without them the command runs joined to the
+connection, and once it may have run a lost connection raises `ExecResultUnknownError` (the
+cause of the `K8sError` raised). If the container restarted or was replaced, its restart or
+replacement error is raised instead.
+
+A recorded command differs from one joined to the connection:
+
+- Its stdin is `/dev/null` unless `input` is given.
+- It can see its own record in `/tmp`, and another process of its user can rewrite the
+  record before it is sent: the output and exit code `exec()` returns are only as
+  trustworthy as every process of that user in the container.
+- If `/tmp` fills while it runs, it gets SIGPIPE at its next write and `exec()` raises
+  `ExecResultUnknownError`.
+- Output past the limit raises `OutputLimitExceededError` once the command has ended, not
+  as the limit is crossed.
+- A background process it leaves with its stdout or stderr open keeps five small processes
+  of the exec alive with it, and gets SIGPIPE only after writing as much as the limit.
 
 ## Must run as root to use the `user` parameter in `exec()` { #exec-user }
 

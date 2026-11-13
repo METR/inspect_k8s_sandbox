@@ -16,7 +16,10 @@ from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import (
     ContainerRestartedError,
     ContainerStoppedError,
+    ExecNeverRecordedError,
     ExecResultUnknownError,
+    ExecStreamLostError,
+    ExecUnrecordedError,
     PodError,
     PodReplacedError,
 )
@@ -28,7 +31,12 @@ from k8s_sandbox._pod.execd import (
     ExecdClient,
     ExecdStream,
 )
-from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
+from k8s_sandbox._pod.execute import (
+    ROOT_USERS,
+    ExecuteOperation,
+    PodStdio,
+    record_path,
+)
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
@@ -78,6 +86,10 @@ class Pod:
         self._restart_lock = threading.Lock()
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
         self._execd = ExecdClient(self._start_execd) if execd else None
+        # The records of finished execs, which the user's next exec removes.
+        self._finished: dict[str | None, list[str]] = {}
+        # Whether the container can keep records at all: if not, execs don't ask.
+        self._records = True
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -163,6 +175,9 @@ class Pod:
         env: dict[str, str],
         user: str | None,
         timeout: int | None,
+        exec_id: str | None = None,
+        resent: bool = False,
+        started: bool = False,
     ) -> ExecResult[str]:
         """
         Execute a command in a pod.
@@ -210,6 +225,13 @@ class Pod:
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd. On a pod with execd, cmd and
             every process it started get SIGKILL instead.
+          exec_id (str | None): Names the command across attempts: a call that
+            follows one whose connection was lost, with the same id and `resent`,
+            returns the result of the command that one started.
+          resent (bool): Whether an earlier call with this id may have sent the
+            command to the pod. If so, it is never run without a record.
+          started (bool): Whether an earlier call with this id found the command
+            started. If so, this one only reads its record.
         """
         if self._execd is not None:
             return await self._execd.exec(cmd, stdin, cwd, env, user, timeout)
@@ -236,10 +258,40 @@ class Pod:
             switch = (
                 self._switch.get(key, False) if user and self._info == info else False
             )
-            result = await self._run_async(
-                lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
-            )
-        except ExecResultUnknownError:
+            done = tuple(self._finished.get(user, ()))
+
+            async def run(recorded: bool) -> ExecResult[str]:
+                return await self._run_async(
+                    lambda: executor.exec(
+                        cmd,
+                        stdin,
+                        cwd,
+                        env,
+                        user,
+                        timeout,
+                        switch,
+                        exec_id,
+                        resent,
+                        started,
+                        recorded,
+                        done,
+                    )
+                )
+
+            try:
+                # A resent attempt always asks: its command's record may be there.
+                result = await run(self._records or resent)
+            except ExecUnrecordedError as e:
+                if resent:
+                    # The attempt whose connection was lost may yet start it.
+                    raise ExecResultUnknownError(str(e)) from e
+                self._records = not isinstance(e, ExecNeverRecordedError)
+                result = await run(False)
+            if done:  # Its script removed them.
+                self._finished[user] = [
+                    r for r in self._finished[user] if r not in done
+                ]
+        except (ExecResultUnknownError, ExecStreamLostError):
             # A container restarted or replaced under the command explains the lost
             # result better.
             if warned_restart is not None:
@@ -251,6 +303,11 @@ class Pod:
                 raise warned_restart
             await self._diagnose_restart_after_failure()
         return result
+
+    def exec_finished(self, user: str | None, exec_id: str) -> None:
+        """Note that no attempt will ask for this exec's result again."""
+        if self._execd is None and self._records:
+            self._finished.setdefault(user, []).append(record_path(exec_id))
 
     async def exec_stdio(
         self, cmd: list[str], user: str | None

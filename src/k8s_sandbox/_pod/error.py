@@ -28,6 +28,30 @@ class ExecResultUnknownError(PodError, GetReturncodeError):
     """
 
 
+class ExecStreamLostError(PodError):
+    """An exec's connection was lost before its result arrived.
+
+    The command is identified in the pod by the exec's id, so asking again with the
+    same id reads its result (or starts it, if it never started) and cannot run it
+    twice.
+    """
+
+
+class ExecRecordUnfinishedError(ExecStreamLostError):
+    """An exec's record arrived before the command's output was all in it.
+
+    The command has started, so asking again may only read the record.
+    """
+
+
+class ExecUnrecordedError(PodError):
+    """The pod could keep no record of an exec's command, and so did not start it."""
+
+
+class ExecNeverRecordedError(ExecUnrecordedError):
+    """The same, for a reason that holds for every exec in the container."""
+
+
 class ContainerStoppedError(ExecResultUnknownError):
     """An operation's container stopped under it.
 
