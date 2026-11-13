@@ -530,27 +530,30 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	detach := "setsid sh -c 'echo $$; kill -STOP $$' & wait" // it names itself once out of the group a kill signals
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached"})
-	s.dispatch(c, frame{kind: fStart, id: 22, payload: req})
-	var pid int
-	for pid == 0 {
-		select {
-		case f := <-frames:
-			if f.kind == fStdout {
-				pid, _ = strconv.Atoi(strings.TrimSpace(string(f.payload)))
+	// Twice: the second finds the thread that searched for the first still at work.
+	for id, tag := range map[uint64]string{22: "detached", 29: "detached later"} {
+		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: tag})
+		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
+		var pid int
+		for pid == 0 {
+			select {
+			case f := <-frames:
+				if f.kind == fStdout {
+					pid, _ = strconv.Atoi(strings.TrimSpace(string(f.payload)))
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the command never printed what it detached")
 			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("the command never printed what it detached")
 		}
-	}
-	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+		t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
 
-	s.dispatch(c, frame{kind: fKill, id: 22})
+		s.dispatch(c, frame{kind: fKill, id: id})
 
-	// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
-	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("process %d, which the command detached, outlived its kill", pid)
+		// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
+		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("process %d, which the command detached, outlived its kill", pid)
+			}
 		}
 	}
 	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable.
