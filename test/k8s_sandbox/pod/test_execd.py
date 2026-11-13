@@ -160,7 +160,7 @@ class Cluster:
         }
         pod = {
             "metadata": {"name": "p", "uid": "u"},
-            "status": {"containerStatuses": [container]},
+            "status": {"podIP": "10.0.0.1", "containerStatuses": [container]},
         }
         return types.SimpleNamespace(data=json.dumps(pod))
 
@@ -169,6 +169,7 @@ class Cluster:
 def cluster(monkeypatch: MonkeyPatch) -> Cluster:
     shown = Cluster()
     monkeypatch.setattr(op, "k8s_client", lambda _: shown)
+    monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
     return shown
 
 
@@ -1232,6 +1233,26 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
 
     printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
     with pytest.raises(PodError, match="execd did not start"):
+        await pod._start_execd(False)
+
+
+async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
+    cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: a container that restarted as execd started served the sample."""
+
+    class Execute:
+        def __init__(self, info: object) -> None:
+            pass
+
+        def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
+            cluster.restarts = 1  # since the check before the start
+            return 0, b"0" * 64 + b"\n", b""
+
+    monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
+    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    with pytest.raises(error.ContainerRestartedError):
         await pod._start_execd(False)
 
 

@@ -102,6 +102,8 @@ class Pod:
         # Exactly the fingerprint execd prints: anything else, cut output too, fails.
         if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
             raise PodError("execd did not start", returncode=code, stderr=stderr)
+        # Again: a container that restarted since the first check runs this daemon.
+        await self.check_for_pod_restart()
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
