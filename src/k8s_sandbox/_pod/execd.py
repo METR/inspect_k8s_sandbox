@@ -233,26 +233,31 @@ class _Conn:
 
 async def _connect(daemon: Daemon, client: ExecdClient, start: bytes) -> _Conn:
     """Open a connection, check it is the daemon's, send the key and queue START."""
+    # Before Python 3.12, wait_for can drop the connection that connect() returned.
+    made: list[_Conn] = []
 
     async def connect() -> _Conn:
         reader, writer = await asyncio.open_connection(daemon.ip, daemon.port)
         conn = _Conn(reader, writer, client)
-        try:
-            await conn.handshake()
-            cert = conn.tls.getpeercert(binary_form=True) or b""
-            if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
-                # Not the daemon this client started, so it gets no key: start another.
-                raise NotOurDaemon("the server on the execd port is not our daemon")
-            conn.pinned = True
-            await conn.send(AUTH, daemon.key)
-            # Not waited on: the call's reads find a daemon that stops reading.
-            conn.write(START, start)
-        except BaseException:
-            conn.close()
-            raise
+        made.append(conn)
+        await conn.handshake()
+        cert = conn.tls.getpeercert(binary_form=True) or b""
+        if hashlib.sha256(cert).hexdigest() != daemon.fingerprint:
+            # Not the daemon this client started, so it gets no key: start another.
+            raise NotOurDaemon("the server on the execd port is not our daemon")
+        conn.pinned = True
+        await conn.send(AUTH, daemon.key)
         return conn
 
-    return await asyncio.wait_for(connect(), CONNECT_TIMEOUT)
+    try:
+        conn = await asyncio.wait_for(connect(), CONNECT_TIMEOUT)
+        # Not waited on: the call's reads find a daemon that stops reading.
+        conn.write(START, start)
+    except BaseException:
+        for conn in made:
+            conn.close()
+        raise
+    return conn
 
 
 async def _upload(conn: _Conn, stdin: bytes) -> None:
@@ -562,6 +567,9 @@ class ExecdStream(ByteStream):
                     await self._conn.send(STDIN, item[i : i + CHUNK])
             except OSError as e:
                 raise anyio.BrokenResourceError(repr(e)) from e
+            except asyncio.CancelledError:
+                self._conn.close()  # an item cut short would corrupt the next
+                raise
 
     async def send_eof(self) -> None:
         async with self._send_lock:

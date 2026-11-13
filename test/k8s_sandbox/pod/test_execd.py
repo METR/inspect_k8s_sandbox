@@ -929,6 +929,30 @@ async def test_concurrent_sends_on_a_stream_stay_whole(daemons: Daemons) -> None
     assert bytes(received) in (b"A" * size + b"B" * size, b"B" * size + b"A" * size)
 
 
+async def test_a_send_cancelled_partway_through_an_item_ends_the_stream(
+    daemons: Daemons,
+) -> None:
+    reading, ended = asyncio.Event(), asyncio.Event()
+
+    async def reads_late(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)
+        await reading.wait()
+        await gone(r)
+        ended.set()
+
+    await daemons.serve(reads_late)
+    stream = await cat(daemons.client())
+    send = asyncio.create_task(stream.send(b"x" * (64 << 20)))  # more than TCP holds
+    await until(stream._send_lock.locked)
+
+    send.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await send
+    reading.set()
+
+    await until(ended.is_set)  # or the next item would follow the part that was sent
+
+
 async def test_closing_a_stream_ends_a_send_the_command_is_not_reading(
     daemons: Daemons,
 ) -> None:

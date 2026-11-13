@@ -80,10 +80,11 @@ class Pod:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
         await self.check_for_pod_restart()
         info = self._info
-        api = k8s_client(info.context_name)
         # Read first, so a started daemon is never lost to a failed read.
         pod = await self._run_async(
-            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+            lambda: read_pod(
+                k8s_client(info.context_name), info.name, info.namespace, API_TIMEOUT
+            )
         )
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)
