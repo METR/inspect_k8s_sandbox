@@ -16,7 +16,7 @@ import (
 
 // kill() runs this binary, as it runs execd, to look for a call's processes as its user.
 func TestMain(m *testing.M) {
-	if len(os.Args) == 3 && os.Args[1] == "kill" {
+	if len(os.Args) > 4 && os.Args[1] == "kill" {
 		main()
 		return
 	}
@@ -447,6 +447,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		t.Skip("only root runs a command as another user")
 	}
 	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
