@@ -39,7 +39,9 @@ func main() {
 	keyHash := fs.String("key-sha256", "", "hex SHA-256 of the session key")
 	replace := fs.Bool("replace", false, "stop any execd already listening")
 	fs.Parse(os.Args[2:])
-	if os.Getenv(foregroundEnv) == "" {
+	// The image or pod can set the marker, but only start() passes a socket as fd 3.
+	_, noStatus := syscall.GetsockoptInt(3, syscall.SOL_SOCKET, syscall.SO_TYPE)
+	if os.Getenv(foregroundEnv) == "" || noStatus != nil {
 		if *replace {
 			stopOthers()
 		}
@@ -113,6 +115,7 @@ func start() {
 	}
 	r, w := os.NewFile(uintptr(fds[0]), "status"), os.NewFile(uintptr(fds[1]), "status")
 	devnull, _ := os.Open(os.DevNull)
+	os.Unsetenv(foregroundEnv) // an inherited one would come first, and the child reads the first
 	_, err = os.StartProcess("/proc/self/exe", os.Args, &os.ProcAttr{
 		Env:   append(os.Environ(), foregroundEnv+"=1"),
 		Files: []*os.File{devnull, devnull, devnull, w},
