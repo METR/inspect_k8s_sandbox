@@ -109,7 +109,7 @@ async def test_a_kill_reaches_what_another_users_command_detached(
 ) -> None:
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
-    root = sandboxes["default"]
+    root = sandboxes["runc"]
     # setsid takes it out of the process group a kill signals.
     detach = "setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' & wait"
     command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))

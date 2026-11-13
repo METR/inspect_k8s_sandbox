@@ -499,7 +499,7 @@ func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
 
 	// Root may enter a test's directory (mode 700); the user may not, and a failed cd is exit 1.
 	if code := exitCode(t, s.get(26)); code != 1 {
-		t.Fatalf("exit %d, want 1: the command ran where its user can't go", code)
+		t.Fatalf("exit %d, want 1 from a cd its user can't make", code)
 	}
 }
 
