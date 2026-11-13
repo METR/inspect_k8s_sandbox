@@ -429,3 +429,24 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		}
 	}
 }
+
+func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
+	var timers []func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "10"}, Env: map[string]string{}, Tag: "a"})
+	first := testConn(t)
+	s.start(first, frame{kind: fStart, id: 23, payload: req})
+	s.detach(first)
+	timers[0]() // six minutes with no client: killed and forgotten
+	late, frames := recordedConn(t)
+
+	s.resume(late, frame{kind: fResume, id: 23, payload: []byte(`{"stdout":0,"stderr":0}`)})
+
+	// The client sends the START of an "unknown call" again: the command would run twice.
+	if f := <-frames; f.kind != fError || string(f.payload) == "unknown call" {
+		t.Fatalf("a late RESUME got frame %d %q", f.kind, f.payload)
+	}
+}
