@@ -497,9 +497,9 @@ func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
 	}
 
 	// As run() starts it, but with no pipe to read the environment from, as when execd has no descriptor to spare.
-	out, _ := exec.Command("/proc/self/exe", "as", "", "65534", "65534", "", "/bin/echo", "ran").CombinedOutput()
+	out, _ := exec.Command("/proc/self/exe", "as", "", "65534", "65534", "", "/bin/echo", "RAN").CombinedOutput()
 
-	if !strings.Contains(string(out), "environment") || strings.Contains(string(out), "ran") {
+	if !strings.HasPrefix(string(out), "execd: ") || strings.Contains(string(out), "RAN") {
 		t.Fatalf("with no environment to read, its output was %q", out)
 	}
 }
@@ -656,7 +656,7 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "10"}, Env: map[string]string{}, Tag: "a"})
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "a"}) // it never ends by itself
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 23, payload: req})
 	s.detach(first)
