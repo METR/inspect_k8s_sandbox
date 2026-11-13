@@ -452,6 +452,41 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	}
 }
 
+func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	env := map[string]string{"GODEBUG": "inittrace=1"} // which has a Go program trace its start on stderr
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "id -u; id -g; id -G; echo $GODEBUG"}, Env: env, User: "65534", Tag: "e"})
+
+	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
+
+	var out []byte
+	for {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout || f.kind == fStderr {
+				out = append(out, f.payload...)
+				continue
+			}
+			if f.kind != fExit {
+				continue
+			}
+			// execd, a Go program, becomes the user itself: none of root's groups stay, and the environment isn't its own to read.
+			if string(out) != "65534\n65534\n65534\ninittrace=1\n" {
+				t.Fatalf("the command's output was %q", out)
+			}
+			return
+		case <-time.After(30 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+}
+
 func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")

@@ -48,6 +48,9 @@ func main() {
 	run(*port, *keyHash, *replace)
 }
 
+// What run() puts before each variable of a command's environment on its way through become.
+const commandEnv = "execd:"
+
 // become takes a user's identity (uid, gid, groups), enters cwd as them and execs argv, failing as a shell would.
 func become(cwd string, ids, argv []string) {
 	var n []int
@@ -58,7 +61,13 @@ func become(cwd string, ids, argv []string) {
 		}
 		n = append(n, i)
 	}
-	err := errors.Join(syscall.Setgroups(n[2:]), syscall.Setgid(n[1]), syscall.Setuid(n[0]))
+	err := syscall.Setgroups(n[2:])
+	if err == nil {
+		err = syscall.Setgid(n[1])
+	}
+	if err == nil {
+		err = syscall.Setuid(n[0])
+	}
 	code := 126
 	if err == nil && cwd != "" {
 		if err = os.Chdir(cwd); err != nil {
@@ -66,7 +75,13 @@ func become(cwd string, ids, argv []string) {
 		}
 	}
 	if err == nil {
-		if err = syscall.Exec(argv[0], argv, os.Environ()); errors.Is(err, syscall.ENOENT) {
+		var env []string
+		for _, kv := range os.Environ() {
+			if kv, ok := strings.CutPrefix(kv, commandEnv); ok {
+				env = append(env, kv)
+			}
+		}
+		if err = syscall.Exec(argv[0], argv, env); errors.Is(err, syscall.ENOENT) {
 			code = 127
 		}
 		err = fmt.Errorf("%s: %w", argv[0], err)

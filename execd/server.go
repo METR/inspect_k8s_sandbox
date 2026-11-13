@@ -357,9 +357,15 @@ func (cl *call) run(req startRequest) error {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
+	env := childEnv(req.Env)
+	if as != nil { // out of reach of the Go runtime in between, which GODEBUG and its like are not meant for
+		for i, kv := range env {
+			env[i] = commandEnv + kv
+		}
+	}
 	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
 	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
-		Dir: dir, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: &syscall.SysProcAttr{Setpgid: true},
+		Dir: dir, Env: env, Files: []*os.File{stdinR, outW, errW}, Sys: &syscall.SysProcAttr{Setpgid: true},
 	})
 	stdinR.Close()
 	outW.Close()
