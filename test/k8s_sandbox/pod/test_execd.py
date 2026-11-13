@@ -1368,6 +1368,30 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
+async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> None:
+    starts = 0
+
+    async def abandons(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if (kind, starts) == (execd.START, 0):
+                starts += 1
+                w.close()  # dropped, so the client resumes
+                return
+            elif kind == execd.START:  # started again: answer, so the test ends
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # as execd answers for a call it gave up on
+                w.write(frame(execd.ERROR, call_id, b"call abandoned"))
+
+    await daemons.serve(abandons)
+
+    with pytest.raises(ExecResultUnknownError):
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
+    assert starts == 1
+
+
 async def test_pacing_lets_other_work_run() -> None:
     ran = asyncio.Event()
     asyncio.get_running_loop().call_soon(ran.set)

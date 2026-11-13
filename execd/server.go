@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
 	"os/user"
-	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +46,7 @@ type call struct {
 	id  uint64
 	tag string
 	pid int
+	as  *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
 	stdinGot int  // bytes of stdin received
@@ -63,6 +66,9 @@ type call struct {
 	code     int
 	startErr string // why the command never started, if it didn't
 	sub      *conn  // the connection streaming this call, if any
+	// killed for want of a client, and kept so a RESUME can be told so
+	abandoned bool
+	killed    bool // asked to stop: a start still under way sees to it
 }
 
 type conn struct {
@@ -229,10 +235,16 @@ func (s *server) detach(c *conn) {
 			afterFunc(abandonAfter, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
+				if orphaned {
+					cl.abandoned = true // not forgotten: "unknown call" would have the client send its START again
+				}
 				cl.mu.Unlock()
 				if orphaned {
-					cl.kill()
-					s.release(cl.id)
+					cl.kill() // before its output is let go: a command that ended on that would leave what it started
+					cl.mu.Lock()
+					cl.gone, cl.out, cl.stdinQ = true, [2][]byte{}, nil
+					cl.room.Broadcast()
+					cl.mu.Unlock()
 				}
 			})
 		}
@@ -271,6 +283,10 @@ func (s *server) start(c *conn, f frame) {
 	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
+	if s.current != nil && s.current != c { // replaced since dispatch looked: its client may have run this call again by now
+		s.mu.Unlock()
+		return
+	}
 	if _, dup := s.calls[f.id]; dup {
 		s.mu.Unlock()
 		c.send(fError, f.id, []byte("call id in use"))
@@ -283,7 +299,7 @@ func (s *server) start(c *conn, f frame) {
 		code := 126
 		if strings.HasPrefix(err.Error(), "cd: ") {
 			code = 1
-		} else if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+		} else if os.IsNotExist(err) {
 			code = 127
 		}
 		msg := err.Error()
@@ -298,11 +314,21 @@ func (s *server) resume(c *conn, f frame) {
 	var req resumeRequest
 	cl := s.get(f.id)
 	if cl == nil || json.Unmarshal(f.payload, &req) != nil {
-		c.send(fError, f.id, []byte("unknown call"))
+		c.send(fError, f.id, []byte("unknown call")) // the client sends its START again
 		return
 	}
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	s.mu.Lock()
+	replaced := s.current != nil && s.current != c // since dispatch looked: the call is the new connection's to resume
+	s.mu.Unlock()
+	if replaced {
+		return
+	}
+	if cl.abandoned {
+		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
+		return
+	}
 	cl.sub = c
 	// Tell the client how much stdin arrived, so it can send the rest.
 	got, _ := json.Marshal(map[string]any{"stdin": cl.stdinGot, "eof": cl.stdinEOF, "put": cl.stdinPut})
@@ -313,15 +339,22 @@ func (s *server) resume(c *conn, f frame) {
 }
 
 func (cl *call) run(req startRequest) error {
+	if strings.HasPrefix(req.Argv[0], "-") { // bash and busybox would read it as an option of their exec
+		return &os.PathError{Op: "exec", Path: req.Argv[0], Err: syscall.ENOENT}
+	}
 	req.Env["HAWK_NEXT_EXEC"] = req.Tag
-	attr := &syscall.SysProcAttr{Setpgid: true}
+	argv := append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...)
+	dir := req.Cwd
+	var as *syscall.Credential
 	if req.User != "" {
 		cred, home, name, err := lookupUser(req.User)
 		if err != nil {
 			return err
 		}
 		if cred != nil {
-			attr.Credential = cred
+			// execd itself becomes the user, then the shell: a child Go switched would be theirs to stop before it execs, with execd waiting on it.
+			argv = append([]string{"/proc/self/exe", "as", dir, fmt.Sprint(cred.Uid), fmt.Sprint(cred.Gid), strings.Trim(fmt.Sprint(cred.Groups), "[]")}, argv...)
+			as, dir = cred, ""
 			// As runuser sets them, unless the caller did.
 			for k, v := range map[string]string{"HOME": home, "USER": name, "LOGNAME": name} {
 				if _, set := req.Env[k]; !set {
@@ -333,11 +366,6 @@ func (cl *call) run(req startRequest) error {
 	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
 		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
 	}
-	env := childEnv(req.Env)
-	argv0, err := lookPath(req.Argv[0], env, req.Cwd)
-	if err != nil {
-		return err
-	}
 	stdinR, stdinW, err := stdinPipe(req.Stdin)
 	if err != nil {
 		return err
@@ -345,8 +373,20 @@ func (cl *call) run(req startRequest) error {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
-	p, err := os.StartProcess(argv0, req.Argv, &os.ProcAttr{
-		Dir: req.Cwd, Env: env, Files: []*os.File{stdinR, outW, errW}, Sys: attr,
+	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
+	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it (GODEBUG)
+		envR, envW, _ := os.Pipe()
+		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
+		for i, kv := range env {
+			raw[i] = []byte(kv)
+		}
+		go func() { json.NewEncoder(envW).Encode(raw); envW.Close() }()
+		defer envR.Close()
+		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // the launcher's: each thread it starts takes a PID of the pod's
+	}
+	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
+	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
+		Dir: dir, Env: env, Files: files, Sys: &syscall.SysProcAttr{Setpgid: true},
 	})
 	stdinR.Close()
 	outW.Close()
@@ -363,8 +403,12 @@ func (cl *call) run(req startRequest) error {
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
 	cl.mu.Lock()
-	cl.pid = p.Pid // before Release, which sets it to -1
+	cl.pid, cl.as = p.Pid, as // before Release, which sets it to -1
+	killed := cl.killed
 	cl.mu.Unlock()
+	if killed { // while it started: that holds even if it has ended since, for what it left running too
+		cl.end(p.Pid, as)
+	}
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
@@ -592,12 +636,50 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
 	cl.mu.Lock()
-	pid := cl.pid
+	cl.killed = true
+	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
-	if pid > 0 { // 0, not started or reaped, would be -0: execd's own group
-		syscall.Kill(-pid, syscall.SIGKILL)
+	// Not started, or ended (reaped, if not yet noted as such): what it left running is not the call's to kill.
+	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH {
+		return
 	}
+	cl.end(pid, as)
+}
+
+// end kills the command's process group and whatever carries the call's tag.
+func (cl *call) end(pid int, as *syscall.Credential) {
+	syscall.Kill(-pid, syscall.SIGKILL)
 	killTagged(cl.tag)
+	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
+		startSearcher()
+		go func() { searches <- search{cl.tag, as} }()
+	}
+}
+
+type search struct {
+	tag string
+	as  *syscall.Credential
+}
+
+var searches = make(chan search)
+
+// startSearcher starts, once, the thread that searches as other users: at execd's start, as a pod out of PIDs can start none.
+var startSearcher = sync.OnceFunc(func() {
+	go func() {
+		runtime.LockOSThread() // the identities it takes are this thread's alone
+		for s := range searches {
+			setfs(s.as.Uid, s.as.Gid)
+			killTagged(s.tag)
+			setfs(uint32(os.Geteuid()), uint32(os.Getegid()))
+		}
+	}()
+})
+
+// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks.
+func setfs(uid, gid uint32) {
+	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
+	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
+	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
 }
 
 func (cl *call) finish(code int, startErr string) {
@@ -648,41 +730,12 @@ func childEnv(extra map[string]string) []string {
 	for k, v := range extra {
 		env = append(env, k+"="+v)
 	}
+	if _, given := extra["PATH"]; !given {
+		if _, inherited := os.LookupEnv("PATH"); !inherited { // or the shell's own applies, and bash's ends in the working directory
+			env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+		}
+	}
 	return env
-}
-
-// lookPath resolves as a shell would: relative PATH entries from cwd; a non-executable match is 126.
-func lookPath(name string, env []string, cwd string) (string, error) {
-	if strings.Contains(name, "/") {
-		return name, nil
-	}
-	path := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
-		}
-	}
-	denied := ""
-	for _, dir := range filepath.SplitList(path) {
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(cwd, dir)
-		}
-		p, _ := filepath.Abs(filepath.Join(dir, name)) // absolute: the child starts in cwd
-		st, err := os.Stat(p)
-		if err != nil || st.IsDir() {
-			continue
-		}
-		if st.Mode()&0o111 != 0 {
-			return p, nil
-		}
-		if denied == "" {
-			denied = p
-		}
-	}
-	if denied != "" {
-		return "", &os.PathError{Op: "exec", Path: denied, Err: syscall.EACCES}
-	}
-	return "", fmt.Errorf("%s: not found", name)
 }
 
 // lookupUser resolves a name or uid in /etc/passwd; a nil credential means execd's own user.
@@ -718,6 +771,20 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
+// More than execve lets an environment hold (6 MiB).
+const maxEnviron = 8 << 20
+
+// tagged says whether the environment a /proc/PID/environ file shows holds needle.
+func tagged(environ string, needle []byte) bool {
+	f, err := os.Open(environ)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
+	return bytes.Contains(append(data, 0), needle)
+}
+
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
@@ -727,8 +794,7 @@ func killTagged(tag string) {
 		if err != nil || pid == os.Getpid() {
 			continue
 		}
-		data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
-		if err == nil && strings.Contains(string(data)+"\x00", string(needle)) {
+		if tagged("/proc/"+e.Name()+"/environ", needle) {
 			syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}

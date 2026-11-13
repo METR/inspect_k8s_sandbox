@@ -41,6 +41,16 @@ services:
     initContainers: *initContainers
     volumes: *volumes
     volumeMounts: *volumeMounts
+  # Linux's own check of who may read /proc: gVisor's differs (see the changelog).
+  runc:
+    image: "python:3.12-bookworm"
+    command: ["tail", "-f", "/dev/null"]
+    runtimeClassName: runc
+    resources: *resources
+    podAnnotations: *annotations
+    initContainers: *initContainers
+    volumes: *volumes
+    volumeMounts: *volumeMounts
 additionalResources:
   # The test client connects from the host, outside the cluster.
   - apiVersion: cilium.io/v2

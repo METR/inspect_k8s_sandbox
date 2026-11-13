@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +28,9 @@ const foregroundEnv = "HN_EXECD_FOREGROUND"
 func init() { prctl(prSetDumpable, 0) }
 
 func main() {
+	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
+		become(os.Args[2], os.Args[3:6], os.Args[6:])
+	}
 	if len(os.Args) < 2 || os.Args[1] != "listen" {
 		fail("usage: execd listen --port N --key-sha256 HEX")
 	}
@@ -43,6 +47,49 @@ func main() {
 		return
 	}
 	run(*port, *keyHash, *replace)
+}
+
+// become takes a user's identity (uid, gid, groups), enters cwd as them and execs argv, failing as a shell would.
+func become(cwd string, ids, argv []string) {
+	var n []int
+	for _, id := range append([]string{ids[0], ids[1]}, strings.Fields(ids[2])...) {
+		i, err := strconv.Atoi(id)
+		if err != nil {
+			fail(err.Error())
+		}
+		n = append(n, i)
+	}
+	err := syscall.Setgroups(n[2:])
+	if err == nil {
+		err = syscall.Setgid(n[1])
+	}
+	if err == nil {
+		err = syscall.Setuid(n[0])
+	}
+	code := 126
+	if err == nil && cwd != "" {
+		if err = os.Chdir(cwd); err != nil {
+			err, code = fmt.Errorf("cd: %s: %w", cwd, errors.Unwrap(err)), 1
+		}
+	}
+	var raw [][]byte
+	if err == nil {
+		pipe := os.NewFile(3, "environment") // run()'s
+		err = json.NewDecoder(pipe).Decode(&raw)
+		pipe.Close()
+	}
+	if err == nil {
+		env := make([]string, len(raw))
+		for i, kv := range raw {
+			env[i] = string(kv)
+		}
+		if err = syscall.Exec(argv[0], argv, env); errors.Is(err, syscall.ENOENT) {
+			code = 127
+		}
+		err = fmt.Errorf("%s: %w", argv[0], err)
+	}
+	fmt.Fprintln(os.Stderr, "execd:", err)
+	os.Exit(code)
 }
 
 func fail(msg string) {
@@ -113,6 +160,7 @@ func run(port int, keyHash string, replace bool) {
 		os.Exit(2)
 	}
 	startReaper()
+	startSearcher()
 	report("ok " + fingerprint)
 	s.serve(l)
 }
