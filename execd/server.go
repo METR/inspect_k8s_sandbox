@@ -403,10 +403,10 @@ func (cl *call) run(req startRequest) error {
 	cl.pid, cl.as = p.Pid, as // before Release, which sets it to -1
 	killed := cl.killed
 	cl.mu.Unlock()
-	p.Release()
-	if killed {
-		cl.kill()
+	if killed { // while it started: that holds even if it has ended since, for what it left running too
+		cl.end(p.Pid, as)
 	}
+	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
 		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
@@ -640,6 +640,11 @@ func (cl *call) kill() {
 	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH {
 		return
 	}
+	cl.end(pid, as)
+}
+
+// end kills the command's process group and whatever carries the call's tag.
+func (cl *call) end(pid int, as *syscall.Credential) {
 	syscall.Kill(-pid, syscall.SIGKILL)
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments

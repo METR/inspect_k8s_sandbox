@@ -658,19 +658,41 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 }
 
 func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
 	startReaper()
 	t.Cleanup(func() { killTagged("early") })
 	cl := &call{id: 30, tag: "early"}
 	cl.room = sync.NewCond(&cl.mu)
-	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"} // it never ends by itself
+	pids := filepath.Join(t.TempDir(), "pids")
+	// It leaves a process running, says which, and ends.
+	req := startRequest{Argv: []string{"sh", "-c", `sleep 600 >/dev/null 2>&1 & echo $$ $! >"$0"`, pids}, Env: map[string]string{}, Tag: "early"}
 
-	cl.kill() // from another connection, while this one's START is still at work
-	if err := cl.run(req); err != nil {
+	cl.kill()    // from another connection, while this one's START is still at work
+	cl.mu.Lock() // and stays at work: the command has ended before the START can note its id
+	noted := sync.OnceFunc(cl.mu.Unlock)
+	t.Cleanup(noted)
+	started := make(chan error, 1)
+	go func() { started <- cl.run(req) }()
+	var leader, left int
+	for deadline := time.Now().Add(30 * time.Second); left == 0 || syscall.Kill(leader, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if b, _ := os.ReadFile(pids); len(strings.Fields(string(b))) == 2 {
+			leader, _ = strconv.Atoi(strings.Fields(string(b))[0])
+			left, _ = strconv.Atoi(strings.Fields(string(b))[1])
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+	noted()
+	if err := <-started; err != nil {
 		t.Fatal(err)
 	}
 
-	if code := exitCode(t, cl); code != 137 {
-		t.Fatalf("exit %d: the kill was lost", code)
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(left, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, which the command left running, outlived a kill that came before it started", left)
+		}
 	}
 }
 
