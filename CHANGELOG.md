@@ -10,7 +10,8 @@
   SIGKILL at once, not SIGTERM. One that leaves the command's process group survives if
   it keeps starting new processes, clears its environment or pads it past 8 MiB or,
   without `CAP_SYS_PTRACE`, makes itself non-dumpable or changes user; on gVisor it also
-  survives if its command ran as another `user`. A pod with no PID to spare can end
+  survives if its command ran as another `user`, and only root and that command itself
+  can open its `/proc/PID/fd`. A pod with no PID to spare can end
   execd itself, which needs one for each thread it starts. Make execd mode 111, and give
   the sandbox neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`, or a process running
   as execd's user can stand in for it while it starts. What a pod's execd sends is paced
