@@ -24,8 +24,13 @@ class GetReturncodeError(Exception):
 class ExecResultUnknownError(PodError, GetReturncodeError):
     """An exec's command was sent to the pod, but its result could not be read.
 
-    The command may have run, and may still be running, so it is not retried.
+    The command may have run, and may still be running. It is sent again, as upstream
+    does, unless its container stopped or the pod runs execd.
     """
+
+
+class ExecdResultUnknownError(ExecResultUnknownError):
+    """execd could not resume the command's call, which is never sent again."""
 
 
 class ContainerStoppedError(ExecResultUnknownError):

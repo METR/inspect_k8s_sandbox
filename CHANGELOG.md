@@ -57,12 +57,12 @@
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
   background process holding its stdout or stderr open now returns a tenth of a
   second after the command exits, rather than at once.
-- `exec()` no longer runs a command a second time when its connection to the pod is
-  lost while the command runs, and no longer returns a successful result whose output
-  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
-  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
-  run; or, if the container restarted or was replaced meanwhile, that error. A
-  connection lost before the command was sent is still retried.
+- `exec()` no longer returns a successful result whose output lost its end on the way.
+  That, and a connection to the pod lost while the command runs, raise
+  `ExecResultUnknownError` (as the cause of a `K8sError`), a `GetReturncodeError` that is
+  retried as before, so the command may run a second time; or, if the container
+  restarted or was replaced meanwhile, that error, which is not retried. A pod with
+  execd resumes the command instead, and never runs it a second time.
 - `exec()` runs fewer programs in the container per call, which makes it faster
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).

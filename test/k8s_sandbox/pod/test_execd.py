@@ -19,7 +19,7 @@ from pytest import MonkeyPatch
 from k8s_sandbox._helm import Release, ValuesSource
 from k8s_sandbox._pod import execd
 from k8s_sandbox._pod import pod as pod_module
-from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
+from k8s_sandbox._pod.error import ExecdResultUnknownError, PodError
 from k8s_sandbox._pod.pod import Pod
 from k8s_sandbox._pod.snapshot import _parse_pod
 
@@ -248,7 +248,7 @@ async def test_command_is_not_run_again_once_its_daemon_is_gone(
     first = await daemons.serve(dies_after_start)
     await daemons.serve(new_daemon)
 
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
     assert len(starts) == 1
 
@@ -316,7 +316,7 @@ async def test_connection_lost_after_start_is_not_retryable(
     monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
 
     # A ConnectionError would be retried, running the command again.
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
 
 
@@ -338,7 +338,7 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     sandbox = daemons.client()
 
     async def times_out() -> None:
-        with pytest.raises((TimeoutError, ExecResultUnknownError)):
+        with pytest.raises((TimeoutError, ExecdResultUnknownError)):
             await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
 
     task = asyncio.ensure_future(times_out())
@@ -446,7 +446,7 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     sandbox = daemons.client()
 
     # PodError is retried too, which would run the command again.
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
 
 
@@ -1161,7 +1161,7 @@ async def test_an_unknown_call_whose_stdin_execd_wrote_is_not_started_again(
 
     await daemons.serve(acks_then_forgets)
 
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
     assert starts == 1
 
@@ -1363,7 +1363,7 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
 
     await daemons.serve(denies_every_call)
 
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 5)
     assert starts == 1
 
@@ -1387,7 +1387,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
 
     await daemons.serve(abandons)
 
-    with pytest.raises(ExecResultUnknownError):
+    with pytest.raises(ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
     assert starts == 1
 

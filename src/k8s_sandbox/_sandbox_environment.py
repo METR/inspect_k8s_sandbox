@@ -48,7 +48,8 @@ from k8s_sandbox._manager import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.error import (
-    ExecResultUnknownError,
+    ContainerStoppedError,
+    ExecdResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
@@ -77,8 +78,9 @@ _TRANSIENT_TYPES = (
 # but are listed defensively: if _TRANSIENT_TYPES ever gains a parent class they
 # inherit from, these entries prevent accidental retries of permanent failures.
 # PermissionError and TimeoutError are OSError subclasses and MUST be excluded.
-# ExecResultUnknownError is a PodError and MUST be excluded: its command may have run,
-# and retrying would run it again.
+# ContainerStoppedError is a PodError and MUST be excluded: a retry would reach the
+# container that replaces it. So is ExecdResultUnknownError: execd resumes a call by its
+# id, and one it could not resume may have run.
 _PERMANENT_TYPES = (
     ExecutableNotFoundError,
     RuntimeError,
@@ -86,7 +88,8 @@ _PERMANENT_TYPES = (
     TimeoutError,
     FileNotFoundError,
     IsADirectoryError,
-    ExecResultUnknownError,
+    ContainerStoppedError,
+    ExecdResultUnknownError,
 )
 
 

@@ -11,6 +11,7 @@ from tenacity import wait_none
 from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
+    ExecdResultUnknownError,
     ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
@@ -113,6 +114,10 @@ class TestExecRetryTransient:
                 GetReturncodeError("no return code"),
                 id="GetReturncodeError",
             ),
+            pytest.param(
+                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                id="ExecResultUnknownError",
+            ),
         ],
     )
     async def test_transient_error_is_retried(self, error: Exception) -> None:
@@ -161,9 +166,9 @@ class TestExecRetryPermanent:
                 id="PermissionError",
             ),
             pytest.param(
-                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                ExecdResultUnknownError("execd stopped", pod="test-pod"),
                 K8sError,
-                id="ExecResultUnknownError",
+                id="ExecdResultUnknownError",
             ),
         ],
     )
