@@ -371,6 +371,53 @@ func TestAScriptWithNoInterpreterLineRuns(t *testing.T) {
 	}
 }
 
+func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	args := []string{"a  b", "$(id)", "`id`", ";x", "$PATH", "*", ""}
+	req, _ := json.Marshal(startRequest{Argv: append([]string{"printf", "%s\n"}, args...), Env: map[string]string{}, Tag: "l"})
+
+	s.dispatch(c, frame{kind: fStart, id: 25, payload: req})
+
+	var out []byte
+	for {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout {
+				out = append(out, f.payload...)
+				continue
+			}
+			if f.kind != fExit {
+				continue
+			}
+			// The shell that starts the command must not read its arguments as shell.
+			if want := strings.Join(args, "\n") + "\n"; string(out) != want {
+				t.Fatalf("printf got %q, want %q", out, want)
+			}
+			return
+		case <-time.After(30 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+}
+
+func TestACommandNamedLikeAShellBuiltinIsTheOneOnThePath(t *testing.T) {
+	startReaper()
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "printf"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"printf"}, Env: map[string]string{"PATH": dir}, Tag: "b"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 24, payload: req})
+
+	// The shell that finds the command must not run its own printf in its place.
+	if code := exitCode(t, s.get(24)); code != 7 {
+		t.Fatalf("exit %d, want 7 from the printf on PATH", code)
+	}
+}
+
 func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")

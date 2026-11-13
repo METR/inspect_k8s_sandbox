@@ -72,8 +72,8 @@ async def sandbox_env(
 async def test_annotation_picks_transport(
     transport: str, sandbox_env: K8sSandboxEnvironment
 ) -> None:
-    # Only execd tags what it starts.
-    result = await sandbox_env.exec(["sh", "-c", "echo ${HAWK_NEXT_EXEC:+execd}"])
+    # execd starts a command itself; Kubernetes exec starts it from a shell.
+    result = await sandbox_env.exec(["sh", "-c", "cat /proc/$PPID/cmdline"])
     assert result.success, result.stderr
     assert ("execd" in result.stdout) == (transport == "execd"), result.stdout
 
@@ -95,7 +95,7 @@ async def test_a_command_is_found_on_the_path_as_its_user(
     root = sandboxes["default"]
     # Root finds this `id` first; the user can't enter its directory.
     hide = "mkdir -m 700 /tmp/roots && cp /bin/false /tmp/roots/id"
-    await root.exec(["sh", "-c", hide])
+    assert (await root.exec(["sh", "-c", hide])).success
 
     result = await root.exec(
         ["id", "-un"], env={"PATH": "/tmp/roots:/usr/bin"}, user="nobody"

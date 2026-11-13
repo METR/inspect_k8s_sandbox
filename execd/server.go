@@ -351,8 +351,8 @@ func (cl *call) run(req startRequest) error {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
-	// The user's own shell finds and starts the command, as it does over Kubernetes exec.
-	p, err := os.StartProcess("/bin/sh", append([]string{"/bin/sh", "-c", `"$@"`, "/bin/sh"}, req.Argv...), &os.ProcAttr{
+	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
+	p, err := os.StartProcess("/bin/sh", append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...), &os.ProcAttr{
 		Dir: req.Cwd, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
 	})
 	stdinR.Close()
