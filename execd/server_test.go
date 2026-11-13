@@ -716,6 +716,43 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	}
 }
 
+func TestAKillAsACommandsEndIsBeingNotedLeavesWhatItLeftRunning(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	t.Cleanup(func() { killTagged("noted") })
+	// Once let go, it leaves a loop running that keeps putting a file back, and ends.
+	left := `until [ -e "$0.go" ]; do sleep 0.01; done; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "noted"})
+	s.start(testConn(t), frame{kind: fStart, id: 32, payload: req})
+	cl := s.get(32)
+	cl.mu.Lock()
+	pid := cl.pid
+	cl.mu.Unlock()
+	reaper.mu.Lock() // as while another command starts: an end is collected, and waits to be noted
+	noted := sync.OnceFunc(reaper.mu.Unlock)
+	t.Cleanup(noted)
+	os.WriteFile(alive+".go", nil, 0o644)
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+
+	cl.kill()
+
+	noted()
+	os.Remove(alive)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(alive); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("what the command left running was killed after it ended")
+		}
+	}
+}
+
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }

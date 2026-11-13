@@ -635,7 +635,8 @@ func (cl *call) kill() {
 	cl.killed = true
 	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
-	if pid <= 0 { // not started, or ended: what it left running is not the call's to kill, and -0 is execd's own group
+	// Not started, or ended (reaped, if not yet noted as such): what it left running is not the call's to kill.
+	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH {
 		return
 	}
 	syscall.Kill(-pid, syscall.SIGKILL)
