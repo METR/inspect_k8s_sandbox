@@ -618,25 +618,35 @@ func (cl *call) kill() {
 	}
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
-		go func() {
-			runtime.LockOSThread() // the identity it takes is this thread's alone
-			setfs(as.Uid, as.Gid)
-			killTagged(cl.tag)
-			if setfs(uint32(os.Geteuid()), uint32(os.Getegid())) {
-				runtime.UnlockOSThread() // if not, the thread ends with this goroutine
-			}
-		}()
+		startSearcher()
+		go func() { searches <- search{cl.tag, as} }()
 	}
 }
 
-// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks, and says whether it took.
-func setfs(uid, gid uint32) bool {
+type search struct {
+	tag string
+	as  *syscall.Credential
+}
+
+var searches = make(chan search)
+
+// startSearcher starts, once, the thread that searches as other users: at execd's start, as a pod out of PIDs can start none.
+var startSearcher = sync.OnceFunc(func() {
+	go func() {
+		runtime.LockOSThread() // the identities it takes are this thread's alone
+		for s := range searches {
+			setfs(s.as.Uid, s.as.Gid)
+			killTagged(s.tag)
+			setfs(uint32(os.Geteuid()), uint32(os.Getegid()))
+		}
+	}()
+})
+
+// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks.
+func setfs(uid, gid uint32) {
 	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
 	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
 	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
-	g, _, _ := syscall.RawSyscall(syscall.SYS_SETFSGID, ^uintptr(0), 0, 0)
-	u, _, _ := syscall.RawSyscall(syscall.SYS_SETFSUID, ^uintptr(0), 0, 0)
-	return uint32(u) == uid && uint32(g) == gid
 }
 
 func (cl *call) finish(code int, startErr string) {

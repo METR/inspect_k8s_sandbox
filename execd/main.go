@@ -158,6 +158,7 @@ func run(port int, keyHash string, replace bool) {
 		os.Exit(2)
 	}
 	startReaper()
+	startSearcher()
 	report("ok " + fingerprint)
 	s.serve(l)
 }

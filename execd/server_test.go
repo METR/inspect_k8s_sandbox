@@ -541,6 +541,29 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	if dumpable() {
 		t.Fatal("dumpable once it has killed a command run as another user")
 	}
+	for range 200 { // many searches at once, each of which takes the identity
+		s.dispatch(c, frame{kind: fKill, id: 22})
+	}
+	// The identity is one thread's, for the search alone: on another it would fail what execd does as itself.
+	for deadline := time.Now().Add(30 * time.Second); len(borrowed()) > 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("threads kept the user's identity: %v", borrowed())
+		}
+	}
+}
+
+// borrowed lists the filesystem ids of this process's threads that aren't its own.
+func borrowed() (ids []string) {
+	tasks, _ := filepath.Glob("/proc/self/task/*/status")
+	for _, task := range tasks {
+		status, _ := os.ReadFile(task)
+		for _, line := range strings.Split(string(status), "\n") {
+			if f := strings.Fields(line); len(f) == 5 && (f[0] == "Uid:" || f[0] == "Gid:") && f[4] != f[1] {
+				ids = append(ids, line)
+			}
+		}
+	}
+	return ids
 }
 
 func dumpable() bool {
