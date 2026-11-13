@@ -538,7 +538,10 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 23, payload: req})
 	s.detach(first)
-	timers[0]() // six minutes with no client: killed and forgotten
+	timers[0]() // six minutes with no client
+	if code := exitCode(t, s.get(23)); code != 137 {
+		t.Fatalf("exit %d: an abandoned call is killed", code)
+	}
 	late, frames := recordedConn(t)
 
 	// The client sends the START of an "unknown call" again: right for 99, which never came; 23 would run twice.
