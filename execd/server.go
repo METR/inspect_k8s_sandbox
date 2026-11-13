@@ -121,15 +121,11 @@ func (s *server) handle(nc net.Conn) {
 // serve runs the command and feeds it stdin until the client closes the connection.
 func (c *call) serve(req startRequest) {
 	if err := c.start(req); err != nil {
-		// Report like a shell would: the message on stderr and 126 or 127 as the exit code.
-		code := 126
-		if os.IsNotExist(err) {
-			code = 127
-		}
+		// Report like a shell would: the message on stderr, and 126 as the exit code.
 		msg := err.Error()
 		msg = msg[:min(len(msg), 512)] // so that even escaped to JSON it fits the client's 4 KiB
 		c.send(fStderr, []byte("execd: "+msg+"\n"))
-		c.finish(exitStatus{Code: code, Error: msg}) // out of band too, so stderr can't fake it
+		c.finish(exitStatus{Code: 126, Error: msg}) // out of band too, so stderr can't fake it
 	}
 	done := make(chan struct{})
 	defer close(done)
@@ -255,8 +251,14 @@ func (c *call) start(req startRequest) error {
 	if err != nil {
 		return err
 	}
-	outR, outW, _ := os.Pipe()
-	errR, errW, _ := os.Pipe()
+	outR, outW, outErr := os.Pipe()
+	errR, errW, errErr := os.Pipe()
+	if err := errors.Join(outErr, errErr); err != nil {
+		for _, f := range []*os.File{stdinR, stdinW, outR, outW, errR, errW} {
+			f.Close()
+		}
+		return err
+	}
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	p, err := os.StartProcess("/bin/sh", append([]string{"sh", "-c", script, "sh"}, args...), &os.ProcAttr{
 		Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
@@ -433,11 +435,12 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
-// killTagged SIGKILLs every process whose environment holds EXECD_CALL=<tag>, even after setsid.
-func killTagged(tag string) {
+// killTagged SIGKILLs each process with EXECD_CALL=<tag> in its environment, and returns its looks.
+func killTagged(tag string) int {
 	needle := "EXECD_CALL=" + tag + "\x00"
+	empty := map[int]int{} // looks that found a live process with no environment
 	// One look misses a process inside execve (it shows no environment) and one forked meanwhile.
-	for range 100 {
+	for look := 1; ; look++ {
 		again := false
 		entries, _ := os.ReadDir("/proc")
 		for _, e := range entries {
@@ -450,15 +453,18 @@ func killTagged(tag string) {
 				continue
 			}
 			if len(data) == 0 {
-				_, err := os.Readlink("/proc/" + e.Name() + "/exe") // a zombie has none
-				again = again || err == nil
+				// A zombie has no exe. One that cleared its environment never shows one: ten looks, no more.
+				if _, err := os.Readlink("/proc/" + e.Name() + "/exe"); err == nil && empty[pid] < 10 {
+					empty[pid]++
+					again = true
+				}
 			} else if strings.Contains(string(data)+"\x00", needle) {
 				syscall.Kill(pid, syscall.SIGKILL)
 				again = true
 			}
 		}
-		if !again {
-			return
+		if !again || look == 100 {
+			return look
 		}
 		time.Sleep(time.Millisecond)
 	}

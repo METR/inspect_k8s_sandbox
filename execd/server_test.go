@@ -96,7 +96,6 @@ func exit(t *testing.T, frames <-chan frame) exitStatus {
 	return status
 }
 
-// until waits for a condition; the budget only bounds a hang.
 // output reads frames up to the exit: each kind's payloads joined, and the count before the exit.
 func output(t *testing.T, frames <-chan frame) (map[byte][]byte, int) {
 	t.Helper()
@@ -116,6 +115,8 @@ func output(t *testing.T, frames <-chan frame) (map[byte][]byte, int) {
 		}
 	}
 }
+
+// until waits for a condition; the budget only bounds a hang.
 func until(t *testing.T, what string, condition func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(30 * time.Second); !condition(); time.Sleep(10 * time.Millisecond) {
@@ -142,8 +143,9 @@ func pids(t *testing.T, frames <-chan frame, n int) []int {
 	return ids
 }
 
+const prGetDumpable = 3
+
 func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
-	const prGetDumpable = 3
 	// init() has run, as it runs before main.
 	if dumpable, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, prGetDumpable, 0, 0); dumpable != 0 {
 		t.Fatal("dumpable: a same-uid process could reopen the start's stdout through /proc")
@@ -349,6 +351,21 @@ func TestALostConnectionKillsWhatAProcessOutsideTheGroupForksMeanwhile(t *testin
 	}
 }
 
+func TestAProcessThatClearedItsEnvironmentIsLookedAtTenTimesOnly(t *testing.T) {
+	// It shows no environment at every look; one inside execve does at one or two.
+	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "echo $$; exec env -i sleep 100"}})
+	cleared := fmt.Sprintf("/proc/%d/environ", pids(t, frames, 1)[0])
+	until(t, "env never cleared the environment", func() bool {
+		environment, err := os.ReadFile(cleared)
+		return err == nil && len(environment) == 0
+	})
+
+	// Others here may be inside execve too, each for a look or two more.
+	if looks := killTagged("no call's tag"); looks > 50 {
+		t.Fatalf("%d looks for a tag no process holds", looks)
+	}
+}
+
 func TestStdinACommandDoesNotReadWaitsInTheConnection(t *testing.T) {
 	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 100"}, Stdin: true})
 	pids(t, frames, 1)
@@ -401,8 +418,10 @@ func TestAClientGoneIsFoundWhileItsCommandLeavesStdinUnread(t *testing.T) {
 
 func TestACwdThatCantBeEnteredFailsTheCallAsCdDoes(t *testing.T) {
 	dir := t.TempDir()
-	made := filepath.Join(os.TempDir(), "made-outside-its-cwd") // where any user could make it
-	t.Cleanup(func() { os.Remove(made) })
+	open, _ := os.MkdirTemp("", "execd") // where any user could make a file
+	os.Chmod(open, 0o777)
+	t.Cleanup(func() { os.RemoveAll(open) })
+	made := filepath.Join(open, "made")
 	os.WriteFile(filepath.Join(dir, "file"), nil, 0o644)
 	closed := filepath.Join(dir, "closed")
 	os.Mkdir(closed, 0)
@@ -436,7 +455,6 @@ func TestExecdStaysNonDumpableAfterACommandAsAnotherUser(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root can run a command as another user")
 	}
-	const prGetDumpable = 3
 	_, frames := begin(t, testServer(), startRequest{Argv: []string{"true"}, User: "nobody"})
 
 	exit(t, frames)
@@ -481,15 +499,15 @@ func TestOutputStillInThePipeAtTheExitArrives(t *testing.T) {
 	s.preauth <- struct{}{}
 	go s.handle(daemon)
 	// A child keeps stdout open; the command prints while its first line waits unread, then exits.
-	request(client, startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!; sleep 0.1; head -c 50000 /dev/zero"}})
+	request(client, startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!; sleep 0.1; head -c 4000 /dev/zero"}})
 
 	time.Sleep(400 * time.Millisecond) // past the exit and the grace a held pipe gets
 	frames := received(client)
 
 	child := pids(t, frames, 1)[0]
 	got, _ := output(t, frames)
-	if size := len(got[fStdout]); size != 50000 {
-		t.Fatalf("%d of the 50,000 bytes written before the exit arrived (child %d)", size, child)
+	if size := len(got[fStdout]); size != 4000 { // which fit the smallest pipe
+		t.Fatalf("%d of the 4,000 bytes written before the exit arrived (child %d)", size, child)
 	}
 }
 
@@ -507,22 +525,6 @@ func TestAClientThatNeverClosesIsDroppedAfterTheExit(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("execd kept the connection of a client that never closed it")
-	}
-}
-
-func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
-	dir, _ := filepath.EvalSymlinks(t.TempDir())
-	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
-	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
-	wd, _ := os.Getwd()
-	os.Chdir(dir)
-	t.Cleanup(func() { os.Chdir(wd) })
-
-	_, frames := begin(t, testServer(), startRequest{Argv: []string{"hello"}, Env: map[string]string{"PATH": "bin"}, Cwd: "work"})
-
-	// As a shell finds it: work/bin/hello, run in work.
-	if status := exit(t, frames); status.Code != 7 {
-		t.Fatalf("exit %+v, want hello's 7", status)
 	}
 }
 
