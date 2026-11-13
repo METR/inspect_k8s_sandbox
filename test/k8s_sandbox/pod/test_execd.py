@@ -224,13 +224,13 @@ async def test_a_lost_exec_raises_the_restart_that_explains_it_and_so_do_later_o
         pod.exec_stdio(["cat"], None),
     ]
     turns: list[bool] = []
-    for operation in later:
+    for count, operation in enumerate(later, 1):
         asyncio.get_running_loop().call_soon(turns.append, True)
         with pytest.raises(ContainerRestartedError):
             await operation
+        assert len(turns) == count  # it gave way first: a caller may retry in a loop
 
     assert daemons.connections == 2  # none of them reached a daemon
-    assert len(turns) == 4  # each gave way first: a caller may retry in a loop
 
 
 async def test_what_ran_when_a_restart_was_found_raises_it_too(

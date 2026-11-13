@@ -503,7 +503,6 @@ class ExecdStream(ByteStream):
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
-        await _land_pending_cancel()  # before it takes output its caller won't get
         if self._closed:
             raise anyio.ClosedResourceError
         self._drop_if_restarted()
@@ -535,6 +534,8 @@ class ExecdStream(ByteStream):
                     log_trace(
                         "An exec_stdio command wrote to stderr.", stderr=self._stderr
                     )
+        # Also one that wait_for swallowed (before Python 3.12): its caller is gone.
+        await _land_pending_cancel()
         # Once its pod can't be used, not even output already read is given out.
         self._conn.client.check()
         self._drop_if_restarted()
