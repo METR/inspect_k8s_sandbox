@@ -14,15 +14,6 @@ import (
 	"time"
 )
 
-// kill() runs this binary, as it runs execd, to look for a call's processes as its user.
-func TestMain(m *testing.M) {
-	if len(os.Args) > 4 && os.Args[1] == "kill" {
-		main()
-		return
-	}
-	os.Exit(m.Run())
-}
-
 func testConn(t *testing.T) *conn {
 	a, b := net.Pipe()
 	go io.Copy(io.Discard, b) //nolint:errcheck // drains what the server sends
@@ -482,6 +473,15 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 			t.Fatalf("process %d, which the command detached, outlived its kill", pid)
 		}
 	}
+	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable.
+	if dumpable() {
+		t.Fatal("dumpable once it has killed a command run as another user")
+	}
+}
+
+func dumpable() bool {
+	d, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, 3, 0, 0) // PR_GET_DUMPABLE
+	return d != 0
 }
 
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {

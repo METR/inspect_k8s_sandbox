@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -604,16 +605,26 @@ func (cl *call) kill() {
 		syscall.Kill(-pid, syscall.SIGKILL)
 	}
 	killTagged(cl.tag)
-	if as != nil { // without CAP_SYS_PTRACE only the command's user can read its processes' environments
-		args := []string{"execd", "kill", cl.tag, fmt.Sprint(as.Uid), fmt.Sprint(as.Gid)}
-		for _, g := range as.Groups {
-			args = append(args, fmt.Sprint(g))
-		}
-		// Started as execd's user: a child Go itself switches is the other user's to stop before it execs.
-		if p, err := os.StartProcess("/proc/self/exe", args, &os.ProcAttr{}); err == nil {
-			p.Release()
-		}
+	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
+		go func() {
+			runtime.LockOSThread() // the identity it takes is this thread's alone
+			setfs(as.Uid, as.Gid)
+			killTagged(cl.tag)
+			if setfs(uint32(os.Geteuid()), uint32(os.Getegid())) {
+				runtime.UnlockOSThread() // if not, the thread ends with this goroutine
+			}
+		}()
 	}
+}
+
+// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks, and says whether it took.
+func setfs(uid, gid uint32) bool {
+	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
+	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
+	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
+	g, _, _ := syscall.RawSyscall(syscall.SYS_SETFSGID, ^uintptr(0), 0, 0)
+	u, _, _ := syscall.RawSyscall(syscall.SYS_SETFSUID, ^uintptr(0), 0, 0)
+	return uint32(u) == uid && uint32(g) == gid
 }
 
 func (cl *call) finish(code int, startErr string) {
@@ -698,18 +709,6 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 		}
 	}
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
-}
-
-// killTaggedAs is killTagged as the user with these ids: uid, gid, then supplementary groups.
-func killTaggedAs(tag string, ids []string) {
-	n := make([]int, len(ids))
-	for i, id := range ids {
-		n[i], _ = strconv.Atoi(id)
-	}
-	if syscall.Setgroups(n[2:]) != nil || syscall.Setgid(n[1]) != nil || syscall.Setuid(n[0]) != nil {
-		fail("cannot become the call's user")
-	}
-	killTagged(tag)
 }
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.

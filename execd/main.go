@@ -27,10 +27,6 @@ const foregroundEnv = "HN_EXECD_FOREGROUND"
 func init() { prctl(prSetDumpable, 0) }
 
 func main() {
-	if len(os.Args) > 4 && os.Args[1] == "kill" { // kill() runs this, to search as a call's user
-		killTaggedAs(os.Args[2], os.Args[3:])
-		return
-	}
 	if len(os.Args) < 2 || os.Args[1] != "listen" {
 		fail("usage: execd listen --port N --key-sha256 HEX")
 	}
