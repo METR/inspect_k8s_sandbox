@@ -14,3 +14,6 @@ jobs:
           cache: false  # no go.sum to key it on
       - run: go vet ./... && go test ./...
         working-directory: execd
+      # As root, which the tests that run a command as another user need.
+      - run: docker run --rm -v "$PWD:/src:ro" -w /src public.ecr.aws/docker/library/golang:1.26 go test ./...
+        working-directory: execd

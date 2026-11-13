@@ -345,3 +345,42 @@ func TestAChargeNeverGivesBackTurnsTaken(t *testing.T) {
 		t.Fatalf("turns moved back %v: flushes waiting for them would send together", ahead-got)
 	}
 }
+
+func TestAScriptWithNoInterpreterLineRuns(t *testing.T) {
+	startReaper()
+	script := filepath.Join(t.TempDir(), "seven")
+	os.WriteFile(script, []byte("exit 7\n"), 0o755)
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{script}, Env: map[string]string{}, Tag: "n"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 20, payload: req})
+
+	// As a shell runs it: execve refuses the file, and the shell reads it.
+	if code := exitCode(t, s.get(20)); code != 7 {
+		t.Fatalf("exit %d, want the script's 7", code)
+	}
+}
+
+func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	startReaper()
+	dir := t.TempDir()
+	os.Chmod(filepath.Dir(dir), 0o755) // so the other user reaches it
+	for name, script := range map[string]string{"roots": "#!/bin/sh\nexit 3\n", "anyones": "#!/bin/sh\nexit 7\n"} {
+		os.Mkdir(filepath.Join(dir, name), 0o755)
+		os.WriteFile(filepath.Join(dir, name, "tool"), []byte(script), 0o755)
+	}
+	os.Chmod(filepath.Join(dir, "roots"), 0o700)
+	path := filepath.Join(dir, "roots") + ":" + filepath.Join(dir, "anyones")
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"tool"}, Env: map[string]string{"PATH": path}, User: "65534", Tag: "u"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 21, payload: req})
+
+	// Root sees roots/tool first; the user can't run it, and their shell goes on to the next.
+	if code := exitCode(t, s.get(21)); code != 7 {
+		t.Fatalf("exit %d, want 7 from the tool the user can run", code)
+	}
+}

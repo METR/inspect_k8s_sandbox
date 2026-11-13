@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -283,7 +282,7 @@ func (s *server) start(c *conn, f frame) {
 		code := 126
 		if strings.HasPrefix(err.Error(), "cd: ") {
 			code = 1
-		} else if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+		} else if os.IsNotExist(err) {
 			code = 127
 		}
 		msg := err.Error()
@@ -333,11 +332,6 @@ func (cl *call) run(req startRequest) error {
 	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
 		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
 	}
-	env := childEnv(req.Env)
-	argv0, err := lookPath(req.Argv[0], env, req.Cwd)
-	if err != nil {
-		return err
-	}
 	stdinR, stdinW, err := stdinPipe(req.Stdin)
 	if err != nil {
 		return err
@@ -345,8 +339,9 @@ func (cl *call) run(req startRequest) error {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
-	p, err := os.StartProcess(argv0, req.Argv, &os.ProcAttr{
-		Dir: req.Cwd, Env: env, Files: []*os.File{stdinR, outW, errW}, Sys: attr,
+	// The user's own shell finds and starts the command, as it does over Kubernetes exec.
+	p, err := os.StartProcess("/bin/sh", append([]string{"/bin/sh", "-c", `"$@"`, "/bin/sh"}, req.Argv...), &os.ProcAttr{
+		Dir: req.Cwd, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
 	})
 	stdinR.Close()
 	outW.Close()
@@ -649,40 +644,6 @@ func childEnv(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
-}
-
-// lookPath resolves as a shell would: relative PATH entries from cwd; a non-executable match is 126.
-func lookPath(name string, env []string, cwd string) (string, error) {
-	if strings.Contains(name, "/") {
-		return name, nil
-	}
-	path := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
-		}
-	}
-	denied := ""
-	for _, dir := range filepath.SplitList(path) {
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(cwd, dir)
-		}
-		p, _ := filepath.Abs(filepath.Join(dir, name)) // absolute: the child starts in cwd
-		st, err := os.Stat(p)
-		if err != nil || st.IsDir() {
-			continue
-		}
-		if st.Mode()&0o111 != 0 {
-			return p, nil
-		}
-		if denied == "" {
-			denied = p
-		}
-	}
-	if denied != "" {
-		return "", &os.PathError{Op: "exec", Path: denied, Err: syscall.EACCES}
-	}
-	return "", fmt.Errorf("%s: not found", name)
 }
 
 // lookupUser resolves a name or uid in /etc/passwd; a nil credential means execd's own user.
