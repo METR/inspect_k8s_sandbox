@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// run() starts this binary, as it starts execd, to become another user.
+func TestMain(m *testing.M) {
+	if len(os.Args) > 6 && os.Args[1] == "as" {
+		main()
+	}
+	os.Exit(m.Run())
+}
+
 func testConn(t *testing.T) *conn {
 	a, b := net.Pipe()
 	go io.Copy(io.Discard, b) //nolint:errcheck // drains what the server sends
@@ -438,9 +446,25 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if code := exitCode(t, s.get(21)); code != 7 {
 		t.Fatalf("exit %d, want 7 from the tool the user can run", code)
 	}
-	// The child's change of user resets the flag to the host's fs.suid_dumpable.
+	// A child of execd that switched user would share its memory till it execs: the flag is reset, and execd waits on a child that user can stop.
 	if dumpable() {
 		t.Fatal("dumpable once it has run a command as another user")
+	}
+}
+
+func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: t.TempDir(), User: "65534", Tag: "d"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 26, payload: req})
+
+	// Root may enter a test's directory (mode 700); the user may not, and a failed cd is exit 1.
+	if code := exitCode(t, s.get(26)); code != 1 {
+		t.Fatalf("exit %d, want 1: the command ran where its user can't go", code)
 	}
 }
 

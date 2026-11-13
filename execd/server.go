@@ -327,14 +327,18 @@ func (s *server) resume(c *conn, f frame) {
 
 func (cl *call) run(req startRequest) error {
 	req.Env["HAWK_NEXT_EXEC"] = req.Tag
-	attr := &syscall.SysProcAttr{Setpgid: true}
+	argv := append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...)
+	dir := req.Cwd
+	var as *syscall.Credential
 	if req.User != "" {
 		cred, home, name, err := lookupUser(req.User)
 		if err != nil {
 			return err
 		}
 		if cred != nil {
-			attr.Credential = cred
+			// execd itself becomes the user, then the shell: a child Go switched would be theirs to stop before it execs, with execd waiting on it.
+			argv = append([]string{"/proc/self/exe", "as", dir, fmt.Sprint(cred.Uid), fmt.Sprint(cred.Gid), strings.Trim(fmt.Sprint(cred.Groups), "[]")}, argv...)
+			as, dir = cred, ""
 			// As runuser sets them, unless the caller did.
 			for k, v := range map[string]string{"HOME": home, "USER": name, "LOGNAME": name} {
 				if _, set := req.Env[k]; !set {
@@ -354,10 +358,9 @@ func (cl *call) run(req startRequest) error {
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
-	p, err := os.StartProcess("/bin/sh", append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...), &os.ProcAttr{
-		Dir: req.Cwd, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
+	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
+		Dir: dir, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: &syscall.SysProcAttr{Setpgid: true},
 	})
-	prctl(prSetDumpable, 0) // the child's change of user, in memory it shares until it execs, resets it
 	stdinR.Close()
 	outW.Close()
 	errW.Close()
@@ -373,7 +376,7 @@ func (cl *call) run(req startRequest) error {
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
 	cl.mu.Lock()
-	cl.pid, cl.as = p.Pid, attr.Credential // before Release, which sets it to -1
+	cl.pid, cl.as = p.Pid, as // before Release, which sets it to -1
 	cl.mu.Unlock()
 	p.Release()
 	var deadline *time.Timer
