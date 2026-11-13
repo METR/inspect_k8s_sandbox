@@ -8,6 +8,7 @@ import json
 import shutil
 import ssl
 import subprocess
+import sys
 import time
 import types
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -435,6 +436,9 @@ async def test_a_daemon_that_goes_silent_is_a_lost_connection(
         await asyncio.wait_for(run(daemons.client()), 30)
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="wait_for returns a read that came in time"
+)
 async def test_a_loop_too_busy_to_read_does_not_take_execd_for_silent(
     daemons: Daemons, tls: Tls, monkeypatch: MonkeyPatch
 ) -> None:

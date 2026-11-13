@@ -14,11 +14,11 @@
   `user` is not killed, nor is anything it started, and a timeout's `TimeoutError` comes
   10 s late. Closing an `exec_stdio` stream kills its command, but no process the
   command started. A background process that writes to a command's stdout or stderr
-  after the command has exited gets SIGPIPE. If what answers on the port sends what
-  execd never does, every operation on the sandbox fails with a `RuntimeError` (as the
-  cause of a `K8sError`). A process running as execd's user can stand in for it unless
-  execd is mode 111, the sandbox has none of `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`
-  and `CAP_SYS_PTRACE`, and the node's `fs.suid_dumpable` is not 1.
+  after the command has exited gets SIGPIPE. If the server on that port breaks execd's
+  protocol, every operation on the sandbox fails with a `RuntimeError` (as the cause of
+  a `K8sError`). A process running as execd's user can stand in for it unless execd is
+  mode 111, the sandbox has none of `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and
+  `CAP_SYS_PTRACE`, and the node's `fs.suid_dumpable` is not 1.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
