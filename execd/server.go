@@ -497,7 +497,7 @@ func (cl *call) feedStdin(w *os.File) {
 }
 
 // Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
-const maxUnacked, streamUnacked = 32 << 20, 1 << 20
+const maxUnacked, streamUnacked = 4 << 20, 1 << 20
 
 func (cl *call) output(stream int, data []byte) {
 	cl.mu.Lock()
@@ -523,7 +523,7 @@ var epoch = time.Now() // turns are measured from here, on the monotonic clock
 
 const slotEvery, slotBurst = 600 * time.Microsecond, 8
 
-const slotAhead = 100 * time.Millisecond // how long exits' and resumes' turns may hold others' output
+const slotAhead = slotBurst * slotEvery // how long exits' and resumes' turns may hold others' output
 
 // flushSoon sends a call's output at most once a millisecond, and any call's once a slot past a burst.
 func (cl *call) flushSoon() {

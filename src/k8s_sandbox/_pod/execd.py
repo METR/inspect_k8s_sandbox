@@ -53,11 +53,11 @@ CHUNK = 1 << 20
 MAX_FRAME = 2 * CHUNK
 MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
 MAX_ACK = 64  # execd's {"stdin": n}; each one is parsed, even a stray
-ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
-HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
+ACK_EVERY = 1 << 20  # execd pauses a command past 4 MiB unacked per stream
+HOLD = 2 * ((4 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
-MAX_STRAY_BYTES = 4 * HOLD  # their payload: output still in flight for calls given up
+MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers per second: past any, reading waits, so a stand-in can't hold
 # the runner's loop. execd sends output in reads of up to 256 KiB.
@@ -586,13 +586,22 @@ class ExecdClient:
         try:
             await link.send(KILL, call.id)
             end = time.monotonic() + KILL_WAIT
+            drained = 0
             while time.monotonic() < end:
                 item = await _next(call.queue, end - time.monotonic())
-                if isinstance(item, tuple) and item[0] == EXIT:
-                    break
-            await link.send(RELEASE, call.id)
+                if not isinstance(item, tuple) or item[0] == EXIT:
+                    break  # its exit, or a dropped connection
+                # acks let execd finish; past HOLD give up, as RELEASE frees the call
+                if item[0] in (STDOUT, STDERR):
+                    if drained + len(item[1]) > call.hold:
+                        break
+                    drained += len(item[1])
+                    await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
+        # Even with no exit: it frees what execd holds for the call.
+        with contextlib.suppress(OSError):
+            await link.send(RELEASE, call.id)
 
     async def exec(
         self,
