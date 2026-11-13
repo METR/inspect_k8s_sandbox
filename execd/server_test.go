@@ -143,7 +143,9 @@ func TestALateResumeOnAReplacedConnectionLeavesTheCallToTheNewOne(t *testing.T) 
 	first, second := testConn(t), testConn(t)
 	s.authenticated(first)
 	s.start(first, frame{kind: fStart, id: 6, payload: req})
-	s.authenticated(second)
+	s.mu.Lock()
+	s.current = second // as authenticated() does, a moment before it closes the first
+	s.mu.Unlock()
 	resume := frame{kind: fResume, id: 6, payload: []byte(`{"stdout":0,"stderr":0}`)}
 	s.resume(second, resume)
 
@@ -625,9 +627,11 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		runtime.GC()
 	}
 	searched.Wait()
-	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable.
-	if dumpable() {
-		t.Fatal("dumpable once it has killed a command run as another user")
+	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable, for an instant each time.
+	for deadline := time.Now().Add(30 * time.Second); dumpable(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("dumpable once it has killed a command run as another user")
+		}
 	}
 	// The identity is one thread's, for the search alone: on another it would fail what execd does as itself.
 	for deadline := time.Now().Add(30 * time.Second); len(borrowed()) > 0; time.Sleep(10 * time.Millisecond) {
@@ -672,15 +676,33 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 }
 
 func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
-	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
-	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
 	startReaper()
 	t.Cleanup(func() { killTagged("early") })
 	cl := &call{id: 30, tag: "early"}
 	cl.room = sync.NewCond(&cl.mu)
+	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"} // it never ends by itself
+
+	cl.kill() // from another connection, while this one's START is still at work
+	if err := cl.run(req); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := exitCode(t, cl); code != 137 {
+		t.Fatalf("exit %d: the kill was lost", code)
+	}
+}
+
+func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	startReaper()
+	t.Cleanup(func() { killTagged("ended") })
+	cl := &call{id: 33, tag: "ended"}
+	cl.room = sync.NewCond(&cl.mu)
 	pids := filepath.Join(t.TempDir(), "pids")
-	// It leaves a process running, says which, and ends.
-	req := startRequest{Argv: []string{"sh", "-c", `sleep 600 >/dev/null 2>&1 & echo $$ $! >"$0"`, pids}, Env: map[string]string{}, Tag: "early"}
+	// It leaves two processes running, says which, and ends: one in its group with no tag, one with its tag in a session of its own.
+	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
+	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
 	cl.kill()    // from another connection, while this one's START is still at work
 	cl.mu.Lock() // and stays at work: the command has ended before the START can note its id
@@ -688,11 +710,12 @@ func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
 	t.Cleanup(noted)
 	started := make(chan error, 1)
 	go func() { started <- cl.run(req) }()
-	var leader, left int
-	for deadline := time.Now().Add(30 * time.Second); left == 0 || syscall.Kill(leader, 0) == nil; time.Sleep(10 * time.Millisecond) {
-		if b, _ := os.ReadFile(pids); len(strings.Fields(string(b))) == 2 {
+	var leader, grouped, detached int
+	for deadline := time.Now().Add(30 * time.Second); detached == 0 || syscall.Kill(leader, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if b, _ := os.ReadFile(pids); len(strings.Fields(string(b))) == 3 {
 			leader, _ = strconv.Atoi(strings.Fields(string(b))[0])
-			left, _ = strconv.Atoi(strings.Fields(string(b))[1])
+			grouped, _ = strconv.Atoi(strings.Fields(string(b))[1])
+			detached, _ = strconv.Atoi(strings.Fields(string(b))[2])
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the command never ended")
@@ -703,9 +726,12 @@ func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(left, 0) == nil; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("process %d, which the command left running, outlived a kill that came before it started", left)
+	// The first is reached by the signal to the command's group alone, the second by the search for its tag alone.
+	for _, left := range []int{grouped, detached} {
+		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(left, 0) == nil; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("process %d, which the command left running, outlived a kill that came before it started", left)
+			}
 		}
 	}
 }
