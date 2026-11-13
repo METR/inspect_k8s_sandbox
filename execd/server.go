@@ -27,8 +27,6 @@ type server struct {
 	calls   map[uint64]*call
 	preauth chan struct{} // a slot per connection not yet authenticated
 	current *conn         // the newest authenticated connection: the client's only live one
-	// Calls killed for want of a client: kept, so a late RESUME isn't told its START never came.
-	abandoned map[uint64]bool
 }
 
 const idleTimeout = 60 * time.Second
@@ -65,6 +63,8 @@ type call struct {
 	code     int
 	startErr string // why the command never started, if it didn't
 	sub      *conn  // the connection streaming this call, if any
+	// killed for want of a client, and kept so a RESUME can be told so
+	abandoned bool
 }
 
 type conn struct {
@@ -98,7 +98,7 @@ func newServer(keyHashHex string) (*server, error) {
 	if err != nil || len(h) != sha256.Size {
 		return nil, fmt.Errorf("key hash must be 64 hex characters")
 	}
-	return &server{keyHash: h, calls: map[uint64]*call{}, abandoned: map[uint64]bool{}, preauth: make(chan struct{}, maxPreauth)}, nil
+	return &server{keyHash: h, calls: map[uint64]*call{}, preauth: make(chan struct{}, maxPreauth)}, nil
 }
 
 func (s *server) serve(l net.Listener) {
@@ -231,13 +231,14 @@ func (s *server) detach(c *conn) {
 			afterFunc(abandonAfter, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
+				if orphaned {
+					// Not forgotten: "unknown call" would have the client send its START again.
+					cl.abandoned, cl.gone, cl.out, cl.stdinQ = true, true, [2][]byte{}, nil
+					cl.room.Broadcast()
+				}
 				cl.mu.Unlock()
 				if orphaned {
-					s.mu.Lock()
-					s.abandoned[cl.id] = true // before it is forgotten
-					s.mu.Unlock()
 					cl.kill()
-					s.release(cl.id)
 				}
 			})
 		}
@@ -303,17 +304,15 @@ func (s *server) resume(c *conn, f frame) {
 	var req resumeRequest
 	cl := s.get(f.id)
 	if cl == nil || json.Unmarshal(f.payload, &req) != nil {
-		msg := "unknown call" // the client sends its START again
-		s.mu.Lock()
-		if s.abandoned[f.id] {
-			msg = "call abandoned: killed after 6 minutes with no client"
-		}
-		s.mu.Unlock()
-		c.send(fError, f.id, []byte(msg))
+		c.send(fError, f.id, []byte("unknown call")) // the client sends its START again
 		return
 	}
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	if cl.abandoned {
+		c.send(fError, f.id, []byte("call abandoned: killed after 6 minutes with no client"))
+		return
+	}
 	cl.sub = c
 	// Tell the client how much stdin arrived, so it can send the rest.
 	got, _ := json.Marshal(map[string]any{"stdin": cl.stdinGot, "eof": cl.stdinEOF, "put": cl.stdinPut})

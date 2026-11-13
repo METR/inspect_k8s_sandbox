@@ -48,13 +48,19 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 	s.detach(again)
 	timers[0]() // the first drop's
 
-	if s.get(1) == nil {
-		t.Fatal("released by the first drop's timer, though resumed since")
+	if abandoned(s.get(1)) {
+		t.Fatal("abandoned by the first drop's timer, though resumed since")
 	}
 	timers[1]()
-	if s.get(1) != nil {
-		t.Fatal("not released by its last drop's timer")
+	if !abandoned(s.get(1)) {
+		t.Fatal("not abandoned by its last drop's timer")
 	}
+}
+
+func abandoned(cl *call) bool {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	return cl.abandoned
 }
 
 func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
@@ -493,8 +499,13 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 
 	s.resume(late, frame{kind: fResume, id: 23, payload: []byte(`{"stdout":0,"stderr":0}`)})
 
-	// The client sends the START of an "unknown call" again: the command would run twice.
-	if f := <-frames; f.kind != fError || string(f.payload) == "unknown call" {
-		t.Fatalf("a late RESUME got frame %d %q", f.kind, f.payload)
+	select {
+	case f := <-frames:
+		// The client sends the START of an "unknown call" again: the command would run twice.
+		if f.kind != fError || string(f.payload) == "unknown call" {
+			t.Fatalf("a late RESUME got frame %d %q", f.kind, f.payload)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("a late RESUME got no answer")
 	}
 }
