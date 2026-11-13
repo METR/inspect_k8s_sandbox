@@ -23,7 +23,7 @@ const (
 	fOK       = 16 // reply to AUTH
 	fStdout   = 17
 	fStderr   = 18
-	fExit     = 19 // payload: {"code": n} (128+signal for a signal death)
+	fExit     = 19 // payload: {"code": n[, "error": why][, "timeout": true]} (128+signal for a signal death)
 	fPong     = 20
 	fError    = 21 // payload: message; "unknown call" answers a RESUME whose START never arrived
 	fResumed  = 22 // reply to RESUME; payload: {"stdin": bytes received, "eof": bool, "put": bytes written}

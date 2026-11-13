@@ -193,6 +193,32 @@ func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 	}
 }
 
+func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: "t", Timeout: 0.05})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
+
+	for {
+		select {
+		case f := <-frames:
+			if f.kind != fExit {
+				continue
+			}
+			var status struct{ Timeout bool }
+			if json.Unmarshal(f.payload, &status); !status.Timeout {
+				t.Fatalf("EXIT %s: the client can't tell the timeout from a kill -9", f.payload)
+			}
+			return
+		case <-time.After(30 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+}
+
 // recordedConn is a connection whose sent frames arrive on the channel.
 func recordedConn(t *testing.T) (*conn, <-chan frame) {
 	a, b := net.Pipe()

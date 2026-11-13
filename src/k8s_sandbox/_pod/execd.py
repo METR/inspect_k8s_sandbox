@@ -549,7 +549,8 @@ class ExecdClient:
                         except BaseException:  # cut off: it may not have gone out
                             await link.send_last(call.id, RELEASE)
                             raise
-                        yield EXIT, json.loads(payload)  # {"code": n[, "error": ...]}
+                        # {"code": n[, "error": why][, "timeout": true]}
+                        yield EXIT, json.loads(payload)
                         return
                     elif kind == RESUMED:  # send the stdin it didn't get
                         got = json.loads(payload)
@@ -660,7 +661,7 @@ class ExecdClient:
                         limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                         truncated_output=str(out[STDOUT]) + str(out[STDERR]),
                     )
-        if status is None:
+        if status is None or status.get("timeout"):  # our timer's, or execd's
             raise TimeoutError(f"Command timed out after {timeout}s.")
         code = int(status["code"])
         result = ExecResult(

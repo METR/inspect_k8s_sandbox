@@ -71,6 +71,7 @@ type call struct {
 	// killed for want of a client, and kept so a RESUME can be told so
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
+	timedOut  bool // its timeout killed it: its exit says so, as the code alone can't
 }
 
 type conn struct {
@@ -414,7 +415,12 @@ func (cl *call) run(req startRequest) error {
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
+		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), func() {
+			cl.mu.Lock()
+			cl.timedOut = true
+			cl.mu.Unlock()
+			cl.kill()
+		})
 	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
@@ -712,9 +718,10 @@ func (cl *call) flush() (frames int) {
 	}
 	if cl.exited {
 		b, _ := json.Marshal(struct {
-			Code  int    `json:"code"`
-			Error string `json:"error,omitempty"`
-		}{cl.code, cl.startErr})
+			Code    int    `json:"code"`
+			Error   string `json:"error,omitempty"`
+			Timeout bool   `json:"timeout,omitempty"`
+		}{cl.code, cl.startErr, cl.timedOut})
 		cl.sub.send(fExit, cl.id, b)
 		frames++
 	}

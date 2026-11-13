@@ -449,6 +449,18 @@ async def test_a_timed_out_call_is_released_with_no_exit(
     await asyncio.wait_for(released.wait(), 5)
 
 
+async def test_a_command_execd_killed_at_its_timeout_raises(daemons: Daemons) -> None:
+    async def times_out(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
+
+    await daemons.serve(times_out)
+    with pytest.raises(TimeoutError, match="Command timed out after 60s"):
+        await asyncio.wait_for(  # well inside the client's own timeout
+            daemons.client().exec(["sleep", "99"], None, None, {}, None, 60), 30
+        )
+
+
 async def test_a_failed_restart_after_start_is_not_retryable(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
