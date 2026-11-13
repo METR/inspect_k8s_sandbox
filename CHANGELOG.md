@@ -90,7 +90,7 @@
   than raising a `RuntimeError` that says the user does not exist.
 - `exec()`, `read_file()` and `write_file()` no longer find the programs they run
   besides the caller's command through the image's `PATH`: `exec(user=...)` runs
-  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir` (and
+  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
   `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
   them there. The caller's command still
   runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.
