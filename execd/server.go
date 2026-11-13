@@ -234,13 +234,14 @@ func (s *server) detach(c *conn) {
 			afterFunc(abandonAfter, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
+				running := !cl.exited
 				if orphaned {
 					// Not forgotten: "unknown call" would have the client send its START again.
 					cl.abandoned, cl.gone, cl.out, cl.stdinQ = true, true, [2][]byte{}, nil
 					cl.room.Broadcast()
 				}
 				cl.mu.Unlock()
-				if orphaned {
+				if orphaned && running { // what a command that ended left running is not the call's to kill
 					cl.kill()
 				}
 			})

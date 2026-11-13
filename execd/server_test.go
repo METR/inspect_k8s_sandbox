@@ -602,6 +602,36 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	}
 }
 
+func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
+	var timers []func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	t.Cleanup(func() { killTagged("left") })
+	left := `(while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &` // a loop that keeps putting a file back
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "left"})
+	c := testConn(t)
+	s.start(c, frame{kind: fStart, id: 28, payload: req})
+	if code := exitCode(t, s.get(28)); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	s.detach(c) // as its RELEASE is lost
+
+	timers[0]() // six minutes with no client
+
+	os.Remove(alive)
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(alive); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("what the command left running was killed with its abandoned call")
+		}
+	}
+}
+
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
