@@ -15,7 +15,8 @@ services:
       - name: execd
         image: execd:local
         imagePullPolicy: Never
-        command: ["cp", "/execd", "/out/execd"]
+        # 111: a non-root execd is non-dumpable from its start.
+        command: ["sh", "-c", "cp /execd /out/execd && chmod 111 /out/execd"]
         volumeMounts:
           - name: execd
             mountPath: /out
