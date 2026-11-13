@@ -234,14 +234,13 @@ func (s *server) detach(c *conn) {
 			afterFunc(abandonAfter, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
-				running := !cl.exited
 				if orphaned {
 					// Not forgotten: "unknown call" would have the client send its START again.
 					cl.abandoned, cl.gone, cl.out, cl.stdinQ = true, true, [2][]byte{}, nil
 					cl.room.Broadcast()
 				}
 				cl.mu.Unlock()
-				if orphaned && running { // what a command that ended left running is not the call's to kill
+				if orphaned {
 					cl.kill()
 				}
 			})
@@ -615,9 +614,10 @@ func (cl *call) kill() {
 	cl.mu.Lock()
 	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
-	if pid > 0 { // 0, not started or reaped, would be -0: execd's own group
-		syscall.Kill(-pid, syscall.SIGKILL)
+	if pid <= 0 { // not started, or ended: what it left running is not the call's to kill, and -0 is execd's own group
+		return
 	}
+	syscall.Kill(-pid, syscall.SIGKILL)
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
 		startSearcher()

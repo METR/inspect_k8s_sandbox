@@ -530,38 +530,39 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	detach := "setsid sh -c 'echo $$; kill -STOP $$' & wait" // it names itself once out of the group a kill signals
-	// Twice: the second finds the thread that searched for the first still at work.
-	for id, tag := range map[uint64]string{22: "detached", 29: "detached later"} {
-		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: tag})
+	victims := map[uint64]int{}
+	for id := uint64(100); id < 120; id++ {
+		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached" + strconv.Itoa(int(id))})
 		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
-		var pid int
-		for pid == 0 {
-			select {
-			case f := <-frames:
-				if f.kind == fStdout {
-					pid, _ = strconv.Atoi(strings.TrimSpace(string(f.payload)))
-				}
-			case <-time.After(30 * time.Second):
-				t.Fatal("the command never printed what it detached")
+	}
+	for len(victims) < 20 {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout {
+				pid, _ := strconv.Atoi(strings.TrimSpace(string(f.payload)))
+				victims[f.id] = pid
+				t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
 			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("a command never printed what it detached")
 		}
-		t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+	}
 
+	for id := range victims { // at once: their searches wait in turn for the one thread
 		s.dispatch(c, frame{kind: fKill, id: id})
+	}
 
-		// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
+	// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
+	for id, pid := range victims {
 		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
-				t.Fatalf("process %d, which the command detached, outlived its kill", pid)
+				t.Fatalf("process %d, which call %d's command detached, outlived its kill", pid, id)
 			}
 		}
 	}
 	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable.
 	if dumpable() {
 		t.Fatal("dumpable once it has killed a command run as another user")
-	}
-	for range 200 { // many searches at once, each of which takes the identity
-		s.dispatch(c, frame{kind: fKill, id: 22})
 	}
 	// The identity is one thread's, for the search alone: on another it would fail what execd does as itself.
 	for deadline := time.Now().Add(30 * time.Second); len(borrowed()) > 0; time.Sleep(10 * time.Millisecond) {
@@ -613,24 +614,37 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	t.Cleanup(func() { killTagged("left") })
-	left := `(while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &` // a loop that keeps putting a file back
+	// Once let go, it leaves a loop running that keeps putting a file back, prints and ends.
+	left := `until [ -e "$0.go" ]; do sleep 0.01; done; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 & echo x`
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "left"})
 	c := testConn(t)
 	s.start(c, frame{kind: fStart, id: 28, payload: req})
-	if code := exitCode(t, s.get(28)); code != 0 {
-		t.Fatalf("exit %d", code)
+	cl := s.get(28)
+	cl.output(0, make([]byte, maxUnacked+1)) // all that execd holds for a client: what it prints now waits, and its exit with that
+	os.WriteFile(alive+".go", nil, 0o644)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		cl.mu.Lock()
+		ended := cl.pid == 0
+		cl.mu.Unlock()
+		if ended {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
 	}
-	s.detach(c) // as its RELEASE is lost
+	s.detach(c)
 
 	timers[0]() // six minutes with no client
+	cl.kill()   // and the client's KILL, on finding the call abandoned
 
 	os.Remove(alive)
-	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		if _, err := os.Stat(alive); err == nil {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("what the command left running was killed with its abandoned call")
+			t.Fatal("what the command left running was killed after it ended")
 		}
 	}
 }
