@@ -223,11 +223,14 @@ async def test_a_lost_exec_raises_the_restart_that_explains_it_and_so_do_later_o
         pod.read_file(Path("/tmp/x"), io.BytesIO()),
         pod.exec_stdio(["cat"], None),
     ]
+    turns: list[bool] = []
     for operation in later:
+        asyncio.get_running_loop().call_soon(turns.append, True)
         with pytest.raises(ContainerRestartedError):
             await operation
 
     assert daemons.connections == 2  # none of them reached a daemon
+    assert len(turns) == 4  # each gave way first: a caller may retry in a loop
 
 
 async def test_what_ran_when_a_restart_was_found_raises_it_too(
@@ -246,20 +249,22 @@ async def test_what_ran_when_a_restart_was_found_raises_it_too(
     pod = Pod("p", "ns", None, "default", "uid", 0, "raise", execd=True)
     assert pod._execd is not None
     pod._execd._start = daemons.client()._start
-    stream = await pod.exec_stdio(["cat"], None)
+    stream, idle = [await pod.exec_stdio(["cat"], None) for _ in range(2)]
     receiving = asyncio.create_task(stream.receive())
     running = [
         asyncio.create_task(pod.exec(["true"], None, None, {}, None, 10)),
         asyncio.create_task(pod.write_file(b"x", Path("/tmp/x"))),
         asyncio.create_task(pod.read_file(Path("/tmp/x"), io.BytesIO())),
     ]
-    await until(lambda: daemons.connections == 4)
+    await until(lambda: daemons.connections == 5)
 
     with patch("k8s_sandbox._pod.op.k8s_client", autospec=True) as api:
         restarted = _k8s_pod("uid", "default", restart_count=1)
         api.return_value.read_namespaced_pod.return_value = restarted
         with pytest.raises(ContainerRestartedError):
             await pod.check_for_pod_restart()
+    with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
+        await asyncio.wait_for(idle.receive(), 30)  # with no output to wait for
     found.set()
 
     for operation in running:
@@ -267,8 +272,9 @@ async def test_what_ran_when_a_restart_was_found_raises_it_too(
             await operation
     with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
         await receiving
-    with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
-        await stream.send(b"to a container that is gone")
+    for send in (stream.send(b"to a container that is gone"), stream.send_eof()):
+        with pytest.raises(anyio.BrokenResourceError, match="ContainerRestartedError"):
+            await send
 
 
 async def test_a_daemon_that_is_gone_is_started_again(daemons: Daemons) -> None:
@@ -304,6 +310,25 @@ async def test_a_port_held_at_the_first_start_says_so(daemons: Daemons) -> None:
 
     with pytest.raises(RuntimeError, match="held by a process other than execd"):
         await run(daemons.client())
+
+
+async def test_what_answers_without_tls_is_not_our_daemon(daemons: Daemons) -> None:
+    async def answers_in_http(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+
+    server = await daemons.serve(exits)
+    daemons.fail_start(execd.DaemonRunning("bind: address already in use"))
+    client = daemons.client()
+    await run(client)
+    port = server.sockets[0].getsockname()[1]
+    server.close()  # as execd gone, and its port taken by another process
+    plain = await asyncio.start_server(answers_in_http, "127.0.0.1", port)
+    daemons.servers.append(plain)
+
+    with pytest.raises(RuntimeError, match="held by a process other than execd"):
+        await run(client)
+
+    assert daemons.starts == [True, True]  # the second to replace what isn't ours
 
 
 async def test_a_daemon_that_is_not_ours_gets_no_key_and_is_replaced(
@@ -413,7 +438,7 @@ async def test_a_daemon_that_goes_silent_is_a_lost_connection(
 async def test_a_loop_too_busy_to_read_does_not_take_execd_for_silent(
     daemons: Daemons, tls: Tls, monkeypatch: MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(execd, "DEAD_AFTER", 0.2)
+    monkeypatch.setattr(execd, "DEAD_AFTER", 0.1)  # less than the loop is held
     monkeypatch.setattr(tls[0], "num_tickets", 0)  # so only the answer is to be read
 
     async def answers_while_the_loop_is_held(
@@ -524,9 +549,11 @@ def frozen_clock(monkeypatch: MonkeyPatch) -> list[float]:
         frame(execd.EXIT, b'{"code": "0"}'),
         frame(execd.EXIT, b'{"code": 0, "error": 5}'),
         frame(execd.EXIT, b"[" * 2000 + b"]" * 2000),
+        frame(execd.EXIT, b'{"code": 0, "timeout": "no"}'),
     ],
     ids=["many-frames", "unknown-type", "large-output", "exit-not-an-object"]
-    + ["exit-code-not-a-number", "exit-error-not-text", "exit-nested-too-deep"],
+    + ["exit-code-not-a-number", "exit-error-not-text", "exit-nested-too-deep"]
+    + ["exit-timeout-not-a-flag"],
 )
 async def test_what_execd_never_sends_breaks_its_daemon_for_good(
     daemons: Daemons, monkeypatch: MonkeyPatch, sent: bytes
@@ -785,6 +812,13 @@ async def test_a_stream_carries_stdin_and_stdout_to_the_command_s_exit(
 
     await stream.send(b"abc")
     assert await stream.receive(2) == b"ab"
+    with anyio.CancelScope() as cancelled:
+        cancelled.cancel()
+        await stream.receive()
+        pytest.fail("a cancelled receive took output")
+    with anyio.CancelScope() as cancelled:
+        cancelled.cancel()
+        await stream.send(b"from a caller that is gone")
     assert await stream.receive() == b"c"
     await stream.send_eof()
 

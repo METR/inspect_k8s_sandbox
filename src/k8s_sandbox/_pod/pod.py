@@ -265,7 +265,7 @@ class Pod:
         drops, as one whose connection was lost.
         """
         if self._execd is not None:
-            self._raise_restart()
+            await self._raise_found_restart()
             return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
@@ -338,10 +338,16 @@ class Pod:
         reader = ReadFileOperation(self._info)
         await self._after_failure_check(lambda: reader.read_file(src, dst))
 
+    async def _raise_found_restart(self) -> None:
+        """Raise a restart found already, once other tasks have had a turn."""
+        if self._restart_error is not None:
+            await asyncio.sleep(0)  # a caller retrying in a loop must not hold the loop
+            self._raise_restart()
+
     async def _over_execd(self, run: Callable[[ExecdClient], Awaitable[T]]) -> T:
         """Run an operation over execd, raising a restart found before or meanwhile."""
         assert self._execd is not None
-        self._raise_restart()
+        await self._raise_found_restart()
         try:
             result = await run(self._execd)
         except Exception:
@@ -401,12 +407,8 @@ class Pod:
                 raise
             return result
 
-        # Not queued behind other operations if it was found already, but suspended
-        # first, as queueing would have: a caller retrying in a loop must not hold the
-        # event loop.
-        if self._restart_error is not None:
-            await asyncio.sleep(0)
-            self._raise_restart()
+        # Not queued behind other operations if it was found already.
+        await self._raise_found_restart()
         executor = PodOpExecutor.get_instance()
         try:
             result = await executor.queue_operation(run, discard=discard)

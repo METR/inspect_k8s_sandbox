@@ -25,7 +25,11 @@ from inspect_ai.util import SandboxEnvironmentLimits as limits
 from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
-from k8s_sandbox._pod.execute import _STDERR_TAIL_BYTES, EXEC_USER_URL
+from k8s_sandbox._pod.execute import (
+    _STDERR_TAIL_BYTES,
+    EXEC_USER_URL,
+    _land_pending_cancel,
+)
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
 from k8s_sandbox._pod.read import read_command
 
@@ -123,6 +127,8 @@ class _Conn:
             except ssl.SSLWantReadError:
                 await self._flush()
                 await self._fill()
+            except ssl.SSLError as e:  # what answers doesn't speak TLS, as execd does
+                raise NotOurDaemon(f"the server on the execd port: {e}") from e
         await self._flush()
 
     def write(self, kind: int, payload: bytes = b"") -> None:
@@ -154,7 +160,12 @@ class _Conn:
         """Parse an EXIT: {"code": n[, "error": why][, "timeout": true]}."""
         with contextlib.suppress(ValueError, LookupError, TypeError, RecursionError):
             status = json.loads(payload)
-            if type(status["code"]) is int and type(status.get("error", "")) is str:
+            fields = (
+                status["code"],
+                status.get("error", ""),
+                status.get("timeout", False),
+            )
+            if tuple(map(type, fields)) == (int, str, bool):
                 return status
         raise self._broken("an EXIT that is not a status")
 
@@ -492,8 +503,10 @@ class ExecdStream(ByteStream):
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
+        await _land_pending_cancel()  # before it takes output its caller won't get
         if self._closed:
             raise anyio.ClosedResourceError
+        self._drop_if_restarted()
         while not self._stdout:
             if self._closed:  # while it waited
                 raise anyio.ClosedResourceError
@@ -536,12 +549,13 @@ class ExecdStream(ByteStream):
             raise anyio.BrokenResourceError(repr(error)) from error
 
     async def send(self, item: bytes) -> None:
-        if self._closed:
-            raise anyio.ClosedResourceError
-        self._drop_if_restarted()
-        if self._ended is not None:
-            raise anyio.BrokenResourceError("the command has ended")
         async with self._send_lock:
+            await _land_pending_cancel()  # also one that came as it waited for the lock
+            if self._closed:
+                raise anyio.ClosedResourceError
+            self._drop_if_restarted()
+            if self._ended is not None:
+                raise anyio.BrokenResourceError("the command has ended")
             try:
                 for i in range(0, len(item), CHUNK):
                     await self._conn.send(STDIN, item[i : i + CHUNK])
@@ -550,6 +564,7 @@ class ExecdStream(ByteStream):
 
     async def send_eof(self) -> None:
         async with self._send_lock:
+            self._drop_if_restarted()
             with contextlib.suppress(OSError):
                 await self._conn.send(STDIN)
 
