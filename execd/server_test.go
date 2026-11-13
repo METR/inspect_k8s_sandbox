@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -843,5 +844,60 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Fatalf("a RESUME of call %d got no answer", id)
 		}
+	}
+}
+
+func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
+	var armed atomic.Bool
+	taken, count := make(chan struct{}), make(chan struct{})
+	afterRead = func() {
+		if armed.Swap(false) {
+			close(taken)
+			<-count
+		}
+	}
+	t.Cleanup(func() { afterRead = func() {} })
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	const head = maxUnacked + 1 // unacked, it makes the reader wait in output() with what it reads next
+	script := "head -c " + strconv.Itoa(head) + " /dev/zero; read x; printf a; read x; printf b"
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: map[string]string{}, Stdin: true, Tag: "o"})
+	s.dispatch(c, frame{kind: fStart, id: 9, payload: req})
+	cl, got := s.get(9), 0
+	next := func() byte {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout {
+				got += len(f.payload)
+			}
+			return f.kind
+		case <-time.After(30 * time.Second):
+			t.Fatalf("no frame after %d bytes of stdout", got)
+			return 0
+		}
+	}
+	for got < head {
+		next()
+	}
+
+	armed.Store(true)
+	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "a"
+	<-taken                                                          // a reader has taken "a" and not counted it
+	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "b" and exits
+	for pid := -1; pid != 0; time.Sleep(10 * time.Millisecond) {     // until the exit has been noticed
+		cl.mu.Lock()
+		pid = cl.pid
+		cl.mu.Unlock()
+	}
+	close(count)
+	time.Sleep(300 * time.Millisecond) // a slow client: longer than an exit waits once it thinks all is delivered
+	s.dispatch(c, frame{kind: fAck, id: 9, payload: []byte(`{"stdout":` + strconv.Itoa(head) + `}`)})
+
+	for next() != fExit {
+	}
+	if got != head+2 {
+		t.Fatalf("%d of %d bytes of stdout arrived: the exit stopped reading the pipe", got, head+2)
 	}
 }
