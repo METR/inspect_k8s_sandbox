@@ -552,6 +552,82 @@ async def test_callers_share_one_reconnect(
     assert opens == 1
 
 
+async def test_only_a_resume_waits_out_a_reconnect(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, 10)
+    stale = client._link
+    assert stale is not None
+    await stale.close()
+
+    back = asyncio.Event()
+    connect = execd._connect
+
+    async def refused_until_back(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        if not back.is_set():
+            raise ConnectionRefusedError
+        return await connect(daemon, pace)
+
+    async def still_running(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("address already in use")
+
+    monkeypatch.setattr(execd, "_connect", refused_until_back)
+    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 0.5)  # past the reconnect's first try
+    client._start = still_running
+    resume = asyncio.create_task(client._get(stale))
+
+    with pytest.raises(ConnectionError, match="ConnectionRefusedError"):
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    back.set()
+    assert await asyncio.wait_for(resume, 30) is not stale
+
+
+async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    started = 0
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal started
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                started += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert client._link is not None
+    await client._link.close()
+    connect, reopened = execd._connect, asyncio.Event()
+
+    async def held(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        await reopened.wait()
+        return await connect(daemon, pace)
+
+    monkeypatch.setattr(execd, "_connect", held)
+    call = asyncio.create_task(client.exec(["true"], None, None, {}, None, None))
+    await until(lambda: client._opening is not None and not client._opening.done())
+    assert client._opening is not None
+    client._opening.add_done_callback(lambda _: call.cancel())
+    reopened.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    # Its START follows any the cancelled call sent.
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert started == 2
+
+
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch: MonkeyPatch,
 ) -> None:
