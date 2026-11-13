@@ -129,8 +129,9 @@ func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
 	s.authenticated(testConn(t))
 
 	s.dispatch(first, frame{kind: fStart, id: 4, payload: req}) // its call may have run and been released
+	s.start(first, frame{kind: fStart, id: 5, payload: req})    // or it was replaced after dispatch had looked
 
-	if s.get(4) != nil {
+	if s.get(4) != nil || s.get(5) != nil {
 		t.Fatal("a START from a replaced connection ran")
 	}
 }

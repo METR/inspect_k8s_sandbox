@@ -283,6 +283,10 @@ func (s *server) start(c *conn, f frame) {
 	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
+	if s.current != nil && s.current != c { // replaced since dispatch looked: its client may have run this call again by now
+		s.mu.Unlock()
+		return
+	}
 	if _, dup := s.calls[f.id]; dup {
 		s.mu.Unlock()
 		c.send(fError, f.id, []byte("call id in use"))
