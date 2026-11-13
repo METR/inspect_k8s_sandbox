@@ -454,6 +454,25 @@ async def test_a_command_whose_connection_closed_before_it_was_sent_is_retryable
         await call
 
 
+async def test_a_command_whose_connection_closed_after_it_was_sent_is_not_retryable(
+    daemons: Daemons,
+) -> None:
+    connections = 0
+
+    async def drops(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        if connections == 1:
+            await read_frame(r)  # START: the command may have run
+        w.close()  # the reopened connection is gone before the RESUME is written
+
+    await daemons.serve(drops)
+
+    # A ConnectionError would be retried, running the command again.
+    with pytest.raises(ExecdResultUnknownError):
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
