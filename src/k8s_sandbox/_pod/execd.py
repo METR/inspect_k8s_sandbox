@@ -94,6 +94,10 @@ class Dropped(Exception):
     """The connection carrying a call ended before the call did."""
 
 
+class NotSent(ConnectionError):
+    """Nothing of a frame was written: its connection had closed."""
+
+
 class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
 
@@ -295,6 +299,8 @@ class Link:
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
         async with self._wlock:
+            if self.pipe._writer.transport.is_closing():  # close() aborts it too
+                raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
             try:
                 await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
@@ -578,6 +584,8 @@ class ExecdClient:
             except (K8sError, ExecResultUnknownError):
                 raise  # a restart found while reconnecting, or already the answer
             except Exception as e:  # a lost connection, or a restart that failed
+                if sender is None and isinstance(e, NotSent):
+                    raise  # the START never left, so nothing ran: it is retried
                 raise ExecdResultUnknownError(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,

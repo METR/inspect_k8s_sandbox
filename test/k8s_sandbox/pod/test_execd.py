@@ -320,6 +320,27 @@ async def test_connection_lost_after_start_is_not_retryable(
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
 
 
+async def test_a_command_whose_connection_closed_before_it_was_sent_is_retryable(
+    daemons: Daemons,
+) -> None:
+    async def reads(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await r.read()
+
+    await daemons.serve(reads)
+    sandbox = daemons.client()
+    link = await sandbox._get()
+    async with link._wlock:  # another call's write
+        call = asyncio.create_task(
+            sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+        )
+        await until(lambda: bool(link.calls))  # it waits to send its START
+        await link.close()  # the connection drops meanwhile
+
+    # Nothing ran, and an ExecdResultUnknownError would fail the sample.
+    with pytest.raises(ConnectionError):
+        await call
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
