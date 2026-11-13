@@ -116,6 +116,23 @@ def test_get_returncode_real_no_exit_code_response(mock_response: WSClient) -> N
     assert "no entry in `details.causes` with `reason`=='ExitCode'" in str(e.value)
 
 
+def test_get_returncode_real_no_details_response(mock_response: WSClient) -> None:
+    """What containerd 2.3.7 sends for an exec that it could not start."""
+    mock_response.read_channel.return_value = yaml.dump(
+        {
+            "status": "Failure",
+            "message": "Internal error occurred: error executing command in container: failed to exec in container: failed to load task: context deadline exceeded",  # noqa: E501
+            "reason": "InternalError",
+            "code": 500,
+        }
+    )
+
+    with pytest.raises(GetReturncodeError) as e:
+        get_returncode(mock_response)
+
+    assert "no entry in `details.causes` with `reason`=='ExitCode'" in str(e.value)
+
+
 def test_get_returncode_when_response_is_open(mock_response: WSClient) -> None:
     mock_response.is_open.return_value = True
 
