@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -9,6 +10,7 @@ from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
 from k8s_sandbox import _sandbox_environment
+from k8s_sandbox._pod import pod
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
     ExecdResultUnknownError,
@@ -44,7 +46,7 @@ def _make_sandbox() -> tuple[K8sSandboxEnvironment, MagicMock]:
     specific AsyncMock methods without mypy method-assign errors.
     """
     sandbox = object.__new__(K8sSandboxEnvironment)
-    mock_pod = MagicMock()
+    mock_pod = mock.create_autospec(pod.Pod, instance=True)
     sandbox._pod = mock_pod
     mock_pod.info = MagicMock()
     mock_pod.info.name = "test-pod"
@@ -52,16 +54,13 @@ def _make_sandbox() -> tuple[K8sSandboxEnvironment, MagicMock]:
     sandbox._config.default_user = None
     sandbox.release = MagicMock()
     sandbox.release.task_name = "test-task"
-    mock_pod.check_for_pod_restart = AsyncMock()
     return sandbox, mock_pod
 
 
 def _make_sandbox_with_mock_pod() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.exec."""
     sandbox, mock_pod = _make_sandbox()
-    mock_exec = AsyncMock()
-    mock_pod.exec = mock_exec
-    return sandbox, mock_exec
+    return sandbox, mock_pod.exec
 
 
 def _make_sandbox_with_mock_read() -> tuple[K8sSandboxEnvironment, AsyncMock]:
