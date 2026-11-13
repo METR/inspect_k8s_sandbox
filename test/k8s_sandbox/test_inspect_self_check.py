@@ -1,3 +1,4 @@
+import asyncio
 from typing import AsyncGenerator
 
 import pytest
@@ -101,3 +102,29 @@ async def test_a_command_is_found_on_the_path_as_its_user(
     )
 
     assert result.stdout == "nobody\n", result
+
+
+async def test_a_kill_reaches_what_another_users_command_detached(
+    transport: str, sandboxes: dict[str, K8sSandboxEnvironment]
+) -> None:
+    if transport == "exec":
+        pytest.skip("Kubernetes exec leaves what a command started running")
+    root = sandboxes["default"]
+    # setsid takes it out of the process group a kill signals.
+    detach = "setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' & wait"
+    command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))
+
+    async def detached() -> str:
+        while not (pid := (await root.exec(["cat", "/tmp/detached"])).stdout):
+            await asyncio.sleep(0.1)
+        return pid.strip()
+
+    pid = await asyncio.wait_for(detached(), 30)
+    command.cancel()
+
+    async def gone() -> None:
+        while (await root.exec(["test", "-e", f"/proc/{pid}"])).success:
+            await asyncio.sleep(0.1)
+
+    # Without CAP_SYS_PTRACE root can't read the user's environment for the call's tag.
+    await asyncio.wait_for(gone(), 30)

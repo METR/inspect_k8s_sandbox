@@ -43,6 +43,7 @@ type call struct {
 	id  uint64
 	tag string
 	pid int
+	as  *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
 	stdinGot int  // bytes of stdin received
@@ -358,7 +359,7 @@ func (cl *call) run(req startRequest) error {
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
 	cl.mu.Lock()
-	cl.pid = p.Pid // before Release, which sets it to -1
+	cl.pid, cl.as = p.Pid, attr.Credential // before Release, which sets it to -1
 	cl.mu.Unlock()
 	p.Release()
 	var deadline *time.Timer
@@ -587,12 +588,17 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
 	cl.mu.Lock()
-	pid := cl.pid
+	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
 	if pid > 0 { // 0, not started or reaped, would be -0: execd's own group
 		syscall.Kill(-pid, syscall.SIGKILL)
 	}
 	killTagged(cl.tag)
+	if as != nil { // without CAP_SYS_PTRACE only the command's user can read its processes' environments
+		if p, err := os.StartProcess("/proc/self/exe", []string{"execd", "kill", cl.tag}, &os.ProcAttr{Sys: &syscall.SysProcAttr{Credential: as}}); err == nil {
+			p.Release()
+		}
+	}
 }
 
 func (cl *call) finish(code int, startErr string) {

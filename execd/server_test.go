@@ -6,12 +6,22 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// kill() runs this binary, as it runs execd, to look for a call's processes as its user.
+func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == "kill" {
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
 
 func testConn(t *testing.T) *conn {
 	a, b := net.Pipe()
@@ -382,5 +392,40 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	// Root sees roots/tool first; the user can't run it, and their shell goes on to the next.
 	if code := exitCode(t, s.get(21)); code != 7 {
 		t.Fatalf("exit %d, want 7 from the tool the user can run", code)
+	}
+}
+
+func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	detach := "setsid sh -c 'echo $$; kill -STOP $$' & wait" // it names itself once out of the group a kill signals
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached"})
+	s.dispatch(c, frame{kind: fStart, id: 22, payload: req})
+	var pid int
+	for pid == 0 {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout {
+				pid, _ = strconv.Atoi(strings.TrimSpace(string(f.payload)))
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("the command never printed what it detached")
+		}
+	}
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+
+	s.dispatch(c, frame{kind: fKill, id: 22})
+
+	// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, which the command detached, outlived its kill", pid)
+		}
 	}
 }

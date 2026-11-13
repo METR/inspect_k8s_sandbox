@@ -8,7 +8,7 @@
   TLS to execd instead of Kubernetes exec stdin. There, a timed-out `exec()` and its
   background processes get SIGKILL at once, not SIGTERM. One that leaves the command's
   process group survives if it clears its environment or, without `CAP_SYS_PTRACE`,
-  makes itself non-dumpable or runs as another `user`. Make execd mode 111, and give
+  makes itself non-dumpable or changes user. Make execd mode 111, and give
   the sandbox neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`, or a process
   running as execd's user can stand in for it while it starts. What a pod's execd
   sends is paced at 4,096 frames and 128 MiB a second.
