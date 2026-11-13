@@ -42,8 +42,23 @@ def _pod(
 def _patch_client(pods, events=None):
     client = MagicMock()
     client.list_namespaced_pod.return_value = V1PodList(items=pods)
-    client.list_namespaced_event.return_value = CoreV1EventList(items=events or [])
-    return patch("k8s_sandbox._diagnostics.k8s_client", return_value=client)
+
+    def list_events(namespace, field_selector, limit, **kwargs) -> CoreV1EventList:
+        """As the API server does: the events the selector matches, cut to the limit."""
+        matching = []
+        for event in events or []:
+            fields = {
+                f"type={event.type}",
+                f"involvedObject.name={event.involved_object.name}",
+            }
+            if fields.issuperset(field_selector.split(",")):
+                matching.append(event)
+        return CoreV1EventList(items=matching[:limit])
+
+    client.list_namespaced_event.side_effect = list_events
+    return patch(
+        "k8s_sandbox._diagnostics.k8s_client", autospec=True, return_value=client
+    )
 
 
 def test_surfaces_oom_killed_reason_exit_code_and_restart_count() -> None:
@@ -165,10 +180,38 @@ def test_surfaces_failed_scheduling_event_when_pod_has_no_container_statuses() -
     # Warning events are filtered server-side rather than in Python, and bounded.
     mock_client_factory.return_value.list_namespaced_event.assert_called_once_with(
         "default",
-        field_selector="type=Warning",
+        field_selector="type=Warning,involvedObject.name=rel-default",
         limit=_MAX_EVENTS,
         _request_timeout=_READ_TIMEOUT,
     )
+
+
+def test_surfaces_an_event_listed_after_other_releases_events() -> None:
+    pods = [_pod("rel-default", "Pending", container_statuses=None)]
+    events = [
+        CoreV1Event(
+            metadata=V1ObjectMeta(name=f"evt-{i}"),
+            involved_object=V1ObjectReference(name=f"another-release-{i}"),
+            reason="FailedScheduling",
+            message="not this release's problem",
+            type="Warning",
+        )
+        for i in range(_MAX_EVENTS)
+    ]
+    events.append(
+        CoreV1Event(
+            metadata=V1ObjectMeta(name="evt-rel"),
+            involved_object=V1ObjectReference(name="rel-default"),
+            reason="FailedScheduling",
+            message="0/1 nodes available",
+            type="Warning",
+        )
+    )
+
+    with _patch_client(pods, events):
+        summary = describe_release_pods(None, "default", "rel")
+
+    assert summary == "event (FailedScheduling): 0/1 nodes available"
 
 
 def test_surfaces_a_controller_event_when_it_cannot_create_its_pod() -> None:

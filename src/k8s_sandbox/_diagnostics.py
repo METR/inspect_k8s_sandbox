@@ -11,8 +11,7 @@ logger = logging.getLogger(__name__)
 # These run on an error path, often one reached *because* the API is not answering,
 # so they must not outlive the error they are decorating.
 _READ_TIMEOUT = (5, 30)  # (connect, read) seconds
-# The event list is namespace-wide and every sample asks for it at once when an eval
-# times out together. Enough to name the cause, not enough to be a second incident.
+# Per object: every sample asks at once when an eval times out together.
 _MAX_EVENTS = 100
 
 
@@ -97,18 +96,17 @@ def _describe_warning_events(
     client: CoreV1Api, namespace: str, names: set[str]
 ) -> list[str]:
     """Return formatted Warning events that involve any of the named objects."""
-    events = client.list_namespaced_event(  # type: ignore[call-arg]
-        namespace,
-        field_selector="type=Warning",
-        limit=_MAX_EVENTS,
-        _request_timeout=_READ_TIMEOUT,
-    )
     lines: list[str] = []
-    for event in events.items:
-        involved = event.involved_object
-        if involved is None or involved.name not in names:
-            continue
-        lines.append(f"event ({event.reason}): {event.message}")
+    for name in sorted(names):
+        # The server filters: a namespace-wide limit goes to other releases' events.
+        events = client.list_namespaced_event(  # type: ignore[call-arg]
+            namespace,
+            field_selector=f"type=Warning,involvedObject.name={name}",
+            limit=_MAX_EVENTS,
+            _request_timeout=_READ_TIMEOUT,
+        )
+        for event in events.items:
+            lines.append(f"event ({event.reason}): {event.message}")
     return lines
 
 
