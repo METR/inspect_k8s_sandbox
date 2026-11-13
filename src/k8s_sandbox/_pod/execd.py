@@ -53,11 +53,11 @@ CHUNK = 1 << 20
 MAX_FRAME = 2 * CHUNK
 MAX_CONTROL = 4096  # any other frame: a little JSON or a short message
 MAX_ACK = 64  # execd's {"stdin": n}; each one is parsed, even a stray
-ACK_EVERY = 4 << 20  # execd pauses a command past 32 MiB unacked per stream
-HOLD = 2 * ((32 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
+ACK_EVERY = 1 << 20  # execd pauses a command past 4 MiB unacked per stream
+HOLD = 2 * ((4 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
-MAX_STRAY_BYTES = 4 * HOLD  # their payload: output still in flight for calls given up
+MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers per second: past any, reading waits, so a stand-in can't hold
 # the runner's loop. execd sends output in reads of up to 256 KiB.
@@ -287,6 +287,7 @@ class Link:
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
         ]
+        self._last: set[asyncio.Task[None]] = set()  # held until sent
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
         async with self._wlock:
@@ -297,6 +298,20 @@ class Link:
                 # a peer that stopped reading must not hold the lock other calls need
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
+
+    async def send_last(self, call_id: int, *kinds: int) -> None:
+        """Send a call's last empty frames, even if the caller is cancelled."""
+
+        async def send() -> None:
+            with contextlib.suppress(OSError):
+                for kind in kinds:
+                    await self.send(kind, call_id)
+
+        # A task of its own: anyio cancels a cancelled caller again at each await.
+        task = asyncio.create_task(send())
+        self._last.add(task)
+        task.add_done_callback(self._last.discard)
+        await asyncio.shield(task)
 
     async def _read(self) -> None:
         reader = self.pipe
@@ -393,6 +408,7 @@ class ExecdClient:
         self._pace = Pace()
         self._opened = float("-inf")
         self._backoff = 0.0
+        self._failed: BaseException | None = None  # why the open under way last failed
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -418,6 +434,7 @@ class ExecdClient:
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
+                self._failed = e
                 if link is not None:
                     await link.close()
                 if time.monotonic() > deadline:
@@ -436,9 +453,17 @@ class ExecdClient:
             return link
         if self._opening is None or self._opening.done():
             wait = FIRST_OPEN_FOR if link is None else RECONNECT_FOR
+            self._failed = None
             self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
-        # Shared: every caller waits on the one reconnect, not on a queue of them.
-        self._link = await asyncio.shield(self._opening)
+            # Retrieved here, as no caller may still wait when it fails.
+            self._opening.add_done_callback(lambda f: f.cancelled() or f.exception())
+        # Shared: callers wait on one open; a new call gives up on a reopen sooner.
+        opening = self._opening
+        new_call = stale is None and link is not None
+        await asyncio.wait({opening}, timeout=FIRST_OPEN_FOR if new_call else None)
+        if not opening.done():
+            raise ConnectionError(f"execd unreachable: {self._failed!r}")
+        self._link = opening.result()
         return self._link
 
     async def run(
@@ -489,9 +514,8 @@ class ExecdClient:
                     if isinstance(item, Dropped):
                         sender.cancel()
                         link.calls.pop(call.id, None)
-                        # Shielded: other calls may wait on the same reconnect.
-                        reconnect = asyncio.shield(self._get(stale=link))
-                        link = await asyncio.wait_for(reconnect, left)
+                        # No shield: _get waits without cancelling the shared reopen.
+                        link = await asyncio.wait_for(self._get(stale=link), left)
                         if link.daemon is not call.daemon:
                             raise ExecResultUnknownError(
                                 "execd stopped while it ran the command",
@@ -508,9 +532,13 @@ class ExecdClient:
                         yield kind, payload
                         await _taken(link, call, kind, len(payload))
                     elif kind == EXIT:
-                        finished = True
-                        with contextlib.suppress(OSError):
-                            await link.send(RELEASE, call.id)
+                        finished = True  # no KILL: it would end what it left running
+                        try:
+                            with contextlib.suppress(OSError):
+                                await link.send(RELEASE, call.id)
+                        except BaseException:  # cut off: it may not have gone out
+                            await link.send_last(call.id, RELEASE)
+                            raise
                         yield EXIT, json.loads(payload)  # {"code": n[, "error": ...]}
                         return
                     elif kind == RESUMED:  # send the stdin it didn't get
@@ -553,12 +581,12 @@ class ExecdClient:
         finally:
             if sender is not None:
                 sender.cancel()
-            if not finished and not link.closed:
-                # Abandoned by the caller (an output limit, a cancel): stop it.
-                with contextlib.suppress(OSError):
-                    await link.send(KILL, call.id)
-                    await link.send(RELEASE, call.id)
-            link.calls.pop(call.id, None)
+            try:
+                if not finished and not link.closed:
+                    # Abandoned by the caller (an output limit, a cancel): stop it.
+                    await link.send_last(call.id, KILL, RELEASE)
+            finally:
+                link.calls.pop(call.id, None)
 
     async def _upload(
         self, link: Link, call: Call, stdin: bytes | None, offset: int
@@ -577,13 +605,22 @@ class ExecdClient:
         try:
             await link.send(KILL, call.id)
             end = time.monotonic() + KILL_WAIT
+            drained = 0
             while time.monotonic() < end:
                 item = await _next(call.queue, end - time.monotonic())
-                if isinstance(item, tuple) and item[0] == EXIT:
-                    break
-            await link.send(RELEASE, call.id)
+                if not isinstance(item, tuple) or item[0] == EXIT:
+                    break  # its exit, or a dropped connection
+                # acks let execd finish; past HOLD give up, as RELEASE frees the call
+                if item[0] in (STDOUT, STDERR):
+                    if drained + len(item[1]) > call.hold:
+                        break
+                    drained += len(item[1])
+                    await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
+        # Even with no exit: it frees what execd holds for the call.
+        with contextlib.suppress(OSError):
+            await link.send(RELEASE, call.id)
 
     async def exec(
         self,
@@ -727,9 +764,7 @@ class ExecdClient:
             await link.send(START, call.id, json.dumps(request).encode())
         except BaseException:
             link.calls.pop(call.id, None)
-            with contextlib.suppress(OSError):  # the START may have gone out
-                await link.send(KILL, call.id)
-                await link.send(RELEASE, call.id)
+            await link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
             raise
         return ExecdStream(link, call)
 
@@ -843,9 +878,5 @@ class ExecdStream(ByteStream):
         self._call.stdin_room.set()  # a send waiting for room sees the close
         self._call.queue.put_nowait(Dropped())  # and so does a receive
         self._link.calls.pop(self._call.id, None)
-        with contextlib.suppress(OSError):
-            await self._link.send(
-                STDIN, self._call.id
-            )  # EOF: the command may end itself
-            await self._link.send(KILL, self._call.id)
-            await self._link.send(RELEASE, self._call.id)
+        # EOF first: the command may end itself
+        await self._link.send_last(self._call.id, STDIN, KILL, RELEASE)

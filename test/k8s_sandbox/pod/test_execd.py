@@ -349,6 +349,85 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     await task
 
 
+async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None:
+    released = asyncio.Event()
+
+    async def full_after_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        while True:
+            kind, _, _ = await read_frame(r)
+            if kind == execd.KILL:  # the killed command's last output fills the window
+                for _ in range(4):
+                    w.write(frame(execd.STDOUT, call_id, b"x" * execd.CHUNK))
+            elif kind == execd.ACK:  # room for the rest of it: the call exits
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
+            elif kind == execd.RELEASE:
+                released.set()
+
+    await daemons.serve(full_after_kill)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
+        )
+    await asyncio.wait_for(released.wait(), 5)
+
+
+async def test_a_timed_out_call_takes_no_more_than_its_hold(daemons: Daemons) -> None:
+    acked = 0
+
+    async def sends_while_acked(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal acked
+        _, call_id, _ = await read_frame(r)  # START
+        more = frame(execd.STDOUT, call_id, b"x" * (execd.CHUNK * 3 // 2))
+        while True:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.ACK:
+                acked = max(acked, sum(json.loads(payload).values()))
+            if kind in (execd.KILL, execd.ACK):  # never exits; sends again when acked
+                w.write(more)
+
+    await daemons.serve(sends_while_acked)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
+        )
+    assert 0 < acked <= execd.HOLD
+
+
+async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
+    daemons: Daemons,
+) -> None:
+    async def drops_on_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while (await read_frame(r))[0] != execd.KILL:
+            pass
+        w.transport.abort()
+
+    await daemons.serve(drops_on_kill)
+    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
+        await asyncio.wait_for(
+            daemons.client().exec(["sleep", "9"], None, None, {}, None, 1), 5
+        )
+
+
+async def test_a_timed_out_call_is_released_with_no_exit(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 0.5)
+    released = asyncio.Event()
+
+    async def never_exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            if (await read_frame(r))[0] == execd.RELEASE:
+                released.set()
+
+    await daemons.serve(never_exits)
+    with pytest.raises(TimeoutError):
+        await daemons.client().exec(["sleep", "9"], None, None, {}, None, 1)
+    await asyncio.wait_for(released.wait(), 5)
+
+
 async def test_a_failed_restart_after_start_is_not_retryable(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
@@ -552,6 +631,82 @@ async def test_callers_share_one_reconnect(
     assert opens == 1
 
 
+async def test_only_a_resume_waits_out_a_reconnect(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, 10)
+    stale = client._link
+    assert stale is not None
+    await stale.close()
+
+    back = asyncio.Event()
+    connect = execd._connect
+
+    async def refused_until_back(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        if not back.is_set():
+            raise ConnectionRefusedError
+        return await connect(daemon, pace)
+
+    async def still_running(replace: bool) -> execd.Daemon:
+        raise execd.DaemonRunning("address already in use")
+
+    monkeypatch.setattr(execd, "_connect", refused_until_back)
+    monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 0.5)  # past the reconnect's first try
+    client._start = still_running
+    resume = asyncio.create_task(client._get(stale))
+
+    with pytest.raises(ConnectionError, match="ConnectionRefusedError"):
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    back.set()
+    assert await asyncio.wait_for(resume, 30) is not stale
+
+
+async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    started = 0
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal started
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                started += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert client._link is not None
+    await client._link.close()
+    connect, reopened = execd._connect, asyncio.Event()
+
+    async def held(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        await reopened.wait()
+        return await connect(daemon, pace)
+
+    monkeypatch.setattr(execd, "_connect", held)
+    call = asyncio.create_task(client.exec(["true"], None, None, {}, None, None))
+    await until(lambda: client._opening is not None and not client._opening.done())
+    assert client._opening is not None
+    client._opening.add_done_callback(lambda _: call.cancel())
+    reopened.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    # Its START follows any the cancelled call sent.
+    await client.exec(["true"], None, None, {}, None, 10)
+    assert started == 2
+
+
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -643,19 +798,136 @@ async def test_a_stream_cancelled_as_it_starts_is_killed(
 
     await daemons.serve(records)
     send = execd.Link.send
+    scope = anyio.CancelScope()
+    writers: list[asyncio.Task[None]] = []
+
+    async def writes(link: execd.Link) -> None:  # another call's
+        async with link._wlock:
+            await asyncio.sleep(0.1)
 
     async def cancelled_after_start(
         link: execd.Link, kind: int, call_id: int, payload: bytes = b""
     ) -> None:
         await send(link, kind, call_id, payload)
         if kind == execd.START:
-            raise asyncio.CancelledError
+            writers.append(asyncio.create_task(writes(link)))
+            scope.cancel()  # anyio cancels again at each await, unlike asyncio
+            await asyncio.sleep(1)
 
     monkeypatch.setattr(execd.Link, "send", cancelled_after_start)
 
-    with pytest.raises(asyncio.CancelledError):
+    with scope:
         await daemons.client().open_stream(["cat"], None)
-    await until(lambda: execd.KILL in got)
+    await writers[0]
+    await until(lambda: execd.RELEASE in got)
+
+    assert scope.cancelled_caught
+    assert got == [execd.START, execd.KILL, execd.RELEASE]
+
+
+async def test_a_call_cancelled_while_another_writes_is_killed(
+    daemons: Daemons,
+) -> None:
+    got: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            got.append((await read_frame(r))[0])
+
+    await daemons.serve(records)
+    client = daemons.client()
+    scope = anyio.CancelScope()
+
+    async def call() -> None:
+        with scope:
+            await client.exec(["sleep", "60"], None, None, {}, None, None)
+
+    task = asyncio.create_task(call())
+    await until(lambda: execd.START in got)
+    link = client._link
+    assert link is not None
+    async with link._wlock:  # another call's write
+        scope.cancel()  # anyio cancels again at each await, unlike asyncio
+        await asyncio.sleep(0.1)
+    await task
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.KILL in got
+    assert not link.calls
+
+
+async def test_a_call_cancelled_as_it_exits_is_released(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    got: list[int] = []
+    go, releasing = asyncio.Event(), asyncio.Event()
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            got.append(kind)
+            if kind == execd.START:
+                await go.wait()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(exits)
+    send = execd.Link.send
+
+    async def signals_release(
+        link: execd.Link, kind: int, call_id: int, payload: bytes = b""
+    ) -> None:
+        if kind == execd.RELEASE:
+            releasing.set()
+        await send(link, kind, call_id, payload)
+
+    monkeypatch.setattr(execd.Link, "send", signals_release)
+    client = daemons.client()
+    scope = anyio.CancelScope()
+
+    async def call() -> None:
+        with scope:
+            await client.exec(["true"], None, None, {}, None, None)
+
+    task = asyncio.create_task(call())
+    await until(lambda: execd.START in got)
+    link = client._link
+    assert link is not None
+    async with link._wlock:  # another call's write
+        go.set()
+        await releasing.wait()
+        scope.cancel()
+        await asyncio.sleep(0.1)
+    await task
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.KILL not in got  # it exited: a KILL would end what it left running
+
+
+async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> None:
+    got: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            got.append((await read_frame(r))[0])
+
+    await daemons.serve(records)
+    stream = await daemons.client().open_stream(["cat"], None)
+    writing = asyncio.Event()
+
+    async def writes() -> None:  # another call's
+        async with stream._link._wlock:
+            writing.set()
+            await asyncio.sleep(0.1)
+
+    writer = asyncio.create_task(writes())
+    await writing.wait()
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        await stream.aclose()
+    await writer
+    await until(lambda: execd.RELEASE in got)
+
+    assert got[-3:] == [execd.STDIN, execd.KILL, execd.RELEASE]
 
 
 async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
