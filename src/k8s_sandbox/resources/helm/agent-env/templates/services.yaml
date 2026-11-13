@@ -55,7 +55,7 @@ spec:
       {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 0
+      terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
       {{- if $.Values.corednsUpstream }}
       {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
       dnsPolicy: None

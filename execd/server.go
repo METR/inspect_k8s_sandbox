@@ -39,6 +39,8 @@ const abandonAfter = 6 * time.Minute
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves
 
+var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
+
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 
@@ -429,6 +431,7 @@ func (cl *call) run(req startRequest) error {
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
+					afterRead()
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
@@ -449,8 +452,8 @@ func (cl *call) run(req startRequest) error {
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
-			want[i] = buffered(r) // before the count, so want can't fall short
-			want[i] += read[i].Load()
+			want[i] = buffered(r)               // before the count, so want can't fall short
+			want[i] += read[i].Load() + 256<<10 // a read under way has taken bytes it hasn't counted
 		}
 		done := make(chan struct{})
 		go func() { drained.Wait(); close(done) }()

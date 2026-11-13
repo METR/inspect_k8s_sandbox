@@ -25,7 +25,11 @@ from inspect_ai.util import SandboxEnvironmentLimits as limits
 from k8s_sandbox._error import K8sError
 from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import ExecResultUnknownError, PodError
+from k8s_sandbox._pod.error import (
+    ExecdResultUnknownError,
+    ExecResultUnknownError,
+    PodError,
+)
 from k8s_sandbox._pod.execute import _STDERR_TAIL_BYTES, EXEC_USER_URL
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
 from k8s_sandbox._pod.read import read_command
@@ -88,6 +92,10 @@ class Daemon:
 
 class Dropped(Exception):
     """The connection carrying a call ended before the call did."""
+
+
+class NotSent(ConnectionError):
+    """Nothing of a frame was written: its connection had closed."""
 
 
 class DaemonRunning(Exception):
@@ -291,6 +299,8 @@ class Link:
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
         async with self._wlock:
+            if self.pipe._writer.transport.is_closing():  # close() aborts it too
+                raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
             try:
                 await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
@@ -517,7 +527,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         link = await asyncio.wait_for(self._get(stale=link), left)
                         if link.daemon is not call.daemon:
-                            raise ExecResultUnknownError(
+                            raise ExecdResultUnknownError(
                                 "execd stopped while it ran the command",
                                 pod=link.daemon.ip,
                             )
@@ -565,7 +575,7 @@ class ExecdClient:
                         await link.send(START, call.id, start)
                         sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                     elif kind == ERROR:
-                        raise ExecResultUnknownError(
+                        raise ExecdResultUnknownError(
                             f"execd: {payload.decode(errors='replace')}",
                             pod=link.daemon.ip,
                         )
@@ -574,7 +584,9 @@ class ExecdClient:
             except (K8sError, ExecResultUnknownError):
                 raise  # a restart found while reconnecting, or already the answer
             except Exception as e:  # a lost connection, or a restart that failed
-                raise ExecResultUnknownError(
+                if sender is None and isinstance(e, NotSent):
+                    raise  # the START never left, so nothing ran: it is retried
+                raise ExecdResultUnknownError(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,
                 ) from e

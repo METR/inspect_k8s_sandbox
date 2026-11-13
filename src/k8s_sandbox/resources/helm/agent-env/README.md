@@ -44,6 +44,7 @@
 | services.default.resources | object | see [templates/services.yaml](./templates/services.yaml) | Resource requests and limits for the container. |
 | services.default.runtimeClassName | string | `"gvisor"` | The container runtime e.g. gvisor or runc. The default is gvisor if not specified or set to `null`. |
 | services.default.securityContext | object | `{}` | Privilege and access control settings for the container. |
+| services.default.terminationGracePeriodSeconds | int | `0` | Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it. |
 | services.default.tolerations | list | `[]` | Toleration settings for the Pod. |
 | services.default.volumeMounts | list | `[]` | Volume mounts that will be mounted in the container. Volumes defined in `volumes:` as colon-separated strings will automatically be mounted at their specified mount paths. |
 | services.default.volumes | list | `[]` | Volumes accessible to the container. Supports arbitrary yaml or colon-separated strings of the form `volume-name:/mount-path`. |

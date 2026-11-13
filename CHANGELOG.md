@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
+  runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
@@ -55,12 +57,12 @@
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
   background process holding its stdout or stderr open now returns a tenth of a
   second after the command exits, rather than at once.
-- `exec()` no longer runs a command a second time when its connection to the pod is
-  lost while the command runs, and no longer returns a successful result whose output
-  lost its end on the way. Both raise `ExecResultUnknownError` (as the cause of a
-  `K8sError`), a `GetReturncodeError` that is not retried, since the command may have
-  run; or, if the container restarted or was replaced meanwhile, that error. A
-  connection lost before the command was sent is still retried.
+- `exec()` no longer returns a successful result whose output lost its end on the way.
+  That, and a connection to the pod lost while the command runs, raise
+  `ExecResultUnknownError` (as the cause of a `K8sError`), a `GetReturncodeError` that is
+  retried as before, so the command may run a second time; or, if the container
+  restarted or was replaced meanwhile, that error, which is not retried. A pod with
+  execd resumes the command instead, and never runs it a second time.
 - `exec()` runs fewer programs in the container per call, which makes it faster
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).
@@ -88,7 +90,7 @@
   than raising a `RuntimeError` that says the user does not exist.
 - `exec()`, `read_file()` and `write_file()` no longer find the programs they run
   besides the caller's command through the image's `PATH`: `exec(user=...)` runs
-  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir` (and
+  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
   `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
   them there. The caller's command still
   runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.

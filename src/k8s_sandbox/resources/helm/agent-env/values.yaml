@@ -156,6 +156,9 @@ services:
     # -- Annotations added to this service's Pod alone; on a clash they win over the
     # top-level `annotations`.
     podAnnotations: {}
+    # -- Seconds a deleted Pod of this service may take to stop. At 0 it leaves the
+    # API at once, before its node has stopped it.
+    terminationGracePeriodSeconds: 0
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"
