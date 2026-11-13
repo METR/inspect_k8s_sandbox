@@ -270,7 +270,8 @@ class Pod:
         drops, as one whose connection was lost.
         """
         if self._execd is not None:
-            return await self._execd.open_stream(cmd, user)
+            self._raise_restart()
+            return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
         stack, ws_client = await self._run_async(

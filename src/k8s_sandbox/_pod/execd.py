@@ -754,7 +754,12 @@ class ExecdClient:
             raise PodError(str(e)) from e
         raise PodError("execd ended the file operation without an exit code")
 
-    async def open_stream(self, argv: list[str], user: str | None) -> ExecdStream:
+    async def open_stream(
+        self,
+        argv: list[str],
+        user: str | None,
+        restarted: Callable[[], Exception | None] | None = None,
+    ) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
         link = await self._get()
         call = Call(
@@ -779,7 +784,7 @@ class ExecdClient:
             link.calls.pop(call.id, None)
             await link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
             raise
-        return ExecdStream(link, call)
+        return ExecdStream(link, call, restarted)
 
 
 async def _next(
@@ -815,9 +820,15 @@ async def _taken(link: Link, call: Call, kind: int, n: int) -> None:
 class ExecdStream(ByteStream):
     """A command's stdin and stdout over execd; a dropped connection ends it."""
 
-    def __init__(self, link: Link, call: Call) -> None:
+    def __init__(
+        self,
+        link: Link,
+        call: Call,
+        restarted: Callable[[], Exception | None] | None,
+    ) -> None:
         self._link = link
         self._call = call
+        self._restarted = restarted  # the restart found since the stream opened, if any
         self._stdout = bytearray()
         self._ended: BaseException | None = None
         self._closed = False
@@ -831,6 +842,7 @@ class ExecdStream(ByteStream):
             raise ValueError("max_bytes must be at least 1")
         if self._closed:
             raise anyio.ClosedResourceError
+        self._drop_if_restarted()
         while not self._stdout:
             if self._closed:
                 raise anyio.ClosedResourceError
@@ -862,14 +874,21 @@ class ExecdStream(ByteStream):
                 self._ended = anyio.BrokenResourceError(
                     item[1].decode(errors="replace")
                 )
+        self._drop_if_restarted()  # also for output that came while this waited
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
+
+    def _drop_if_restarted(self) -> None:
+        """Fail as a lost connection does if a restart was found, as PodStdio does."""
+        if self._restarted is not None and (error := self._restarted()) is not None:
+            raise anyio.BrokenResourceError(repr(error)) from error
 
     async def send(self, item: bytes) -> None:
         if self._closed:
             raise anyio.ClosedResourceError
         async with self._send_lock:
+            self._drop_if_restarted()
             try:
                 for i in range(0, len(item), CHUNK):
                     await _window(self._link, self._call, self._sent)

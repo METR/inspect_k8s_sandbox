@@ -218,6 +218,47 @@ async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
     assert (starts, others_ran) == (1, [True])
 
 
+async def test_a_restart_found_in_raise_mode_ends_streams_over_execd(
+    daemons: Daemons, cluster: Cluster
+) -> None:
+    """Regression: a restarted container's stream stayed open, and another opened."""
+    starts = 0
+    found = asyncio.Event()
+
+    async def writes_once_found(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                await found.wait()
+                w.write(frame(execd.STDOUT, call_id, b"late"))
+
+    await daemons.serve(writes_once_found)
+    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod._execd = daemons.client()
+    stream = await pod.exec_stdio(["cat"], None)
+    waiting = asyncio.ensure_future(stream.receive())
+    await until(lambda: starts == 1)
+    cluster.restarts = 1
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.check_for_pod_restart()
+
+    with pytest.raises(anyio.BrokenResourceError):  # nothing to read: it would wait
+        await asyncio.wait_for(stream.receive(), 30)
+    found.set()
+    with pytest.raises(anyio.BrokenResourceError):  # not the restarted container's
+        await waiting
+    with pytest.raises(anyio.BrokenResourceError):
+        await stream.send(b"x")
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.exec_stdio(["cat"], None)
+    assert starts == 1
+    await stream.aclose()
+
+
 async def test_output_the_caller_has_not_taken_stays_bounded(
     daemons: Daemons,
 ) -> None:
