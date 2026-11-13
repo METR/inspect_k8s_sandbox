@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -48,9 +49,6 @@ func main() {
 	run(*port, *keyHash, *replace)
 }
 
-// What run() puts before each variable of a command's environment on its way through become.
-const commandEnv = "execd:"
-
 // become takes a user's identity (uid, gid, groups), enters cwd as them and execs argv, failing as a shell would.
 func become(cwd string, ids, argv []string) {
 	var n []int
@@ -74,13 +72,13 @@ func become(cwd string, ids, argv []string) {
 			err, code = fmt.Errorf("cd: %s: %w", cwd, errors.Unwrap(err)), 1
 		}
 	}
+	var env []string
 	if err == nil {
-		var env []string
-		for _, kv := range os.Environ() {
-			if kv, ok := strings.CutPrefix(kv, commandEnv); ok {
-				env = append(env, kv)
-			}
-		}
+		pipe := os.NewFile(3, "environment") // run()'s
+		err = json.NewDecoder(pipe).Decode(&env)
+		pipe.Close()
+	}
+	if err == nil {
 		if err = syscall.Exec(argv[0], argv, env); errors.Is(err, syscall.ENOENT) {
 			code = 127
 		}
