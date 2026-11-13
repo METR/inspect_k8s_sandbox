@@ -883,7 +883,14 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 			<-count
 		}
 	}
-	t.Cleanup(func() { afterRead = func() {} })
+	checked, acked := make(chan bool), make(chan struct{})
+	afterDrainCheck = func(late bool) {
+		select {
+		case checked <- late:
+		case <-acked:
+		}
+	}
+	t.Cleanup(func() { afterRead, afterDrainCheck = func() {}, func(bool) {} })
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
@@ -892,7 +899,7 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 	script := "head -c " + strconv.Itoa(head) + " /dev/zero; read x; printf a; read x; printf b"
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: map[string]string{}, Stdin: true, Tag: "o"})
 	s.dispatch(c, frame{kind: fStart, id: 9, payload: req})
-	cl, got := s.get(9), 0
+	got := 0
 	next := func() byte {
 		select {
 		case f := <-frames:
@@ -905,21 +912,32 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 			return 0
 		}
 	}
+	check := func() bool { // the exit has checked its pipes once more: whether its grace is over
+		select {
+		case late := <-checked:
+			return late
+		case <-time.After(30 * time.Second):
+			t.Fatal("the exit never checked its pipes")
+			return false
+		}
+	}
 	for got < head {
 		next()
 	}
 
 	armed.Store(true)
 	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "a"
-	<-taken                                                          // a reader has taken "a" and not counted it
-	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "b" and exits
-	for pid := -1; pid != 0; time.Sleep(10 * time.Millisecond) {     // until the exit has been noticed
-		cl.mu.Lock()
-		pid = cl.pid
-		cl.mu.Unlock()
+	select {
+	case <-taken: // a reader has taken "a" and not counted it
+	case <-time.After(30 * time.Second):
+		t.Fatal("no reader took the output")
 	}
+	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "b" and exits
+	check()                                                          // the exit has worked out how much to wait for, "a" not counted
 	close(count)
-	time.Sleep(300 * time.Millisecond) // a slow client: longer than an exit waits once it thinks all is delivered
+	for !check() { // a slow client: it acks only once the exit's grace is over
+	}
+	close(acked)
 	s.dispatch(c, frame{kind: fAck, id: 9, payload: []byte(`{"stdout":` + strconv.Itoa(head) + `}`)})
 
 	for next() != fExit {

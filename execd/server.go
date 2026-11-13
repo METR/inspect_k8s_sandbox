@@ -41,6 +41,8 @@ var afterFunc = time.AfterFunc // tests fire the abandon timers themselves
 
 var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
 
+var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes: late once its grace is over
+
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 
@@ -475,13 +477,16 @@ func (cl *call) run(req startRequest) error {
 			for i, r := range pipes {
 				delivered = delivered && (read[i].Load() >= want[i] || buffered(r) == 0)
 			}
-			if delivered && time.Now().After(grace) {
+			late := time.Now().After(grace)
+			if delivered && late {
 				outR.SetReadDeadline(time.Now())
 				errR.SetReadDeadline(time.Now())
+				afterDrainCheck(true)
 				<-done
 				cl.finish(code, "")
 				return
 			}
+			afterDrainCheck(late)
 		}
 	}()
 	return nil
