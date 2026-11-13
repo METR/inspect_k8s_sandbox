@@ -136,6 +136,27 @@ func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
 	}
 }
 
+func TestALateResumeOnAReplacedConnectionLeavesTheCallToTheNewOne(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "s"})
+	first, second := testConn(t), testConn(t)
+	s.authenticated(first)
+	s.start(first, frame{kind: fStart, id: 6, payload: req})
+	s.authenticated(second)
+	resume := frame{kind: fResume, id: 6, payload: []byte(`{"stdout":0,"stderr":0}`)}
+	s.resume(second, resume)
+
+	s.resume(first, resume) // dispatch had looked before the connection was replaced
+
+	cl := s.get(6)
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.sub != second {
+		t.Fatal("a RESUME from a replaced connection took the call from the client's")
+	}
+}
+
 func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 	path := os.Getenv("PATH")
 	os.Unsetenv("PATH")

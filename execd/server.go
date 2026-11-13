@@ -319,6 +319,11 @@ func (s *server) resume(c *conn, f frame) {
 	}
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	select {
+	case <-c.dead: // replaced since dispatch looked: the call is the new connection's to resume
+		return
+	default:
+	}
 	if cl.abandoned {
 		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
