@@ -437,6 +437,10 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if code := exitCode(t, s.get(21)); code != 7 {
 		t.Fatalf("exit %d, want 7 from the tool the user can run", code)
 	}
+	// The child's change of user resets the flag to the host's fs.suid_dumpable.
+	if dumpable() {
+		t.Fatal("dumpable once it has run a command as another user")
+	}
 }
 
 func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {

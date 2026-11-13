@@ -355,6 +355,7 @@ func (cl *call) run(req startRequest) error {
 	p, err := os.StartProcess("/bin/sh", append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...), &os.ProcAttr{
 		Dir: req.Cwd, Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
 	})
+	prctl(prSetDumpable, 0) // the child's change of user, in memory it shares until it execs, resets it
 	stdinR.Close()
 	outW.Close()
 	errW.Close()
