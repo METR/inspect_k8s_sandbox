@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -486,6 +487,21 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 func dumpable() bool {
 	d, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, 3, 0, 0) // PR_GET_DUMPABLE
 	return d != 0
+}
+
+func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
+	huge := filepath.Join(t.TempDir(), "environ")
+	os.WriteFile(huge, nil, 0o644)
+	os.Truncate(huge, 1<<30) // as prctl(PR_SET_MM_MAP) lets any process make its own look
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	tagged(huge, []byte("HAWK_NEXT_EXEC=huge\x00"))
+
+	runtime.ReadMemStats(&after)
+	if took := (after.TotalAlloc - before.TotalAlloc) >> 20; took > 64 {
+		t.Fatalf("took %d MiB to read an environment of 1 GiB", took)
+	}
 }
 
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -712,6 +714,20 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
+// More than execve lets an environment hold (6 MiB).
+const maxEnviron = 8 << 20
+
+// tagged says whether the environment a /proc/PID/environ file shows holds needle.
+func tagged(environ string, needle []byte) bool {
+	f, err := os.Open(environ)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
+	return bytes.Contains(append(data, 0), needle)
+}
+
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
@@ -721,8 +737,7 @@ func killTagged(tag string) {
 		if err != nil || pid == os.Getpid() {
 			continue
 		}
-		data, err := os.ReadFile("/proc/" + e.Name() + "/environ")
-		if err == nil && strings.Contains(string(data)+"\x00", string(needle)) {
+		if tagged("/proc/"+e.Name()+"/environ", needle) {
 			syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
