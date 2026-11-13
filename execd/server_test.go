@@ -351,17 +351,17 @@ func TestALostConnectionKillsWhatAProcessOutsideTheGroupForksMeanwhile(t *testin
 	}
 }
 
-func TestAProcessThatClearedItsEnvironmentIsLookedAtTenTimesOnly(t *testing.T) {
-	// It shows no environment at every look; one inside execve does at one or two.
+func TestAProcessThatClearedItsEnvironmentIsNotLookedAtForEver(t *testing.T) {
+	// It shows no environment at every look; one inside execve does at a few.
 	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "echo $$; exec env -i sleep 100"}})
-	cleared := fmt.Sprintf("/proc/%d/environ", pids(t, frames, 1)[0])
-	until(t, "env never cleared the environment", func() bool {
-		environment, err := os.ReadFile(cleared)
-		return err == nil && len(environment) == 0
+	pid := pids(t, frames, 1)[0]
+	until(t, "sleep never started", func() bool {
+		name, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		return string(name) == "sleep\n"
 	})
 
-	// Others here may be inside execve too, each for a look or two more.
-	if looks := killTagged("no call's tag"); looks > 50 {
+	// Thirty looks at it, and others here may be inside execve for a few more.
+	if looks := killTagged("no call's tag"); looks > 60 {
 		t.Fatalf("%d looks for a tag no process holds", looks)
 	}
 }

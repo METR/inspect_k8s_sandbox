@@ -452,8 +452,8 @@ func killTagged(tag string) int {
 				continue
 			}
 			if len(data) == 0 {
-				// A zombie has no exe. One that cleared its environment never shows one: ten looks, no more.
-				if _, err := os.Readlink("/proc/" + e.Name() + "/exe"); err == nil && empty[pid] < 10 {
+				// A zombie has no exe. One that cleared its environment never shows one: thirty looks, no more.
+				if _, err := os.Readlink("/proc/" + e.Name() + "/exe"); err == nil && empty[pid] < 30 {
 					empty[pid]++
 					again = true
 				}
