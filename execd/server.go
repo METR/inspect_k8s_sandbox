@@ -28,6 +28,7 @@ type server struct {
 	preauth     chan struct{} // a slot per connection not yet authenticated
 	authTimeout time.Duration // for a connection to send its AUTH
 	pingEvery   time.Duration
+	workdir     string // where execd started, and so does a command given no cwd
 	// How long execd reads on after an exit: a close with stdin unread could reset the EXIT away.
 	lingerFor time.Duration
 }
@@ -57,8 +58,9 @@ func newServer(keyHashHex string) (*server, error) {
 	if err != nil || len(h) != sha256.Size {
 		return nil, fmt.Errorf("key hash must be 64 hex characters")
 	}
+	workdir, _ := os.Getwd()
 	return &server{
-		keyHash: h, preauth: make(chan struct{}, maxPreauth),
+		keyHash: h, preauth: make(chan struct{}, maxPreauth), workdir: workdir,
 		authTimeout: 10 * time.Second, pingEvery: 15 * time.Second, lingerFor: time.Minute,
 	}, nil
 }
@@ -259,7 +261,8 @@ func (c *call) start(req startRequest) error {
 		}
 		return err
 	}
-	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
+	os.Chdir(c.s.workdir) // by its path, as Kubernetes exec does: a command may have replaced the directory
+	reaper.mu.Lock()      // so the reaper cannot collect the exit before it is registered
 	p, err := os.StartProcess("/bin/sh", append([]string{"sh", "-c", script, "sh"}, args...), &os.ProcAttr{
 		Env: childEnv(req.Env), Files: []*os.File{stdinR, outW, errW}, Sys: attr,
 	})
@@ -295,11 +298,7 @@ func (c *call) start(req startRequest) error {
 	var read [2]atomic.Int64 // bytes read from each pipe
 	pipes := []*os.File{outR, errR}
 	for i, r := range pipes {
-		drained.Add(1)
-		go func() {
-			defer drained.Done()
-			c.copyOut(byte(fStdout+i), r, &read[i])
-		}()
+		drained.Go(func() { c.copyOut(byte(fStdout+i), r, &read[i]) })
 	}
 	go func() {
 		code := <-exited

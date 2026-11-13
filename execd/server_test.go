@@ -484,11 +484,35 @@ func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 }
 
 func TestOutputWrittenBeforeTheExitArrivesThoughAChildHoldsThePipe(t *testing.T) {
-	_, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!"}})
+	client, frames := begin(t, testServer(), startRequest{Argv: []string{"sh", "-c", "sleep 100 & echo $!"}})
 
-	pids(t, frames, 1) // the child's, which keeps stdout open: the exit must not wait for it
+	child := pids(t, frames, 1)[0] // which keeps stdout open: the exit must not wait for it
 	if status := exit(t, frames); status.Code != 0 {
 		t.Fatalf("exit %+v", status)
+	}
+
+	client.Close()
+
+	time.Sleep(50 * time.Millisecond) // long enough for execd to kill the child, if it would
+	if gone(child) {
+		t.Fatal("closing a finished call's connection killed what its command left running")
+	}
+}
+
+func TestACommandGivenNoCwdStartsWhereExecdDidThoughTheDirectoryWasReplaced(t *testing.T) {
+	s := testServer()
+	tests := s.workdir
+	t.Cleanup(func() { os.Chdir(tests) }) // back where the tests run
+	s.workdir = filepath.Join(t.TempDir(), "work")
+	for _, content := range []string{"old", "new"} { // as a command's rm -rf and mkdir of it
+		os.RemoveAll(s.workdir)
+		os.Mkdir(s.workdir, 0o755)
+		os.WriteFile(filepath.Join(s.workdir, "f"), []byte(content), 0o644)
+		_, frames := begin(t, s, startRequest{Argv: []string{"cat", "f"}})
+
+		if got, _ := output(t, frames); string(got[fStdout]) != content {
+			t.Fatalf("cat f gave %q, want %q: the command ran in the directory that was removed", got[fStdout], content)
+		}
 	}
 }
 
