@@ -55,7 +55,8 @@ spec:
       {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 0
+      {{- /* Not 0, which drops a deleted Pod from the API before the kubelet has stopped it. */}}
+      terminationGracePeriodSeconds: 1
       {{- if $.Values.corednsUpstream }}
       {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
       dnsPolicy: None

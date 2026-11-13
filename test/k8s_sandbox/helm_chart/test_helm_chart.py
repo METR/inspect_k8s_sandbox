@@ -32,6 +32,7 @@ def test_default_chart(chart_dir: Path) -> None:
     assert services[0]["spec"]["template"]["metadata"]["labels"][
         "aisi.gov.uk/k8s-sandbox-version"
     ] == _chart_version(chart_dir)
+    assert services[0]["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 1
     default_container = next(
         c
         for c in services[0]["spec"]["template"]["spec"]["containers"]

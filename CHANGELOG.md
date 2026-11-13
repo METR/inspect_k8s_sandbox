@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Sandbox Pods have a termination grace period of 1 second instead of 0, so a deleted
+  Pod stays `Terminating` until its node has stopped it. Before, a Pod waiting for room
+  on a full node could start while the deleted one still held its memory.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
   mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
   at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
