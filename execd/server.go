@@ -339,6 +339,9 @@ func (s *server) resume(c *conn, f frame) {
 }
 
 func (cl *call) run(req startRequest) error {
+	if strings.HasPrefix(req.Argv[0], "-") { // bash and busybox would read it as an option of their exec
+		return &os.PathError{Op: "exec", Path: req.Argv[0], Err: syscall.ENOENT}
+	}
 	req.Env["HAWK_NEXT_EXEC"] = req.Tag
 	argv := append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...)
 	dir := req.Cwd

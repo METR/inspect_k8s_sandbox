@@ -467,6 +467,20 @@ func TestACommandNamedLikeAShellBuiltinIsTheOneOnThePath(t *testing.T) {
 	}
 }
 
+func TestACommandNamedLikeAnOptionIsNotFound(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"-c", "true"}, Env: map[string]string{}, Tag: "o"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 34, payload: req})
+
+	// bash would run `true` with no environment and busybox nothing, both as options of their exec: the shell isn't asked.
+	cl := s.get(34)
+	if code := exitCode(t, cl); code != 127 || cl.startErr == "" {
+		t.Fatalf("exit %d, start error %q: want 127 from execd itself", code, cl.startErr)
+	}
+}
+
 func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
