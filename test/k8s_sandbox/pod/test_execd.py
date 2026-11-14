@@ -1,4 +1,5 @@
 import asyncio
+import collections.abc
 import contextlib
 import gc
 import hashlib
@@ -15,7 +16,6 @@ import subprocess
 import threading
 import time
 import types
-from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import anyio
 import inspect_ai.util
@@ -26,8 +26,12 @@ from k8s_sandbox import _helm
 from k8s_sandbox._pod import error, execd, op, snapshot
 from k8s_sandbox._pod import pod as pod_module
 
-Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
-TlsDaemon = Callable[[Handler], Awaitable[execd.ExecdClient]]
+Handler = collections.abc.Callable[
+    [asyncio.StreamReader, asyncio.StreamWriter], collections.abc.Awaitable[None]
+]
+TlsDaemon = collections.abc.Callable[
+    [Handler], collections.abc.Awaitable[execd.ExecdClient]
+]
 
 
 async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
@@ -96,7 +100,7 @@ def daemons(monkeypatch: pytest.MonkeyPatch) -> Daemons:
     return stand_ins
 
 
-async def until(condition: Callable[[], bool]) -> None:
+async def until(condition: collections.abc.Callable[[], bool]) -> None:
     """Wait for a condition; the budget only bounds a hang."""
 
     async def poll() -> None:
@@ -224,7 +228,9 @@ def cluster(monkeypatch: pytest.MonkeyPatch) -> Cluster:
 async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
     tls_daemon: TlsDaemon,
     cluster: Cluster,
-    operation: Callable[[pod_module.Pod], Awaitable[object]],
+    operation: collections.abc.Callable[
+        [pod_module.Pod], collections.abc.Awaitable[object]
+    ],
 ) -> None:
     """Regression: a cached connection kept serving a restarted container's sample."""
     starts = 0
@@ -1666,7 +1672,7 @@ async def test_the_stray_count_spans_reconnects(
 
 
 async def test_a_daemon_that_drops_each_connection_is_reconnected_with_backoff(
-    daemons: Daemons,
+    daemons: Daemons, clock: types.SimpleNamespace
 ) -> None:
     connections = 0
 
@@ -1678,10 +1684,11 @@ async def test_a_daemon_that_drops_each_connection_is_reconnected_with_backoff(
 
     await daemons.serve(drops)
 
-    with pytest.raises(TimeoutError):
-        await daemons.client().exec(["true"], None, None, {}, None, 1)
+    with pytest.raises(TimeoutError):  # the budget only bounds a hang
+        call = daemons.client().exec(["true"], None, None, {}, None, 1)
+        await asyncio.wait_for(call, 30)
 
-    # Paced: a handful in the second, where an unpaced loop makes hundreds.
+    # Paced: a handful before the waits between them pass the second.
     assert connections <= 10
 
 
@@ -1710,7 +1717,7 @@ async def test_only_one_fingerprint_line_starts_execd(
         def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
             return 0, printed, b""
 
-    async def run(f: Callable[[], object]) -> object:
+    async def run(f: collections.abc.Callable[[], object]) -> object:
         return f()
 
     async def no_restart() -> None:
@@ -1731,7 +1738,7 @@ async def test_only_one_fingerprint_line_starts_execd(
 
 
 def execd_starts(
-    monkeypatch: pytest.MonkeyPatch, meanwhile: Callable[[], None]
+    monkeypatch: pytest.MonkeyPatch, meanwhile: collections.abc.Callable[[], None]
 ) -> None:
     """Stand in for the exec that starts execd: meanwhile() runs as it does."""
     running = False
@@ -2035,7 +2042,9 @@ async def test_a_file_write_stops_at_the_output_limit(
 )
 async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
     tls_daemon: TlsDaemon,
-    operation: Callable[[execd.ExecdClient], Awaitable[None]],
+    operation: collections.abc.Callable[
+        [execd.ExecdClient], collections.abc.Awaitable[None]
+    ],
 ) -> None:
     async def loses_it(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
@@ -2373,19 +2382,20 @@ async def test_full_reads_spend_no_turns() -> None:
 
 
 async def test_what_a_pass_delivers_pays_for_its_decryption(
-    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    clock: types.SimpleNamespace,
 ) -> None:
     pace = execd.Pace()
     pipe = stub_pipe(1.0, [], pace)
-    clock.cpu = lambda: 1.0
-    monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
+    # One read's bytes, and less CPU than delivering them is excused.
+    read, spent = execd.RAW_READ, 40e-6
+    clock.cpu = lambda: spent
 
     # Cheaper than its credit, finishing a record begun before: nothing carried over.
-    await pipe._charge(0.0, delivered=4 * 10**9, used=2 * 10**9)
-    await pipe._charge(0.0)  # a second of CPU for nothing delivered
-    await pipe._charge(1.0, used=10**9)  # no CPU, but a GB of padding
+    await pipe._charge(0.0, delivered=read, used=read // 2)
+    await pipe._charge(0.0)  # that CPU again, for nothing delivered
+    await pipe._charge(spent, used=read)  # no CPU, but a read of padding
 
-    assert pace.tls == 1.7
+    assert pace.tls == pytest.approx(spent + read * execd.TLS_PER_BYTE)
 
 
 @pytest.fixture
@@ -2410,7 +2420,7 @@ def tls(tmp_path: pathlib.Path) -> tuple[ssl.SSLContext, str]:
 @pytest.fixture
 async def tls_daemon(
     tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
-) -> AsyncGenerator[TlsDaemon, None]:
+) -> collections.abc.AsyncGenerator[TlsDaemon, None]:
     """Serves a stand-in for execd over TLS; gives the client that pins it."""
     context, pin = tls
     servers: list[asyncio.Server] = []
@@ -2572,24 +2582,15 @@ async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
     server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
     clock.cpu = lambda: 0.0  # charge bytes only
-    charged: list[float] = []
-
-    async def take(_: execd.Pace, n: int, frames: int = 1, tls: float = 0.0) -> None:
-        charged.append(tls)
-
-    monkeypatch.setattr(execd.Pace, "take", take)
+    monkeypatch.setattr(execd, "PACE_TLS", 50e-6)  # as padding, 256 KiB costs 180 µs
 
     async def start(replace: bool) -> execd.Daemon:
         return execd.Daemon("127.0.0.1", pin, b"key")
 
-    client = execd.ExecdClient(start)
-    await client._get()
-    charged.clear()  # the handshake's and AUTH's
+    await execd.ExecdClient(start).exec(["yes"], None, None, {}, None, 30)
 
-    await client.exec(["yes"], None, None, {}, None, 30)
-
-    # Records' headers and tags; as padding, the 256 KiB would cost over 100 µs.
-    assert 0 < sum(charged) < 50e-6
+    # Records' headers and tags are within it: no pass waited for the next second.
+    assert clock.now < 1
     server.close()
 
 
