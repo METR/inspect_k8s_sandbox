@@ -50,7 +50,9 @@ type call struct {
 	id  uint64
 	tag string
 	pid int
-	as  *syscall.Credential // who its command runs as, if not execd
+	// where the reaper sends its command's exit status: registered until then, so the id is still the command's
+	status chan int
+	as     *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
 	stdinGot int  // bytes of stdin received
@@ -407,11 +409,16 @@ func (cl *call) run(req startRequest) error {
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
 	cl.mu.Lock()
-	cl.pid, cl.as = p.Pid, as // before Release, which sets it to -1
+	cl.pid, cl.as, cl.status = p.Pid, as, exited // before Release, which sets it to -1
 	killed := cl.killed
 	cl.mu.Unlock()
 	if killed { // while it started: that holds even if it has ended since, for what it left running too
-		cl.end(p.Pid, as)
+		reaper.mu.Lock()
+		if ch, taken := reaper.waiting[p.Pid]; !taken || ch == exited { // not another command's id by now
+			syscall.Kill(-p.Pid, syscall.SIGKILL)
+		}
+		reaper.mu.Unlock()
+		cl.end(as)
 	}
 	p.Release()
 	var deadline *time.Timer
@@ -647,20 +654,27 @@ func (cl *call) ackLocked(req resumeRequest) {
 func (cl *call) kill() {
 	cl.mu.Lock()
 	cl.killed = true
-	pid, as := cl.pid, cl.as
+	pid, as, status := cl.pid, cl.as, cl.status
 	cl.mu.Unlock()
 	var ended [128]byte // a siginfo_t: waitid sets its first field while the child has exited and is not yet reaped
 	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
-	// Not started, or ended (even if not yet reaped, or noted as such): what it left running is not the call's to kill.
-	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH || ended[0] != 0 {
+	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
+	if pid <= 0 || ended[0] != 0 {
 		return
 	}
-	cl.end(pid, as)
+	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is the command's own
+	running := reaper.waiting[pid] == status
+	if running {
+		syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	reaper.mu.Unlock()
+	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
+		cl.end(as)
+	}
 }
 
-// end kills the command's process group and whatever carries the call's tag.
-func (cl *call) end(pid int, as *syscall.Credential) {
-	syscall.Kill(-pid, syscall.SIGKILL)
+// end kills whatever carries the call's tag.
+func (cl *call) end(as *syscall.Credential) {
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
 		go func() { searches <- search{cl.tag, as} }()
@@ -812,7 +826,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper reaps every child, orphans included; it waits on mu until run() registers the PID.
+// The reaper reaps every child, orphans included, under mu: an id is freed and its status sent in one step, and run() registers a new one in another.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int
@@ -834,15 +848,16 @@ func startReaper() {
 		for range sigs {
 			for {
 				var ws syscall.WaitStatus
+				reaper.mu.Lock()
 				pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
 				if pid <= 0 || err != nil {
+					reaper.mu.Unlock()
 					break
 				}
 				code := ws.ExitStatus()
 				if ws.Signaled() {
 					code = 128 + int(ws.Signal())
 				}
-				reaper.mu.Lock()
 				if ch, ok := reaper.waiting[pid]; ok {
 					delete(reaper.waiting, pid)
 					ch <- code
