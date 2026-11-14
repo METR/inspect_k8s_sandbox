@@ -83,9 +83,10 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
 workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; true' | tr '\n' ' '; }
-worker=$(workers)
-[ -n "$worker" ] && pass "one worker for the pod on its node: pid $worker, uid $(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status") (not root), CapEff $(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status")" \
-  || fail "no worker for $NS/$SANDBOX on $node: $(k -n "$LNS" logs "$(launcher)" --tail=5 2>&1 | tr '\n' '|')"
+worker=$(workers); uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
+[ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
+  && pass "one worker for the pod on its node: pid $worker, uid $uid, CapEff $caps" \
+  || fail "expected one worker for $NS/$SANDBOX on $node, not root and with no capability: pids '$worker', uid '$uid', CapEff '$caps'; the launcher says: $(k -n "$LNS" logs "$(launcher)" --tail=5 2>&1 | tr '\n' '|')"
 
 say "2. a listed host answers"
 code=$(in_sandbox curl -sS -o /dev/null -m 60 -w '%{http_code} in %{time_total}s' "$LISTED" 2>&1)
