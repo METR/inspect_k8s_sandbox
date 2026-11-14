@@ -80,7 +80,7 @@ PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to th
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 # shortcut: AWS's guest agent reorders exec messages in flight, drop with its fix
 MESSAGE_GAP = 0.001
-MESSAGE_SIZE = 64 << 10  # one a gap: 50 MiB/s of writes; 256 KiB was reordered
+MESSAGE_SIZE = 64 << 10  # one a gap; at 256 KiB they were still reordered
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone

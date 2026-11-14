@@ -2839,12 +2839,14 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
 ) -> None:
     """Regression: a message a write, which AWS's guest agent reordered in flight."""
     sent: list[bytes] = []
+    at: list[float] = []
 
     class Records(anyio.abc.ByteStream):
-        """An exec's stdio that keeps each message written to it."""
+        """An exec's stdio that keeps each message written to it, and when."""
 
         async def send(self, item: bytes) -> None:
             sent.append(item)
+            at.append(clock.now)
 
         async def receive(self, max_bytes: int = 65536) -> bytes:
             await asyncio.Event().wait()
@@ -2862,13 +2864,15 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     stdio.write(b"while it ")
     stdio.write(b"is on its way")
     await until(lambda: len(sent) == 2)
-    stdio.write(b"x" * (2 * execd.MESSAGE_SIZE + 1))
-    await until(lambda: len(sent) == 5)
+    upload = bytes(range(256)) * 600  # 150 KiB: more than a message may carry
+    stdio.write(upload)
+    await until(lambda: sum(map(len, sent[2:])) == len(upload))
     stdio.abort()
 
     assert sent[1] == b"while it is on its way"
-    assert [len(message) for message in sent[2:]] == [*[execd.MESSAGE_SIZE] * 2, 1]
-    assert clock.now >= 4 * execd.MESSAGE_GAP  # each waited out the last one's gap
+    assert b"".join(sent[2:]) == upload and max(map(len, sent)) <= 65536
+    # On the fake clock: every message a millisecond or more after the one before.
+    assert all(later - earlier >= 0.001 for earlier, later in zip(at, at[1:]))
 
 
 async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
