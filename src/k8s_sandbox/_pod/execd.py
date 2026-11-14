@@ -519,7 +519,12 @@ class ExecdClient:
         finished = False
         try:
             try:
-                await link.send(START, call.id, start)
+                try:
+                    await link.send(START, call.id, start)
+                except NotSent:
+                    raise
+                except OSError:  # it may have left: the resume asks execd
+                    call.queue.put_nowait(Dropped(link))
                 sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                 while True:
                     left = (

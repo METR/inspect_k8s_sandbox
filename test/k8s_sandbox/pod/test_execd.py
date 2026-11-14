@@ -575,6 +575,38 @@ async def test_a_command_whose_connection_closed_after_it_was_sent_is_resumed(
     assert (result.returncode, starts) == (7, 1)
 
 
+async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
+    daemons: Daemons,
+) -> None:
+    """Regression: a START cut mid-write failed the call; execd can say if it ran."""
+    starts = connections = 0
+
+    async def cuts_the_first_start(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts, connections
+        connections += 1
+        if connections == 1:
+            await r.readexactly(execd.HEADER.size)  # the START has begun to arrive
+            w.transport.abort()  # reset, the rest unread
+            return
+        _, call_id, _ = await read_frame(r)  # RESUME
+        w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        kind, call_id, _ = await read_frame(r)
+        starts += kind == execd.START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+        await r.read()
+
+    await daemons.serve(cuts_the_first_start)
+    # More than a socket takes at once, so the write is under way when it is cut.
+    argv = ["echo", "x" * (16 << 20)]
+
+    call = daemons.client().exec(argv, None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert (result.returncode, starts) == (7, 1)
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
