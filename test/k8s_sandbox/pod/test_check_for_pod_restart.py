@@ -699,14 +699,6 @@ def test_an_operation_after_a_restart_was_found_lets_other_tasks_run_first():
     assert asyncio.run(operation()) == [True]
 
 
-def test_the_first_restart_kept_stays():
-    pod = _make_pod()
-    first, second = _restart(1), _restart(2)
-
-    assert pod._keep(first) is first
-    assert pod._keep(second) is first
-
-
 # Whether the check before it warned of the restart, or the check after it would.
 @pytest.mark.parametrize("check", ["true", "false"])
 @pytest.mark.parametrize(

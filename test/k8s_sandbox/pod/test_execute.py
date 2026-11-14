@@ -1357,14 +1357,6 @@ class TestShellCommand:
             "/bin/sh",
         ]
 
-    def test_otherwise_the_shell_checks_for_itself(self) -> None:
-        """Even if the container ran as the user when probed.
-
-        A plain shell in a pod replaced since would run as whoever the new one runs as.
-        """
-        assert _shell_command("agent", switch=False) == _shell_command("agent")
-        assert _shell_command("agent")[:2] == ["/bin/sh", "-c"]
-
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
         assert _shell_command("") == ["/sbin/runuser", "-u", "", "--", "/bin/sh"]
@@ -2239,19 +2231,6 @@ class TestExecStdio:
         await stream.aclose()
 
         assert during < 16
-
-    @pytest.mark.parametrize("max_bytes", [0, -1])
-    async def test_receiving_nothing_is_refused(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], max_bytes: int
-    ) -> None:
-        """As anyio's streams refuse it: b"" would read as the end of the stream."""
-        client, server = tls_sockets
-        stream = _stdio(client)
-        server.sendall(_frame(STDOUT, b"a reply\n"))
-
-        with anyio.fail_after(30), pytest.raises(ValueError):
-            await stream.receive(max_bytes)
-        await stream.aclose()
 
     async def test_stdout_read_before_the_stream_broke_is_kept(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

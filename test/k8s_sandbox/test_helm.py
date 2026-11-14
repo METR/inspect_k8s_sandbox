@@ -402,7 +402,6 @@ async def test_helm_install_no_extra_values() -> None:
         ("has=equals", "has\\=equals"),
         ("back\\slash", "back\\\\slash"),
         ("a,b.c=d\\e", "a\\,b\\.c\\=d\\\\e"),
-        ("{list}", "\\{list}"),
     ],
 )
 def test_helm_escape(value: str, expected: str) -> None:

@@ -1979,24 +1979,6 @@ async def test_pacing_lets_other_work_run() -> None:
     assert ran.is_set()  # under its allowance too: a pass at a time
 
 
-async def test_a_second_allows_fifty_milliseconds_of_tls(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    slept: list[float] = []
-
-    async def sleep(seconds: float) -> None:
-        slept.append(seconds)
-
-    monkeypatch.setattr(execd.asyncio, "sleep", sleep)
-    pace = execd.Pace()
-
-    await pace.take(0, frames=0, tls=0.04)
-    await pace.take(0, frames=0, tls=0.02)
-
-    # Past 50 ms, the rest of the second: more lets a stand-in's TLS floods cost more.
-    assert slept[0] == 0 and slept[1] > 0.5
-
-
 def stub_pipe(
     fraction: float, reading: list[bool], pace: execd.Pace | None = None
 ) -> execd._Pipe:

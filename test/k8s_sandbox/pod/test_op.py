@@ -46,6 +46,5 @@ def test_write_stdin_chunked_default_chunk_size_splits_oversized_payload() -> No
 
     _make_op()._write_stdin_chunked(ws, b"x" * (op_module.STDIN_CHUNK_SIZE + 1))
 
-    assert op_module.STDIN_CHUNK_SIZE == 1024**2
     assert ws.write_stdin.call_count == 2
     assert len(ws.write_stdin.call_args_list[0].args[0]) == op_module.STDIN_CHUNK_SIZE

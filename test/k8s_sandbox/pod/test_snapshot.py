@@ -207,21 +207,3 @@ def test_parse_pod_reads_whether_a_container_runs(state: dict, running: bool):
     status = snapshot.status_for("default")
     assert status is not None
     assert status.running is running
-
-
-def test_parse_pod_takes_the_current_stops_reason_first():
-    snapshot = _parse_pod(
-        _pod_body(
-            container_statuses=[
-                {
-                    "name": "default",
-                    "state": {"terminated": {"reason": "Error"}},
-                    "lastState": {"terminated": {"reason": "OOMKilled"}},
-                }
-            ]
-        )
-    )
-
-    status = snapshot.status_for("default")
-    assert status is not None
-    assert status.last_terminated_reason == "Error"

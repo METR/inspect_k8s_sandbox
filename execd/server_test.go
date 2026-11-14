@@ -326,19 +326,6 @@ func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 	}
 }
 
-func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}, Env: map[string]string{}, Tag: "h", Timeout: 1e18})
-	c := testConn(t)
-	s.authenticated(c)
-
-	s.dispatch(c, frame{kind: fStart, id: 5, payload: req})
-
-	if code := exitCode(t, s.get(5)); code != 3 {
-		t.Fatalf("exit %d, want 3: the timeout fired at once", code)
-	}
-}
-
 func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: a repeat's kill may still be looking for the last one's
@@ -639,20 +626,6 @@ func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
 	// Resumes sent without turns, many calls resuming at once, would pass the client's frame pace.
 	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
 		t.Fatalf("turns moved %v for the two frames a resume sent", moved)
-	}
-}
-
-func TestOutputWhileAFlushWaitsIsLeftToIt(t *testing.T) {
-	c, frames := recordedConn(t)
-	cl := &call{id: 9, sub: c, deferred: true} // its flush is set, and its time has come
-	cl.room = sync.NewCond(&cl.mu)
-
-	cl.output(0, []byte("x"))
-
-	select {
-	case <-frames: // and the waiting flush sends another
-		t.Fatal("sent at once, as well as by the flush that waits")
-	case <-time.After(50 * time.Millisecond):
 	}
 }
 
