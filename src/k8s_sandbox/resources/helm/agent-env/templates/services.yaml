@@ -65,6 +65,19 @@ spec:
         nameservers:
           - 127.0.0.1
       {{- end }}
+      {{- if and $noCard (include "shouldCreateDnsRecord" $service) }}
+      {{- /* No sidecar answers there, so the pod's own names lead to itself; /etc/hosts takes no wildcard. */}}
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+            - {{ $name }}
+            - {{ template "agentEnv.fullname" $ -}}-{{ $name }}
+            {{- range $host := $service.additionalDnsRecords }}
+            {{- if not (contains "*" $host) }}
+            - {{ $host }}
+            {{- end }}
+            {{- end }}
+      {{- end }}
 
       {{- if $service.initContainers }}
       initContainers:

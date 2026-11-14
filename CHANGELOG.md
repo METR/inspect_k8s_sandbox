@@ -24,7 +24,7 @@
   most of it kept for minutes after the command ends.
 - Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
-  sidecar.
+  sidecar, and its own service names resolve to `127.0.0.1`.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
