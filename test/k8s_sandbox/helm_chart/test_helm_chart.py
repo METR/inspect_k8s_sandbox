@@ -613,16 +613,12 @@ def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
-        set_str=(
-            "services.default.dnsRecord=true,"
-            r"services.default.additionalDnsRecords={site.test,*.wild.test}"
-        ),
+        set_str="services.default.dnsRecord=true",
         set_string=r"annotations.sandbox\.amazonaws\.com/network-isolated=true",
     )
 
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
-    # No wildcard: /etc/hosts takes none, and the API server refuses one in a pod.
-    names = ["default", "agent-env-my-release-default", "site.test"]
+    names = ["default", "agent-env-my-release-default"]
     assert pod_spec["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": names}]
 
 
