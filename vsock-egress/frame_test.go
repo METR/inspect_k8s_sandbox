@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"path/filepath"
@@ -100,12 +98,5 @@ func TestPeerThatGoesAwayAfterItsLastFrameEndsTheStream(t *testing.T) {
 	case <-ended:
 	case <-time.After(budget):
 		t.Fatal("the stream outlived its vsock connection: it would hold its slot until the proxy gave up")
-	}
-}
-
-func TestFrameLongerThanTheBoundIsRefused(t *testing.T) {
-	long := binary.BigEndian.AppendUint32(nil, maxFrame+1)
-	if err := fromFrames(io.Discard, bytes.NewReader(long), nil); !errors.Is(err, errFrame) {
-		t.Fatalf("got %v, want %v", err, errFrame)
 	}
 }

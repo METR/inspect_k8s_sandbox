@@ -3,17 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 )
 
-// maxFrame bounds a frame's payload. With its 4-byte length, a full frame is one 64 KiB vsock packet.
+// maxFrame is the most payload toFrames puts in a frame: with its 4-byte length, a full frame is one 64 KiB vsock packet.
 const maxFrame = 64<<10 - 4
-
-var errFrame = errors.New("frame longer than the bound")
 
 // A stream holds one of each while it lasts: without the pools every connection would allocate 128 KiB.
 var (
@@ -107,14 +104,11 @@ func fromFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 		if left == 0 {
 			return nil
 		}
-		if left > maxFrame {
-			return errFrame
-		}
 		for left > 0 {
 			if _, err := r.Peek(1); err != nil { // waits for more of the frame
 				return err
 			}
-			part, _ := r.Peek(min(int(left), r.Buffered()))
+			part, _ := r.Peek(int(min(left, uint32(r.Buffered())))) // a peer may claim a frame of any length: it is passed on like several
 			pace.wait(len(part))
 			if _, err := dst.Write(part); err != nil {
 				return err
