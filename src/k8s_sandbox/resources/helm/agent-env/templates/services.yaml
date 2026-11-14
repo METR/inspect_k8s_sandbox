@@ -52,7 +52,7 @@ spec:
       {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
       {{- $egressCapture := eq (get $podAnnotations "inspect-k8s-sandbox/egress-capture") "true" }}
       {{- if and $egressCapture (not $egressProxy) }}
-      {{- fail "the annotation inspect-k8s-sandbox/egress-capture needs inspect-k8s-sandbox/egress-proxy: the forwarder carries what is captured" }}
+      {{- fail "the annotation inspect-k8s-sandbox/egress-capture needs inspect-k8s-sandbox/egress-proxy" }}
       {{- end }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
@@ -125,7 +125,7 @@ spec:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
       {{- if $egressCapture }}
-        {{- /* Once, before any program of the service: none of them holds NET_ADMIN to undo it. */}}
+        {{- /* Once, before any program of the service. */}}
         - name: egress-capture
           image: {{ $.Values.egressForwarderImage | quote }}
           command: ["/vsock-egress", "redirect"]

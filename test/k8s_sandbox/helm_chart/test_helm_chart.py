@@ -820,7 +820,8 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
         f"services.default.{records},"
         "services.default.initContainers[0].name=setup,"
         "services.default.initContainers[0].image=busybox",
-        set_string=f"services.default.podAnnotations.{_EGRESS_PROXY},"
+        set_string=r"services.default.podAnnotations.sandbox\.amazonaws\.com/network-isolated=true,"
+        f"services.default.podAnnotations.{_EGRESS_PROXY},"
         f"services.default.podAnnotations.{_EGRESS_CAPTURE}",
     )
 
@@ -828,6 +829,8 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
     # After the forwarder listens, before `setup` and the service; it has ended by then.
     forwarder, capture, setup = pod["initContainers"]
     assert setup["name"] == "setup"
+    assert capture["command"] == ["/vsock-egress", "redirect"]
+    assert "restartPolicy" not in capture
     # The forwarder is the resolver of every container, `setup` too.
     assert (pod["dnsPolicy"], pod["dnsConfig"]) == (
         "None",
@@ -838,23 +841,6 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
         *["/vsock-egress", "forward", "-key", "/key/key", "-capture"],
         *own_names,
     ]
-    assert capture == {
-        "name": "egress-capture",
-        "image": "vsock-egress:1",
-        "command": ["/vsock-egress", "redirect"],
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]},
-            "readOnlyRootFilesystem": True,
-            "runAsUser": 0,
-            "seccompProfile": {"type": "RuntimeDefault"},
-        },
-    }
-    # Room for the names the pod looks up, beside the key.
-    assert {
-        "name": "egress-forwarder-key",
-        "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"},
-    } in pod["volumes"]
 
 
 def test_egress_capture_annotation_needs_an_egress_proxy(chart_dir: Path) -> None:

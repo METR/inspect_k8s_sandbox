@@ -7,12 +7,9 @@ A pod annotated `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cl
 that Service of its own namespace. Its forwarder has no resource requests, so the pod is not of the Guaranteed QoS class.
 
 A pod that also carries `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that ignore proxy
-settings. Its forwarder answers the pod's DNS queries at `127.0.0.1`: a name gets an address of its own in
-`198.18.0.0/15` (the service's own names and `additionalDnsRecords` get `127.0.0.1`), and a TCP connection to that
-address reaches the proxy as `CONNECT <name>:<port>`. An address literal, IPv6, and UDP other than those queries are not
-carried. The pod gets an init container that runs `vsock-egress redirect` as root with `NET_ADMIN` and no other
-capability, which a namespace at the `baseline` Pod Security Standard refuses. A container of the pod that holds
-`NET_ADMIN` can undo the redirect.
+settings: its forwarder is the pod's resolver. An address literal, IPv6, and UDP other than DNS are not carried. The pod
+gets an init container that runs `vsock-egress redirect` as root with `NET_ADMIN` and no other capability, which a
+namespace at the `baseline` Pod Security Standard refuses.
 
 Each node needs:
 
