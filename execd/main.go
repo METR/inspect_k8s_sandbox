@@ -22,8 +22,6 @@ import (
 	"time"
 )
 
-const foregroundEnv = "HN_EXECD_FOREGROUND"
-
 // As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
 func init() { prctl(prSetDumpable, 0) }
 
@@ -31,17 +29,15 @@ func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
-	if len(os.Args) < 2 || os.Args[1] != "listen" {
+	if len(os.Args) < 2 || os.Args[1] != "listen" && os.Args[1] != "serve" {
 		fail("usage: execd listen --port N --key-sha256 HEX")
 	}
-	fs := flag.NewFlagSet("listen", flag.ExitOnError)
+	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	port := fs.Int("port", 0, "TCP port")
 	keyHash := fs.String("key-sha256", "", "hex SHA-256 of the session key")
 	replace := fs.Bool("replace", false, "stop any execd already listening")
 	fs.Parse(os.Args[2:])
-	// The image or pod can set the marker, but only start() passes a socket as fd 3.
-	_, noStatus := syscall.GetsockoptInt(3, syscall.SOL_SOCKET, syscall.SO_TYPE)
-	if os.Getenv(foregroundEnv) == "" || noStatus != nil {
+	if os.Args[1] == "listen" { // an exec's: the daemon it starts runs "serve"
 		if *replace {
 			stopOthers()
 		}
@@ -115,9 +111,7 @@ func start() {
 	}
 	r, w := os.NewFile(uintptr(fds[0]), "status"), os.NewFile(uintptr(fds[1]), "status")
 	devnull, _ := os.Open(os.DevNull)
-	os.Unsetenv(foregroundEnv) // an inherited one would come first, and the child reads the first
-	_, err = os.StartProcess("/proc/self/exe", os.Args, &os.ProcAttr{
-		Env:   append(os.Environ(), foregroundEnv+"=1"),
+	_, err = os.StartProcess("/proc/self/exe", append([]string{os.Args[0], "serve"}, os.Args[2:]...), &os.ProcAttr{
 		Files: []*os.File{devnull, devnull, devnull, w},
 		Sys:   &syscall.SysProcAttr{Setsid: true},
 	})
@@ -135,7 +129,6 @@ func start() {
 }
 
 func run(port int, keyHash string, replace bool) {
-	os.Unsetenv(foregroundEnv)
 	status := os.NewFile(3, "status")
 	report := func(msg string) {
 		status.WriteString(msg + "\n")
@@ -168,7 +161,7 @@ func run(port int, keyHash string, replace bool) {
 	s.serve(l)
 }
 
-// stopOthers kills every other process running this binary's listen mode.
+// stopOthers kills every other process running this binary as the daemon.
 func stopOthers() {
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
@@ -178,7 +171,7 @@ func stopOthers() {
 		}
 		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
 		args := strings.Split(string(cmdline), "\x00")
-		if err == nil && len(args) > 1 && args[0] == os.Args[0] && args[1] == "listen" {
+		if err == nil && len(args) > 1 && args[0] == os.Args[0] && args[1] == "serve" {
 			syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
