@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
+// As early as it can be; only a binary its exec can't read (mode 111, and no CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH) closes the window.
 func init() { prctl(prSetDumpable, 0) }
 
 func main() {
