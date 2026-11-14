@@ -39,6 +39,8 @@ const abandonAfter = 6 * time.Minute
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
+var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
+
 var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
 
 var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes: late once its grace is over
@@ -369,6 +371,7 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
+	os.Chdir(workdir) // by its path, as Kubernetes exec does: a command may have replaced the directory
 	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
 		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
 	}

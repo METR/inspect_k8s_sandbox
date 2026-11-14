@@ -140,9 +140,9 @@ func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
 	dir, _ := filepath.EvalSymlinks(t.TempDir())
 	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
 	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
-	wd, _ := os.Getwd()
-	os.Chdir(dir)
-	t.Cleanup(func() { os.Chdir(wd) })
+	tests := workdir
+	workdir = dir // as execd started there
+	t.Cleanup(func() { workdir = tests; os.Chdir(tests) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"hello"}, Env: map[string]string{"PATH": "bin"}, Cwd: "work", Tag: "p"})
 
@@ -151,6 +151,25 @@ func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
 	// As a shell finds it: work/bin/hello, run in work.
 	if code := exitCode(t, s.get(2)); code != 7 {
 		t.Fatalf("exit %d, want hello's 7", code)
+	}
+}
+
+func TestACommandGivenNoCwdStartsWhereExecdDidThoughTheDirectoryWasReplaced(t *testing.T) {
+	tests := workdir
+	t.Cleanup(func() { workdir = tests; os.Chdir(tests) }) // back where the tests run
+	workdir = filepath.Join(t.TempDir(), "work")
+	os.Mkdir(workdir, 0o755)
+	os.Chdir(workdir) // as execd starts in it
+	s, _ := newServer(strings.Repeat("00", 32))
+	os.RemoveAll(workdir) // as a command's rm -rf and mkdir of it
+	os.Mkdir(workdir, 0o755)
+	os.WriteFile(filepath.Join(workdir, "made"), nil, 0o644)
+	req, _ := json.Marshal(startRequest{Argv: []string{"test", "-e", "made"}, Env: map[string]string{}, Tag: "w"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 35, payload: req})
+
+	if code := exitCode(t, s.get(35)); code != 0 {
+		t.Fatalf("exit %d: the command ran in the directory that was removed", code)
 	}
 }
 
