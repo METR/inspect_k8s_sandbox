@@ -45,7 +45,7 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
-// proxyBuffer bounds what the kernel holds each way for a stream whose reader has stopped, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
+// proxyBuffer caps a stream's socket to the proxy each way, and the kernel accounts twice it, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, target string, rate int) *worker {
