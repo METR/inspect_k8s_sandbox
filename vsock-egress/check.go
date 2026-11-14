@@ -81,7 +81,7 @@ func probeVM(vsock string, wait time.Duration) error {
 		var said string
 		if c, err := l.Accept(); err == nil {
 			c.SetDeadline(time.Now().Add(dialWait))
-			said, _ = bufio.NewReader(c).ReadString('\n')
+			said, _ = line(c)
 			c.Close()
 		}
 		dialled <- said
@@ -109,10 +109,15 @@ func greet(vsock string) error {
 		return err
 	}
 	defer c.Close()
-	if line, err := bufio.NewReader(c).ReadString('\n'); line != "canary\n" {
-		return fmt.Errorf("guest vsock port %d said %q: %v", canaryPort, line, err)
+	if said, err := line(c); said != "canary\n" {
+		return fmt.Errorf("guest vsock port %d said %q: %v", canaryPort, said, err)
 	}
 	return nil
+}
+
+// line reads the guest's one line, or the start of one that is longer than any it should send.
+func line(c io.Reader) (string, error) {
+	return bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
 }
 
 // canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
