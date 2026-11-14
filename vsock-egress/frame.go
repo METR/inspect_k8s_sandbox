@@ -131,8 +131,8 @@ func (p *pacer) wait(n int) {
 	}
 	p.mu.Lock()
 	now := p.now()
-	if p.paid.Before(now) {
-		p.paid = now
+	if idle := now.Add(-paceSlack); p.paid.Before(idle) {
+		p.paid = idle // a sleep that ran late is made up, an idle spell is not saved up
 	}
 	p.paid = p.paid.Add(time.Duration(float64(n) / p.rate * float64(time.Second)))
 	owed := p.paid.Sub(now)

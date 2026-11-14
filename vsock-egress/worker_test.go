@@ -201,8 +201,8 @@ func TestWorkerHoldsItsStreamsToTheRate(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if want := sent / rate * time.Second; slept < want-paceSlack || slept > want {
-		t.Fatalf("carrying %d bytes at %d a second slept %v: want %v, less at most %v", sent, rate, slept, want, paceSlack)
+	if want := sent / rate * time.Second; slept < want-2*paceSlack || slept > want {
+		t.Fatalf("carrying %d bytes at %d a second slept %v: want %v, less at most %v", sent, rate, slept, want, 2*paceSlack)
 	}
 }
 
