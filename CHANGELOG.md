@@ -21,6 +21,8 @@
   `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
   against the container's limit: about 6 MB idle, and up to about 30 MB more for each
   command printing at once.
+- A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
+  sidecar.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

@@ -1,4 +1,5 @@
 import ipaddress
+import pathlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -598,6 +599,19 @@ def test_coredns_upstream_replaces_the_resolv_conf_file_mount(chart_dir: Path) -
     assert "agent-env-my-release-resolv-conf" not in config_maps
     corefile = config_maps["agent-env-my-release-coredns-configmap"]["data"]["Corefile"]
     assert "forward . 10.96.0.10 fd00::a {" in corefile
+
+
+def test_a_pod_with_no_network_card_has_no_coredns_sidecar(
+    chart_dir: pathlib.Path,
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_string=r"annotations.sandbox\.amazonaws\.com/network-isolated=true",
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    assert [c["name"] for c in pod_spec["containers"]] == ["default"]
+    assert [v["name"] for v in pod_spec["volumes"]] == ["resolv-conf"]
 
 
 def test_coredns_upstream_defaults_to_the_kubelet_resolv_conf(chart_dir: Path) -> None:
