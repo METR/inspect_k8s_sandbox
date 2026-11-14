@@ -2106,6 +2106,23 @@ class TestExecStdio:
 
         assert received == b"a reply\n"
 
+    async def test_frames_that_have_arrived_are_received_together_a_turn_at_most(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """One apiece, a guest's small writes cost the reader a pass each."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        turn = execute_module._STEPS_PER_TURN
+        server.sendall(b"".join(_frame(STDOUT, b"x") for _ in range(3 * turn)))
+        await _wait_for(lambda: bool(select.select([client], [], [], 0)[0]))
+
+        with anyio.fail_after(30):
+            received = await stream.receive()
+        await stream.aclose()
+
+        # More would hold the loop for as long as a guest cared to write.
+        assert 1 < len(received) <= turn + 1
+
     async def test_a_receive_in_a_task_already_cancelled_takes_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
@@ -2128,7 +2145,7 @@ class TestExecStdio:
             reply = await stream.receive()
         await stream.aclose()
 
-        assert reply == b"a reply\n"
+        assert reply.startswith(b"a reply\n")  # and what has arrived since
 
     async def test_a_send_in_a_task_already_cancelled_sends_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
