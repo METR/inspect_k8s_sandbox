@@ -668,7 +668,7 @@ class ExecdClient:
             for i in range(offset, len(stdin), CHUNK):
                 await _window(link, call, i)
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
-                call.stdin_sent = max(call.stdin_sent, i + len(stdin[i : i + CHUNK]))
+                call.stdin_sent = max(call.stdin_sent, min(i + CHUNK, len(stdin)))
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
     async def _kill(self, link: Link, call: Call) -> None:
@@ -954,7 +954,7 @@ class ExecdStream(ByteStream):
                 for i in range(0, len(item), CHUNK):
                     await _window(self._link, self._call, self._sent)
                     await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
-                    self._sent += len(item[i : i + CHUNK])
+                    self._sent += min(CHUNK, len(item) - i)
                     self._call.stdin_sent = self._sent
             except OSError as e:
                 raise anyio.BrokenResourceError(repr(e)) from e
