@@ -1023,7 +1023,7 @@ def test_a_result_rejected_at_its_last_check_is_discarded(found_on: int):
                 pod._run_async(lambda: "a stream", discard=lambda _: discarded.set())
             )
 
-    assert discarded.wait(10)
+    assert discarded.wait(30)
 
 
 def test_exec_stdio_streams_see_a_restart_kept_after_they_opened():

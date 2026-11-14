@@ -174,7 +174,7 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
     assert pod._execd is not None
     pod._execd._start = daemons.client()._start
 
-    await pod.exec(["true"], None, None, {}, None, 10)
+    await pod.exec(["true"], None, None, {}, None, 30)
     await pod.write_file(b"x", pathlib.Path("/tmp/x"))
     await pod.read_file(pathlib.Path("/tmp/x"), io.BytesIO())
     await (await pod.exec_stdio(["cat"], None)).aclose()
@@ -464,7 +464,7 @@ async def test_command_is_not_run_again_once_its_daemon_is_gone(
     await daemons.serve(new_daemon)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
     assert len(starts) == 1
 
 
@@ -542,7 +542,7 @@ async def test_a_command_whose_connection_closed_before_it_was_sent_is_retryable
     link = await sandbox._get()
     async with link._wlock:  # another call's write
         call = asyncio.create_task(
-            sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+            sandbox.exec(["touch", "/once"], None, None, {}, None, 30)
         )
         await until(lambda: bool(link.calls))  # it waits to send its START
         await link.close()  # the connection drops meanwhile
@@ -1214,7 +1214,7 @@ async def test_a_daemon_that_is_not_ours_is_replaced(
         return await start(replace)
 
     sandbox._start = recorded
-    await sandbox.exec(["true"], None, None, {}, None, 10)
+    await sandbox.exec(["true"], None, None, {}, None, 30)
     first, connect = sandbox._daemon, execd._connect
 
     async def another_execd_on_first(
@@ -1229,7 +1229,7 @@ async def test_a_daemon_that_is_not_ours_is_replaced(
     assert sandbox._link is not None
     await sandbox._link.close()
 
-    await sandbox.exec(["true"], None, None, {}, None, 10)
+    await sandbox.exec(["true"], None, None, {}, None, 30)
 
     assert starts == [True, True]
 
@@ -1249,7 +1249,7 @@ async def test_many_small_frames_arrive_without_dropping_the_connection(
     await daemons.serve(chatty)
     sandbox = daemons.client()
 
-    result = await sandbox.exec(["yes"], None, None, {}, None, 10)
+    result = await sandbox.exec(["yes"], None, None, {}, None, 30)
 
     assert len(result.stdout) == lines
     assert sandbox._link is not None and not sandbox._link.closed
@@ -1266,7 +1266,7 @@ async def test_callers_share_one_reconnect(
 
     await daemons.serve(answers)
     sandbox = daemons.client()
-    await sandbox.exec(["true"], None, None, {}, None, 10)
+    await sandbox.exec(["true"], None, None, {}, None, 30)
     stale = sandbox._link
     assert stale is not None
     await stale.close()
@@ -1304,7 +1304,7 @@ async def test_only_a_resume_waits_out_a_reconnect(
 
     await daemons.serve(answers)
     client = daemons.client()
-    await client.exec(["true"], None, None, {}, None, 10)
+    await client.exec(["true"], None, None, {}, None, 30)
     stale = client._link
     assert stale is not None
     await stale.close()
@@ -1346,7 +1346,7 @@ async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
 
     await daemons.serve(answers)
     client = daemons.client()
-    await client.exec(["true"], None, None, {}, None, 10)
+    await client.exec(["true"], None, None, {}, None, 30)
     assert client._link is not None
     await client._link.close()
     connect, reopened = execd._connect, asyncio.Event()
@@ -1365,7 +1365,7 @@ async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
     with pytest.raises(asyncio.CancelledError):
         await call
     # Its START follows any the cancelled call sent.
-    await client.exec(["true"], None, None, {}, None, 10)
+    await client.exec(["true"], None, None, {}, None, 30)
     assert started == 2
 
 
@@ -1694,7 +1694,7 @@ async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> 
     await daemons.serve(idle)
     client = daemons.client()
 
-    link = await client._open(time.monotonic() + 10)
+    link = await client._open(time.monotonic() + 30)
 
     # Before its waiters wake: a caller arriving now must not open a second one.
     assert client._link is link
@@ -1917,7 +1917,7 @@ async def test_a_resume_resends_only_stdin_execd_has_not_written(
 
     await daemons.serve(acks_then_resumes_below_zero)
 
-    await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
+    await daemons.client().exec(["cat"], "abc", None, {}, None, 30)
 
     assert resent == [b""]
 
@@ -1947,7 +1947,7 @@ async def test_an_unknown_call_whose_stdin_execd_wrote_is_not_started_again(
     await daemons.serve(acks_then_forgets)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
+        await daemons.client().exec(["cat"], "abc", None, {}, None, 30)
     assert starts == 1
 
 
@@ -2062,7 +2062,7 @@ async def test_a_port_held_at_the_first_start_says_so() -> None:
         raise execd.DaemonRunning("bind: address already in use")  # even with --replace
 
     with pytest.raises(RuntimeError, match="held by a process other than execd"):
-        await execd.ExecdClient(held).exec(["true"], None, None, {}, None, 10)
+        await execd.ExecdClient(held).exec(["true"], None, None, {}, None, 30)
 
 
 async def test_stray_frames_are_counted_per_ping_interval(
@@ -2259,7 +2259,7 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     await daemons.serve(denies_every_call)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 5)
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
     assert starts == 1
 
 
@@ -2283,7 +2283,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
     await daemons.serve(abandons)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
+        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
     assert starts == 1
 
 

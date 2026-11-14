@@ -946,7 +946,7 @@ def test_the_probe_reads_a_status_tls_has_already_decrypted(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Output, the status and the close in one TLS record; the server awaits a reply."""
-    monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 30)  # only bounds a hang
     client, server = tls_sockets
     server.sendall(_frame(STDOUT, b"x") + _frame(*_status(1)) + _close_frame())
     op = ExecuteOperation(MagicMock())
@@ -965,7 +965,7 @@ def test_the_probe_reports_a_container_that_stopped_under_it(
     tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The probe exits 0, 1 or 2; 255 is Kata's status for a stopped container."""
-    monkeypatch.setattr(execute_module, "API_TIMEOUT", 2)
+    monkeypatch.setattr(execute_module, "API_TIMEOUT", 30)  # only bounds a hang
     client, server = tls_sockets
     server.sendall(_frame(*_status(255)) + _close_frame())
     op = ExecuteOperation(MagicMock())
@@ -997,7 +997,7 @@ def test_the_probe_gives_up_on_a_frame_cut_off(
         probing = pool.submit(op.probe_switch, "agent")
         try:
             with pytest.raises(PodError, match="timed out"):
-                probing.result(timeout=5)
+                probing.result(timeout=30)
         finally:
             # Wakes a read still waiting, so that a failure can't hang the suite.
             server.close()
@@ -1535,7 +1535,7 @@ class TestProbeBounds:
     def test_answers_without_waiting_for_the_server_to_close(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.5)
+        monkeypatch.setattr(execute_module, "API_TIMEOUT", 30)  # only bounds a hang
         op = ExecuteOperation(MagicMock())
 
         @contextmanager

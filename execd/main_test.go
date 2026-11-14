@@ -21,8 +21,12 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	// The daemon it leaves running.
 	t.Cleanup(stopOthers)
 
-	out, _ := first.Output() // its exit status may go to another test's reaper
+	first.WaitDelay = time.Second // or a daemon that kept its stdout would hold Output() past the budget
+	out, _ := first.Output()      // its exit status may go to another test's reaper
 
+	if ctx.Err() != nil {
+		t.Fatal("the first exec never returned")
+	}
 	if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out) {
 		t.Fatalf("the first exec printed %q, want its daemon's fingerprint", out)
 	}
