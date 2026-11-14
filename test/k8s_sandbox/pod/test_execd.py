@@ -475,7 +475,8 @@ async def test_a_command_whose_connection_closed_after_it_was_sent_is_not_retrya
 
     # A ConnectionError would be retried, running the command again.
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
+        call = daemons.client().exec(["touch", "/once"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
