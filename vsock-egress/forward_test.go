@@ -120,7 +120,7 @@ func proxyPort(t *testing.T, f *forwarder) *net.TCPConn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	c, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	dialled := make(chan *os.File, 2*maxStreams)
 	go func() {
 		for {
@@ -271,7 +271,7 @@ func TestClientsThatReopenAtTheCapAreAllServed(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 
 	const rounds = 15
 	failed := make(chan error, maxStreams*rounds)

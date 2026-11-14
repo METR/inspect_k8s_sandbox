@@ -46,10 +46,6 @@ func vsockPair(t *testing.T) (net.Conn, net.Conn) {
 	return pair(t, "unix", filepath.Join(t.TempDir(), "vsock"))
 }
 
-func frame(payload string) []byte {
-	return append(binary.BigEndian.AppendUint32(nil, uint32(len(payload))), payload...)
-}
-
 func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	client, inSandbox := tcpPair(t)
 	onNode, proxy := tcpPair(t)

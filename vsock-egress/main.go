@@ -23,6 +23,9 @@ const (
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second
+
+	capturePort = 3127 // redirect sends the sandbox's DNS queries and its TCP connections here, on loopback
+	captureAddr = "127.0.0.1:3127"
 )
 
 func main() {
@@ -31,12 +34,12 @@ func main() {
 	// forwarder to one of its own CPUs and its worker to one of the node's.
 	runtime.GOMAXPROCS(1)
 	commands := map[string]func([]string) error{
-		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
+		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, // in the sandbox
 		"launch": launch, "check": check, // on the node
 		"work": work, "probe": probe, "reap": reap, // started by launch and check, as a VM's uid
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
-		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check (on the node)")
+		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|canary (in the sandbox), launch|check (on the node)")
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {
