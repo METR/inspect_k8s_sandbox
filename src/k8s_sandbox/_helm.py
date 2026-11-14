@@ -61,6 +61,8 @@ HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
 # read it by the same rule, so a release cannot pass readiness while a sandbox the
 # caller is about to ask for is missing.
 _SERVICE_LABEL = "inspect/service"
+# The label a release's pods are listed by.
+_INSTANCE_LABEL = "app.kubernetes.io/instance"
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
 _TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
@@ -390,7 +392,7 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
-        self._expected_pods = frozenset(_stateful_set_pods(docs))
+        self._expected_pods = frozenset(_stateful_set_pods(docs, self.release_name))
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
@@ -445,7 +447,7 @@ class Release:
         return list_pods(
             k8s_client(self._context_name),
             self._namespace,
-            label_selector=f"app.kubernetes.io/instance={self.release_name}",
+            label_selector=f"{_INSTANCE_LABEL}={self.release_name}",
             resource_version="0" if allow_stale else None,
             request_timeout=_LIST_PODS_READ_TIMEOUT,
         )
@@ -464,8 +466,8 @@ class Release:
         return (
             not self._missing_services(pods)
             and all(map(_pod_ready, live))
-            # A pod its controller has yet to create is not in `live` to be judged.
-            and self._expected_pods <= {pod.name for pod in live}
+            # A pod its controller has yet to create is in no list to be judged.
+            and self._expected_pods <= {pod.name for pod in pods if pod.ready}
         )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
@@ -848,13 +850,21 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
 
 
-def _stateful_set_pods(docs: Iterable[Any]) -> Iterator[str]:
-    """The name of each pod the StatefulSets of a rendered manifest make."""
+def _stateful_set_pods(docs: Iterable[Any], release_name: str) -> Iterator[str]:
+    """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
-        if _dig(doc, "kind") == "StatefulSet":
+        labels = _dig(doc, "spec", "template", "metadata", "labels")
+        if _dig(doc, "kind") == "List":
+            yield from _stateful_set_pods(_dig(doc, "items") or [], release_name)
+        # A pod without the label is in no poll, so waiting for it would never end.
+        elif (
+            _dig(doc, "kind") == "StatefulSet"
+            and _dig(labels, _INSTANCE_LABEL) == release_name
+        ):
             replicas = _dig(doc, "spec", "replicas")
+            start = _dig(doc, "spec", "ordinals", "start") or 0
             for ordinal in range(1 if replicas is None else replicas):
-                yield f"{_dig(doc, 'metadata', 'name')}-{ordinal}"
+                yield f"{_dig(doc, 'metadata', 'name')}-{start + ordinal}"
 
 
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:
