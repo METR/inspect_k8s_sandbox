@@ -519,63 +519,122 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 	}
 }
 
-// handTimer stands in for a stream's idle timer: a test sees it wound back, and fires it.
-type handTimer struct {
-	end     func()
-	wound   atomic.Int32
-	stopped chan struct{}
+// hand is the clock of the worker's idle timers, moved by the test: a timer whose wait is over when time passes ends its stream.
+type hand struct {
+	mu      sync.Mutex
+	now     time.Duration
+	pending map[*handTimer]bool
 }
 
-func (h *handTimer) Reset(time.Duration) bool { h.wound.Add(1); return true }
-func (h *handTimer) Stop() bool               { close(h.stopped); return true }
+type handTimer struct {
+	clock *hand
+	at    time.Duration
+	end   func()
+}
+
+func (h *hand) after(d time.Duration, end func()) idleTimer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	t := &handTimer{clock: h, at: h.now + d, end: end}
+	h.pending[t] = true
+	return t
+}
+
+func (h *hand) pass(d time.Duration) {
+	h.mu.Lock()
+	h.now += d
+	var over []*handTimer
+	for t := range h.pending {
+		if t.at <= h.now {
+			over = append(over, t)
+			delete(h.pending, t)
+		}
+	}
+	h.mu.Unlock()
+	for _, t := range over {
+		t.end()
+	}
+}
+
+func (h *hand) left() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.pending)
+}
+
+func (t *handTimer) Reset(d time.Duration) bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	t.at = t.clock.now + d
+	return true
+}
+
+func (t *handTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	delete(t.clock.pending, t)
+	return true
+}
 
 func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
-	timers := make(chan *handTimer, 1)
-	w.idle = func(_ time.Duration, end func()) idleTimer {
-		h := &handTimer{end: end, stopped: make(chan struct{})}
-		timers <- h
-		return h
-	}
-	guest := serve(t, w)()
-	guest.Write(append(key, frame("to the proxy")...))
+	clock := &hand{pending: map[*handTimer]bool{}}
+	w.idle = clock.after
+	dial := serve(t, w)
+	guest := dial()
+	guest.Write(key)
+	// up and down send a message one way and read it at the other end: by then the worker has passed it on.
 	var atProxy net.Conn
-	select {
-	case atProxy = <-accepted:
-	case <-time.After(budget):
-		t.Fatal("the stream did not reach the proxy")
+	up := func() error {
+		guest.Write(frame("to the proxy"))
+		if atProxy == nil {
+			atProxy = within(t, accepted, "stream at the proxy")
+			atProxy.SetDeadline(time.Now().Add(budget))
+		}
+		_, err := io.ReadFull(atProxy, make([]byte, 12))
+		return err
 	}
-	atProxy.SetDeadline(time.Now().Add(budget))
-	got := make([]byte, 12)
-	if _, err := io.ReadFull(atProxy, got); err != nil {
+	down := func() error {
+		atProxy.Write([]byte("to the guest"))
+		_, err := io.ReadFull(guest, make([]byte, 4+12))
+		return err
+	}
+	if err := up(); err != nil {
 		t.Fatal(err)
 	}
-	idle := within(t, timers, "idle timer")
-	fromGuest := idle.wound.Load()
-	if fromGuest == 0 {
-		t.Fatal("bytes from the guest did not wind the stream's idle timer back")
-	}
-	atProxy.Write([]byte("to the guest"))
-	if _, err := io.ReadFull(guest, make([]byte, 4+12)); err != nil {
+	clock.pass(idleWait - time.Second)
+	if err := down(); err != nil {
 		t.Fatal(err)
 	}
-	if idle.wound.Load() == fromGuest {
-		t.Fatal("bytes from the proxy did not wind the stream's idle timer back: a download would end after the wait")
+	clock.pass(2 * time.Second) // the wait since the guest's bytes is over, the wait since the proxy's is not
+	if err := up(); err != nil {
+		t.Fatalf("%v: bytes from the proxy did not keep the stream: a download would end after the wait", err)
+	}
+	clock.pass(idleWait - time.Second) // the wait since the proxy's bytes is over as well
+	if err := down(); err != nil {
+		t.Fatalf("%v: bytes from the guest did not keep the stream: an upload would end after the wait", err)
 	}
 
-	idle.end()
-	if n, err := atProxy.Read(got); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("the proxy read %d bytes, %v from an idle stream that was ended: want a reset", n, err)
+	clock.pass(idleWait)
+	if n, err := atProxy.Read(make([]byte, 1)); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("the proxy read %d bytes, %v from a stream that moved no byte for the wait: want a reset", n, err)
 	}
 	if err := fromFrames(io.Discard, guest, nil); err == nil {
 		t.Fatal("the guest's side of an idle stream that was ended closed as a stream that ends cleanly")
 	}
-	select {
-	case <-idle.stopped:
-	case <-time.After(budget):
-		t.Fatal("the timer of a stream that is over was left to run: each would hold the stream's connections for the wait")
+
+	guest = dial()
+	guest.Write(append(key, 0, 0, 0, 0)) // a stream the guest ends at once, and the proxy after it
+	within(t, accepted, "second stream at the proxy").Close()
+	if err := fromFrames(io.Discard, guest, nil); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(budget); clock.left() > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the timer of a stream that is over still runs: each would hold the stream's connections for the wait")
+		}
 	}
 }
 

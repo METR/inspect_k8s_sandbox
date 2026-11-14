@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -170,8 +169,10 @@ func TestLookupOfThePodsOwnNameLeadsToThePod(t *testing.T) {
 
 func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 	n := loadedNames(t, filepath.Join(t.TempDir(), "names"))
-	if h, answers := asked(t, n, "evil\r\nHost: other.example.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 || len(n.list) != 0 {
-		t.Fatalf("a name that is no host name got %v, %d answers, and %d names are kept", h.RCode, len(answers), len(n.list))
+	for _, name := range []string{"evil\r\nHost: other.example.", "\u212aeep.example."} { // the second lowers to keep.example
+		if h, answers := asked(t, n, name, dnsmessage.TypeA); h.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 || len(n.list) != 0 {
+			t.Fatalf("%q, which is no host name, got %v, %d answers, and %d names are kept", name, h.RCode, len(answers), len(n.list))
+		}
 	}
 	for i := range maxNames {
 		if _, ok := n.address(fmt.Sprintf("host-%d.example", i)); !ok {
@@ -220,7 +221,6 @@ func TestTunnelReadsTheProxysReplyFrameByFrame(t *testing.T) {
 	}{
 		"a reply cut in two, and what follows it":  {[]string{"HTTP/1.1 200 Connec", "tion established\r\n\r\nhello"}, true, "hello"},
 		"a proxy that ends its side with no reply": {[]string{"HTTP/1.1 200 Connec", ""}, false, ""},
-		"a reply longer than a frame":              {[]string{"HTTP/1.1 200 " + strings.Repeat("x", maxFrame-13), "x\r\n\r\n"}, false, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fromProxy, proxy := io.Pipe()

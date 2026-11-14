@@ -23,7 +23,7 @@ const (
 	maxNames    = 1 << 14 // names a pod can look up in its life: each keeps its address, and the next gets no answer
 	nameSeconds = 30      // how long a program may keep an answer
 	namesSuffix = ".names"
-	hostLetters = "abcdefghijklmnopqrstuvwxyz0123456789-_."
+	hostLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
 )
 
 // names gives each host name an address in captureRange and finds the name again for a connection to it.
@@ -102,9 +102,10 @@ func (n *names) answer(query []byte) []byte {
 	var addr netip.Addr
 	// Any other question gets an empty answer: a program that asks for IPv6 too then settles on IPv4.
 	if q.Type == dnsmessage.TypeA && q.Class == dnsmessage.ClassINET {
-		name := strings.ToLower(strings.TrimSuffix(q.Name.String(), "."))
+		name := strings.TrimSuffix(q.Name.String(), ".")
 		// DNS lets a label hold any byte: only a host name can stand in a CONNECT request.
 		ok := name != "" && strings.Trim(name, hostLetters) == ""
+		name = strings.ToLower(name)
 		switch {
 		case !ok:
 		case n.own[name]:
