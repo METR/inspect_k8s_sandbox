@@ -33,6 +33,6 @@ func main() {
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {
-		log.Fatalf("vsock-egress %s: %v", os.Args[1], err)
+		log.Fatalf("%s_failed: %v", os.Args[1], err) // one word no pod's name can hold, as each line an alarm reads has
 	}
 }

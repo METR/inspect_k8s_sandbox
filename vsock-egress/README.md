@@ -20,5 +20,18 @@ Each node needs:
   downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
 
+A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
+<why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
+them, has one word to alarm on:
+
+- `<pod>: no_worker: <why>`: the sandbox has had no worker for a minute, so no egress. Again each minute while that
+  lasts.
+- `uid <n>: worker_not_ended: <why>`: the launcher has failed for a minute to end a worker's processes, and no
+  sandbox of that uid gets a worker meanwhile. Again each minute while that lasts.
+- `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
+- `<pod>: proxy_unreached: <why>`, then `<pod>: proxy_unreached: <n> streams since the last report` each minute.
+- `<pod>: streams_refused: a stream with no key, or past the 128 open` and `<pod>: key_unfetched: <why>`, then their
+  counts each minute: what a sandbox can cause itself. Until a fetch of the key succeeds its streams are refused.
+
 `gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
 which names the assumption about AWS's runtime that broke.

@@ -113,7 +113,7 @@ type child struct {
 	uid, gid uint32
 	done     chan struct{} // closed when the process has ended
 	reaper   *child        // a worker's, from when its end began until that reaper has ended
-	unended  bool          // a worker's failed end is in the log
+	unended  time.Time     // when a worker's end first failed, or that was last in the log
 }
 
 func (c *child) exited() bool {
@@ -230,11 +230,15 @@ type launcher struct {
 	reap     time.Duration        // how long a pass waits for its workers' reapers
 	workers  map[string]*child    // by sandbox id
 	tried    map[string]time.Time // when each sandbox's worker was last started
-	reported map[string]bool      // sandboxes whose fault is already in the log
+	reported map[string]time.Time // when each sandbox without a worker was first seen so, or last in the log
+	had      map[string]bool      // sandboxes whose VM directory has been there
 }
 
+// faultAgain is how long a fault lasts before its first line, and between lines.
+const faultAgain = time.Minute
+
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]bool{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, had: map[string]bool{}}
 }
 
 func launch(args []string) error {
@@ -271,25 +275,39 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 			continue
 		}
 		sb, err := l.sandbox(r)
+		gone := errors.Is(err, os.ErrNotExist)
+		l.had[r.ContainerID] = l.had[r.ContainerID] || !gone
 		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0]) {
 			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port>", proxyAnnotation, sb.target)
 		}
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
 		}
-		if err == nil {
+		switch {
+		case err == nil:
 			wanted[r.ContainerID] = sb
-		} else if !errors.Is(err, os.ErrNotExist) && !l.reported[r.ContainerID] { // a VM's directory can follow its record
-			l.reported[r.ContainerID] = true
-			log.Printf("%s: no worker: %v", sb.pod, err)
+		case gone && l.had[r.ContainerID]: // its sandbox is being deleted: the directory goes before the record does
+		default:
+			l.fault(r.ContainerID, sb.pod, err)
 		}
 	}
-	for id := range l.reported {
+	for id := range l.had {
 		if !present[id] {
+			delete(l.had, id)
 			delete(l.reported, id)
 		}
 	}
 	return wanted, nil
+}
+
+// fault writes why a sandbox has no worker once that has lasted faultAgain: a VM's directory follows its record, and is root's at first.
+func (l *launcher) fault(id, pod string, err error) {
+	if last, seen := l.reported[id]; !seen {
+		l.reported[id] = time.Now()
+	} else if time.Since(last) >= faultAgain {
+		l.reported[id] = time.Now()
+		log.Printf("%s: no_worker: %v", pod, err)
+	}
 }
 
 // pass starts a worker for each sandbox that lacks one, and ends the worker of each sandbox that has gone.
@@ -302,13 +320,17 @@ func (l *launcher) pass() error {
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
 			if err := w.end(time.Until(deadline)); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
-				if !w.unended {
-					w.unended = true
-					log.Printf("uid %d: its processes are not ended yet: %v", w.uid, err)
+				if w.unended.IsZero() { // a pass out of time ends it on the next: only one that is faultAgain late is a fault
+					w.unended = time.Now()
+				} else if time.Since(w.unended) >= faultAgain {
+					w.unended = time.Now()
+					log.Printf("uid %d: worker_not_ended: %v", w.uid, err)
 				}
 				continue
 			}
 			delete(l.workers, id)
+		} else {
+			delete(l.reported, id) // it serves its sandbox: a later fault gets a minute of its own
 		}
 	}
 	for id := range l.tried {
@@ -328,7 +350,7 @@ func (l *launcher) pass() error {
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
 			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
-			log.Printf("%s: %v", sb.pod, err)
+			l.fault(id, sb.pod, err)
 			continue
 		}
 		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)

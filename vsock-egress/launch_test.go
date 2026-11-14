@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -116,6 +117,126 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 	if len(wanted) != 0 {
 		t.Fatalf("wanted %v: a worker as that uid could open the other VM's socket", wanted)
 	}
+}
+
+func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *testing.T) {
+	for name, comes := range map[string]bool{"never": false, "after its record": true} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				out := capture(t)
+				l := fakeNode(t)
+				proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
+				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+				vm := filepath.Join(l.vms, id("a")[:12])
+				os.RemoveAll(vm)
+				var said []int
+				for pass, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
+					time.Sleep(wait)
+					if comes && pass == 2 {
+						addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+					}
+					wanted, err := l.wanted()
+					if _, ok := wanted[id("a")]; err != nil || ok != (comes && pass == 2) {
+						t.Fatalf("pass %d: wanted %v, error %v: want a worker only once its directory has come", pass, wanted, err)
+					}
+					os.RemoveAll(vm) // a sandbox that is deleted loses its directory before its record, which can stay
+					said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: no VM directory at "+vm))
+				}
+				want := []int{0, 0, 1, 1, 2}
+				if comes {
+					want = []int{0, 0, 0, 0, 0}
+				}
+				if !slices.Equal(said, want) {
+					t.Fatalf("lines after each pass %v, want %v, in %q: a fault once it has lasted a minute and each minute after, and never for a deleted sandbox", said, want, out.String())
+				}
+			})
+		})
+	}
+}
+
+func TestWorkerThatCannotBeEndedIsAFaultOnceItLasts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.reap = 0 // as when the reapers before this worker's used all of each pass's time
+		l.workers[id("a")] = &child{uid: vmUID, done: make(chan struct{})}
+		var said []int
+		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
+			time.Sleep(wait)
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			said = append(said, strings.Count(out.String(), "uid 4242: worker_not_ended: "))
+		}
+		if !slices.Equal(said, []int{0, 0, 1, 1, 2}) {
+			t.Fatalf("lines after each pass %v, in %q: want none for a minute, then one each minute", said, out.String())
+		}
+	})
+}
+
+func TestSandboxThatGoesBeforeItHadAWorkerIsNoFault(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("only root can make a VM directory root's")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, 0) // root's, as a VM's directory is at first
+		// Its start is given up: the directory goes, the record stays.
+		for range 2 {
+			if _, err := l.wanted(); err != nil {
+				t.Fatal(err)
+			}
+			os.RemoveAll(filepath.Join(l.vms, id("a")[:12]))
+			time.Sleep(time.Minute)
+		}
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing of a sandbox that is gone", out.String())
+		}
+	})
+}
+
+func TestFaultAfterAWorkerRanGetsAMinuteOfItsOwn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.netns = filepath.Join(l.vms, "none") // where no pod's network namespace is bound
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		pass := func() {
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(31 * time.Second)
+		}
+		pass() // no worker can start
+		l.workers[id("a")] = &child{done: make(chan struct{})}
+		pass() // one runs
+		delete(l.workers, id("a"))
+		pass() // and is gone: none can start again
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing 31 s after a worker that ran was lost", out.String())
+		}
+	})
+}
+
+func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.netns = filepath.Join(l.vms, "none") // where no pod's network namespace is bound
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		var said []int
+		for range 25 { // a pass every retry, for two minutes
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: "))
+			time.Sleep(l.retry)
+		}
+		if said[11] != 0 || said[12] != 1 || said[23] != 1 || said[24] != 2 {
+			t.Fatalf("lines after each pass %v, in %q: want none for a minute, then one each minute", said, out.String())
+		}
+	})
 }
 
 // A profile made again from the node's default would bring these back: io_uring, and the calls by which a worker could slow its own reaper.

@@ -55,11 +55,23 @@ func newWorker(vsock, target string, rate int) *worker {
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
-// report writes what went wrong since the last report as one line: a guest cannot fill the node's log a stream at a time.
+// report writes what went wrong since the last report, a line for each kind: a guest cannot fill the node's log a stream at a time.
 func (w *worker) report() {
-	if refused, failed, keyless := w.refused.Swap(0), w.failed.Swap(0), w.keyless.Swap(0); refused+failed+keyless > 0 {
-		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy; %d fetches of the key failed",
-			refused, workerStreams, failed, keyless)
+	if refused := w.refused.Swap(0); refused > 0 {
+		log.Printf("streams_refused: %d since the last report", refused)
+	}
+	if failed := w.failed.Swap(0); failed > 0 {
+		log.Printf("proxy_unreached: %d streams since the last report", failed)
+	}
+	if keyless := w.keyless.Swap(0); keyless > 0 {
+		log.Printf("key_unfetched: %d fetches since the last report", keyless)
+	}
+}
+
+// refuse counts a stream turned away; the first of each report is written at once.
+func (w *worker) refuse() {
+	if w.refused.Add(1) == 1 {
+		log.Printf("streams_refused: a stream with no key, or past the %d open", workerStreams)
 	}
 }
 
@@ -102,7 +114,7 @@ func (w *worker) serve(l net.Listener) error {
 		case w.unkeyed <- struct{}{}:
 			go w.stream(c)
 		default: // a guest that floods the port with connections that show no key is held to these, as to its streams
-			w.refused.Add(1)
+			w.refuse()
 			c.Close()
 		}
 	}
@@ -117,21 +129,21 @@ func (w *worker) stream(c net.Conn) {
 	keyed := err == nil && w.holds(key)
 	<-w.unkeyed
 	if !keyed {
-		w.refused.Add(1)
+		w.refuse()
 		return
 	}
 	select { // only now: a connection that sends no key holds no stream's place
 	case w.slots <- struct{}{}:
 		defer func() { <-w.slots }()
 	default:
-		w.refused.Add(1)
+		w.refuse()
 		return
 	}
 	c.SetReadDeadline(time.Time{})
 	t, err := w.dial()
 	if err != nil {
 		if w.failed.Add(1) == 1 { // the first of each report says why
-			log.Print(err)
+			log.Printf("proxy_unreached: %v", err)
 		}
 		return
 	}
@@ -175,7 +187,7 @@ func (w *worker) holds(key []byte) bool {
 		fetched, err := fetchKey(w.vsock)
 		if err != nil {
 			if w.keyless.Add(1) == 1 { // the first of each report says why
-				log.Print(err)
+				log.Printf("key_unfetched: %v", err)
 			}
 			return false
 		}

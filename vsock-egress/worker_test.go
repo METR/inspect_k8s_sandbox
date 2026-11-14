@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -176,10 +177,17 @@ func (l *logged) Write(p []byte) (int, error) {
 	return l.Buffer.Write(p)
 }
 
+// capture sends the log to the buffer it returns until the test ends.
+func capture(t *testing.T) *logged {
+	out := &logged{}
+	was := log.Writer()
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(was) })
+	return out
+}
+
 func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
-	var out logged
-	log.SetOutput(&out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	out := capture(t)
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
 	dial := serve(t, w)
@@ -197,14 +205,15 @@ func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
 	out.Lock()
 	written := out.String()
 	out.Unlock()
-	if written != "" {
-		t.Fatalf("%d lines were written as the streams were refused: %q", strings.Count(written, "\n"), written)
+	if strings.Count(written, "\n") != 1 || !strings.Contains(written, "streams_refused: a stream with no key") {
+		t.Fatalf("%d lines were written as the streams were refused, %q: want the first said at once, and no other", strings.Count(written, "\n"), written)
 	}
 	w.report()
+	w.report() // nothing more was refused since the first
 	out.Lock()
 	defer out.Unlock()
-	if want := fmt.Sprintf("refused %d streams", refused); !strings.Contains(out.String(), want) {
-		t.Fatalf("the report is %q, want %q in it", out.String(), want)
+	if want := fmt.Sprintf("streams_refused: %d since the last report\n", refused); !strings.HasSuffix(out.String(), want) || strings.Count(out.String(), "\n") != 2 {
+		t.Fatalf("the log is %q, want one more line, %q: no stream failed in any other way, or since", out.String(), want)
 	}
 }
 
@@ -246,9 +255,7 @@ func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 }
 
 func TestFailedKeyFetchesAreCountedNotLoggedOneByOne(t *testing.T) {
-	var out logged
-	log.SetOutput(&out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	out := capture(t)
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, nil), target, 0) // nothing in the guest holds the key port
 	var clock atomic.Int64
@@ -266,16 +273,24 @@ func TestFailedKeyFetchesAreCountedNotLoggedOneByOne(t *testing.T) {
 		}
 	}
 	out.Lock()
-	lines := strings.Count(out.String(), fmt.Sprintf("guest vsock port %d", keyPort))
+	lines := strings.Count(out.String(), fmt.Sprintf("key_unfetched: guest vsock port %d", keyPort))
 	out.Unlock()
 	if lines != 1 {
 		t.Fatalf("%d lines say why the key was not fetched: want 1 until the report", lines)
 	}
 	w.report()
+	w.report() // no fetch failed since the first
 	out.Lock()
 	defer out.Unlock()
-	if want := fmt.Sprintf("%d fetches of the key failed", fetches); !strings.Contains(out.String(), want) {
-		t.Fatalf("the report is %q, want %q in it", out.String(), want)
+	if want := fmt.Sprintf("key_unfetched: %d fetches since the last report", fetches); !strings.Contains(out.String(), want) || strings.Count(out.String(), "since the last report") != 2 {
+		t.Fatalf("the reports are %q, want %q in them once, beside the refusals'", out.String(), want)
+	}
+}
+
+func TestWorkerThatEndsWithAnErrorSaysSoInTheWordAnAlarmReads(t *testing.T) {
+	out, err := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", filepath.Join(t.TempDir(), "none", "vm.vsock")).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "ns/pod: work_failed: ") {
+		t.Fatalf("got %v and %q: want a worker with nowhere to listen to end with work_failed", err, out)
 	}
 }
 
@@ -379,6 +394,7 @@ func TestProxyNamedByHostIsLookedUp(t *testing.T) {
 }
 
 func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
+	out := capture(t)
 	key := newKey()
 	target, accepted := proxy(t)
 	_, port, _ := net.SplitHostPort(target)
@@ -400,6 +416,11 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 	case <-closed(first):
 	case <-time.After(budget):
 		t.Fatal("the first stream was neither joined nor closed")
+	}
+	w.report()
+	w.report() // no stream failed since the first
+	if want := "proxy_unreached: 1 streams since the last report\n"; !strings.HasSuffix(out.String(), want) || !strings.Contains(out.String(), "proxy_unreached: dial tcp ") || strings.Count(out.String(), "\n") != 2 {
+		t.Fatalf("the log is %q, want one line at once that says why and one report's %q, and no other", out.String(), want)
 	}
 	second := dial()
 	second.Write(key)
