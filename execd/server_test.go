@@ -172,6 +172,18 @@ func TestACommandGivenNoCwdFailsOnceThatDirectoryIsGone(t *testing.T) {
 	}
 }
 
+func TestAUidWithNoPasswdEntryIsUnknownUnlessItIsRootOrExecdsOwn(t *testing.T) {
+	// Over Kubernetes exec runuser refuses such a user; execd ran the command as that uid.
+	if _, _, _, err := lookupUser("4242424"); err == nil || !strings.HasPrefix(err.Error(), "unknown user") {
+		t.Fatalf("a uid with no passwd entry got %v, want unknown user", err)
+	}
+	for _, own := range []string{"0", strconv.Itoa(os.Getuid())} {
+		if _, _, _, err := lookupUser(own); err != nil && strings.HasPrefix(err.Error(), "unknown user") {
+			t.Fatalf("uid %s got %v: root and execd's own user need no passwd entry", own, err)
+		}
+	}
+}
+
 func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	t.Cleanup(func() { killTagged("stream") })

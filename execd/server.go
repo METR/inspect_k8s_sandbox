@@ -799,6 +799,9 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	}
 	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil { // no uid wraps to 0
 		if u, err = user.LookupId(name); err != nil {
+			if name != "0" && name != strconv.Itoa(os.Getuid()) { // as runuser refuses a user with no entry
+				return nil, "", "", fmt.Errorf("unknown user %s", name)
+			}
 			u = &user.User{Uid: name, Gid: name, Username: name, HomeDir: "/"}
 		}
 	} else if u, err = user.Lookup(name); err != nil {
