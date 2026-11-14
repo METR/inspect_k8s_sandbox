@@ -818,21 +818,28 @@ _EGRESS_CAPTURE = "inspect-k8s-sandbox/egress-capture=true"
 
 
 @pytest.mark.parametrize(
-    ("dns_record", "own_names"),
+    ("records", "own_names"),
     [
         pytest.param(
-            "true", ["-own", "default,agent-env-my-release-default"], id="own"
+            "dnsRecord=true",
+            ["-own", "default,agent-env-my-release-default"],
+            id="own",
         ),
-        pytest.param("false", [], id="no record"),
+        pytest.param(
+            "additionalDnsRecords={Site.test,my_db}",
+            ["-own", "default,agent-env-my-release-default,Site.test,my_db"],
+            id="additional records",
+        ),
+        pytest.param("dnsRecord=false", [], id="no record"),
     ],
 )
 def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
-    chart_dir: Path, dns_record: str, own_names: list[str]
+    chart_dir: Path, records: str, own_names: list[str]
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
         set_str="egressForwarderImage=vsock-egress:1,"
-        f"services.default.dnsRecord={dns_record},"
+        f"services.default.{records},"
         "services.default.initContainers[0].name=setup,"
         "services.default.initContainers[0].image=busybox",
         set_string=f"services.default.podAnnotations.{_EGRESS_PROXY},"
@@ -843,7 +850,12 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
     # After the forwarder listens, before `setup` and the service; it has ended by then.
     forwarder, capture, setup = pod["initContainers"]
     assert setup["name"] == "setup"
-    # The forwarder is the pod's resolver: a service's own names lead to its pod.
+    # The forwarder is the resolver of every container, `setup` too.
+    assert (pod["dnsPolicy"], pod["dnsConfig"]) == (
+        "None",
+        {"nameservers": ["127.0.0.1"]},
+    )
+    # So a service's own names, which lead to its pod, are the forwarder's to answer.
     assert forwarder["command"] == [
         *["/vsock-egress", "forward", "-key", "/key/key", "-capture"],
         *own_names,

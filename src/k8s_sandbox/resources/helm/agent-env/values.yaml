@@ -52,9 +52,10 @@ extraContainers: []
 # `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that
 # ignore proxy settings too: the sidecar answers the pod's DNS queries at `127.0.0.1`
 # with an address of `198.18.0.0/15` for each name (and `127.0.0.1` for the service's
-# own names), and a TCP connection to such an address reaches the proxy as
-# `CONNECT <name>:<port>`. That adds an init container that runs as root with
-# `NET_ADMIN` alone, which a namespace at the `baseline` Pod Security Standard refuses.
+# own names and `additionalDnsRecords`), and a TCP connection to such an address
+# reaches the proxy as `CONNECT <name>:<port>`. That adds an init container that runs
+# as root with `NET_ADMIN` alone, which a namespace at the `baseline` Pod Security
+# Standard refuses.
 # @default -- Empty (required once a pod carries the annotation)
 egressForwarderImage: ""
 # -- References to pre-existing secrets that contain registry credentials.

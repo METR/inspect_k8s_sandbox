@@ -16,7 +16,8 @@
 - A pod that names an egress proxy and is also annotated
   `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that
   ignore proxy settings: a name the pod looks up gets an address in `198.18.0.0/15`, and
-  a TCP connection to that address reaches the proxy as `CONNECT <name>:<port>`. A
+  a TCP connection to that address reaches the proxy as `CONNECT <name>:<port>`. The
+  service's own names and its `additionalDnsRecords` resolve to `127.0.0.1`. A
   connection to any other address still has no route, and IPv6 and UDP other than DNS
   are not carried. The pod gets an init container that runs as root with `NET_ADMIN`,
   which a namespace at the `baseline` Pod Security Standard refuses.

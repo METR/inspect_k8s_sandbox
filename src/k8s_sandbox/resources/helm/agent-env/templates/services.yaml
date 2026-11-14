@@ -66,7 +66,8 @@ spec:
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
-      {{- if $.Values.corednsUpstream }}
+      {{- /* With capture the forwarder is the resolver of every container of the pod, its init containers too. */}}
+      {{- if or $.Values.corednsUpstream $egressCapture }}
       {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
       dnsPolicy: None
       dnsConfig:
@@ -98,7 +99,7 @@ spec:
             {{- if include "shouldCreateDnsRecord" $service }}
             {{- /* The forwarder is the pod's resolver: the service's own names lead to the pod itself. */}}
             - -own
-            - {{ printf "%s,%s-%s" $name (include "agentEnv.fullname" $) $name | quote }}
+            - {{ concat (list $name (printf "%s-%s" (include "agentEnv.fullname" $) $name)) ($service.additionalDnsRecords | default list) | join "," | quote }}
             {{- end }}
             {{- end }}
           restartPolicy: Always
