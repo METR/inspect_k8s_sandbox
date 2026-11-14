@@ -373,10 +373,11 @@ class ExecuteOperation(PodOperation):
         return result
 
     def _check_for_runuser_error(self, stderr: str, user: str) -> None:
+        end = stderr[-_STDERR_TAIL_BYTES:]  # a command can fill stderr to its limit
         if re.search(r"runuser: user \S+ does not exist", stderr, re.IGNORECASE):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does "
-                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{stderr}"
+                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{end}"
             )
         # The three arms below describe an environment that cannot perform the
         # switch, not a caller asking for something that does not exist. Callers
@@ -392,7 +393,7 @@ class ExecuteOperation(PodOperation):
                 "runuser cannot switch users. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # Anchored on the `runuser: ` prefix like the arms above it: `newgrp`,
@@ -406,7 +407,7 @@ class ExecuteOperation(PodOperation):
                 "been dropped. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # dash and busybox say "not found", bash "No such file or directory".
@@ -418,7 +419,7 @@ class ExecuteOperation(PodOperation):
                 "at /sbin/runuser, which this container lacks. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
 

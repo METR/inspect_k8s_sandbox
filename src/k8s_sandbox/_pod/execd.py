@@ -28,6 +28,7 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import (
     ExecdResultUnknownError,
+    ExecdStoppedError,
     ExecResultUnknownError,
     PodError,
 )
@@ -68,6 +69,7 @@ HOLD = 2 * ((4 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
+MAX_OWED = 1024  # calls over whose RELEASE no PONG has followed: a PING asks at half
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers a second; past any, reading waits: no stand-in holds the loop.
 PACE_FRAMES = 4096
@@ -85,7 +87,6 @@ STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays smal
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
 RECONNECT_FOR = 300.0
-ABANDONED_AFTER = 360.0  # execd ends a call no client has resumed by then
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
@@ -383,15 +384,27 @@ class Pace:
 class Link:
     """One authenticated connection; a reader task routes frames to calls by id."""
 
-    def __init__(self, pipe: _Pipe, daemon: Daemon, strays: Strays, pace: Pace) -> None:
+    def __init__(
+        self,
+        pipe: _Pipe,
+        daemon: Daemon,
+        strays: Strays,
+        pace: Pace,
+        owed: dict[int, tuple[int, ...]],
+    ) -> None:
         self.pipe = pipe
         self.daemon = daemon
         self.strays = strays
         self.pace = pace
+        self.owed = owed
+        self.confirmed = asyncio.Event()  # set by each PONG, and when this closes
+        self._released: list[int] = []  # ids, since the last PING
+        self._pinged: list[list[int]] = []  # those each unanswered PING followed
         self.calls: dict[int, Call] = {}
         self.closed = False
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
+        self.bulk = asyncio.Lock()
         self._last_rx = time.monotonic()
         self._tasks = [
             asyncio.create_task(self._read()),
@@ -400,7 +413,9 @@ class Link:
         self._last: set[asyncio.Task[None]] = set()  # held until sent
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
-        async with self._wlock:
+        # Only a START or STDIN waits its turn: any other frame has one ahead at most.
+        turn = self.bulk if kind in (START, STDIN) else contextlib.nullcontext()
+        async with turn, self._wlock:
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
@@ -410,6 +425,11 @@ class Link:
                 # a peer that stopped reading must not hold the lock other calls need
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
+            if kind == RELEASE:
+                self._released.append(call_id)
+            elif kind == PING:
+                self._pinged.append(self._released)
+                self._released = []
 
     def send_last(self, call_id: int, *kinds: int) -> None:
         """Send a call's last empty frames in a task of their own: no caller waits."""
@@ -443,6 +463,10 @@ class Link:
                     c.exited = True
                     c.stdin_room.set()  # a send waiting for room sees the exit
                 put = json.loads(payload)["stdin"] if kind == STDIN_ACK else 0
+                if kind == PONG and self._pinged:  # execd read what its PING followed
+                    for released in self._pinged.pop(0):
+                        self.owed.pop(released, None)
+                    self.confirmed.set()
                 if kind == OK and not self.ready.done():
                     self.ready.set_result(None)
                 elif (
@@ -499,6 +523,7 @@ class Link:
         if self.closed:
             return
         self.closed = True
+        self.confirmed.set()
         if not self.ready.done():
             self.ready.set_exception(Dropped("connection closed before auth"))
             self.ready.exception()  # retrieved: an open that timed out no longer waits
@@ -527,7 +552,7 @@ class ExecdClient:
         self._opened = float("-inf")
         self._backoff = 0.0
         self._failed: BaseException | None = None  # why the open under way last failed
-        self._unkilled: list[tuple[float, int]] = []  # when a call was left, its id
+        self._owed: dict[int, tuple[int, ...]] = {}  # a call's last frames, by its id
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -546,12 +571,13 @@ class ExecdClient:
                         raise _port_held() from e
                 daemon = self._daemon
                 pipe = await _connect(daemon, self._pace)
-                link = Link(pipe, daemon, self._strays, self._pace)
+                link = Link(pipe, daemon, self._strays, self._pace, self._owed)
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
-                await self._kill_left(link)
+                async with link.bulk:  # no START or STDIN goes between what is owed
+                    await self._replay(link)
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 self._failed = e
@@ -573,19 +599,23 @@ class ExecdClient:
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
 
-    def _left(self) -> list[tuple[float, int]]:
-        """The calls left that execd may still be running."""
-        now = time.monotonic()
-        return [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
+    def _over(self, link: Link, call_id: int, *kinds: int) -> None:
+        """Send a call's last frames, now and until a PONG follows its RELEASE."""
+        self._owed[call_id] = kinds
+        if len(self._owed) % (MAX_OWED // 2) == 0:  # the next PING may be 15 s off
+            kinds += (PING,)
+        to = link if not link.closed else self._link
+        if to is not None and not to.closed:
+            to.send_last(call_id, *kinds)
 
-    async def _kill_left(self, link: Link) -> None:
-        """KILL and RELEASE again, on each new connection, the calls left."""
+    async def _replay(self, link: Link) -> None:
+        """Send again, on each new connection, the last frames no PONG has followed."""
         with contextlib.suppress(OSError):  # dropped again: the next one sends them
-            for _, call_id in self._unkilled:  # a daemon ignores ids not its own
-                await link.send(KILL, call_id)
-                await link.send(RELEASE, call_id)
-            # An older one has now had the RELEASE that frees execd's record of it.
-            self._unkilled = self._left()
+            for call_id, kinds in list(self._owed.items()):
+                for kind in kinds:  # a daemon ignores ids not its own
+                    await link.send(kind, call_id)
+            if self._owed:
+                await link.send(PING, 0)
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link
@@ -629,6 +659,17 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
+        # One end across connections.
+        end = time.monotonic() + DEAD_AFTER + PING_EVERY + CONNECT_TIMEOUT
+        while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
+            if not link.closed:  # else it is set for good, and the next one is opened
+                link.confirmed.clear()
+            try:
+                await asyncio.wait_for(link.confirmed.wait(), end - time.monotonic())
+                if link.closed:
+                    link = await asyncio.wait_for(self._get(), end - time.monotonic())
+            except asyncio.TimeoutError:  # a peer that answers no PING is not execd
+                raise ConnectionError("execd has not confirmed its calls") from None
         deadline = None if timeout is None else time.monotonic() + timeout
 
         def left() -> float | None:  # of the command's timeout
@@ -660,7 +701,6 @@ class ExecdClient:
                             )
                         except asyncio.TimeoutError:  # a write the peer never reads
                             await link.close()
-                        finished = True
                         yield EXIT, None
                         return
                     if isinstance(item, Dropped):
@@ -671,7 +711,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         link = await asyncio.wait_for(self._get(stale=link), left())
                         if link.daemon is not call.daemon:
-                            raise ExecdResultUnknownError(
+                            raise ExecdStoppedError(
                                 "execd stopped while it ran the command",
                                 pod=link.daemon.ip,
                             )
@@ -691,7 +731,7 @@ class ExecdClient:
                         await _taken(link, call, kind, len(payload), left())
                     elif kind == EXIT:
                         finished = True  # no KILL: it would end what it left running
-                        link.send_last(call.id, RELEASE)
+                        self._over(link, call.id, RELEASE)
                         status = json.loads(payload)
                         code, why = status.get("code"), status.get("error", "")
                         if (
@@ -741,7 +781,8 @@ class ExecdClient:
             except Exception as e:  # a lost connection, or a restart that failed
                 if sender is None and isinstance(e, NotSent):
                     raise  # the START never left, so nothing ran: it is retried
-                raise ExecdResultUnknownError(
+                stopped = self._daemon is not call.daemon  # another was started since
+                raise (ExecdStoppedError if stopped else ExecdResultUnknownError)(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,
                 ) from e
@@ -749,14 +790,8 @@ class ExecdClient:
             if sender is not None:
                 sender.cancel()
             try:
-                if not finished:
-                    # Left by its caller: stopped now, and again on each new connection.
-                    to = link if not link.closed else self._link
-                    if to is not None and not to.closed:
-                        # Cut off, an old one would still be owed its RELEASE.
-                        self._unkilled = self._left()
-                        to.send_last(call.id, KILL, RELEASE)
-                    self._unkilled.append((time.monotonic(), call.id))
+                if not finished:  # left by its caller, or timed out
+                    self._over(link, call.id, KILL, RELEASE)
             finally:
                 link.calls.pop(call.id, None)
 
@@ -791,9 +826,6 @@ class ExecdClient:
                     await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
-        # Even with no exit: it frees what execd holds for the call.
-        with contextlib.suppress(OSError):
-            await link.send(RELEASE, call.id)
 
     async def exec(
         self,
@@ -837,7 +869,8 @@ class ExecdClient:
         if error.startswith("unknown user"):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does not appear to "
-                f"exist in the container. Docs: {EXEC_USER_URL}\n{result.stderr}"
+                f"exist in the container. Docs: {EXEC_USER_URL}\n"
+                f"{result.stderr[-_STDERR_TAIL_BYTES:]}"
             )
         if error.startswith("cannot run as"):
             logger.warning(
@@ -845,7 +878,7 @@ class ExecdClient:
                 "cannot switch users. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                result.stderr,
+                result.stderr[-_STDERR_TAIL_BYTES:],
             )
         return result
 
@@ -912,6 +945,8 @@ class ExecdClient:
                             limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                             truncated_output=None,
                         )
+        except ExecdStoppedError:
+            raise  # run again, it may reach a container that replaced its own
         except ExecResultUnknownError as e:
             # Unlike a command, a file operation may be run again.
             raise PodError(str(e)) from e
