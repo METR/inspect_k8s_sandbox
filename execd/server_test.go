@@ -173,6 +173,26 @@ func TestACommandGivenNoCwdFailsOnceThatDirectoryIsGone(t *testing.T) {
 	}
 }
 
+func TestACommandGivenNoCwdRunsWhereItsUserCannotEnterTheDirectoryByPath(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root enters any directory")
+	}
+	tests, closed := workdir, t.TempDir()
+	t.Cleanup(func() { os.Chmod(closed, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
+	workdir = filepath.Join(closed, "work")
+	os.Mkdir(workdir, 0o755)
+	os.Chdir(workdir)   // as a runtime starts a container's processes in its working directory
+	os.Chmod(closed, 0) // whose path its user may be unable to follow: a 700 /root for uid 1000
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 42, payload: req})
+
+	if code := exitCode(t, s.get(42)); code != 0 {
+		t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+	}
+}
+
 func TestAUidWithNoPasswdEntryIsUnknownUnlessItIsRootOrExecdsOwn(t *testing.T) {
 	// Over Kubernetes exec runuser refuses such a user; execd ran the command as that uid.
 	if _, _, _, err := lookupUser("4242424"); err == nil || !strings.HasPrefix(err.Error(), "unknown user") {

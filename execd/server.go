@@ -387,8 +387,8 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
-	// By its path, as Kubernetes exec does: a command may have replaced the directory.
-	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
+	// By its path, as Kubernetes exec does: a command may have replaced the directory. A user who can't enter it that way stays in it.
+	if err := os.Chdir(workdir); err != nil && !errors.Is(err, syscall.EACCES) && !strings.HasPrefix(req.Cwd, "/") {
 		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
 	}
 	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
