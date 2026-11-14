@@ -60,7 +60,7 @@
   background process holding its stdout or stderr open now returns a tenth of a
   second after the command exits, rather than at once.
 - `exec()` no longer returns a successful result whose output lost its end on the way.
-  That, and a connection to the pod lost while the command runs, are retried as before,
+  That, and a connection to the pod lost while the command runs, are retried,
   so the command may run a second time; if every attempt fails, `exec()` raises
   `ExecResultUnknownError` (a `GetReturncodeError`, as the cause of a `K8sError`). They
   are not retried once the container has restarted or been replaced. A pod with execd
