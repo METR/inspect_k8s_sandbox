@@ -13,7 +13,6 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
-import k8s_sandbox._pod.write as writefile_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.write import WriteFileOperation
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
@@ -53,17 +52,11 @@ def test_write_file_writes_data_via_chunked_helper(
         pytest.param(2, PodError, id="failed"),
     ],
 )
-def test_a_255_is_a_stopped_container(
-    monkeypatch: pytest.MonkeyPatch, returncode: int, error: type[Exception]
-) -> None:
-    monkeypatch.setattr(writefile_module, "get_returncode", lambda _ws: returncode)
-    op = WriteFileOperation(MagicMock())
-    ws = MagicMock(spec=WSClient)
-    ws.is_open.return_value = False
-    ws.read_stderr.return_value = ""
+def test_a_255_is_a_stopped_container(returncode: int, error: type[Exception]) -> None:
+    ws = _FakeWSClient([_status(returncode)])
 
     with pytest.raises(error) as raised:
-        op._handle_stream_output(ws)
+        WriteFileOperation(MagicMock())._handle_stream_output(ws)
 
     assert type(raised.value) is error
 

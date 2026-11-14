@@ -636,7 +636,9 @@ def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> No
     cuts = [i + 1 for i, char in enumerate(script[:-1]) if char == "\n"]
 
     for cut in cuts:
-        result = subprocess.run(shell, input=script[:cut].encode(), capture_output=True)
+        result = subprocess.run(
+            shell, input=script[:cut].encode(), capture_output=True, timeout=30
+        )
 
         assert not ran.exists(), f"ran after a cut at {cut}: {script[:cut]!r}"
         assert result.stdout == b""
@@ -694,6 +696,7 @@ def _tls(
         + ["-keyout", str(key), "-out", str(cert)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -707,9 +710,14 @@ def _tls(
     )
     client = client_context.wrap_socket(client_socket, do_handshake_on_connect=False)
     handshake = threading.Thread(target=server.do_handshake)
+    for end in (client, server):
+        end.settimeout(30)  # only bounds a hang
     handshake.start()
     client.do_handshake()
-    handshake.join()
+    handshake.join(30)
+    assert not handshake.is_alive()
+    for end in (client, server):
+        end.settimeout(None)
     return client, server
 
 
@@ -1466,7 +1474,7 @@ class TestProbeSwitch:
             stub.chmod(0o755)
             script = script.replace("/sbin/runuser", str(stub))
 
-        result = subprocess.run([*shell, "-c", script])
+        result = subprocess.run([*shell, "-c", script], timeout=30)
 
         assert result.returncode == expected
 

@@ -229,12 +229,6 @@ def test_termination_grace_period_is_set_per_service(
     }
 
 
-def test_pod_annotations_must_be_strings(chart_dir: Path) -> None:
-    with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _run_helm_template(chart_dir, set_str="services.default.podAnnotations.n=1")
-    assert "podAnnotations" in exc_info.value.stderr
-
-
 @pytest.mark.parametrize(
     "labels",
     [

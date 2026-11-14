@@ -451,6 +451,7 @@ async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
         capture_output=True,
         text=True,
         check=True,
+        timeout=30,
     )
     values = json.loads(yaml.safe_load(rendered.stdout)["data"]["values"])
     assert values == {

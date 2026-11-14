@@ -114,7 +114,11 @@ func TestConnectionsNotYetAuthenticatedAreBounded(t *testing.T) {
 	dial := func() net.Conn {
 		ours, theirs := net.Pipe()
 		t.Cleanup(func() { ours.Close(); theirs.Close() })
-		l <- silent{theirs}
+		select {
+		case l <- silent{theirs}:
+		case <-time.After(30 * time.Second):
+			t.Fatal("serve took no more connections")
+		}
 		return ours
 	}
 	first := dial()
@@ -533,6 +537,7 @@ func TestACommandKilledBeforeItsTimeoutIsNotTimedOut(t *testing.T) {
 // exitStatus returns a call's EXIT under the keys the client reads: a struct would match them in any case.
 func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 	t.Helper()
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -540,7 +545,7 @@ func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 				json.Unmarshal(f.payload, &status)
 				return status
 			}
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -622,6 +627,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 
 	s.dispatch(c, frame{kind: fStart, id: 6, payload: req})
 
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -632,7 +638,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 				t.Fatalf("EXIT is %d bytes", len(f.payload))
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -837,6 +843,7 @@ func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
 	s.dispatch(c, frame{kind: fStart, id: 25, payload: req})
 
 	var out []byte
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -852,7 +859,7 @@ func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
 				t.Fatalf("printf got %q, want %q", out, want)
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -928,6 +935,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
 
 	var out []byte
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -943,7 +951,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 				t.Fatalf("the command's output was %q", out)
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -994,6 +1002,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached" + strconv.Itoa(int(id))})
 		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
 	}
+	deadline := time.After(30 * time.Second)
 	for len(victims) < 20 {
 		select {
 		case f := <-frames:
@@ -1002,7 +1011,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 				victims[f.id] = pid
 				t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
 			}
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("a command never printed what it detached")
 		}
 	}
@@ -1113,8 +1122,13 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 		}
 	}
 	noted()
-	if err := <-started; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the START never returned")
 	}
 
 	// Only the signal to its group reaches the first, only the search for its tag the second.
@@ -1219,6 +1233,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 	s.dispatch(c, frame{kind: fStart, id: 35, payload: req})
 	s.dispatch(c, frame{kind: fStdin, id: 35, payload: make([]byte, 1<<20)}) // more than a pipe holds
 	var pipe string
+	deadline := time.After(30 * time.Second)
 	for exited := false; !exited; {
 		select {
 		case f := <-frames:
@@ -1226,7 +1241,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 				pipe += string(f.payload)
 			}
 			exited = f.kind == fExit
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}

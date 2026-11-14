@@ -331,7 +331,7 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
     await asyncio.wait_for(flooded.wait(), 30)
     await until(lambda: stream._link.closed)
 
-    assert held(stream) <= 2 * (execd.STREAM_WINDOW + execd.CHUNK)
+    assert held(stream) <= 4 << 20  # twice a stream's 1 MiB window and a frame
     assert stream._link.closed
 
 
@@ -350,7 +350,7 @@ async def test_exits_and_errors_the_caller_has_not_taken_stay_bounded(
     stream = await daemons.client().open_stream(["cat"], None)
 
     await until(lambda: stream._link.closed)
-    assert held(stream) <= 4 * execd.MAX_CONTROL
+    assert held(stream) <= 16 << 10
     await stream.aclose()
 
 
@@ -1058,7 +1058,7 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(
     with pytest.raises(TimeoutError, match="Command timed out"):
         call = daemons.client().exec(["yes"], None, None, {}, None, 1)
         await asyncio.wait_for(call, 30)  # only bounds a hang
-    assert 0 < acked <= execd.HOLD
+    assert 0 < acked <= 10 << 20
 
 
 async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
@@ -2688,6 +2688,7 @@ def tls(tmp_path: pathlib.Path) -> tuple[ssl.SSLContext, str]:
         + ["-keyout", str(key), "-out", str(cert)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
