@@ -695,8 +695,9 @@ class ExecdClient:
         with contextlib.suppress(OSError):  # the reader sees the drop
             for i in range(offset, len(stdin), CHUNK):
                 await _window(link, call, i)
-                await link.send(STDIN, call.id, stdin[i : i + CHUNK])
+                # Before the send: its ack can be read before this task runs again.
                 call.stdin_sent = max(call.stdin_sent, min(i + CHUNK, len(stdin)))
+                await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
     async def _kill(self, link: Link, call: Call) -> None:
@@ -983,9 +984,9 @@ class ExecdStream(ByteStream):
             try:
                 for i in range(0, len(item), CHUNK):
                     await _window(self._link, self._call, self._sent)
-                    await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
                     self._sent += min(CHUNK, len(item) - i)
-                    self._call.stdin_sent = self._sent
+                    self._call.stdin_sent = self._sent  # before the send, as _upload
+                    await self._link.send(STDIN, self._call.id, item[i : i + CHUNK])
             except OSError as e:
                 raise anyio.BrokenResourceError(repr(e)) from e
             except asyncio.CancelledError:

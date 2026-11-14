@@ -700,6 +700,49 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_the_next(
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])
+async def test_a_stdin_ack_read_before_its_send_returns_is_counted(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    """Regression: such an ack was dropped, and an upload past 8 MiB never finished."""
+    got = 0
+
+    class Late(Plain):
+        async def write(self, data: bytes) -> None:
+            await super().write(data)
+            await asyncio.sleep(0.03)  # the ack is read before the sender runs again
+
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
+        return Late(r, w)
+
+    async def acks_at_once(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal got
+        _, call_id, _ = await read_frame(r)  # START
+        while True:
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN and payload:
+                got += len(payload)
+                ack = json.dumps({"stdin": got}).encode()
+                w.write(frame(execd.STDIN_ACK, call_id, ack))
+            elif kind == execd.STDIN:  # stdin's end
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    monkeypatch.setattr(execd, "_connect", connect)
+    await daemons.serve(acks_at_once)
+    stdin = b"x" * (execd.STDIN_WINDOW + 2 * execd.CHUNK)
+    client = daemons.client()
+
+    if stream:
+        opened = await client.open_stream(["cat"], None)
+        await asyncio.wait_for(opened.send(stdin), 30)  # only bounds a hang
+    else:
+        call = client.exec(["cat"], stdin, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    await until(lambda: got == len(stdin))
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
