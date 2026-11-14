@@ -20,8 +20,8 @@
   running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in
   for it while it starts. execd's memory counts against the container's limit: about 7
   MB idle, 9 to 16 MB for each stream (stdout, stderr) of a command that prints faster
-  than the client reads, and about 8 MB for each command that leaves its stdin unread,
-  most of it kept for minutes after the command ends.
+  than the client reads, and up to about 9 MB of the stdin a command leaves unread, most
+  of it kept for minutes after the command ends.
 - Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
   sidecar. A service with a DNS record finds itself there under its own name through

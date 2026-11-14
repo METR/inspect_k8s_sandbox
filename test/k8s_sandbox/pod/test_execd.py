@@ -744,6 +744,58 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
+async def test_calls_left_while_cut_off_are_all_killed_however_far_apart(
+    daemons: Daemons, clock: types.SimpleNamespace
+) -> None:
+    """Regression: the second one left dropped the first, once six minutes old."""
+    auths = 0
+    answer = asyncio.Event()
+    started: list[int] = []
+    got: list[tuple[int, int]] = []
+
+    async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal auths
+        await read_frame(r)  # AUTH
+        auths += 1
+        if auths == 1:
+            w.write(frame(execd.OK, 0))
+            for _ in range(2):
+                started.append((await read_frame(r))[1])  # START
+            w.close()  # the connection drops under both commands
+            return
+        await answer.wait()  # the client is still reconnecting
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:  # the next command: what was kept came before
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                break
+            got.append((kind, call_id))
+        await r.read()
+
+    server = await asyncio.start_server(connection, "127.0.0.1", 0)
+    daemon = execd.Daemon("127.0.0.1", "cert", b"key")
+    daemons.ports[daemon] = server.sockets[0].getsockname()[1]
+    daemons.unstarted.append(daemon)
+    client = daemons.client()
+    sleep = ["sleep", "600"]
+    first = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
+    await until(lambda: len(started) == 1)
+    second = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
+    await until(lambda: auths == 2)
+
+    for call, later in ((first, 361), (second, 0)):  # execd lets a call go at 360 s
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, 30)
+        clock.now += later
+    answer.set()
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    both = (execd.KILL, execd.RELEASE)
+    assert got == [(kind, call) for call in started for kind in both]
+
+
 async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     daemons: Daemons,
 ) -> None:

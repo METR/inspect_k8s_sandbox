@@ -748,10 +748,12 @@ class ExecdClient:
             try:
                 if not finished:
                     # Left by its caller: stopped now, and again on each new connection.
-                    self._unkilled = [*self._left(), (time.monotonic(), call.id)]
                     to = link if not link.closed else self._link
                     if to is not None and not to.closed:
+                        # Cut off, an old one would still be owed its RELEASE.
+                        self._unkilled = self._left()
                         to.send_last(call.id, KILL, RELEASE)
+                    self._unkilled.append((time.monotonic(), call.id))
             finally:
                 link.calls.pop(call.id, None)
 
