@@ -6,9 +6,9 @@ import kubernetes.client
 import pytest
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 
+import k8s_sandbox._pod.execute as execute_module
 import k8s_sandbox._pod.op as op_module
-from k8s_sandbox._pod.execute import ExecuteOperation
-from k8s_sandbox._pod.op import PodInfo, PodOperation
+from k8s_sandbox._pod.op import PodOperation
 
 
 class _ConcretePodOp(PodOperation):
@@ -64,10 +64,10 @@ def test_an_exec_ends_when_the_api_server_never_answers(
     api = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
     monkeypatch.setattr(op_module, "k8s_client", lambda _: api)
     monkeypatch.setattr(op_module, "API_TIMEOUT", 0.5)
-    pod = PodInfo("p", "ns", None, "default", "u", 0, "raise")
+    pod = op_module.PodInfo("p", "ns", None, "default", "u", 0, "raise")
     pool = concurrent.futures.ThreadPoolExecutor(1)
 
-    exec_ = pool.submit(ExecuteOperation(pod).run_argv, ["true"])
+    exec_ = pool.submit(execute_module.ExecuteOperation(pod).run_argv, ["true"])
 
     try:
         with pytest.raises(kubernetes.client.exceptions.ApiException):
