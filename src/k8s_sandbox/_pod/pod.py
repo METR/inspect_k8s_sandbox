@@ -101,6 +101,8 @@ class Pod:
         if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
             raise PodError("execd did not start", returncode=code, stderr=stderr)
         self._execd_lost = True  # until it is returned: a failure below loses its key
+        if not replace:  # the daemon reached before died, perhaps with its container
+            self._execd_restarted = time.monotonic()
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
         # Read last: a pod that replaced the one first checked has another address.
@@ -113,8 +115,6 @@ class Pod:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
-        if not replace:  # the daemon reached before died, perhaps with its container
-            self._execd_restarted = self._execd_started
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property

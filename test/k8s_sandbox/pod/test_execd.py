@@ -1739,6 +1739,36 @@ async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
     assert starts == 0
 
 
+async def test_a_restart_shown_after_a_start_that_lost_its_key_is_still_found(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the start replacing a daemon a failed pod read lost was unchecked."""
+    starts = 0
+    read_fails = iter([True])
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    execd_starts(
+        monkeypatch, lambda: setattr(cluster, "unavailable", next(read_fails, False))
+    )
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    with pytest.raises(kubernetes.client.exceptions.ApiException):
+        await pod._start_execd(False)  # execd had died: perhaps with its container
+    await pod._start_execd(True)  # the client replaces the daemon whose key that lost
+    pod._execd = await tls_daemon(exits)
+    cluster.restarts = 1  # only now does Kubernetes show the restart
+
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.exec(["true"], None, None, {}, None, None)
+    assert starts == 0
+
+
 async def test_a_restart_shown_late_is_found_though_no_operation_ran_meanwhile(
     tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
