@@ -153,7 +153,7 @@ func (w *worker) dial() (net.Conn, error) {
 		}
 		found := net.JoinHostPort(ips[0].String(), port)
 		addr = &found
-		w.addr.Store(addr)
+		w.addr.CompareAndSwap(nil, addr) // an answer that came meanwhile is the newer one
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {

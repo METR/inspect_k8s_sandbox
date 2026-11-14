@@ -343,26 +343,20 @@ func TestStreamsDoNotWaitForEachOthersLookup(t *testing.T) {
 	target, accepted := proxy(t)
 	_, port, _ := net.SplitHostPort(target)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
-	asked, answer := make(chan struct{}, 3), make(chan struct{})
-	var answered sync.Once
-	t.Cleanup(func() { answered.Do(func() { close(answer) }) })
+	var lookups atomic.Int32
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
 	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
-		asked <- struct{}{}
-		<-answer // the cluster's DNS is slow
+		if lookups.Add(1) == 1 {
+			<-hang // the cluster's DNS has no answer for one stream
+		}
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	}
 	dial := serve(t, w)
 
-	for range cap(asked) {
-		dial().Write(key)
-	}
-	for range cap(asked) {
-		within(t, asked, "lookup for a stream while another's had no answer")
-	}
-	answered.Do(func() { close(answer) })
-	for range cap(asked) {
-		within(t, accepted, "stream at the proxy once its lookup was answered")
-	}
+	dial().Write(key)
+	dial().Write(key)
+	within(t, accepted, "stream at the proxy while another stream's lookup hangs")
 }
 
 func TestProxyNamedByHostIsLookedUp(t *testing.T) {
