@@ -44,6 +44,8 @@ func TestProbeNamesTheAssumptionThatBroke(t *testing.T) {
 		"the guest cannot dial":           {guest: map[uint32]string{canaryPort: greeting}, want: "can no longer dial the node"},
 		"the node cannot reach the guest": {dials: "bind: ok\n", want: "can no longer reach a guest-bound port"},
 		"no path either way":              {want: "no vsock path between guest and node either way"},
+		"the canary's line has no end":    {guest: map[uint32]string{canaryPort: greeting}, dials: strings.Repeat("x", 1<<20), want: "can no longer bind a vsock port"},
+		"the guest's greeting has no end": {guest: map[uint32]string{canaryPort: strings.Repeat("x", 1<<20)}, dials: "bind: ok\n", want: "can no longer reach a guest-bound port"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			vsock := firecracker(t, tc.guest)
@@ -58,7 +60,10 @@ func TestProbeNamesTheAssumptionThatBroke(t *testing.T) {
 			}
 			err := probeVM(vsock, wait)
 			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
-				t.Fatalf("got %v, want %q", err, tc.want)
+				t.Fatalf("got %.300v, want %q", err, tc.want)
+			}
+			if err != nil && len(err.Error()) > 1<<10 {
+				t.Fatalf("the error is %d bytes long: the probe kept all that the guest sent", len(err.Error()))
 			}
 		})
 	}

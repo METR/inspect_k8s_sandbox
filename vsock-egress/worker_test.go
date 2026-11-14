@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,9 +22,17 @@ import (
 	"time"
 )
 
-// firecracker stands in for a VM's vsock socket on the node: it answers CONNECT for a guest port with what a
-// guest process listening there would say first.
+// firecracker stands in for a VM's vsock socket on the node: it answers CONNECT for a guest port with what a guest process listening there would say first.
 func firecracker(t *testing.T, says map[uint32]string) (vsock string) {
+	t.Helper()
+	return firecrackerThat(t, func(port uint32) (string, bool) {
+		say, ok := says[port]
+		return say, ok
+	})
+}
+
+// firecrackerThat is firecracker for a guest whose ports do not always say the same.
+func firecrackerThat(t *testing.T, says func(port uint32) (say string, listening bool)) (vsock string) {
 	t.Helper()
 	vsock = filepath.Join(t.TempDir(), "vm.vsock")
 	l, err := net.Listen("unix", vsock)
@@ -39,7 +48,7 @@ func firecracker(t *testing.T, says map[uint32]string) (vsock string) {
 			}
 			var port uint32
 			fmt.Fscanf(bufio.NewReader(c), "CONNECT %d\n", &port)
-			if say, ok := says[port]; ok { // with no listener in the guest, Firecracker closes without a word
+			if say, ok := says(port); ok { // with no listener in the guest, Firecracker closes without a word
 				fmt.Fprintf(c, "OK 1073741824\n%s", say)
 			}
 			c.Close()
@@ -222,10 +231,48 @@ func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 	}
 }
 
+func TestFailedKeyFetchesAreCountedNotLoggedOneByOne(t *testing.T) {
+	var out logged
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	target, _ := proxy(t)
+	w := newWorker(firecracker(t, nil), target, 0) // nothing in the guest holds the key port
+	var clock atomic.Int64
+	w.now = func() time.Time { return time.Unix(clock.Add(1), 0) } // a second on for each stream: each asks for the key again
+	dial := serve(t, w)
+
+	const fetches = 5
+	for range fetches {
+		c := dial()
+		c.Write(newKey())
+		select {
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream was not closed while there was no key to fetch")
+		}
+	}
+	out.Lock()
+	lines := strings.Count(out.String(), fmt.Sprintf("guest vsock port %d", keyPort))
+	out.Unlock()
+	if lines != 1 {
+		t.Fatalf("%d lines say why the key was not fetched: want 1 until the report", lines)
+	}
+	w.report()
+	out.Lock()
+	defer out.Unlock()
+	if want := fmt.Sprintf("%d fetches of the key failed", fetches); !strings.Contains(out.String(), want) {
+		t.Fatalf("the report is %q, want %q in it", out.String(), want)
+	}
+}
+
 func TestKeyIsFetchedOnceForAWorker(t *testing.T) {
 	key, other := newKey(), newKey()
+	var held atomic.Pointer[[]byte] // the key that whoever holds the guest's key port gives
+	held.Store(&key)
 	target, accepted := proxy(t)
-	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	w := newWorker(firecrackerThat(t, func(port uint32) (string, bool) { return string(*held.Load()), port == keyPort }), target, 0)
+	var clock atomic.Int64
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
 	dial := serve(t, w)
 	dial().Write(key)
 	select {
@@ -234,11 +281,9 @@ func TestKeyIsFetchedOnceForAWorker(t *testing.T) {
 		t.Fatal("the forwarder's stream reached nothing")
 	}
 
-	// The forwarder has died and a workload process holds the guest's key port, with a key of its own.
-	squatted := firecracker(t, map[uint32]string{keyPort: string(other)})
-	w.mu.Lock()
-	w.vsock = squatted
-	w.mu.Unlock()
+	// A minute on, the forwarder has died and a workload process holds the guest's key port, with a key of its own.
+	held.Store(&other)
+	clock.Add(60)
 	intruder := dial()
 	intruder.Write(other)
 	select {
@@ -499,8 +544,17 @@ func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 // deafWorker, in the environment, makes this binary a worker that ignores its stdin closing.
 const deafWorker = "VSOCK_EGRESS_TEST_DEAF_WORKER"
 
+// hostileWorker, in the environment, names a signal: this binary as a worker then sends it to all of its uid, again and again.
+const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+		if signal, err := strconv.Atoi(os.Getenv(hostileWorker)); err == nil && os.Args[1] == "work" {
+			os.WriteFile(filepath.Join(filepath.Dir(os.Args[5]), "signalling"), nil, 0o600) // beside the socket -vsock names
+			for {
+				syscall.Kill(-1, syscall.Signal(signal))
+			}
+		}
 		for os.Args[1] == "work" && os.Getenv(deafWorker) != "" {
 			time.Sleep(time.Hour)
 		}

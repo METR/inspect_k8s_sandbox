@@ -12,13 +12,13 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// worker is the node's side for one VM. It runs as the VM's uid, with no capability, inside the pod's network
-// namespace, so that the pod's own network policy governs what it dials.
+// worker is the node's side for one VM: it runs as the VM's uid inside the pod's network namespace, so the pod's own network policy governs what it dials.
 type worker struct {
 	vsock  string        // Firecracker's socket for the VM
 	target string        // the pod's egress proxy: every stream is joined to it, and nothing a guest sends names another
@@ -28,6 +28,7 @@ type worker struct {
 	mu      sync.Mutex
 	key     []byte // the forwarder's
 	fetched time.Time
+	now     func() time.Time
 
 	looked sync.Mutex
 	addr   string // the target's address, once looked up
@@ -37,19 +38,18 @@ type worker struct {
 	accepts *pacer       // new streams a second
 	refused atomic.Int64 // streams turned away since the last report: without the key, or past the cap
 	failed  atomic.Int64 // streams that did not reach the proxy since the last report
+	keyless atomic.Int64 // fetches of the key that failed since the last report
 }
 
-// workerStreams is the most streams a worker joins at once. The forwarder keeps a sandbox to maxStreams; a
-// stream ends on the node a moment after it ends in the guest, so the worker's own bound is twice that.
+// workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest.
 const workerStreams = 2 * maxStreams
 
-// newStreams bounds the streams a worker takes in a second. Past it the worker's listener fills, and
-// Firecracker resets the guest's connections: a guest that floods its worker spends its own VM's time.
+// newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
 func newWorker(vsock, target string, rate int) *worker {
 	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
-		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams),
+		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams),
 		idle: func(d time.Duration, end func()) idleTimer { return time.AfterFunc(d, end) }}
 }
 
@@ -78,11 +78,11 @@ func (m moving) Write(p []byte) (int, error) {
 	return m.Conn.Write(p)
 }
 
-// report writes what went wrong since the last report as one line: a guest must not be able to fill the
-// node's log a stream at a time.
+// report writes what went wrong since the last report as one line: a guest cannot fill the node's log a stream at a time.
 func (w *worker) report() {
-	if refused, failed := w.refused.Swap(0), w.failed.Swap(0); refused+failed > 0 {
-		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy", refused, workerStreams, failed)
+	if refused, failed, keyless := w.refused.Swap(0), w.failed.Swap(0), w.keyless.Swap(0); refused+failed+keyless > 0 {
+		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy; %d fetches of the key failed",
+			refused, workerStreams, failed, keyless)
 	}
 }
 
@@ -94,6 +94,8 @@ func work(args []string) error {
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
+	// It waits on sockets, where more threads only wake each other, and one holds it to one of the node's CPUs.
+	runtime.GOMAXPROCS(1)
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
@@ -160,9 +162,7 @@ func (w *worker) stream(c net.Conn) {
 	join(moving{c, idle}, t.(*net.TCPConn), w.pace)
 }
 
-// dial connects to the pod's proxy. A name is looked up from inside the pod's namespace, so under the pod's own
-// network policy, and its address is kept until a dial to it fails: a Service keeps its address, a pod that
-// is replaced does not.
+// dial connects to the pod's proxy, whose address it keeps until a dial fails: a Service keeps its address, a pod that is replaced does not.
 func (w *worker) dial() (net.Conn, error) {
 	w.looked.Lock()
 	addr := w.addr
@@ -192,16 +192,17 @@ func (w *worker) dial() (net.Conn, error) {
 	return c, err
 }
 
-// holds reports whether key is the forwarder's, which a worker fetches once: whoever holds the guest's key
-// port later cannot give it another. Until a forwarder answers, it asks at most once a second.
+// holds reports whether key is the forwarder's, which a worker fetches once, asking at most once a second: whoever holds the guest's key port later cannot give it another.
 func (w *worker) holds(key []byte) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.key == nil && time.Since(w.fetched) >= time.Second {
-		w.fetched = time.Now()
+	if now := w.now(); w.key == nil && now.Sub(w.fetched) >= time.Second {
+		w.fetched = now
 		fetched, err := fetchKey(w.vsock)
 		if err != nil {
-			log.Print(err)
+			if w.keyless.Add(1) == 1 { // the first of each report says why
+				log.Print(err)
+			}
 			return false
 		}
 		w.key = fetched
@@ -222,8 +223,7 @@ func fetchKey(vsock string) ([]byte, error) {
 	return key, nil
 }
 
-// guestDial connects to a vsock port that a guest process listens on, as Firecracker's socket asks:
-// "CONNECT port\n", answered "OK port\n". The connection keeps a deadline of dialWait.
+// guestDial connects to a guest's vsock port as Firecracker's socket asks ("CONNECT port\n", answered "OK port\n"); the connection keeps a deadline of dialWait.
 func guestDial(vsock string, port uint32) (net.Conn, error) {
 	c, err := net.DialTimeout("unix", vsock, dialWait)
 	if err != nil {

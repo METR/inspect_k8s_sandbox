@@ -23,8 +23,7 @@ import (
 // proxyAnnotation names, as host:port, the one place a sandbox's streams are joined to: its sample's egress proxy.
 const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
 
-// A proxy is a Service of the pod's own namespace, by its cluster name, and a port: a Service keeps its
-// address when its pod is replaced, and nothing else reaches a worker's command line.
+// A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
 var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:[0-9]{1,5}$`)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
@@ -40,8 +39,7 @@ func (n *node) flags(fs *flag.FlagSet) {
 	fs.StringVar(&n.netns, "netns", "/run/netns", "where each pod's network namespace is bound")
 }
 
-// record is what libcni keeps for a pod's eth0: the sandbox, its network namespace, and the pod's name and
-// annotations as they were when the sandbox was made. A later change to the pod changes nothing here.
+// record is what libcni keeps for a pod's eth0, as the pod was when its sandbox was made: a later change to the pod changes nothing here.
 type record struct {
 	ContainerID string      `json:"containerId"`
 	IfName      string      `json:"ifName"`
@@ -103,6 +101,9 @@ func (n *node) sandbox(r record) (sandbox, error) {
 	if owner.Uid == 0 {
 		return sb, fmt.Errorf("%s is root's: expected a uid of the VM's own", sb.root)
 	}
+	if owner.Uid == reaperUID {
+		return sb, fmt.Errorf("%s is uid %d's, which a worker may not have: its reaper runs as that uid", sb.root, reaperUID)
+	}
 	sb.uid, sb.gid = owner.Uid, owner.Gid
 	return sb, nil
 }
@@ -156,25 +157,38 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	return c, nil
 }
 
-// end stops a worker and whatever else runs as its uid here. Closing its stdin only asks; the launcher may
-// not signal another uid's process, so a child of that uid kills them all. Each live VM has a uid of its
-// own, and its Firecracker is outside this PID namespace.
-func (c *child) end() {
+// end stops a worker and whatever else runs as its uid here: closing its stdin only asks, and the launcher may not signal another uid.
+func (c *child) end() error {
 	c.stdin.Close()
-	if reaper, err := start(c.uid, c.gid, "", "reap"); err != nil {
-		log.Printf("uid %d: its processes are not ended: %v", c.uid, err)
-	} else {
-		<-reaper.done
+	reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
+	if err != nil {
+		return err
 	}
+	<-reaper.done
+	if !reaper.cmd.ProcessState.Success() {
+		return fmt.Errorf("its reaper ended with %v", reaper.cmd.ProcessState)
+	}
+	return nil
 }
 
-// reap is what end runs as the VM's uid.
-func reap([]string) error {
-	return syscall.Kill(-1, syscall.SIGKILL)
+const reaperUID = 65534 // the reaper's real and saved uid, which no VM may have
+
+// reap kills every process of one VM's uid here. Only its effective uid is the VM's, so no such process can signal it first.
+func reap(args []string) error {
+	uid, err := strconv.Atoi(strings.Join(args, " "))
+	if err != nil || uid <= 0 || uid == reaperUID {
+		return fmt.Errorf("%q is no VM's uid", args)
+	}
+	if err := syscall.Setresuid(reaperUID, uid, reaperUID); err != nil {
+		return err
+	}
+	if err := syscall.Kill(-1, syscall.SIGKILL); err != syscall.ESRCH { // none left is how it mostly ends: a worker goes when its stdin closes
+		return err
+	}
+	return nil
 }
 
-// inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
-// A thread that cannot come back stays locked, so it is never used again: it ends with its goroutine.
+// inNetns runs f on a thread inside the network namespace at path; a thread that cannot come back stays locked, so it ends with its goroutine.
 func inNetns(path string, f func() error) error {
 	ns, err := os.Open(path)
 	if err != nil {
@@ -275,7 +289,9 @@ func (l *launcher) pass() error {
 	}
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
-			w.end()
+			if err := w.end(); err != nil {
+				log.Printf("uid %d: its processes are not ended: %v", w.uid, err)
+			}
 			delete(l.workers, id)
 		}
 	}

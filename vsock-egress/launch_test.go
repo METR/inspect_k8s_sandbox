@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -78,10 +80,11 @@ func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 		"more than a name and a port":     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128 -rate=1"}, vmUID, false},
 		"the loopback interface's record": {"lo", proxied, vmUID, false},
 		"a VM directory that is root's":   {"eth0", proxied, 0, false},
+		"a VM with the reaper's uid":      {"eth0", proxied, reaperUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if tc.uid == 0 && os.Geteuid() != 0 {
-				t.Skip("only root can make a directory root's")
+			if tc.uid != vmUID && os.Geteuid() != 0 {
+				t.Skip("only root can give a directory to another uid")
 			}
 			l := fakeNode(t)
 			addSandbox(t, l, id("a"), tc.ifName, tc.annotations, tc.uid)
@@ -191,6 +194,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	l := fakeNode(t)
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
+	addSandbox(t, l, id("b"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+1)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
 			w.end()
@@ -199,11 +203,12 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	if err := l.pass(); err != nil {
 		t.Fatal(err)
 	}
-	first := l.workers[id("a")]
-	if first == nil {
+	first, other := l.workers[id("a")], l.workers[id("b")]
+	if first == nil || other == nil {
 		t.Fatal("no worker for a sandbox that names a proxy")
 	}
 	listening(t, l, id("a"))
+	listening(t, l, id("b"))
 	pid := first.cmd.Process.Pid
 	uids, caps := fmt.Sprintf("%d %[1]d %[1]d %[1]d", vmUID), "0000000000000000"
 	if got := status(t, pid, "Uid"); got != uids {
@@ -264,7 +269,74 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	ended(t, second)
-	if len(l.workers) != 0 {
-		t.Fatalf("the launcher still holds %d workers", len(l.workers))
+	// Through three ends of its neighbour's workers, the other sandbox kept its own.
+	if l.workers[id("b")] != other || len(l.workers) != 1 || other.exited() {
+		t.Fatalf("the launcher holds %d workers, and the other sandbox's has ended: %v", len(l.workers), other.exited())
+	}
+}
+
+// A worker the guest has taken over can signal every process of its own uid, the VM's.
+func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
+	self, _ := os.Executable()
+	for d := filepath.Dir(self); d != "/"; d = filepath.Dir(d) {
+		if st, err := os.Stat(d); os.Geteuid() != 0 || err != nil || st.Mode().Perm()&0o005 != 0o005 {
+			t.Skip("needs root, and this test binary where another uid can run it: go test -c -o DIR/x.test with DIR open to all")
+		}
+	}
+	for name, signal := range map[string]syscall.Signal{"kills": syscall.SIGKILL, "stops": syscall.SIGSTOP} {
+		t.Run(name, func(t *testing.T) {
+			const uid = vmUID + 2 // no other test's processes run as it
+			l := fakeNode(t)
+			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
+			t.Setenv(hostileWorker, strconv.Itoa(int(signal)))
+			t.Cleanup(func() { // whatever a failed run left as that uid
+				stats, _ := filepath.Glob("/proc/[0-9]*/status")
+				for _, file := range stats {
+					if b, _ := os.ReadFile(file); strings.Contains(string(b), fmt.Sprintf("\nUid:\t%d\t", uid)) {
+						pid, _ := strconv.Atoi(filepath.Base(filepath.Dir(file)))
+						syscall.Kill(pid, syscall.SIGKILL)
+					}
+				}
+			})
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			w := l.workers[id("a")]
+			if w == nil {
+				t.Fatal("no worker for a sandbox that names a proxy")
+			}
+			signalling := filepath.Join(l.vms, id("a")[:12], "root", "signalling")
+			for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+				if _, err := os.Stat(signalling); err == nil {
+					break
+				}
+				if time.Now().After(deadline) || w.exited() {
+					t.Fatal("the worker did not come to signal its uid")
+				}
+			}
+
+			os.Remove(record) // the sandbox is deleted
+			passed := make(chan error, 1)
+			go func() { passed <- l.pass() }()
+			select {
+			case err := <-passed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(budget):
+				t.Fatal("the launcher's pass did not return: no sandbox on the node gets or loses a worker now")
+			}
+			ended(t, w)
+		})
+	}
+}
+
+func TestEndSaysWhenItsReaperFailed(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root: the reaper starts as root")
+	}
+	c := &child{uid: reaperUID, stdin: io.NopCloser(nil)} // a uid the reaper refuses
+	if err := c.end(); err == nil {
+		t.Fatal("end said nothing of a reaper that killed no process")
 	}
 }

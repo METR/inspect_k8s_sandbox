@@ -14,9 +14,7 @@ import (
 	"time"
 )
 
-// check is the contract with AWS's runtime, for a canary to run on a node before nodes take a new runtime
-// release. It fails, naming the assumption that broke, unless the VM of the pod that runs canary is where and
-// whose the launcher expects, and guest and node still reach each other over its vsock.
+// check is the contract with AWS's runtime, to run before nodes take a new release of it: it fails, naming the assumption that broke, unless the launcher would still find and reach the VM of the pod that runs canary.
 func check(args []string) error {
 	var n node
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
@@ -83,7 +81,7 @@ func probeVM(vsock string, wait time.Duration) error {
 		var said string
 		if c, err := l.Accept(); err == nil {
 			c.SetDeadline(time.Now().Add(dialWait))
-			said, _ = bufio.NewReader(c).ReadString('\n')
+			said, _ = line(c)
 			c.Close()
 		}
 		dialled <- said
@@ -111,14 +109,18 @@ func greet(vsock string) error {
 		return err
 	}
 	defer c.Close()
-	if line, err := bufio.NewReader(c).ReadString('\n'); line != "canary\n" {
-		return fmt.Errorf("guest vsock port %d said %q: %v", canaryPort, line, err)
+	if said, err := line(c); said != "canary\n" {
+		return fmt.Errorf("guest vsock port %d said %q: %v", canaryPort, said, err)
 	}
 	return nil
 }
 
-// canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once
-// a second to say whether it could.
+// line reads the guest's one line, or the start of one that is longer than any it should send.
+func line(c io.Reader) (string, error) {
+	return bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
+}
+
+// canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
 func canary([]string) error {
 	bound := "ok"
 	if l, err := vsockListen(canaryPort); err != nil {

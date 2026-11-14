@@ -1,14 +1,10 @@
-// vsock-egress carries a sandbox's proxy connections out of an AWS Nitro Sandbox that has no network card.
-// In the sandbox, forward serves the proxy port on loopback and sends each connection over the VM's vsock.
-// On the node, launch starts a worker for each such VM, as the VM's own uid inside the pod's network
-// namespace, and the worker joins each connection to the one address the pod's annotation names. Linux only.
+// vsock-egress carries a sandbox's proxy connections out of an AWS Nitro Sandbox with no network card, over the VM's vsock to the one address its pod names. Linux only.
 package main
 
 import (
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"time"
 )
 
@@ -31,13 +27,10 @@ const (
 
 func main() {
 	log.SetFlags(0)
-	// Each command waits on sockets, where more threads only wake each other. It also holds a sandbox's
-	// forwarder to one of its own CPUs and its worker to one of the node's.
-	runtime.GOMAXPROCS(1)
 	commands := map[string]func([]string) error{
 		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, // in the sandbox
 		"launch": launch, "check": check, // on the node
-		"work": work, "probe": probe, "reap": reap, // started by launch and check, as a VM's uid
+		"work": work, "probe": probe, "reap": reap, // started by launch and check
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
 		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|canary (in the sandbox), launch|check (on the node)")

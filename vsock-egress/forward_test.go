@@ -225,8 +225,7 @@ func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 	}
 }
 
-// viaUnix makes f reach w as it does through Firecracker, without one: each of f's vsock connections is a
-// connection to w's socket.
+// viaUnix makes f reach w as it does through Firecracker, without one: each of f's vsock connections is a connection to w's socket.
 func viaUnix(t *testing.T, f *forwarder, w *worker) {
 	dial := serve(t, w)
 	f.connect = func(uint32, uint32) (*os.File, error) {

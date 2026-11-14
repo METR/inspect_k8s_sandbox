@@ -7,6 +7,7 @@
 {{- range $svcName, $svc := .Values.services }}
 {{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
+{{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
 {{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}

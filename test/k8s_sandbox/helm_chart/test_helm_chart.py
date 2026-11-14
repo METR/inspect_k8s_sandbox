@@ -893,6 +893,12 @@ def test_egress_capture_annotation_needs_an_egress_proxy(chart_dir: Path) -> Non
         pytest.param("10.0.0.9:3128", id="an address"),
         pytest.param("proxy.other.svc.cluster.local:3128", id="another namespace"),
         pytest.param("proxy.default.svc.cluster.local", id="no port"),
+        pytest.param("-x-.default.svc.cluster.local:3128", id="no Service's name"),
+        # Cilium reads port 0 as every port: the pod's one policy would bound nothing.
+        pytest.param("proxy.default.svc.cluster.local:0", id="port 0"),
+        pytest.param("proxy.default.svc.cluster.local:03128", id="a leading zero"),
+        pytest.param("proxy.default.svc.cluster.local:65536", id="past the last port"),
+        pytest.param("proxy.default.svc.cluster.local:123456", id="six digits"),
     ],
 )
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
@@ -1049,6 +1055,12 @@ def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> Non
         ("networks.backend.driver=bridge", "networks"),
         ("services.default.networks[0]=backend", "services.default.networks"),
         ("services.default.networkIsolated=true", "services.default.networkIsolated"),
+        # With no policy, only a Service's name bounds what the pod's node dials.
+        (
+            "egressForwarderImage=vsock-egress:1,services.default.podAnnotations."
+            "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local:3128",
+            "the egress proxy services.default names",
+        ),
     ],
 )
 def test_network_policy_disabled_refuses_unenforceable_restrictions(
