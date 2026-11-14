@@ -19,8 +19,8 @@
   on gVisor as a user other than root: execd can't start there unless it can read its
   own file. A process running as execd's user with `CAP_DAC_OVERRIDE` or
   `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
-  against the container's limit: about 6 MB idle, and about 70 MB while eight commands
-  print 10 MiB each at once.
+  against the container's limit: about 6 MB idle, and up to about 30 MB more for each
+  command printing at once.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
@@ -60,8 +60,8 @@
   are not retried once the container has restarted or been replaced. A pod with execd
   resumes the command instead and never runs it a second time; if it can't resume, it
   raises `ExecResultUnknownError`.
-- `exec()` is faster where starting a program is slow. Images no longer need `sync`,
-  and need `printf` (a shell builtin in dash, bash and busybox).
+- Images no longer need `sync`, and need `printf` (a shell builtin in dash, bash and
+  busybox).
 - Add a per-service `podAnnotations` value: annotations for that service's Pod
   alone, over the top-level `annotations`, for a runtime that reads per-pod
   settings from annotations.
@@ -77,10 +77,9 @@
   command wrote stdout (Kata's status for a command whose VM stopped), the stream ends
   as usual and every later operation fails as after a detected restart. The command
   must not exit 255 itself once it has written.
-- `exec(user="root")` no longer needs `id` or `runuser` in the image, and is faster
-  where starting a program is slow. In a container that is not root,
-  `exec(user="0")` now fails as `exec(user="root")` does, with a warning, rather
-  than raising a `RuntimeError` that says the user does not exist.
+- `exec(user="root")` no longer needs `id` or `runuser` in the image. In a container
+  that is not root, `exec(user="0")` now fails as `exec(user="root")` does, with a
+  warning, rather than raising a `RuntimeError` that says the user does not exist.
 - `exec()`, `read_file()` and `write_file()` no longer find the programs they run
   besides the caller's command through the image's `PATH`: `exec(user=...)` runs
   `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
