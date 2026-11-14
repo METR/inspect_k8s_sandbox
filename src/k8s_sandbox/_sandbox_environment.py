@@ -101,6 +101,12 @@ def _retry() -> AsyncRetrying:
             lambda e: isinstance(e, _TRANSIENT_TYPES)
             and not isinstance(e, _PERMANENT_TYPES)
         ),
+        # Logged: over Kubernetes exec the operation may run a second time.
+        before_sleep=lambda state: log_warn(
+            "sandbox operation failed: sending it again",
+            attempt=state.attempt_number,
+            error=repr(state.outcome.exception()) if state.outcome else None,
+        ),
         reraise=True,
     )
 

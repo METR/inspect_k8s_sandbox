@@ -144,6 +144,19 @@ class TestExecRetryTransient:
         assert result.success
         assert mock_exec.call_count == 3
 
+    async def test_each_resend_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A command sent again may have run twice: the log has to show it."""
+        sandbox, mock_exec = _make_sandbox_with_mock_pod()
+        mock_exec.side_effect = [ConnectionError("cut"), _success_result()]
+
+        with caplog.at_level("WARNING"):
+            await sandbox.exec(["echo", "hello"])
+
+        assert caplog.text.count("sending it again") == 1
+        assert "ConnectionError('cut')" in caplog.text
+
 
 class TestExecRetryPermanent:
     """Permanent errors should NOT be retried."""
