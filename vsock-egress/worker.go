@@ -78,10 +78,6 @@ func work(args []string) error {
 	if err != nil {
 		return err
 	}
-	go func() { // the launcher ends a worker by closing its stdin, and so does the launcher's own end
-		io.Copy(io.Discard, os.Stdin)
-		os.Exit(0)
-	}()
 	w := newWorker(*vsock, *target, *rate)
 	go func() {
 		for range time.Tick(time.Minute) {

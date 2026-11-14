@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -252,24 +251,12 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	}
 	listening(t, l, id("a"))
 
-	// The next worker does not end when its stdin closes: it is ended all the same.
-	t.Setenv(deafWorker, "1")
-	syscall.Kill(second.cmd.Process.Pid, syscall.SIGKILL)
-	ended(t, second)
-	if err := l.pass(); err != nil {
-		t.Fatal(err)
-	}
-	second = l.workers[id("a")]
-	if second == nil {
-		t.Fatal("a worker that died was not replaced")
-	}
-
 	os.Remove(record) // the sandbox is deleted
 	if err := l.pass(); err != nil {
 		t.Fatal(err)
 	}
 	ended(t, second)
-	// Through three ends of its neighbour's workers, the other sandbox kept its own.
+	// Through two ends of its neighbour's workers, the other sandbox kept its own.
 	if l.workers[id("b")] != other || len(l.workers) != 1 || other.exited() {
 		t.Fatalf("the launcher holds %d workers, and the other sandbox's has ended: %v", len(l.workers), other.exited())
 	}
@@ -335,7 +322,7 @@ func TestEndSaysWhenItsReaperFailed(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root: the reaper starts as root")
 	}
-	c := &child{uid: reaperUID, stdin: io.NopCloser(nil)} // a uid the reaper refuses
+	c := &child{uid: reaperUID} // a uid the reaper refuses
 	if err := c.end(); err == nil {
 		t.Fatal("end said nothing of a reaper that killed no process")
 	}

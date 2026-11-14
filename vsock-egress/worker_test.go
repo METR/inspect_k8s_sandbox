@@ -480,9 +480,6 @@ type zeros struct{}
 
 func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 
-// deafWorker, in the environment, makes this binary a worker that ignores its stdin closing.
-const deafWorker = "VSOCK_EGRESS_TEST_DEAF_WORKER"
-
 // hostileWorker, in the environment, names a signal: this binary as a worker then sends it to all of its uid, again and again.
 const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
 
@@ -493,9 +490,6 @@ func TestMain(m *testing.M) {
 			for {
 				syscall.Kill(-1, syscall.Signal(signal))
 			}
-		}
-		for os.Args[1] == "work" && os.Getenv(deafWorker) != "" {
-			time.Sleep(time.Hour)
 		}
 		main()
 		return
