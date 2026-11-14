@@ -75,21 +75,24 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 	}
 }
 
-// peerBuffer is what Firecracker holds of a connection's bytes from the guest (its CONN_TX_BUF_SIZE, src/vmm/src/devices/virtio/vsock/csm/mod.rs): the guest's kernel sends no more until Firecracker tells it of room.
+// peerBuffer is Firecracker's CONN_TX_BUF_SIZE: all it holds of a connection's bytes from the guest.
 const peerBuffer = 64 << 10
 
-// fitted is a dialled vsock connection whose frames end where the peer's buffer ends: a full frame that starts part-way through the buffer goes in two packets, and so does every full frame after it.
+// fitted is a dialled vsock connection whose frames end where the peer's buffer ends.
 type fitted struct {
 	*os.File
-	room int // bytes the peer's buffer takes before it is full, known once a write has found it full
+	used int // bytes in the peer's buffer since it was last empty
 }
 
-// payload is the most the next frame carries: what fills the peer's buffer, when that is known.
+// payload is the most the next frame carries: what fills the peer's buffer. A nil fitted fits nothing.
 func (f *fitted) payload() int {
-	if f.room > 4 {
-		return min(maxFrame, f.room-4)
+	if f == nil {
+		return maxFrame
 	}
-	return maxFrame
+	if room := peerBuffer - f.used; room > 4 {
+		return room - 4
+	}
+	return maxFrame - 4 // no frame fits in under five bytes of room: four bytes short leaves the next one five to eight
 }
 
 func (f *fitted) Write(p []byte) (int, error) {
@@ -97,20 +100,21 @@ func (f *fitted) Write(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	done, full := 0, -1 // full: where in p the peer's buffer was last found full
+	done, full := 0, -1 // full: where in p the peer's buffer was found full
 	var failed error
 	if err := raw.Write(func(fd uintptr) bool {
 		for done < len(p) {
 			n, err := unix.Write(int(fd), p[done:])
 			switch err {
 			case nil:
-				done += n
+				if done += n; done < len(p) { // the kernel cuts a write short only where the peer's buffer is full
+					full = done
+				}
 			case unix.EINTR:
 			case unix.EAGAIN:
-				full = done
 				return false
 			default:
-				failed = err
+				failed = fmt.Errorf("vsock write: %w", err)
 				return true
 			}
 		}
@@ -118,13 +122,9 @@ func (f *fitted) Write(p []byte) (int, error) {
 	}); err != nil {
 		return done, err
 	}
-	if failed != nil {
-		return done, failed
-	}
 	if full >= 0 {
-		f.room = peerBuffer - (len(p) - full) // the rest of p went into an emptied buffer
-	} else {
-		f.room = max(f.room-len(p), 0)
+		f.used = -full // the rest of p went into an emptied buffer
 	}
-	return done, nil
+	f.used = (f.used + len(p)) % peerBuffer
+	return done, failed
 }

@@ -137,14 +137,15 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
-	if _, err := up.Write(f.key[:]); err != nil {
+	fit := &fitted{File: up}
+	if _, err := fit.Write(f.key[:]); err != nil {
 		log.Print(err)
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
 		return
 	}
-	join(&fitted{File: up}, c, nil)
+	join(fit, c, nil)
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.
