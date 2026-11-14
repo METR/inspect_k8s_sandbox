@@ -98,10 +98,11 @@ class Pod:
         self._execd_lost = True  # until it is returned: a failure below loses its key
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
-        api = k8s_client(info.context_name)
         # Read last: a pod that replaced the one first checked has another address.
         pod = await self._run_async(
-            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+            lambda: read_pod(
+                k8s_client(info.context_name), info.name, info.namespace, API_TIMEOUT
+            )
         )
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)

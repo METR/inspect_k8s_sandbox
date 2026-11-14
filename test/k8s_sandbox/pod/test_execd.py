@@ -7,6 +7,7 @@ import json
 import shutil
 import ssl
 import subprocess
+import threading
 import time
 import types
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -1505,6 +1506,31 @@ async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
         await pod._start_execd(False)
 
     assert (await pod._start_execd(False)).ip == "10.0.0.1"
+
+
+async def test_the_read_of_execds_address_uses_a_client_of_its_own_thread(
+    cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: the event loop's thread-local client was used on a worker thread."""
+    made: list[int] = []
+    used: list[int] = []
+
+    class Api:
+        def read_namespaced_pod(self, **kwargs: object) -> types.SimpleNamespace:
+            used.append(threading.get_ident())
+            return cluster.read_namespaced_pod(**kwargs)
+
+    def client(_: object) -> Api:
+        made.append(threading.get_ident())
+        return Api()
+
+    monkeypatch.setattr(pod_module, "k8s_client", client)
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    await pod._start_execd(False)
+
+    assert made == used != []
 
 
 async def test_a_resume_resends_only_stdin_execd_has_not_written(
