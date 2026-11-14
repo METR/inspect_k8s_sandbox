@@ -72,7 +72,7 @@ class ReadFileOperation(PodOperation):
             raise_if_stopped_before_lost(ws_client, e, self._pod.name)
             raise
         returncode = get_returncode(ws_client)
-        # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
+        # `head` never exits 255: Kata gives it when the VM stopped.
         if returncode == 255:
             raise ContainerStoppedError(
                 "The container stopped while reading the file.",
