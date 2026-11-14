@@ -13,8 +13,7 @@
   where over Kubernetes exec it waits. A timed-out `exec()` whose command is
   still running gets SIGKILL at once, not SIGTERM, and so do its background processes;
   those of a command that has ended are left running, by a closed `exec_stdio()` too.
-  One that leaves the command's process group can survive, for example by clearing its
-  environment. A command that ends execd, by killing every process or taking the pod's
+  A command that ends execd, by killing every process or taking the pod's
   last PID, makes each running `exec()` raise `ExecResultUnknownError`, and commands
   still running lose their timeout. Make execd mode 111, except where a container runs
   on gVisor as a user other than root: execd can't start there unless it can read its
@@ -41,19 +40,14 @@
 - With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` over
   Kubernetes exec that fails checks whether the container restarted or the pod was
   replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead.
-  Otherwise its error stands, and a connection error is still retried. Each check costs
-  one pod read.
 - The pod read that checks for a restart no longer waits without end on an API server
-  that sends nothing: each of the kubernetes client's four tries gives up after 60
-  seconds, and the operation then fails. A server that keeps sending, however slowly,
-  is still waited on.
+  that sends nothing: the operation fails after about four minutes.
 - An operation whose container stopped under it, which Kata reports with exit code 255
-  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`, also
-  when the connection is lost after the client read that status.
-  Before, `exec()` returned 255 as the command's exit code, and `read_file()` and
-  `write_file()` were retried, reaching the container that replaced it. With
-  `restarted_container_behavior="raise"`, or for an `exec()` whose check after it sees
-  the restart, it raises `ContainerRestartedError` instead.
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`:
+  `exec()` no longer returns 255 as the command's exit code, and `read_file()` and
+  `write_file()` are no longer retried. With `restarted_container_behavior="raise"`, or
+  for an `exec()` whose check after it sees the restart, it raises
+  `ContainerRestartedError` instead.
 - Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
   before it finished, with exit code `N`, and that marker being left at the end of
   stdout when it arrived in two pieces. `exec()` of a command that leaves a
@@ -66,17 +60,13 @@
   are not retried once the container has restarted or been replaced. A pod with execd
   resumes the command instead and never runs it a second time; if it can't resume, it
   raises `ExecResultUnknownError`.
-- `exec()` runs fewer programs in the container per call, which makes it faster
-  where starting one is slow. Images no longer need `sync`, and need `printf` (a
-  shell builtin in dash, bash and busybox).
-- `exec(user=...)` runs fewer programs per call after its first call as each user,
-  where the container switches to that user.
+- `exec()` is faster where starting a program is slow. Images no longer need `sync`,
+  and need `printf` (a shell builtin in dash, bash and busybox).
 - Add a per-service `podAnnotations` value: annotations for that service's Pod
   alone, over the top-level `annotations`, for a runtime that reads per-pod
   settings from annotations.
-- Fix an exec's input (such as a large `write_file()`, which streams over the exec's
-  stdin) going unread after about a minute with the `kubernetes` Python client 36 or
-  later.
+- Fix an exec's input, such as a large `write_file()`, going unread after about a minute
+  with the `kubernetes` Python client 36 or later.
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
   taking one each. Needs anyio 4.14 or later. With
@@ -95,8 +85,7 @@
   besides the caller's command through the image's `PATH`: `exec(user=...)` runs
   `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
   `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
-  them there. The caller's command still
-  runs with the container's `PATH`. `read_file()` starts `head` through `/bin/sh`.
+  them there. The caller's command still runs with the container's `PATH`.
 - The task name and sample UUID reach the chart verbatim, as strings, whatever
   characters they contain (a comma, `=`, a leading `{`, or a name such as `123`).
 

@@ -41,7 +41,7 @@ services:
     initContainers: *initContainers
     volumes: *volumes
     volumeMounts: *volumeMounts
-  # Linux's own check of who may read /proc: gVisor's differs (see the changelog).
+  # Linux's own check of who may read /proc: gVisor's differs.
   runc:
     image: "python:3.12-bookworm"
     command: ["tail", "-f", "/dev/null"]
