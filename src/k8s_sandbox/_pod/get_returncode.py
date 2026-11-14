@@ -39,10 +39,10 @@ def returncode_from_status(channel_value: Any) -> int:
         )
     if loaded["status"] == "Success":
         return 0
-    for cause in loaded["details"]["causes"]:
+    for cause in (loaded.get("details") or {}).get("causes") or []:
         if cause.get("reason") == "ExitCode":
             return int(cause["message"])
-    if "error finding executable" in loaded["message"]:
+    if "error finding executable" in (loaded.get("message") or ""):
         raise ExecutableNotFoundError(loaded["message"])
     raise GetReturncodeError(
         "Failed to get returncode from k8s error channel because `status`!='Success' "
