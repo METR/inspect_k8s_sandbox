@@ -96,7 +96,9 @@ class PodOpExecutor:
         future: Future[T] | None = None
         try:
             async with concurrency("pod-op", self._max_workers):
-                # Pool threads get no context: the caller's carries Inspect's overrides.
+                # The executor does not propagate the caller's context into the
+                # worker thread, so pass it directly to preserve Inspect
+                # sandbox config overrides
                 context = contextvars.copy_context()
                 future = self._executor.submit(context.run, callable)
                 return await asyncio.wrap_future(future)

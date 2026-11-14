@@ -248,7 +248,9 @@ class ExecuteOperation(PodOperation):
             # The markers end each stream when a background process keeps the exec open.
             yield f"printf '{marker}%d>' \"$returncode\"\n"
             yield f"printf '{marker}%d>' \"$returncode\" >&2\n"
-            # Exit the shell: the websocket closes only once stdout and stderr do.
+            # Exit the shell. This won't actually close the websocket connection until
+            # stdout and stderr (which have been inherited by the user command) are
+            # closed.
             yield 'exit "$returncode"\n'
             yield _CLOSE_GROUP
 

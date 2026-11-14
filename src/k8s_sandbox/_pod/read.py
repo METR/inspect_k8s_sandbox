@@ -60,7 +60,8 @@ class ReadFileOperation(PodOperation):
         # response in memory.
         try:
             while ws_client.is_open():
-                # `timeout=None`: `update` blocks until there is data to read.
+                # `timeout=None` means `update` will block indefinitely until there is
+                # data to read.
                 ws_client.update(timeout=None)
                 if ws_client.peek_stdout():
                     dst.write(ws_client.read_stdout())
