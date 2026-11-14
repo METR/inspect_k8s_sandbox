@@ -264,8 +264,9 @@ async def test_another_users_process_is_refused_at_execds_socket(
     context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
     theirs = await execs.connect("-u", "65534")
 
-    # Closed, where its own user is served; the budgets only bound a hang.
-    with anyio.fail_after(30), pytest.raises(anyio.EndOfStream):
+    # Closed, before the handshake or in it, where its own user is served.
+    closed = (anyio.EndOfStream, anyio.BrokenResourceError)
+    with anyio.fail_after(30), pytest.raises(closed):  # the budgets only bound a hang
         await anyio.streams.tls.TLSStream.wrap(
             theirs, server_side=False, ssl_context=context, standard_compatible=False
         )
