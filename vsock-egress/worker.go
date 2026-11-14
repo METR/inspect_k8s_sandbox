@@ -30,8 +30,7 @@ type worker struct {
 	fetched time.Time
 	now     func() time.Time
 
-	looked sync.Mutex
-	addr   string // the target's address, once looked up
+	addr   atomic.Pointer[string] // the target's address, once looked up
 	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 
 	accepts *pacer       // new streams a second
@@ -130,30 +129,25 @@ func (w *worker) stream(c net.Conn) {
 
 // dial connects to the pod's proxy, whose address it keeps until a dial fails: a Service keeps its address, a pod that is replaced does not.
 func (w *worker) dial() (net.Conn, error) {
-	w.looked.Lock()
-	addr := w.addr
-	if addr == "" {
+	addr := w.addr.Load()
+	if addr == nil { // under no lock: a lookup that hangs holds up its own stream alone
 		host, port, err := net.SplitHostPort(w.target)
 		if err != nil {
-			w.looked.Unlock()
 			return nil, err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialWait)
 		ips, err := w.lookup(ctx, "ip4", host)
 		cancel()
 		if err != nil {
-			w.looked.Unlock()
 			return nil, err
 		}
-		addr = net.JoinHostPort(ips[0].String(), port)
-		w.addr = addr
+		found := net.JoinHostPort(ips[0].String(), port)
+		addr = &found
+		w.addr.Store(addr)
 	}
-	w.looked.Unlock()
-	c, err := net.DialTimeout("tcp", addr, dialWait)
+	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
-		w.looked.Lock()
-		w.addr = ""
-		w.looked.Unlock()
+		w.addr.CompareAndSwap(addr, nil)
 		return nil, err
 	}
 	c.(*net.TCPConn).SetReadBuffer(proxyBuffer)

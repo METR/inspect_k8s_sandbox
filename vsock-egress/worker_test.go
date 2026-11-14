@@ -338,6 +338,33 @@ func TestKeyIsAskedForAtMostOnceASecond(t *testing.T) {
 	}
 }
 
+func TestStreamsDoNotWaitForEachOthersLookup(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	_, port, _ := net.SplitHostPort(target)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+	asked, answer := make(chan struct{}, 3), make(chan struct{})
+	var answered sync.Once
+	t.Cleanup(func() { answered.Do(func() { close(answer) }) })
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		asked <- struct{}{}
+		<-answer // the cluster's DNS is slow
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serve(t, w)
+
+	for range cap(asked) {
+		dial().Write(key)
+	}
+	for range cap(asked) {
+		within(t, asked, "lookup for a stream while another's had no answer")
+	}
+	answered.Do(func() { close(answer) })
+	for range cap(asked) {
+		within(t, accepted, "stream at the proxy once its lookup was answered")
+	}
+}
+
 func TestProxyNamedByHostIsLookedUp(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)
