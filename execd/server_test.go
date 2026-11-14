@@ -1252,20 +1252,22 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 	var armed atomic.Bool
 	taken, count := make(chan struct{}), make(chan struct{})
-	afterRead = func() {
+	read := func(bool) {
 		if armed.Swap(false) {
 			close(taken)
 			<-count
 		}
 	}
 	checked, acked := make(chan bool), make(chan struct{})
-	afterDrainCheck = func(late bool) {
+	drainChecked := func(late bool) {
 		select {
 		case checked <- late:
 		case <-acked:
 		}
 	}
-	t.Cleanup(func() { afterRead, afterDrainCheck = func() {}, func(bool) {} })
+	afterRead.Store(&read)
+	afterDrainCheck.Store(&drainChecked)
+	t.Cleanup(func() { afterRead.Store(nil); afterDrainCheck.Store(nil) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)

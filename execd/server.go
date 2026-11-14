@@ -44,9 +44,14 @@ var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and 
 
 var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
 
-var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
+// Tests hold a reader here with output it has taken and not counted, and an exit each time it has checked its pipes.
+var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
 
-var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes
+func hook(h *atomic.Pointer[func(late bool)], late bool) {
+	if f := h.Load(); f != nil {
+		(*f)(late)
+	}
+}
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -455,7 +460,7 @@ func (cl *call) run(req startRequest) error {
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
-					afterRead()
+					hook(&afterRead, false)
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
@@ -504,12 +509,12 @@ func (cl *call) run(req startRequest) error {
 			if delivered && late {
 				outR.SetReadDeadline(time.Now())
 				errR.SetReadDeadline(time.Now())
-				afterDrainCheck(true)
+				hook(&afterDrainCheck, true)
 				<-done
 				cl.finish(code, "")
 				return
 			}
-			afterDrainCheck(late)
+			hook(&afterDrainCheck, late)
 		}
 	}()
 	return nil
