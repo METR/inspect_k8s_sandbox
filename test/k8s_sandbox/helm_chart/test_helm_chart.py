@@ -820,6 +820,26 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
 
 
+@pytest.mark.parametrize(
+    "mount", ["volumeMounts[0]", "initContainers[0].volumeMounts[0]"]
+)
+def test_a_service_cannot_mount_the_egress_forwarders_key(
+    chart_dir: pathlib.Path, mount: str
+) -> None:
+    # Whoever reads the key can open streams to the node as the forwarder.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1,"
+            "services.default.initContainers[0].name=setup,"
+            "services.default.initContainers[0].image=busybox,"
+            f"services.default.{mount}.name=egress-forwarder-key,"
+            f"services.default.{mount}.mountPath=/key",
+            set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
+        )
+    assert "egress-forwarder-key" in exc_info.value.stderr
+
+
 def test_an_isolated_service_cannot_name_an_egress_proxy(
     chart_dir: pathlib.Path,
 ) -> None:
