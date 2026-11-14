@@ -324,6 +324,9 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 				t.Fatal("the launcher's pass did not return: no sandbox on the node gets or loses a worker now")
 			}
 			ended(t, w)
+			if len(l.workers) != 0 { // a reaper the worker reached may still have ended it, and then been stopped or killed itself
+				t.Fatal("the worker's reaper did not end cleanly: the launcher still holds the worker")
+			}
 		})
 	}
 }
