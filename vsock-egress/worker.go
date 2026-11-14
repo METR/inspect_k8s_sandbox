@@ -25,6 +25,7 @@ type worker struct {
 	pace    *pacer        // all of the sandbox's streams, both ways
 	slots   chan struct{} // one for each open stream
 	unkeyed chan struct{} // one for each connection whose key has not been checked yet
+	keyWait time.Duration // how long a connection has to show its key
 
 	mu      sync.Mutex
 	key     []byte // the forwarder's
@@ -50,7 +51,7 @@ const newStreams = 2000
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams),
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait,
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -111,7 +112,7 @@ func (w *worker) serve(l net.Listener) error {
 func (w *worker) stream(c net.Conn) {
 	defer c.Close()
 	key := make([]byte, keySize)
-	c.SetReadDeadline(time.Now().Add(handshakeWait))
+	c.SetReadDeadline(time.Now().Add(w.keyWait))
 	_, err := io.ReadFull(c, key)
 	keyed := err == nil && w.holds(key)
 	<-w.unkeyed

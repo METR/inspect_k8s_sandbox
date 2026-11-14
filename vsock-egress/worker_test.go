@@ -435,20 +435,27 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 func TestConnectionPastThoseThatHaveShownNoKeyIsClosed(t *testing.T) {
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	w.keyWait = time.Hour // no silent connection gives its place up while the test runs
 	dial := serve(t, w)
 
-	for range workerStreams { // each holds its place until the handshake's own bound
+	for range workerStreams {
 		dial()
 	}
-	extra := dial()
-	extra.SetReadDeadline(time.Now().Add(handshakeWait / 2)) // a silent connection is closed as well, after handshakeWait
-	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := dial().Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("connection %d that showed no key ended with %v: want it closed at once", workerStreams+1, err)
 	}
 }
 
-// The kernel takes twice what is asked. On loopback it never grows a buffer, so reading the option back is all a test can hold of the cap.
+// The kernel takes twice what is asked, up to its own maximum. On loopback it never grows a buffer, so reading the option back is all a test can hold of the cap.
 func TestProxySocketIsCappedEachWay(t *testing.T) {
+	most := func(sysctl string) int {
+		b, err := os.ReadFile("/proc/sys/net/core/" + sysctl)
+		n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || n <= 0 {
+			t.Skipf("cannot read the kernel's %s: %v", sysctl, err)
+		}
+		return min(n, proxyBuffer)
+	}
 	target, _ := proxy(t)
 	c, err := newWorker("", target, 0).dial()
 	if err != nil {
@@ -460,9 +467,9 @@ func TestProxySocketIsCappedEachWay(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw.Control(func(fd uintptr) {
-		for name, option := range map[string]int{"receive": syscall.SO_RCVBUF, "send": syscall.SO_SNDBUF} {
-			if got, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); got != 2*proxyBuffer || err != nil {
-				t.Errorf("the %s buffer is %d bytes (%v): want %d, the kernel's count of the cap", name, got, err, 2*proxyBuffer)
+		for option, want := range map[int]int{syscall.SO_RCVBUF: 2 * most("rmem_max"), syscall.SO_SNDBUF: 2 * most("wmem_max")} {
+			if got, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); got != want || err != nil {
+				t.Errorf("socket option %d is %d bytes (%v): want %d, the kernel's count of the cap", option, got, err, want)
 			}
 		}
 	})
