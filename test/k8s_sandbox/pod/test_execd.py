@@ -2937,7 +2937,10 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
     server.close()
 
 
-async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> None:
+async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execd, "CONNECT_TIMEOUT", None)  # or a stalled machine ends it
     writing, closed, left = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class Stalled(anyio.abc.ByteStream):
