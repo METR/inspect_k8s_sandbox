@@ -93,6 +93,62 @@ func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
 	}
 }
 
+// pipes is a listener whose connections come from no address of the pod's.
+type pipes chan net.Conn
+
+func (p pipes) Accept() (net.Conn, error) { return <-p, nil }
+func (p pipes) Close() error              { return nil }
+func (p pipes) Addr() net.Addr            { return nil }
+
+// silent is a connection that never authenticates, and that no deadline ends.
+type silent struct{ net.Conn }
+
+func (silent) SetReadDeadline(time.Time) error { return nil }
+
+func TestConnectionsNotYetAuthenticatedAreBounded(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	l := make(pipes)
+	go s.serve(l) // left waiting for the next: serve has no end
+	dial := func() net.Conn {
+		ours, theirs := net.Pipe()
+		t.Cleanup(func() { ours.Close(); theirs.Close() })
+		l <- silent{theirs}
+		return ours
+	}
+	first := dial()
+	for range maxPreauth - 1 {
+		dial()
+	}
+
+	late := dial()
+
+	late.SetReadDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	if _, err := late.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("with %d connections yet to authenticate, one more got %v, want it closed: a flood of them would take execd's memory", maxPreauth, err)
+	}
+	first.Close() // it gives up: its place is the next connection's
+	for deadline := time.Now().Add(30 * time.Second); len(s.preauth) == maxPreauth; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("a connection that ended kept its place: execd would refuse every connection after its first %d", maxPreauth)
+		}
+	}
+}
+
+func TestAReleasedCallIsForgotten(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c := testConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"echo", "held"}, Env: map[string]string{}, Tag: "released"})
+	s.dispatch(c, frame{kind: fStart, id: 38, payload: req})
+	exitCode(t, s.get(38))
+
+	s.dispatch(c, frame{kind: fRelease, id: 38})
+
+	if s.get(38) != nil {
+		t.Fatal("a released call is still held: each command's output would stay in memory until execd ends")
+	}
+}
+
 func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	t.Cleanup(func() { killTagged("stream") })

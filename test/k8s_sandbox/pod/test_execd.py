@@ -4,6 +4,7 @@ import gc
 import hashlib
 import io
 import json
+import os
 import shutil
 import ssl
 import subprocess
@@ -1634,6 +1635,37 @@ async def test_an_unknown_call_whose_stdin_execd_wrote_is_not_started_again(
     assert starts == 1
 
 
+async def test_an_unknown_call_whose_output_arrived_is_not_started_again(
+    tls_daemon: TlsDaemon,
+) -> None:
+    starts = 0
+
+    async def prints_then_forgets(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if (kind, starts) == (execd.START, 0):
+                starts += 1
+                w.write(frame(execd.STDOUT, call_id, b"x" * execd.ACK_EVERY))
+            elif kind == execd.START:  # started again: answer, so the test ends
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.ACK:  # the client has the output: now it is dropped
+                w.close()
+                return
+            elif kind == execd.RESUME:
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+
+    client = await tls_daemon(prints_then_forgets)
+
+    with pytest.raises(error.ExecdResultUnknownError):
+        call = client.exec(["touch", "/once"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)
+    assert starts == 1
+
+
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
 async def test_a_file_write_stops_at_the_output_limit(
     daemons: Daemons, monkeypatch: MonkeyPatch, kind: int
@@ -1650,6 +1682,57 @@ async def test_a_file_write_stops_at_the_output_limit(
 
     with pytest.raises(OutputLimitExceededError):
         await daemons.client().write_file(b"data", Path("/tmp/f"))
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda c: c.write_file(b"x", Path("/tmp/x")), id="write_file"),
+        pytest.param(lambda c: c.read_file(Path("/x"), io.BytesIO()), id="read_file"),
+    ],
+)
+async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
+    tls_daemon: TlsDaemon,
+    operation: Callable[[execd.ExecdClient], Awaitable[None]],
+) -> None:
+    async def loses_it(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.ERROR, call_id, b"call id in use"))
+        await r.read()
+
+    client = await tls_daemon(loses_it)
+
+    with pytest.raises(error.PodError) as lost:
+        await asyncio.wait_for(operation(client), 30)
+    # Not a command's lost result, which is never retried: the sample would fail.
+    assert type(lost.value) is error.PodError
+
+
+async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
+    tls_daemon: TlsDaemon, tmp_path: Path
+) -> None:
+    """They run as the container's user."""
+    started: list[list[str]] = []
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, payload = await read_frame(r)  # START
+        started.append(json.loads(payload)["argv"])
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    client = await tls_daemon(exits)
+    ran, stubs, dst = tmp_path / "ran", tmp_path / "stubs", tmp_path / "new" / "dst"
+    stubs.mkdir()
+    for name in ("mkdir", "cat"):
+        (stubs / name).write_text(f"#!/bin/sh\necho {name} >> {ran}\n")
+        (stubs / name).chmod(0o755)
+    await asyncio.wait_for(client.write_file(b"data", dst), 30)
+    env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
+
+    subprocess.run(started[0], input=b"data", env=env, capture_output=True, timeout=30)
+
+    assert not ran.exists()
+    assert dst.read_bytes() == b"data"
 
 
 async def test_a_port_held_at_the_first_start_says_so() -> None:
@@ -1703,6 +1786,29 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
     assert (await client.exec(["sh"], None, None, {}, None, 30)).success
     with pytest.raises(RuntimeError, match="does not appear to exist"):
         await client.exec(["true"], None, None, {}, "nobody2", 30)
+
+
+async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
+    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture
+) -> None:
+    why = "cannot run as 0: execd is not root"
+
+    async def refuses(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDERR, call_id, f"execd: {why}\n".encode()))
+        status = json.dumps({"code": 126, "error": why}).encode()
+        w.write(frame(execd.EXIT, call_id, status))
+        await r.read()
+
+    client = await tls_daemon(refuses)
+
+    with caplog.at_level("WARNING"):
+        call = client.exec(["true"], None, None, {}, "root", None)
+        result = await asyncio.wait_for(call, 30)
+
+    # Inspect tries user="root" and falls back on a failed result, not an exception.
+    assert (result.returncode, result.stderr) == (126, f"execd: {why}\n")
+    assert "the container is not running as root" in caplog.text
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(
