@@ -8,7 +8,9 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import ssl
+import struct
 import subprocess
 import threading
 import time
@@ -578,17 +580,20 @@ async def test_a_command_whose_connection_closed_after_it_was_sent_is_resumed(
 async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     daemons: Daemons,
 ) -> None:
-    """Regression: a START cut mid-write failed the call; execd can say if it ran."""
+    """Regression: a START cut as it was written failed a call execd could resume."""
     starts = connections = 0
+    first: list[asyncio.StreamWriter] = []
 
-    async def cuts_the_first_start(
+    async def resets_the_first(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         nonlocal starts, connections
         connections += 1
         if connections == 1:
-            await r.readexactly(execd.HEADER.size)  # the START has begun to arrive
-            w.transport.abort()  # reset, the rest unread
+            first.append(w)
+            _, call_id, _ = await read_frame(r)  # the command that opens the connection
+            w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            await r.read()
             return
         _, call_id, _ = await read_frame(r)  # RESUME
         w.write(frame(execd.ERROR, call_id, b"unknown call"))
@@ -597,11 +602,18 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
         w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
         await r.read()
 
-    await daemons.serve(cuts_the_first_start)
-    # More than a socket takes at once, so the write is under way when it is cut.
-    argv = ["echo", "x" * (16 << 20)]
+    await daemons.serve(resets_the_first)
+    client = daemons.client()
+    await client.exec(["true"], None, None, {}, None, None)
+    reset = struct.pack("ii", 1, 0)  # close with a reset, not an end of stream
+    first[0].get_extra_info("socket").setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, reset
+    )
+    first[0].transport.abort()
+    # Closed in this turn of the loop: the client's socket has the reset, its loop not.
+    await asyncio.sleep(0)
 
-    call = daemons.client().exec(argv, None, None, {}, None, None)
+    call = client.exec(["touch", "/once"], None, None, {}, None, None)
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
     assert (result.returncode, starts) == (7, 1)
@@ -2286,24 +2298,17 @@ async def test_a_read_of_costly_records_takes_a_pass_for_each_slice(
 
     server = await asyncio.start_server(sends, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
-    passes = 0
-
-    async def take(_: execd.Pace, n: int, frames: int = 1, tls: float = 0.0) -> None:
-        nonlocal passes
-        passes += 1
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(execd.Pace, "take", take)
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
-    passes = 0  # the handshake's
     looks = itertools.count()
     clock.cpu = lambda: next(looks) * 0.003  # each look at the clock: 3 ms more spent
+    began = clock.now
 
     await pipe.readexactly(size)
 
     await pipe.close()
     server.close()
-    assert passes >= size // execd.SLICE  # unsliced, a pass for each 64 KiB read
+    # A pass for each 8 KiB at that cost; unsliced, the few passes fit a second's 50 ms.
+    assert clock.now - began > 0.5
 
 
 async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
