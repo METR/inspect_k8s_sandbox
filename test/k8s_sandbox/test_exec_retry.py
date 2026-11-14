@@ -66,17 +66,13 @@ def _make_sandbox_with_mock_pod() -> tuple[K8sSandboxEnvironment, AsyncMock]:
 def _make_sandbox_with_mock_read() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.read_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_read = AsyncMock()
-    mock_pod.read_file = mock_read
-    return sandbox, mock_read
+    return sandbox, mock_pod.read_file
 
 
 def _make_sandbox_with_mock_write() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.write_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_write = AsyncMock()
-    mock_pod.write_file = mock_write
-    return sandbox, mock_write
+    return sandbox, mock_pod.write_file
 
 
 def _success_result() -> ExecResult[str]:
