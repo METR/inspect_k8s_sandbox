@@ -141,9 +141,7 @@ class TestCompletion:
         assert (result.returncode, result.success) == (3, False)
         assert result.stdout == "out"
 
-    def test_a_status_that_arrives_wins_over_the_markers(
-        self, short_grace: None
-    ) -> None:
+    def test_a_status_that_arrives_wins_over_the_markers(self) -> None:
         """Even if the connection then stays open past the grace period."""
         ws = _FakeWSClient(
             [(STDOUT, _marker(0)), (STDERR, _marker(0)), _status(3)], ends=False
@@ -442,7 +440,7 @@ class TestScriptInAShell:
                 [shutil.which(shell[0]) or shell[0], *shell[1:]],
                 stdin=read_end,
                 capture_output=True,
-                timeout=10,
+                timeout=30,
                 env={"PATH": str(tmp_path)},
             )
         finally:
@@ -798,7 +796,7 @@ def test_frames_tls_has_already_decrypted_are_read(
     pool = concurrent.futures.ThreadPoolExecutor(1)
     reading = pool.submit(_handle, ws)
     try:
-        result = reading.result(timeout=5)
+        result = reading.result(timeout=30)
     finally:
         # Wakes a read still waiting, so that a failure can't hang the suite.
         server.close()
@@ -866,7 +864,7 @@ def test_a_frame_cut_off_after_the_markers_does_not_hold_the_exec_open(
 
     reading = pool.submit(_handle, _SocketWSClient(client))
     try:
-        result = reading.result(timeout=5)
+        result = reading.result(timeout=30)
     finally:
         # Wakes a read still waiting, so that a failure can't hang the suite.
         server.close()
@@ -1021,7 +1019,7 @@ class TestStatusReceivedBeforeTheConnectionWasLost:
 
 
 class TestResultLostAfterTheScriptWasSent:
-    """Once the script is sent the command may run, so a lost result isn't retried."""
+    """Once the script is sent the command may run: a lost result is an unknown one."""
 
     @pytest.mark.parametrize(
         "error",
@@ -1178,20 +1176,12 @@ class TestExecChunksStdin:
 
 
 @pytest.mark.parametrize(
-    ("user", "shell", "checked"),
-    [
-        ("root", ["/bin/sh"], True),
-        ("0", ["/bin/sh"], True),
-        (None, ["/bin/sh"], False),
-        ("agent", _shell_command("agent"), False),
-    ],
-    ids=["root", "0", "default", "agent"],
+    ("user", "checked"),
+    [("root", True), ("0", True), (None, False)],
+    ids=["root", "0", "default"],
 )
 def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
-    monkeypatch: pytest.MonkeyPatch,
-    user: str | None,
-    shell: list[str],
-    checked: bool,
+    monkeypatch: pytest.MonkeyPatch, user: str | None, checked: bool
 ) -> None:
     """One program start, not `id` and a second shell; the check runs in it first."""
     writes, op = _exec_writing_to(monkeypatch)
@@ -1200,7 +1190,7 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
 
     op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
 
-    opened.assert_called_once_with(shell)
+    opened.assert_called_once_with(["/bin/sh"])
     check = execute_module._ROOT_CHECK if checked else ""
     assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
 

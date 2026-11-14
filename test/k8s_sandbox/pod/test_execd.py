@@ -185,11 +185,12 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
 class Cluster:
     """What Kubernetes shows of pod p: running, its container restarted this often."""
 
-    restarts = 0
+    restarts = reads = 0
     uid, ip = "u", "10.0.0.1"
     unavailable = False  # its next read fails
 
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
+        self.reads += 1
         if self.unavailable:
             self.unavailable = False
             raise kubernetes.client.exceptions.ApiException(status=503)
@@ -1997,6 +1998,34 @@ async def test_a_restart_shown_late_is_found_though_no_operation_ran_meanwhile(
     with pytest.raises(error.ContainerRestartedError):
         await pod.exec(["true"], None, None, {}, None, None)
     assert starts == 0
+
+
+async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 0.0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    monkeypatch.setattr(
+        pod_module, "time", types.SimpleNamespace(monotonic=lambda: now)
+    )
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(True)
+    pod._execd = await tls_daemon(exits)
+    now = pod_module.RESTART_SHOWN_WITHIN
+    await pod.exec(["true"], None, None, {}, None, None)  # the late check: no restart
+    read = cluster.reads
+
+    await pod.exec(["true"], None, None, {}, None, None)
+
+    # A read of the pod for each operation is what execd takes off the API server.
+    assert cluster.reads == read
 
 
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
