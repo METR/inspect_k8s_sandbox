@@ -229,6 +229,20 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 	}
 }
 
+func TestACommandKilledBeforeItsTimeoutIsNotTimedOut(t *testing.T) {
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -9 $$"}, Env: map[string]string{}, Tag: "k", Timeout: 60})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fStart, id: 9, payload: req})
+
+	if status := exitStatus(t, frames); status["code"] != 137.0 || status["timeout"] != nil {
+		t.Fatalf("EXIT %v, want code 137 and no timeout", status)
+	}
+}
+
 // exitStatus waits for a call's EXIT and returns it under the keys the client reads: a struct would match them in any case.
 func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 	t.Helper()
