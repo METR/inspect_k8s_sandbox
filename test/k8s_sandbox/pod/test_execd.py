@@ -611,6 +611,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
             await r.read()
             return
         kind, call_id, _ = await read_frame(r)
+        while kind in (execd.RELEASE, execd.PING):  # the first command's, again
+            kind, call_id, _ = await read_frame(r)
         resumes.append(kind == execd.RESUME)
         w.write(frame(execd.ERROR, call_id, b"unknown call"))
         kind, call_id, _ = await read_frame(r)
@@ -744,56 +746,311 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
-async def test_calls_left_while_cut_off_are_all_killed_however_far_apart(
-    daemons: Daemons, clock: types.SimpleNamespace
+async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
+    tls_daemon: TlsDaemon,
 ) -> None:
-    """Regression: the second one left dropped the first, once six minutes old."""
-    auths = 0
-    answer = asyncio.Event()
-    started: list[int] = []
-    got: list[tuple[int, int]] = []
+    """Regressions: ids forgotten once written; a finished call's RELEASE not kept."""
+    got: list[list[tuple[int, int]]] = []
+    starts: list[int] = []
+    drop = False  # the connection, under the next command sent
 
-    async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal auths
-        await read_frame(r)  # AUTH
-        auths += 1
-        if auths == 1:
-            w.write(frame(execd.OK, 0))
-            for _ in range(2):
-                started.append((await read_frame(r))[1])  # START
-            w.close()  # the connection drops under both commands
-            return
-        await answer.wait()  # the client is still reconnecting
-        w.write(frame(execd.OK, 0))
+    async def answers_its_third_ping_late(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal drop
+        mine: list[tuple[int, int]] = []
+        got.append(mine)
+        pinged = False
         while True:
             kind, call_id, _ = await read_frame(r)
-            if kind == execd.START:  # the next command: what was kept came before
-                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            if kind == execd.START and drop:
                 break
-            got.append((kind, call_id))
-        await r.read()
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) > 1:  # the first command is left running
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+            elif kind == execd.PING:
+                pinged = len(got) == 3
+            elif kind in (execd.KILL, execd.RELEASE):
+                mine.append((kind, call_id))
+                if pinged:  # only now: this RELEASE came after the PING
+                    w.write(frame(execd.PONG, 0))
+                    pinged = False
+        drop = False
+        w.close()
 
-    server = await asyncio.start_server(connection, "127.0.0.1", 0)
-    daemon = execd.Daemon("127.0.0.1", "cert", b"key")
-    daemons.ports[daemon] = server.sockets[0].getsockname()[1]
-    daemons.unstarted.append(daemon)
-    client = daemons.client()
-    sleep = ["sleep", "600"]
-    first = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
-    await until(lambda: len(started) == 1)
-    second = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
-    await until(lambda: auths == 2)
+    async def call() -> int:
+        """Run a command; its id, once the stand-in has read its RELEASE."""
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+        await until(lambda: (execd.RELEASE, starts[-1]) in got[-1])
+        return starts[-1]
 
-    for call, later in ((first, 361), (second, 0)):  # execd lets a call go at 360 s
-        call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(call, 30)
-        clock.now += later
-    answer.set()
+    client = await tls_daemon(answers_its_third_ping_late)
+    left = asyncio.ensure_future(
+        client.exec(["sleep", "600"], None, None, {}, None, None)
+    )
+    await until(lambda: bool(starts))
+    left.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(left, 30)
+    a = starts[0]
+    await until(lambda: (execd.RELEASE, a) in got[0])
+    drop = True
+    b = await call()
+    drop = True
+    c = await call()  # on the third connection, whose PONG comes behind this RELEASE
+    d = await call()  # its EXIT comes behind the PONG: the client has read that
+    drop = True
+    e = await call()
+
+    kept = [(execd.KILL, a), (execd.RELEASE, a), (execd.RELEASE, b)]
+    after = [(execd.RELEASE, c), (execd.RELEASE, d)]
+    # No PONG: sent again. A PONG: only what its PING followed is not sent again.
+    assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
+
+
+async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
+    tls_daemon: TlsDaemon, clock: types.SimpleNamespace
+) -> None:
+    """Regressions: no PONG, and every call was kept; a busy, or slow, execd refused."""
+    connections: list[asyncio.StreamWriter] = []
+    starts: list[int] = []
+    killed: list[int] = []
+    released: list[int] = []
+    drop = False  # the connection, under the next command sent
+    half = execd.MAX_OWED // 2
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal drop
+        connections.append(w)
+        second = len(connections) == 2
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop:
+                break
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) > 1 + half:  # the first, and half the bound more, run on
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+            elif kind == execd.KILL:
+                killed.append(call_id)
+            elif kind == execd.RELEASE and second:
+                released.append(call_id)
+        drop = False
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    held = call("sleep", "600")
+    await until(lambda: len(starts) == 1)
+    left = [call("sleep", "600") for _ in range(half)]
+    await until(lambda: len(starts) == 1 + half)
+    for _ in range(2):  # each half is asked about with a PING
+        await asyncio.wait_for(asyncio.gather(*(call() for _ in range(half))), 30)
+    commands: list[asyncio.Future[object]] = []
+    for some in left[: half // 2], left[half // 2 :]:
+        clock.now += execd.PING_EVERY  # the second begins to wait that much later
+        commands.append(call())
+        for running in some:  # a KILL is written behind a START that did not wait
+            running.cancel()
+        await asyncio.wait(some, timeout=30)
+        await until(lambda: len(killed) == len(commands) * half // 2)
+    early, late = commands
+    waited = len(starts) == 1 + 3 * half
+    # The second has now waited 56 s; the first, 71.
+    clock.now += execd.DEAD_AFTER + execd.CONNECT_TIMEOUT + 1
+    # One PONG; then the first command's exit, behind which the client has read it.
+    exit_ = frame(execd.EXIT, starts[0], b'{"code": 0}')
+    connections[0].write(frame(execd.PONG, 0) + exit_)
+    await asyncio.wait_for(held, 30)  # as many calls as the bound still await a PONG
+    connections[0].write(frame(execd.PONG, 0))
+    with pytest.raises(ConnectionError, match="not confirmed"):  # its time was up
+        await asyncio.wait_for(early, 30)
+    await asyncio.wait_for(late, 30)
+    drop = True
+    await asyncio.wait_for(call(), 30)
+    await until(lambda: starts[-1] in released)
+
+    # The PONGs answered the first two PINGs: neither half is sent again.
+    assert waited
+    assert set(released) == {*starts[: 1 + half], starts[-2], starts[-1]}
+
+
+async def test_a_command_handed_a_closed_connection_gets_its_pong_on_the_next(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: handed a connection just closed, it waited for a PONG on that one."""
+    connections: list[asyncio.StreamWriter] = []
+
+    async def closes_its_second(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        connections.append(w)
+        nth = len(connections)
+        if nth == 2:  # with its OK, a frame too large: the client closes it as it opens
+            w.write(execd.HEADER.pack(execd.STDOUT, 1, execd.MAX_FRAME + 1))
+        with contextlib.suppress(asyncio.IncompleteReadError):  # the client has gone
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.START:
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.PING and nth > 1:  # the first answers no PING
+                    w.write(frame(execd.PONG, 0))
+
+    def call() -> collections.abc.Coroutine[object, object, object]:
+        return client.exec(["true"], None, None, {}, None, None)
+
+    client = await tls_daemon(closes_its_second)
+    calls = (call() for _ in range(execd.MAX_OWED))
+    await asyncio.wait_for(asyncio.gather(*calls), 30)
+    connections[0].close()
+
+    await asyncio.wait_for(call(), 30)
+
+    assert len(connections) == 3
+
+
+@pytest.mark.parametrize(
+    ("waits", "opened"),
+    [
+        pytest.param([3600], 1, id="on the connection it began on"),
+        pytest.param(
+            [execd.DEAD_AFTER + execd.PING_EVERY + 1, execd.CONNECT_TIMEOUT],
+            2,
+            id="on the next: its time is one",
+        ),
+    ],
+)
+async def test_a_command_out_of_time_for_its_pong_is_refused_with_no_other_connection(
+    tls_daemon: TlsDaemon,
+    clock: types.SimpleNamespace,
+    waits: list[float],
+    opened: int,
+) -> None:
+    """Regression: its time up, another connection was opened before it was refused."""
+    connections: list[asyncio.StreamWriter] = []
+    asked: list[int] = []  # the connection each PING came on
+    starts = 0
+    killed = False
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts, killed
+        connections.append(w)
+        nth = len(connections)
+        with contextlib.suppress(asyncio.IncompleteReadError):  # the client has gone
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.START:
+                    starts += 1
+                    if starts > 1:  # the first command runs on
+                        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.KILL:
+                    killed = True
+                elif kind == execd.PING:
+                    asked.append(nth)
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    running = call("sleep", "600")
+    await until(lambda: starts == 1)
+    calls = (call() for _ in range(execd.MAX_OWED))
+    await asyncio.wait_for(asyncio.gather(*calls), 30)
+    command = call()
+    running.cancel()  # its KILL is written behind a START that did not wait
+    await until(lambda: killed)
+    for nth, seconds in enumerate(waits, 1):  # the last uses up the command's time
+        await until(lambda: nth in asked)  # sent what is owed, and a PING
+        clock.now += seconds
+        connections[nth - 1].close()
+
+    with pytest.raises(ConnectionError, match="not confirmed"):
+        await asyncio.wait_for(command, 30)
+    assert len(connections) == opened
+
+
+async def test_a_call_left_once_its_connection_is_replaced_is_killed_on_the_new_one(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it ran on until the next reconnect, or until execd let it go."""
+    got: list[tuple[int, int, int]] = []
+    connections = 0
+
+    async def prints_then_drops(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal connections
+        connections += 1
+        nth = connections
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and nth == 1 and got:  # under the second command
+                break
+            got.append((nth, kind, call_id))
+            if kind == execd.START and nth == 1:  # the command to be left
+                w.write(frame(execd.STDOUT, call_id, b"x"))
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    client = await tls_daemon(prints_then_drops)
+    left = client.run(["cat"], env={}, cwd=None, user=None, stdin=None, timeout=None)
+    await asyncio.wait_for(anext(left), 30)
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
-    both = (execd.KILL, execd.RELEASE)
-    assert got == [(kind, call) for call in started for kind in both]
+    await asyncio.wait_for(left.aclose(), 30)
+
+    call_id = got[0][2]
+    await until(lambda: (2, execd.RELEASE, call_id) in got)
+    assert (2, execd.KILL, call_id) in got
+
+
+async def test_a_call_timed_out_as_its_connection_drops_is_killed_on_the_next(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: its RELEASE was never sent, so execd kept its record."""
+    got: list[tuple[int, int]] = []
+    starts: list[int] = []
+
+    async def drops_the_first_on_kill(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        first = not starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if first and kind == execd.START:
+                starts.append(call_id)
+            elif first and kind == execd.KILL:
+                w.transport.abort()
+                return
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif not first:
+                got.append((kind, call_id))
+
+    client = await tls_daemon(drops_the_first_on_kill)
+    run = client.run(
+        ["sleep", "9"], env={}, cwd=None, user=None, stdin=None, timeout=0.01
+    )
+
+    async def items() -> list[tuple[int, object]]:
+        return [item async for item in run]
+
+    assert await asyncio.wait_for(items(), 30) == [(execd.EXIT, None)]
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    assert got[:2] == [(execd.KILL, starts[0]), (execd.RELEASE, starts[0])]
 
 
 async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
@@ -836,45 +1093,6 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
-
-
-async def test_a_call_left_is_killed_and_released_once_more_after_execd_lets_it_go(
-    daemons: Daemons, clock: types.SimpleNamespace
-) -> None:
-    """Regressions: sent for ever; then dropped unsent, so execd kept its record."""
-    left: list[int] = []
-    got: list[list[int]] = []
-
-    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        mine: list[int] = []
-        got.append(mine)
-        while True:
-            kind, call_id, _ = await read_frame(r)
-            if not left:
-                left.append(call_id)  # the START of the command to be left
-            elif call_id == left[0]:
-                mine.append(kind)
-            elif kind == execd.START:
-                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
-
-    await daemons.serve(records)
-    client = daemons.client()
-    run = client.exec(["sleep", "600"], None, None, {}, None, None)
-    call = asyncio.ensure_future(run)
-    await until(lambda: bool(left))
-    call.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(call, 30)
-
-    for later in (350, 20, 0):  # execd lets it go at 360 s: before, after, again
-        clock.now += later
-        await asyncio.wait_for(client._get(stale=client._link), 30)
-    # In order behind anything the last connection was sent for the call left.
-    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
-
-    again = [execd.KILL, execd.RELEASE]
-    await until(lambda: got[1:3] == [again, again])
-    assert got[3] == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])
@@ -2474,6 +2692,37 @@ async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
     # Inspect tries user="root" and falls back on a failed result, not an exception.
     assert (result.returncode, result.stderr) == (126, f"execd: {why}\n")
     assert "the container is not running as root" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("why", "raises"),
+    [("cannot run as 0: execd is not root", False), ("unknown user 0", True)],
+)
+async def test_a_user_execd_cannot_run_as_is_told_with_only_the_end_of_stderr(
+    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture, why: str, raises: bool
+) -> None:
+    """Regression: a stand-in for execd had 10 MiB logged by each call."""
+
+    async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDERR, call_id, b"x" * execd.CHUNK + b"the end\n"))
+        status = json.dumps({"code": 126, "error": why}).encode()
+        w.write(frame(execd.EXIT, call_id, status))
+        await r.read()
+
+    client = await tls_daemon(floods)
+    call = client.exec(["true"], None, None, {}, "root", None)
+
+    with caplog.at_level("WARNING"):
+        if raises:
+            with pytest.raises(RuntimeError) as unknown_user:
+                await asyncio.wait_for(call, 30)
+            told = str(unknown_user.value)
+        else:
+            await asyncio.wait_for(call, 30)
+            told = caplog.text
+
+    assert "the end" in told and len(told) < 8192
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(
