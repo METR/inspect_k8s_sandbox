@@ -32,8 +32,9 @@ containers which you'd like `K8sSandboxEnvironment` to directly interact with (i
 * `runuser`, at `/sbin/runuser`, for `exec(user=...)` to switch to another user
 * `id`, for `exec(user=...)` as a user other than root
 
-`head`, `mkdir`, `timeout`, `base64` and `id` must be in `/usr/bin` or `/bin`, and so
-must `printf` where `/bin/sh` has no builtin one.
+`head`, `cat`, `mkdir`, `timeout`, `base64` and `id` must be in `/usr/bin` or `/bin`, and
+so must `printf` where `/bin/sh` has no builtin one. A Pod with execd needs neither
+`runuser` nor `id`.
 
 ## Cluster requirements
 

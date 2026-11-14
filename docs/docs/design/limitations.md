@@ -43,10 +43,11 @@ You can reduce the impact of a container restarting by using persistent volumes.
 
 The framework will issue a warning if a container restarts during an eval. If an
 `exec()` returns a failure or loses its result, and the check before or after it finds a
-restart, the restart is raised as the cause regardless of mode. If you set the
-`restarted_container_behavior` parameter to `raise`, the eval will fail the sample
-immediately on detection, even if `exec()` has not failed, and a `read_file()` or
-`write_file()` that fails checks for a restart too.
+restart, the restart is raised as the cause regardless of mode (on a Pod with execd, in
+`raise` mode only). If you set the `restarted_container_behavior` parameter to `raise`,
+the eval will fail the sample immediately on detection, even if `exec()` has not failed,
+and a `read_file()` or `write_file()` over Kubernetes exec that fails checks for a
+restart too.
 Every later `exec()`, `read_file()` and `write_file()` in that sandbox raises the same
 error, so a solver that catches it cannot carry on in the restarted container.
 
@@ -187,7 +188,8 @@ That said, if you need to run commands as different users, the `user` parameter 
 `exec()` is supported. To switch to a *different* user, you must run the container as
 root, ensure that `runuser` is installed at `/sbin/runuser`, and keep `CAP_SETGID` — the
 switch goes through `runuser`, which calls `setgroups(2)`. A container with
-`capabilities: {drop: [ALL]}` therefore cannot switch users.
+`capabilities: {drop: [ALL]}` therefore cannot switch users. A Pod with execd needs no
+`runuser`: execd switches users itself.
 
 Naming the user the container already runs as needs none of those: that case skips
 `runuser` entirely (it checks the user with `id`, from `/usr/bin` or `/bin`), so it works on a capability-dropped or non-root container, and on an

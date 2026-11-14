@@ -5,24 +5,20 @@
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
-  mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client
-  at the pod's IP, runs `exec()`, `read_file()`, `write_file()` and `exec_stdio()` over
-  TLS to execd instead of Kubernetes exec stdin, each command started by the image's
-  `/bin/sh` as its user: a command name that starts with `-` is not found, and a bash
-  there reads a `SHELLOPTS` in the command's environment as its own. There, a timed-out
-  `exec()` whose command is still running gets SIGKILL at once, not SIGTERM, and so do
-  its background processes; those of a command that has ended are left running, by a
-  closed `exec_stdio()` too. One that leaves the command's process group survives if it
-  keeps starting new processes, clears its environment or pads it past 8 MiB or, without
-  `CAP_SYS_PTRACE`, makes itself non-dumpable or changes user; on gVisor it also survives
-  if its command ran as another `user`. On gVisor that user's other processes can't open
-  such a command's `/proc/PID/fd`. A pod with no PID to spare can end execd itself, and a
-  command run as another `user` needs up to four to start. Make execd mode 111, except
-  where a container runs on gVisor as a user other than root: execd can't start there
-  unless it can read its own file. A process
-  running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in for
-  it while it starts, as it could already forge a result under `kubectl exec`. What a pod's execd sends is paced
-  at 4,096 frames and 128 MiB a second.
+  mounted read-only at `/execd/execd` and TCP port 24601 reachable from the client at
+  the pod's IP and from no other pod, runs `exec()`, `read_file()`, `write_file()` and
+  `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
+  a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
+  and its environment holds `HAWK_NEXT_EXEC`. A timed-out `exec()` whose command is
+  still running gets SIGKILL at once, not SIGTERM, and so do its background processes;
+  those of a command that has ended are left running, by a closed `exec_stdio()` too.
+  One that leaves the command's process group can survive, for example by clearing its
+  environment. A command that ends execd, by killing every process or taking the pod's
+  last PID, makes each running `exec()` raise `ExecResultUnknownError`, and commands
+  still running lose their timeout. Make execd mode 111, except where a container runs
+  on gVisor as a user other than root: execd can't start there unless it can read its
+  own file. A process running as execd's user with `CAP_DAC_OVERRIDE` or
+  `CAP_DAC_READ_SEARCH` can stand in for it while it starts.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
@@ -39,14 +35,15 @@
   it was detected. `read_file()` and `write_file()` do too when
   `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
   waiting to start again, counts as restarted.
-- With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` that
-  fails checks whether the container restarted or the pod was replaced, also when
-  `INSPECT_POD_RESTART_CHECK=false`, and raises that instead. Otherwise its error stands,
-  and a connection error is still retried. Each check costs one pod read.
-- The pod read that checks for a restart gives up when the API server sends nothing for
-  60 seconds (the kubernetes client tries up to four times), and the operation then
-  fails, instead of waiting on a stalled API server without end. A server that keeps
-  sending, however slowly, is still waited on.
+- With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` over
+  Kubernetes exec that fails checks whether the container restarted or the pod was
+  replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead.
+  Otherwise its error stands, and a connection error is still retried. Each check costs
+  one pod read.
+- The pod read that checks for a restart no longer waits without end on an API server
+  that sends nothing: each of the kubernetes client's four tries gives up after 60
+  seconds, and the operation then fails. A server that keeps sending, however slowly,
+  is still waited on.
 - An operation whose container stopped under it, which Kata reports with exit code 255
   when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`, also
   when the connection is lost after the client read that status.
@@ -64,7 +61,8 @@
   so the command may run a second time; if every attempt fails, `exec()` raises
   `ExecResultUnknownError` (a `GetReturncodeError`, as the cause of a `K8sError`). They
   are not retried once the container has restarted or been replaced. A pod with execd
-  resumes the command instead, and never runs it a second time.
+  resumes the command instead and never runs it a second time; if it can't resume, it
+  raises `ExecResultUnknownError`.
 - `exec()` runs fewer programs in the container per call, which makes it faster
   where starting one is slow. Images no longer need `sync`, and need `printf` (a
   shell builtin in dash, bash and busybox).

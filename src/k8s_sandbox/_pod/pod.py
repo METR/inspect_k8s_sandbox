@@ -215,7 +215,8 @@ class Pod:
           env (dict[str, str]): The environment variables to set before running cmd.
           user (str | None): The user to run the command as. If None, the default user
             for the pod will be used. The container must be running as root to run as a
-            different user and runuser must be available at /sbin/runuser.
+            different user and runuser must be available at /sbin/runuser (a pod with
+            execd needs no runuser).
           timeout (int | None): The optional timeout for cmd to complete in. Defaults to
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
