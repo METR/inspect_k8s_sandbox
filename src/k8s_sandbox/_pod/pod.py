@@ -129,15 +129,12 @@ class Pod:
         """An exec whose stdin and stdout are joined to the daemon's socket."""
         operation = ExecuteOperation(self._info)
         try:
-            stack, ws_client = await asyncio.wait_for(
-                self._run_async(
-                    # No stderr: nothing would pace it, were a guest to flood it.
-                    lambda: operation.open_stdio(
-                        [EXECD_PATH, "connect", EXECD_SOCKET], None, stderr=False
-                    ),
-                    discard=lambda opened: opened[0].close(),
+            stack, ws_client = await self._run_async(
+                # No stderr: nothing would pace it, were a guest to flood it.
+                lambda: operation.open_stdio(
+                    [EXECD_PATH, "connect", EXECD_SOCKET], None, stderr=False
                 ),
-                API_TIMEOUT,  # the Kubernetes client gives the upgrade none
+                discard=lambda opened: opened[0].close(),
             )
         except ApiException as e:  # every refusal reads alike: dialled again, as a port
             raise ConnectionError(f"no exec for execd: {e.reason}") from e
