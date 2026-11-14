@@ -1599,6 +1599,36 @@ async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
     assert starts == 0
 
 
+async def test_a_restart_shown_late_is_found_though_no_operation_ran_meanwhile(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: only operations in the 30 s after a restart of execd read the pod."""
+    starts = 0
+    now = 0.0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    monkeypatch.setattr(
+        pod_module, "time", types.SimpleNamespace(monotonic=lambda: now)
+    )
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(True)  # a first start, in a container that had restarted
+    pod._execd = await tls_daemon(exits)
+    cluster.restarts = 1  # only now does Kubernetes show the restart
+    now = pod_module.RESTART_SHOWN_WITHIN  # and nothing ran in the meantime
+
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.exec(["true"], None, None, {}, None, None)
+    assert starts == 0
+
+
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
     cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:

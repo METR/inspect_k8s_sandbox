@@ -82,6 +82,7 @@ class Pod:
         self._execd = ExecdClient(self._start_execd) if execd else None
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
+        self._execd_started: float | None = None  # a start whose late check is owed
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -111,8 +112,9 @@ class Pod:
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
+        self._execd_started = time.monotonic()
         if not replace:  # the daemon reached before died, perhaps with its container
-            self._execd_restarted = time.monotonic()
+            self._execd_restarted = self._execd_started
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
@@ -440,8 +442,12 @@ class Pod:
         if self._restart_error is not None:
             await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
             self._raise_restart()
-        if time.monotonic() - self._execd_restarted < RESTART_SHOWN_WITHIN:
+        now, started = time.monotonic(), self._execd_started
+        late = started is not None and now - started >= RESTART_SHOWN_WITHIN
+        if late or now - self._execd_restarted < RESTART_SHOWN_WITHIN:
             await self.check_for_pod_restart()
+            if late and self._execd_started == started:
+                self._execd_started = None  # a restart before that start shows by now
 
     def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
         """Keep the restart of a container that stopped under an operation."""
