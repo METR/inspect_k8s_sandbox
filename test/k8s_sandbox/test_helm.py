@@ -1049,9 +1049,7 @@ async def _wait(
     mock = MagicMock(side_effect=polls)
     monkeypatch.setattr(Release, "_list_release_pods", mock, raising=True)
     monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 0)
-    # A short deadline of its own: the wait treats an exhausted script as a failed
-    # poll and would otherwise spin for the whole INSPECT_HELM_TIMEOUT.
-    # Bounded too: before Python 3.12 an exhausted script's StopIteration hangs it.
+    # Two bounds: an exhausted script fails every poll, or before Python 3.12 hangs one.
     await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 2), 10)
     if isinstance(polls, list):
         assert mock.call_count == len(polls), (
@@ -1164,6 +1162,12 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_t
         pytest.param(
             lambda release: "kind: StatefulSet\nmetadata: {name: helper}\n",
             id="not-labelled-as-the-release",
+        ),
+        pytest.param(
+            lambda release: _helper(release).replace(
+                "{name: helper}", "{name: helper, namespace: elsewhere}"
+            ),
+            id="in-another-namespace",
         ),
     ],
 )

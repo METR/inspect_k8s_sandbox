@@ -392,7 +392,9 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
-        self._expected_pods = frozenset(_stateful_set_pods(docs, self.release_name))
+        self._expected_pods = frozenset(
+            _stateful_set_pods(docs, self.release_name, self._namespace)
+        )
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
@@ -850,16 +852,21 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
 
 
-def _stateful_set_pods(docs: Iterable[Any], release_name: str) -> Iterator[str]:
+def _stateful_set_pods(
+    docs: Iterable[Any], release_name: str, namespace: str
+) -> Iterator[str]:
     """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
         labels = _dig(doc, "spec", "template", "metadata", "labels")
         if _dig(doc, "kind") == "List":
-            yield from _stateful_set_pods(_dig(doc, "items") or [], release_name)
-        # A pod without the label is in no poll, so waiting for it would never end.
+            yield from _stateful_set_pods(
+                _dig(doc, "items") or [], release_name, namespace
+            )
+        # The poll lists by this label in this namespace: no other pod is ever seen.
         elif (
             _dig(doc, "kind") == "StatefulSet"
             and _dig(labels, _INSTANCE_LABEL) == release_name
+            and _dig(doc, "metadata", "namespace") in (None, namespace)
         ):
             replicas = _dig(doc, "spec", "replicas")
             start = _dig(doc, "spec", "ordinals", "start") or 0
