@@ -17,12 +17,12 @@
   those of a command that has ended are left running. A command that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()` raise
   `ExecResultUnknownError`, and commands still running lose their timeout. Make execd
-  mode 111, except where a container runs on gVisor as a user other than root: execd
-  can't start there unless it can read its own file. A process running as execd's user
-  with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in for it while it starts.
-  execd's memory counts against the container's limit: about 7 MB idle, and 9 to 13 MB
-  for each stream (stdout, stderr) of a command that prints faster than the client
-  reads.
+  mode 111; where a container runs on gVisor as a user other than root it must be
+  readable too (555). A process running as execd's user with `CAP_DAC_OVERRIDE` or
+  `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
+  against the container's limit: about 7 MB idle, and 9 to 13 MB for each stream
+  (stdout, stderr) of a command that prints faster than the client reads, most of it
+  kept for minutes after the command ends.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
