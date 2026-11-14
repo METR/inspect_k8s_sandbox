@@ -28,6 +28,7 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import (
     ExecdResultUnknownError,
+    ExecdStoppedError,
     ExecResultUnknownError,
     PodError,
 )
@@ -624,7 +625,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         link = await asyncio.wait_for(self._get(stale=link), left())
                         if link.daemon is not call.daemon:
-                            raise ExecdResultUnknownError(
+                            raise ExecdStoppedError(
                                 "execd stopped while it ran the command",
                                 pod=link.daemon.ip,
                             )
@@ -694,7 +695,8 @@ class ExecdClient:
             except Exception as e:  # a lost connection, or a restart that failed
                 if sender is None and isinstance(e, NotSent):
                     raise  # the START never left, so nothing ran: it is retried
-                raise ExecdResultUnknownError(
+                stopped = self._daemon is not call.daemon  # another was started since
+                raise (ExecdStoppedError if stopped else ExecdResultUnknownError)(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,
                 ) from e
@@ -857,6 +859,8 @@ class ExecdClient:
                             limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                             truncated_output=None,
                         )
+        except ExecdStoppedError:
+            raise  # run again, it may reach a container that replaced its own
         except ExecResultUnknownError as e:
             # Unlike a command, a file operation may be run again.
             raise PodError(str(e)) from e
