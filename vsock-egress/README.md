@@ -5,7 +5,7 @@ An HTTP proxy port for a pod in an AWS Nitro Sandbox that has no network device.
 A pod annotated `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`, in a release whose
 `egressForwarderImage` value is an image built from this directory, gets a proxy at `127.0.0.1:3128` that reaches only
 that Service of its own namespace. Its forwarder has no resource requests, so the pod is not of the Guaranteed QoS class.
-A connection on which no byte has moved for 300 s is ended, which includes one whose reader has stopped reading.
+A connection on which no byte has moved for 300 s is ended.
 
 A pod that also carries `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that ignore proxy
 settings: its forwarder is the pod's resolver. An address literal, IPv6, and UDP other than DNS are not carried. The pod
