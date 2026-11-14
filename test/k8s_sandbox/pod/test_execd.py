@@ -2059,6 +2059,16 @@ async def test_pacing_lets_other_work_run() -> None:
     assert ran.is_set()  # under its allowance too: a pass at a time
 
 
+async def test_a_costly_pass_gives_way_to_a_timer_already_due() -> None:
+    """Regression: three KeyUpdate passes ran before a task whose sleep had ended."""
+    due = asyncio.Event()
+    asyncio.get_running_loop().call_later(0, due.set)
+
+    await execd.Pace().take(0, frames=0, tls=0.005)
+
+    assert due.is_set()
+
+
 def stub_pipe(
     fraction: float, reading: list[bool], pace: execd.Pace | None = None
 ) -> execd._Pipe:
@@ -2220,6 +2230,41 @@ async def test_what_tls_decryption_costs_is_paced(
 
     # Each pass is over the second's allowance: the next waits for the next second.
     assert clock.now - began >= 2
+
+
+async def test_a_read_of_costly_records_takes_a_pass_for_each_slice(
+    tls: tuple[ssl.SSLContext, str],
+    clock: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: 64 KiB of TLS KeyUpdates, one pass, held the loop 45 ms."""
+    context, pin = tls
+    size = 4 * execd.RAW_READ
+
+    async def sends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write(b"x" * size)
+        await r.read()
+
+    server = await asyncio.start_server(sends, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+    passes = 0
+
+    async def take(_: execd.Pace, n: int, frames: int = 1, tls: float = 0.0) -> None:
+        nonlocal passes
+        passes += 1
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(execd.Pace, "take", take)
+    pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
+    passes = 0  # the handshake's
+    looks = itertools.count()
+    clock.cpu = lambda: next(looks) * 0.003  # each look at the clock: 3 ms more spent
+
+    await pipe.readexactly(size)
+
+    await pipe.close()
+    server.close()
+    assert passes >= size // execd.SLICE  # unsliced, a pass for each 64 KiB read
 
 
 async def test_a_stream_is_charged_only_for_tls_s_own_bytes(

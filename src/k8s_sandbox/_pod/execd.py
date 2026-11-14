@@ -73,6 +73,8 @@ PACE_BYTES = 128 << 20
 PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes
 TLS_PER_BYTE = 0.7e-9  # CPU seconds a byte delivered excuses: its decryption, no more
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
+SLICE = 8 << 10  # of them given to TLS at once: one read handles all its KeyUpdates
+PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
@@ -131,6 +133,7 @@ class _Pipe:
         self.tls = context.wrap_bio(self._in, self._out)
         self._pace = pace
         self._plain = bytearray()
+        self._rest = b""  # TCP bytes a pass left undecrypted
         self._small_at = float("-inf")  # when the next small read may start
         self._transport = cast(asyncio.Transport, writer.transport)  # TCP: it reads too
         self._transport.pause_reading()  # read only while a pass waits for bytes
@@ -153,16 +156,23 @@ class _Pipe:
 
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
-            raw = await self._raw()
+            raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
-            self._in.write(raw)
-            with contextlib.suppress(ssl.SSLWantReadError):
-                while True:
-                    chunk = self.tls.read(RAW_READ)  # a record at a time
-                    if not chunk:
-                        raise ConnectionResetError("execd ended the TLS session")
-                    self._plain += chunk
-            used = held + len(raw) - self._in.pending  # TCP bytes this pass took
+            for i in range(0, len(raw), SLICE):
+                self._in.write(raw[i : i + SLICE])
+                with contextlib.suppress(ssl.SSLWantReadError):
+                    while True:
+                        chunk = self.tls.read(RAW_READ)  # a record at a time
+                        if not chunk:
+                            raise ConnectionResetError("execd ended the TLS session")
+                        self._plain += chunk
+                if time.thread_time() - began > PASS_CPU:
+                    self._rest = raw[i + SLICE :]
+                    break
+            else:
+                self._rest = b""
+            # TCP bytes this pass took
+            used = held + len(raw) - len(self._rest) - self._in.pending
             await self._charge(began, len(self._plain) - had, used)
         data = bytes(self._plain[:n])
         del self._plain[:n]
@@ -279,8 +289,8 @@ class Pace:
         self.tls += tls
         if self.frames > PACE_FRAMES or self.size > PACE_BYTES or self.tls > PACE_TLS:
             await asyncio.sleep(self.since + 1.0 - now)
-        else:
-            await asyncio.sleep(0)  # so other work runs between passes
+        else:  # a timer after a costly pass: tasks whose own timers came due run first
+            await asyncio.sleep(0.001 if tls > PASS_CPU else 0)
 
 
 class Link:
