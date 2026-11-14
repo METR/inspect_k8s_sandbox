@@ -606,6 +606,7 @@ def test_a_pod_with_no_network_card_has_no_coredns_sidecar(
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
     assert [c["name"] for c in pod_spec["containers"]] == ["default"]
     assert [v["name"] for v in pod_spec["volumes"]] == ["resolv-conf"]
+    assert "hostAliases" not in pod_spec  # its service asked for no DNS record
 
 
 def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
