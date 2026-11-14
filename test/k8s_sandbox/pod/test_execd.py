@@ -2807,6 +2807,40 @@ async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> Non
     await asyncio.wait_for(closed.wait(), 30)
 
 
+async def test_what_a_guest_writes_to_its_exec_is_paced(
+    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "PACE_FRAMES", 50)
+
+    class Floods(anyio.abc.ByteStream):
+        """An exec whose guest writes a byte at a time, as fast as it is read."""
+
+        left = 150
+
+        async def send(self, item: bytes) -> None:
+            await asyncio.Event().wait()
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            if not self.left:
+                await asyncio.Event().wait()
+            self.left -= 1
+            return b"x"
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    reader, writer = await execd._through(Floods())
+
+    await asyncio.wait_for(reader.readexactly(150), 30)  # only bounds a hang
+
+    # Three times the second's allowance: twice, reading waits for the next second.
+    assert clock.now == 2.0
+    writer.transport.abort()
+
+
 @pytest.fixture
 async def refused(
     monkeypatch: pytest.MonkeyPatch,

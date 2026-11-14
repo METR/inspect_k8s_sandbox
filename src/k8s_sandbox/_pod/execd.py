@@ -231,9 +231,13 @@ async def _through(
         while data := await loop.sock_recv(far, RAW_READ):
             await stdio.send(data)
 
+    pace = Pace()  # a message costs a pass here before _Pipe counts a byte of it
+
     async def back() -> None:
         while True:
-            await loop.sock_sendall(far, await stdio.receive(RAW_READ))
+            data = await stdio.receive(RAW_READ)
+            await pace.take(len(data))
+            await loop.sock_sendall(far, data)
 
     async def relay() -> None:
         # _Pipe's closing too: out() may be waiting on an exec that takes no more.
