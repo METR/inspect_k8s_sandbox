@@ -12,7 +12,7 @@ import shlex
 import ssl
 import struct
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, cast
@@ -333,8 +333,12 @@ class Link:
                 for kind in kinds:
                     await self.send(kind, call_id)
 
+        await self.last(send())
+
+    async def last(self, sends: Coroutine[Any, Any, None]) -> None:
+        """Run a call's last sends to their end, even if the caller is cancelled."""
         # A task of its own: anyio cancels a cancelled caller again at each await.
-        task = asyncio.create_task(send())
+        task = asyncio.create_task(sends)
         self._last.add(task)
         task.add_done_callback(self._last.discard)
         await asyncio.shield(task)
@@ -440,7 +444,7 @@ class ExecdClient:
         self._opened = float("-inf")
         self._backoff = 0.0
         self._failed: BaseException | None = None  # why the open under way last failed
-        self._unkilled: list[tuple[Daemon, int]] = []  # calls left while cut off
+        self._unkilled: list[tuple[Daemon, int]] = []  # calls left, KILL not yet sent
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -464,10 +468,7 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
-                for left_on, call_id in self._unkilled:
-                    if left_on is daemon:
-                        await link.send_last(call_id, KILL, RELEASE)
-                self._unkilled.clear()
+                await self._kill_left(link)
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 self._failed = e
@@ -486,6 +487,19 @@ class ExecdClient:
                     if self._link is None or isinstance(failed, K8sError):
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
+
+    async def _kill_left(self, link: Link) -> None:
+        """KILL and RELEASE the calls their callers left; each stays until sent."""
+        while self._unkilled:
+            daemon, call_id = self._unkilled[0]
+            if daemon is link.daemon:
+                try:
+                    await link.send(KILL, call_id)
+                    await link.send(RELEASE, call_id)
+                except OSError:
+                    return  # dropped again: the next connection sends it
+            if self._unkilled[:1] == [(daemon, call_id)]:
+                del self._unkilled[0]
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link
@@ -652,11 +666,12 @@ class ExecdClient:
             if sender is not None:
                 sender.cancel()
             try:
-                if not finished and not link.closed:
+                if not finished:
                     # Abandoned by the caller (an output limit, a cancel): stop it.
-                    await link.send_last(call.id, KILL, RELEASE)
-                elif not finished:  # cut off: stopped once its daemon is reached again
                     self._unkilled.append((call.daemon, call.id))
+                    now = link if not link.closed else self._link
+                    if now is not None and not now.closed:  # else at the next open
+                        await now.last(self._kill_left(now))
             finally:
                 link.calls.pop(call.id, None)
 
