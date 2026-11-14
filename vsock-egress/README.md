@@ -9,7 +9,8 @@ that Service of its own namespace. Its forwarder has no resource requests, so th
 Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
-  containerd 2.3's default profile for a container with no capability, plus `socket(AF_VSOCK)`, for the pod's forwarder.
+  the default profile of Amazon Linux's containerd 2.3 for a container with no capability, less the three `io_uring`
+  calls it allows and upstream's does not, plus `socket(AF_VSOCK)`, for the pod's forwarder.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: the same default plus `setns` into a network
   namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
@@ -18,5 +19,5 @@ Each node needs:
   runs in that container's cgroup, where a sandbox that stops reading 64 downloads holds 80 MiB: give it a CPU request,
   and a memory limit for as many sandboxes as the node can hold.
 
-`gate.sh` proves the whole path with real traffic on a cluster. It runs `vsock-egress check` there, which names the
-assumption about AWS's runtime that broke.
+`gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
+which names the assumption about AWS's runtime that broke.

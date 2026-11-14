@@ -2,7 +2,7 @@
 # The gate for egress over the vsock: real traffic from a sandbox with no network card to its egress proxy, under the seccomp profiles the nodes hold.
 usage() {
   cat >&2 <<'EOF'
-usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... gate.sh VALUES.yaml
+usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
   VALUES.yaml  chart values for one service, `default`, with no network card, that names the egress proxy of its own
                release (a pod <fullname>-egress-proxy-0 that allows LISTED's host and refuses UNLISTED's), as Hawk's
                runner makes them for a strict sandbox that names a host
@@ -10,17 +10,19 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... gate.sh VALUES.yaml
   NS           namespace to install into; it must exist
   CHART        the agent-env chart's directory
   LAUNCHERS    namespace/name of the DaemonSet that runs `vsock-egress launch` on the nodes under test
+  NODE         the node the sandbox is put on, one set aside for the gate: its launcher is deleted in step 7, which
+               resets the connections of every other sandbox there
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
   KEEP=1       leave the release installed when a step fails
 It needs helm, kubectl and python3, and leaves nothing behind: one helm release, and one pod with the node's process
-list and a read-only mount of its VM directories. Exit 0: every step passed. Exit 1: a step failed, and step 5
+list and a read-only mount of its VM directories. Exit 0: every step passed. Exit 1: a step failed, and step 6
 (`vsock-egress check`) says which assumption about AWS's runtime broke, if one did.
 EOF
   exit 2
 }
 set -u
-[ $# = 1 ] && [ -n "${CONTEXT:-}" ] && [ -n "${NS:-}" ] && [ -n "${CHART:-}" ] && [ -n "${LAUNCHERS:-}" ] || usage
+[ $# = 1 ] && [ -n "${CONTEXT:-}" ] && [ -n "${NS:-}" ] && [ -n "${CHART:-}" ] && [ -n "${LAUNCHERS:-}" ] && [ -n "${NODE:-}" ] || usage
 VALUES=$1
 LABELS=${LABELS:-"{}"}
 LISTED=${LISTED:-https://pypi.org/simple/sampleproject/}
@@ -50,12 +52,12 @@ cleanup() {
 trap cleanup EXIT
 
 # A second container beside the sandbox's, under the forwarder's seccomp profile: the only way to open the vsock by hand.
-probe='[{"name":"gate-probe","image":"public.ecr.aws/docker/library/python:3.12-alpine","command":["sleep","infinity"],
+probe='[{"name":"gate-probe","image":"public.ecr.aws/docker/library/python:3.12-alpine@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89","command":["sleep","infinity"],
  "securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"runAsNonRoot":true,"runAsUser":65532,
  "seccompProfile":{"type":"Localhost","localhostProfile":"profiles/vsock-egress.json"}}}]'
 
 say "1. helm install $REL: a sandbox with no network card that names its release's egress proxy"
-h install "$REL" "$CHART" -f "$VALUES" -f <(echo "{\"labels\":$LABELS}") --set-json "extraContainers=$probe" > /dev/null \
+h install "$REL" "$CHART" -f "$VALUES" -f <(echo "{\"labels\":$LABELS}") --set-json "extraContainers=$probe" --set-string "services.default.nodeSelector.kubernetes\.io/hostname=$NODE" > /dev/null \
   || { fail "helm install"; exit 1; }
 if wait_for 300 k -n "$NS" wait --for=condition=Ready "pod/$SANDBOX" "pod/agent-env-$REL-egress-proxy-0" --timeout=5s; then
   pass "the sandbox and its proxy are Ready (the forwarder's startup probe passed)"
@@ -63,6 +65,7 @@ else
   fail "the pods did not become Ready in 300 s"; k -n "$NS" get pods -l "app.kubernetes.io/instance=$REL" -o wide; k -n "$NS" get events --sort-by=.lastTimestamp | tail -8; exit 1
 fi
 node=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.spec.nodeName}')
+[ "$node" = "$NODE" ] || { fail "the sandbox is on $node, not on $NODE"; exit 1; }
 selector=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{range .spec.selector.matchLabels}{end}{.spec.selector.matchLabels}' | python3 -c 'import json,sys; print(",".join(f"{k}={v}" for k, v in json.load(sys.stdin).items()))')
 echo "   node $node; launcher $(launcher); annotations: $(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.annotations.sandbox\.amazonaws\.com/network-isolated} {.metadata.annotations.inspect-k8s-sandbox/egress-proxy}')"
 [ "$(in_sandbox sh -c 'ls /sys/class/net | grep -vc -e "^lo$" -e "^dummy"; true')" = 0 ] && pass "the guest has no network device" || fail "the guest has a network device: $(in_sandbox ls /sys/class/net | tr '\n' ' ')"
@@ -76,7 +79,7 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
 {"apiVersion":"v1","kind":"Pod","metadata":{"name":"$REL-peek","labels":$LABELS},
  "spec":{"nodeName":"$node","hostPID":true,"restartPolicy":"Never","terminationGracePeriodSeconds":1,"automountServiceAccountToken":false,
   "tolerations":[{"operator":"Exists"}],
-  "containers":[{"name":"peek","image":"public.ecr.aws/docker/library/busybox:1.37-musl","command":["sleep","3600"],
+  "containers":[{"name":"peek","image":"public.ecr.aws/docker/library/busybox:1.38-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6","command":["sleep","3600"],
    "securityContext":{"runAsUser":0,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
    "volumeMounts":[{"name":"vms","mountPath":"/vms","readOnly":true}]}],
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
@@ -113,14 +116,23 @@ case "$answer" in closed*|reset*) pass "32 zero bytes for a key, then a request:
 code=$(in_sandbox curl -sS -o /dev/null -m 60 -w '%{http_code}' "$LISTED" 2>&1)
 [ "$code" = 200 ] && pass "the forwarder's own streams still pass: $code" || fail "after the refusal GET $LISTED -> $code"
 
-say "5. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
+say "5. the service's own container may not open a vsock socket"
+opened=$(in_sandbox python3 -c 'import socket
+try:
+    socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM); print("opened")
+except PermissionError:
+    print("refused")' 2>&1 | tail -1)
+[ "$opened" = refused ] && pass "socket(AF_VSOCK) is refused there: seccomp is applied in the guest" \
+  || fail "socket(AF_VSOCK) in the service's container: $opened. Only the key now keeps a workload from the node's port"
+
+say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 contract=$(k -n "$LNS" exec "$(launcher)" -c launcher -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
 case "$contract" in *"ok: "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
 
-say "6. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
+say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
 old=$(launcher)
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
