@@ -28,6 +28,7 @@ type worker struct {
 	mu      sync.Mutex
 	key     []byte // the forwarder's
 	fetched time.Time
+	now     func() time.Time
 
 	looked sync.Mutex
 	addr   string // the target's address, once looked up
@@ -36,6 +37,7 @@ type worker struct {
 	accepts *pacer       // new streams a second
 	refused atomic.Int64 // streams turned away since the last report: without the key, or past the cap
 	failed  atomic.Int64 // streams that did not reach the proxy since the last report
+	keyless atomic.Int64 // fetches of the key that failed since the last report
 }
 
 // workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest.
@@ -46,13 +48,14 @@ const newStreams = 2000
 
 func newWorker(vsock, target string, rate int) *worker {
 	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
-		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
+		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
 // report writes what went wrong since the last report as one line: a guest cannot fill the node's log a stream at a time.
 func (w *worker) report() {
-	if refused, failed := w.refused.Swap(0), w.failed.Swap(0); refused+failed > 0 {
-		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy", refused, workerStreams, failed)
+	if refused, failed, keyless := w.refused.Swap(0), w.failed.Swap(0), w.keyless.Swap(0); refused+failed+keyless > 0 {
+		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy; %d fetches of the key failed",
+			refused, workerStreams, failed, keyless)
 	}
 }
 
@@ -160,11 +163,13 @@ func (w *worker) dial() (net.Conn, error) {
 func (w *worker) holds(key []byte) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.key == nil && time.Since(w.fetched) >= time.Second {
-		w.fetched = time.Now()
+	if now := w.now(); w.key == nil && now.Sub(w.fetched) >= time.Second {
+		w.fetched = now
 		fetched, err := fetchKey(w.vsock)
 		if err != nil {
-			log.Print(err)
+			if w.keyless.Add(1) == 1 { // the first of each report says why
+				log.Print(err)
+			}
 			return false
 		}
 		w.key = fetched
