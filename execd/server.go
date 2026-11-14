@@ -67,11 +67,11 @@ type call struct {
 	detached int  // times its connection dropped
 	stdinEOF bool // the client closed stdin
 	mu       sync.Mutex
-	out      [2][]byte // stdout, stderr: what the process wrote and the client has not acked
-	base     [2]int    // the stream offset of out[i][0]
-	sent     [2]int    // the offset up to which the current subscriber has been sent output
-	flushed  time.Time // when output was last sent
-	deferred bool      // a flush waits for its millisecond
+	out      [2]bytes.Buffer // stdout, stderr: what the process wrote and the client has not acked
+	base     [2]int          // the stream offset of out[i][0]
+	sent     [2]int          // the offset up to which the current subscriber has been sent output
+	flushed  time.Time       // when output was last sent
+	deferred bool            // a flush waits for its millisecond
 	room     *sync.Cond
 	gone     bool // released: drop any further output
 	exited   bool
@@ -257,7 +257,7 @@ func (s *server) detach(c *conn) {
 				if orphaned {
 					cl.kill() // before its output is let go: a command that ended on that would leave what it started
 					cl.mu.Lock()
-					cl.gone, cl.out, cl.stdinQ = true, [2][]byte{}, nil
+					cl.gone, cl.out, cl.stdinQ = true, [2]bytes.Buffer{}, nil
 					cl.room.Broadcast()
 					cl.mu.Unlock()
 				}
@@ -274,7 +274,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out = true, [2][]byte{}
+		cl.gone, cl.out = true, [2]bytes.Buffer{}
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -587,13 +587,13 @@ func (cl *call) output(stream int, data []byte) {
 	if cl.stream {
 		limit = streamUnacked
 	}
-	for len(cl.out[stream]) > limit && !cl.gone {
+	for cl.out[stream].Len() > limit && !cl.gone {
 		cl.room.Wait()
 	}
 	if cl.gone {
 		return
 	}
-	cl.out[stream] = append(cl.out[stream], data...)
+	cl.out[stream].Write(data)
 	cl.flushSoon()
 }
 
@@ -662,8 +662,8 @@ func (cl *call) ack(req resumeRequest) {
 // ackLocked forgets output the client confirmed it has.
 func (cl *call) ackLocked(req resumeRequest) {
 	for i, upto := range []int{req.Stdout, req.Stderr} {
-		n := min(max(upto-cl.base[i], 0), len(cl.out[i]))
-		cl.out[i] = cl.out[i][n:]
+		n := min(max(upto-cl.base[i], 0), cl.out[i].Len())
+		cl.out[i].Next(n)
 		cl.base[i] += n
 		cl.sent[i] = max(cl.sent[i], cl.base[i])
 	}
@@ -750,10 +750,10 @@ func (cl *call) flush() (frames int) {
 		return 0
 	}
 	for i, kind := range []byte{fStdout, fStderr} {
-		end := cl.base[i] + len(cl.out[i])
+		end := cl.base[i] + cl.out[i].Len()
 		for cl.sent[i] < end {
 			next := min(end, cl.sent[i]+1<<20)
-			cl.sub.send(kind, cl.id, cl.out[i][cl.sent[i]-cl.base[i]:next-cl.base[i]])
+			cl.sub.send(kind, cl.id, cl.out[i].Bytes()[cl.sent[i]-cl.base[i]:next-cl.base[i]])
 			cl.sent[i] = next
 			frames++
 		}
