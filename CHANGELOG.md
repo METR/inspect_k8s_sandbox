@@ -17,7 +17,9 @@
   `CAP_SYS_PTRACE`, makes itself non-dumpable or changes user; on gVisor it also survives
   if its command ran as another `user`. On gVisor that user's other processes can't open
   such a command's `/proc/PID/fd`. A pod with no PID to spare can end execd itself, and a
-  command run as another `user` needs up to four to start. Make execd mode 111. A process
+  command run as another `user` needs up to four to start. Make execd mode 111, except
+  where a container runs on gVisor as a user other than root: execd can't start there
+  unless it can read its own file. A process
   running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in for
   it while it starts, as it could already forge a result under `kubectl exec`. What a pod's execd sends is paced
   at 4,096 frames and 128 MiB a second.
