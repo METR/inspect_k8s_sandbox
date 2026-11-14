@@ -41,6 +41,7 @@ func forward(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer keys.f.Close()
 	go f.serveKey(keys)
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {

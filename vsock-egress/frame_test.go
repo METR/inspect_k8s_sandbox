@@ -11,6 +11,19 @@ import (
 
 const budget = 30 * time.Second // bounds a hang; a passing test never waits for it
 
+func TestPacerMakesUpForASleepThatRanLate(t *testing.T) {
+	start := time.Unix(0, 0)
+	clock := start
+	const rate, late = 1 << 20, 5 * time.Millisecond
+	p := &pacer{rate: rate, now: func() time.Time { return clock }, sleep: func(d time.Duration) { clock = clock.Add(d + late) }}
+	for range 160 { // 10 MiB
+		p.wait(64 << 10)
+	}
+	if took := clock.Sub(start); took > 10*time.Second+paceSlack {
+		t.Fatalf("10 MiB at 1 MiB a second took %v on a clock whose sleeps run %v late: each late wake was paid for again", took, late)
+	}
+}
+
 // pair returns the two ends of a new connection, closed when the test ends.
 func pair(t *testing.T, network, address string) (net.Conn, net.Conn) {
 	t.Helper()
