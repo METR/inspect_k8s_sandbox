@@ -254,9 +254,11 @@ async def test_a_restart_found_in_raise_mode_ends_streams_over_execd(
         await waiting
     with pytest.raises(anyio.BrokenResourceError):
         await stream.send(b"x")
+    others_ran: list[bool] = []
+    asyncio.get_running_loop().call_soon(others_ran.append, True)
     with pytest.raises(error.ContainerRestartedError):
         await pod.exec_stdio(["cat"], None)
-    assert starts == 1
+    assert (starts, others_ran) == (1, [True])
     await stream.aclose()
 
 

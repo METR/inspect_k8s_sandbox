@@ -272,7 +272,9 @@ class Pod:
         drops, as one whose connection was lost.
         """
         if self._execd is not None:
-            self._raise_restart()
+            if self._restart_error is not None:
+                await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
+                self._raise_restart()
             return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
