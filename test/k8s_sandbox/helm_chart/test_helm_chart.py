@@ -820,6 +820,12 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> N
         pytest.param("10.0.0.9:3128", id="an address"),
         pytest.param("proxy.other.svc.cluster.local:3128", id="another namespace"),
         pytest.param("proxy.default.svc.cluster.local", id="no port"),
+        pytest.param("-x-.default.svc.cluster.local:3128", id="no Service's name"),
+        # Cilium reads port 0 as every port: the pod's one policy would bound nothing.
+        pytest.param("proxy.default.svc.cluster.local:0", id="port 0"),
+        pytest.param("proxy.default.svc.cluster.local:03128", id="a leading zero"),
+        pytest.param("proxy.default.svc.cluster.local:65536", id="past the last port"),
+        pytest.param("proxy.default.svc.cluster.local:123456", id="six digits"),
     ],
 )
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
