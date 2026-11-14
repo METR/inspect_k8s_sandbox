@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import gc
 import hashlib
 import io
 import json
@@ -72,7 +73,10 @@ class Plain(execd._Pipe):
         self._reader, self._writer = r, w
 
     async def readexactly(self, n: int) -> bytes:
-        return await self._reader.readexactly(n)
+        try:
+            return await self._reader.readexactly(n)
+        except asyncio.IncompleteReadError:  # as execd's own pipe ends
+            raise ConnectionResetError("execd closed the connection") from None
 
     async def write(self, data: bytes) -> None:
         self._writer.write(data)
@@ -295,6 +299,25 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
     assert stream._link.closed
 
 
+async def test_exits_and_errors_the_caller_has_not_taken_stay_bounded(
+    daemons: Daemons,
+) -> None:
+    """Regression: a stand-in queued 16 MiB of them on one call, past its hold."""
+
+    async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        for _ in range(64):
+            w.write(frame(execd.ERROR, call_id, b"e" * execd.MAX_CONTROL))
+        await r.read()
+
+    await daemons.serve(floods)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    await until(lambda: stream._link.closed)
+    assert held(stream) <= 4 * execd.MAX_CONTROL
+    await stream.aclose()
+
+
 async def test_a_stream_acks_only_what_its_reader_takes(daemons: Daemons) -> None:
     acks = 0
     start: dict[str, object] = {}
@@ -497,7 +520,6 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
             await asyncio.sleep(0.05)
 
     await daemons.serve(stops_reading)
-    monkeypatch.setattr(execd, "DEAD_AFTER", 0.5)
     monkeypatch.setattr(execd, "KILL_WAIT", 0.5)
     sandbox = daemons.client()
 
@@ -627,6 +649,56 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     # PodError is retried too, which would run the command again.
     with pytest.raises(ExecdResultUnknownError):
         await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+
+
+@pytest.mark.parametrize(
+    "status", [b"[]", b"null", b"{}", b'{"code": "0"}', b'{"code": 0, "error": 5}']
+)
+async def test_an_exit_status_that_is_not_one_is_a_lost_result(
+    daemons: Daemons, status: bytes
+) -> None:
+    """Regression: a stand-in's exit raised AttributeError, or read as a timeout."""
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, status))
+        await r.read()
+
+    await daemons.serve(exits)
+
+    with pytest.raises(ExecdResultUnknownError):
+        call = daemons.client().exec(["true"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)
+
+
+@pytest.mark.parametrize("ack", [b"[]", b"{}", b"0", b'{"stdin": "1"}'])
+async def test_a_stdin_ack_that_is_not_one_ends_the_connection_quietly(
+    daemons: Daemons, ack: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: it ended the reader with an exception nothing retrieved."""
+    served = 0
+
+    async def acks(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal served
+        served += 1
+        _, call_id, _ = await read_frame(r)  # START, then RESUME
+        if served == 1:
+            w.write(frame(execd.STDIN_ACK, call_id, ack))
+        else:
+            w.write(
+                frame(execd.RESUMED, call_id, b'{"stdin": 1, "eof": true, "put": 1}')
+            )
+            w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(acks)
+
+    call = daemons.client().exec(["cat"], b"x", None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)
+
+    assert (result.returncode, served) == (0, 2)
+    gc.collect()  # asyncio reports the reader's exception when the task is freed
+    assert "exception was never retrieved" not in caplog.text
 
 
 async def test_a_port_held_by_another_process_fails_at_once(
@@ -1772,6 +1844,20 @@ async def test_only_the_pinned_certificate_is_trusted(
         await execd._connect(execd.Daemon("127.0.0.1", "0" * 64, b"key"), execd.Pace())
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
     await pipe.close()
+    server.close()
+
+
+async def test_the_client_offers_one_key_exchange_group(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: a stand-in chose a group whose handshake held the loop 150 ms."""
+    context, pin = tls
+    context.set_ecdh_curve("secp384r1")  # the only group this server takes
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+
+    with pytest.raises(OSError):  # no group in common: the handshake ends
+        await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
     server.close()
 
 

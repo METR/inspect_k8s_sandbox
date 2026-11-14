@@ -198,6 +198,7 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.set_ecdh_curve("X25519")  # a stand-in can't pick a group that costs 150 ms
 
     async def handshake() -> _Pipe:
         reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
@@ -234,6 +235,7 @@ class Call:
     closed: bool = False  # by its caller
     exited: bool = False
     resuming: bool = False  # a RESUME awaits its one RESUMED
+    ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
     hold: int = HOLD
     ack_every: int = ACK_EVERY
 
@@ -361,6 +363,10 @@ class Link:
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return
+                    if kind in (EXIT, ERROR):
+                        c.ends += n
+                        if c.ends > 4 * MAX_CONTROL:
+                            return
                     if kind in (STDOUT, STDERR):
                         if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
@@ -370,7 +376,7 @@ class Link:
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
-        except (asyncio.IncompleteReadError, OSError, ValueError):
+        except (OSError, ValueError, LookupError, TypeError):  # not execd's frames
             pass
         finally:
             await self.close()
@@ -516,7 +522,12 @@ class ExecdClient:
                     try:
                         item = await _next(call.queue, left)
                     except asyncio.TimeoutError:
-                        await self._kill(link, call)
+                        try:
+                            await asyncio.wait_for(
+                                self._kill(link, call), KILL_WAIT + 1
+                            )
+                        except asyncio.TimeoutError:  # a write the peer never reads
+                            await link.close()
                         finished = True
                         yield EXIT, None
                         return
@@ -549,7 +560,11 @@ class ExecdClient:
                         except BaseException:  # cut off: it may not have gone out
                             await link.send_last(call.id, RELEASE)
                             raise
-                        yield EXIT, json.loads(payload)
+                        status = json.loads(payload)
+                        code, why = status.get("code"), status.get("error", "")
+                        if type(code) is not int or type(why) is not str:
+                            raise ValueError(f"not an exit status: {payload!r}")
+                        yield EXIT, status
                         return
                     elif kind == RESUMED:  # send the stdin it didn't get
                         got = json.loads(payload)
