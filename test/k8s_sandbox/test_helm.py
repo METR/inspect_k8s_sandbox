@@ -1107,16 +1107,28 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
     return _pod(name=f"helper-{ordinal}", service=None, **status)
 
 
+def _in_a_list(manifest: str) -> str:
+    return "kind: List\nitems:\n  - " + manifest.replace("\n", "\n    ")
+
+
 @pytest.mark.parametrize(
-    ("spec", "short", "enough", "in_a_list"),
+    ("spec", "short", "enough", "reshape"),
     [
-        pytest.param("", [], [_helper_pod()], False, id="a-pod-that-is-no-sandbox"),
-        pytest.param("", [], [_helper_pod()], True, id="in-a-list"),
+        pytest.param("", [], [_helper_pod()], str, id="a-pod-that-is-no-sandbox"),
+        pytest.param("", [], [_helper_pod()], _in_a_list, id="in-a-list"),
+        # Helm installs a manifest whose namespace is empty into the release's.
+        pytest.param(
+            "",
+            [],
+            [_helper_pod()],
+            lambda manifest: manifest.replace("{name:", '{namespace: "", name:'),
+            id="in-a-namespace-left-empty",
+        ),
         pytest.param(
             "  replicas: 2\n",
             [_helper_pod()],
             [_helper_pod(), _helper_pod(1)],
-            False,
+            str,
             id="every-replica",
         ),
         # Failed by the pod GC, a pod stays Ready; its replacement takes its name.
@@ -1124,22 +1136,18 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
             "",
             [_helper_pod(phase="Failed")],
             [_helper_pod()],
-            False,
+            str,
             id="a-pod-that-failed",
         ),
         pytest.param(
             "",
             [_helper_pod(ready=False, phase="Succeeded")],
             [_helper_pod()],
-            False,
+            str,
             id="a-pod-that-ran-to-completion",
         ),
         pytest.param(
-            "  ordinals: {start: 3}\n",
-            [],
-            [_helper_pod(3)],
-            False,
-            id="a-start-ordinal",
+            "  ordinals: {start: 3}\n", [], [_helper_pod(3)], str, id="a-start-ordinal"
         ),
     ],
 )
@@ -1147,16 +1155,12 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_t
     spec: str,
     short: list[PodSnapshot],
     enough: list[PodSnapshot],
-    in_a_list: bool,
+    reshape: Callable[[str], str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A pod its controller has not created yet is in no poll to be found unready.
     release = Release(__file__, None, ValuesSource.none(), None)
-    helper = _helper(release, spec)
-    if in_a_list:
-        helper = "kind: List\nitems:\n  - " + helper.replace("\n", "\n    ")
     with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
-        _helm_installed(mock_run, _STATEFUL_SET, helper)
+        _helm_installed(mock_run, _STATEFUL_SET, reshape(_helper(release, spec)))
         await release._install(None, time.monotonic() + 60, upgrade=False)
 
     await _wait(release, [[_pod(), *short]] * 2 + [[_pod(), *enough]] * 2, monkeypatch)
@@ -1264,6 +1268,22 @@ async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
     assert "missing_sandboxes" in str(excinfo.value)
     # The sandbox which did arrive is not a thing to go looking at.
     assert "default" not in str(excinfo.value).split("missing_sandboxes")[1]
+
+
+async def test_wait_until_ready_names_the_stateful_set_pod_which_never_arrived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, _STATEFUL_SET, _helper(release))
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, itertools.repeat([_pod()]), monkeypatch)
+
+    assert "helper-0" in str(excinfo.value).split("missing_pods")[1]
 
 
 async def test_wait_until_ready_says_so_when_the_chart_made_no_pods(

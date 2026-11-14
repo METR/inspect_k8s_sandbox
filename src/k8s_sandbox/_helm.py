@@ -460,6 +460,13 @@ class Release:
             pod.labels[_SERVICE_LABEL] for pod in _sandbox_pods(pods) if pod.ready
         }
 
+    def _missing_pods(self, pods: list[PodSnapshot]) -> frozenset[str]:
+        """The pods of the chart's StatefulSets which are not yet there and Ready."""
+        # A pod its controller has yet to create is in no list to be judged.
+        return self._expected_pods - {
+            pod.name for pod in pods if pod.phase != "Failed" and pod.ready
+        }
+
     def _is_ready(self, pods: list[PodSnapshot]) -> bool:
         """Whether `pods` means the release is ready to be handed to a caller."""
         # A terminally failed pod is replaced by its controller; a bare one that
@@ -468,8 +475,7 @@ class Release:
         return (
             not self._missing_services(pods)
             and all(map(_pod_ready, live))
-            # A pod its controller has yet to create is in no list to be judged.
-            and self._expected_pods <= {pod.name for pod in live if pod.ready}
+            and not self._missing_pods(pods)
         )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
@@ -481,11 +487,13 @@ class Release:
         saw_a_pod = False
         poll_error: Exception | None = None
         missing: frozenset[str] = self._expected_services
+        absent: frozenset[str] = self._expected_pods
         while True:
             try:
                 pods = await asyncio.to_thread(self._list_release_pods, True)
                 saw_a_pod = saw_a_pod or bool(pods)
                 missing = self._missing_services(pods)
+                absent = self._missing_pods(pods)
                 # The cache can lag reality in either direction, so confirm against a
                 # consistent read and hand those same pods on: nothing may change
                 # between the verdict and the sandbox the caller gets. One read per
@@ -503,11 +511,17 @@ class Release:
             else:
                 poll_error = None
             if time.monotonic() >= deadline:
-                await self._raise_not_ready_error(saw_a_pod, poll_error, missing)
+                await self._raise_not_ready_error(
+                    saw_a_pod, poll_error, missing, absent
+                )
             await asyncio.sleep(_READINESS_POLL_INTERVAL)
 
     async def _raise_not_ready_error(
-        self, saw_a_pod: bool, poll_error: Exception | None, missing: frozenset[str]
+        self,
+        saw_a_pod: bool,
+        poll_error: Exception | None,
+        missing: frozenset[str],
+        absent: frozenset[str],
     ) -> NoReturn:
         extra = await self._pod_diagnostics()
         budget = f"{_get_timeout()}s"
@@ -536,6 +550,8 @@ class Release:
         extra["missing_sandboxes" if missing else "declared_sandboxes"] = ", ".join(
             sorted(missing or self._expected_services)
         )
+        if absent:
+            extra["missing_pods"] = ", ".join(sorted(absent))
         _raise_runtime_error(
             f"Helm release did not become ready within {budget}. Please see the docs "
             f"for why this might occur: {HELM_RELEASE_NOT_READY_URL}. Also consider "
@@ -857,7 +873,6 @@ def _stateful_set_pods(
 ) -> Iterator[str]:
     """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
-        labels = _dig(doc, "spec", "template", "metadata", "labels")
         if _dig(doc, "kind") == "List":
             yield from _stateful_set_pods(
                 _dig(doc, "items") or [], release_name, namespace
@@ -865,8 +880,9 @@ def _stateful_set_pods(
         # The poll lists by this label in this namespace: no other pod is ever seen.
         elif (
             _dig(doc, "kind") == "StatefulSet"
-            and _dig(labels, _INSTANCE_LABEL) == release_name
-            and _dig(doc, "metadata", "namespace") in (None, namespace)
+            and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
+            == release_name
+            and (_dig(doc, "metadata", "namespace") or namespace) == namespace
         ):
             replicas = _dig(doc, "spec", "replicas")
             start = _dig(doc, "spec", "ordinals", "start") or 0
