@@ -940,6 +940,17 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     assert (execd.KILL in got) is not exits
 
 
+async def test_an_empty_user_is_refused_not_run_as_the_containers(
+    daemons: Daemons,
+) -> None:
+    client = daemons.client()  # it serves nothing: a refusal needs no connection
+
+    with pytest.raises(RuntimeError, match="empty user"):
+        await client.exec(["id"], None, None, {}, "", None)
+    with pytest.raises(RuntimeError, match="empty user"):
+        await client.open_stream(["id"], "")
+
+
 async def test_a_timeout_of_zero_is_no_timeout(daemons: Daemons) -> None:
     async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START

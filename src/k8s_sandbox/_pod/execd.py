@@ -533,7 +533,7 @@ class ExecdClient:
             "argv": argv,
             "env": env,
             "cwd": cwd or "",
-            "user": user or "",
+            "user": _named(user),
             "stdin": stdin is not None,
             "tag": tag,
             "timeout": timeout or 0,  # execd kills it then, even if we're cut off
@@ -835,6 +835,7 @@ class ExecdClient:
         restarted: Callable[[], Exception | None] | None = None,
     ) -> ExecdStream:
         """Start a command whose stdin and stdout are a byte stream (exec_stdio)."""
+        user = _named(user)
         link = await self._get()
         call = Call(
             int.from_bytes(os.urandom(8), "big") >> 1,
@@ -859,6 +860,13 @@ class ExecdClient:
             link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
             raise
         return ExecdStream(link, call, restarted)
+
+
+def _named(user: str | None) -> str:
+    """The user to ask execd for: "" is none to execd, and no user to a caller."""
+    if user == "":  # runuser refuses it over Kubernetes exec
+        raise RuntimeError(f"exec() was given an empty user. Docs: {EXEC_USER_URL}")
+    return user or ""
 
 
 async def _next(
