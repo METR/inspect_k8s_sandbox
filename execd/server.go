@@ -664,7 +664,6 @@ func (cl *call) end(pid int, as *syscall.Credential) {
 	syscall.Kill(-pid, syscall.SIGKILL)
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
-		startSearcher()
 		go func() { searches <- search{cl.tag, as} }()
 	}
 }

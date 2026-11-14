@@ -27,6 +27,7 @@ func TestMain(m *testing.M) {
 		return
 	}
 	startReaper()
+	startSearcher()
 	os.Exit(m.Run())
 }
 
