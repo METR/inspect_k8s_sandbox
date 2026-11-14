@@ -1483,6 +1483,31 @@ async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
         await pod._start_execd(False)
 
 
+async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: over execd no later operation read the pod: the sample ran on."""
+    starts = 0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(False)  # again, in a container its checks read as the first
+    pod._execd = await tls_daemon(exits)
+    cluster.restarts = 1  # only now does Kubernetes show the restart
+
+    with pytest.raises(error.ContainerRestartedError):
+        await pod.exec(["true"], None, None, {}, None, None)
+    assert starts == 0
+
+
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
     cluster: Cluster, monkeypatch: MonkeyPatch
 ) -> None:

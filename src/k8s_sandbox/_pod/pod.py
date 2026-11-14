@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import IO, Awaitable, Callable, Literal, TypeVar
 
@@ -38,6 +39,8 @@ from k8s_sandbox._pod.write import WriteFileOperation
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+RESTART_SHOWN_WITHIN = 30.0  # of execd's death: Kubernetes can show a restart late
 
 
 def _file_op_restart_check_enabled() -> bool:
@@ -78,6 +81,7 @@ class Pod:
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
         self._execd = ExecdClient(self._start_execd) if execd else None
         self._execd_lost = False  # a daemon started whose key a failure then lost
+        self._execd_restarted = float("-inf")
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -107,6 +111,8 @@ class Pod:
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
+        if not replace:  # the daemon reached before died, perhaps with its container
+            self._execd_restarted = time.monotonic()
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
@@ -271,9 +277,7 @@ class Pod:
         drops, as one whose connection was lost.
         """
         if self._execd is not None:
-            if self._restart_error is not None:
-                await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
-                self._raise_restart()
+            await self._check_before_execd()
             return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
         await self.check_for_pod_restart()
         operation = ExecuteOperation(self._info)
@@ -421,9 +425,7 @@ class Pod:
 
     async def _over_execd(self, operation: Callable[[], Awaitable[T]]) -> T:
         """Run an operation over execd, raising a kept restart as _run_async() does."""
-        if self._restart_error is not None:
-            await asyncio.sleep(0)
-            self._raise_restart()
+        await self._check_before_execd()
         try:
             result = await operation()
         except Exception:
@@ -431,6 +433,14 @@ class Pod:
             raise
         self._raise_restart()
         return result
+
+    async def _check_before_execd(self) -> None:
+        """Raise a kept restart; look for one that shows only after execd restarted."""
+        if self._restart_error is not None:
+            await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
+            self._raise_restart()
+        if time.monotonic() - self._execd_restarted < RESTART_SHOWN_WITHIN:
+            await self.check_for_pod_restart()
 
     def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
         """Keep the restart of a container that stopped under an operation."""
