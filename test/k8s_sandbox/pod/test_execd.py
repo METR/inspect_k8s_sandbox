@@ -1886,7 +1886,7 @@ async def test_the_stray_count_spans_reconnects(
     await until(lambda: client._strays.frames == 60)
     await first.close()
 
-    second = await client._get(first)
+    second = await asyncio.wait_for(client._get(first), 30)
 
     await until(lambda: second.closed)  # 120 in one interval, over two connections
 
