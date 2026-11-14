@@ -1506,6 +1506,18 @@ class TestProbeBounds:
             with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
 
+    def test_keeps_only_the_start_of_what_a_probe_floods(self) -> None:
+        op = ExecuteOperation(MagicMock())
+
+        @contextmanager
+        def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
+            yield _FakeWSClient([(STDOUT, b"x" * 10_000), _status(0)])
+
+        with patch.object(op, "_interactive_shell", fake_shell):
+            _, out, _ = op.run_argv(["id"])
+
+        assert len(out) < 10_000
+
     def test_a_status_received_before_the_connection_was_lost_answers(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

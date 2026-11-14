@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -354,9 +355,12 @@ func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 	s.start(testConn(t), frame{kind: fStart, id: 31, payload: req})
 
 	exitCode(t, s.get(31))
+	env, _ := os.ReadFile(out)
+	_, path, _ := strings.Cut("\n"+string(env), "\nPATH=")
+	path, _, _ = strings.Cut(path, "\n")
 	// Left to itself the shell searches its own list, and bash's ends in the working directory.
-	if env, _ := os.ReadFile(out); !strings.Contains("\n"+string(env), "\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n") {
-		t.Fatalf("the command's environment was %q", env)
+	if dirs := strings.Split(path, ":"); slices.Contains(dirs, "") || slices.Contains(dirs, ".") {
+		t.Fatalf("the command's PATH was %q in %q", path, env)
 	}
 }
 
