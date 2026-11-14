@@ -74,9 +74,8 @@ PACE_BYTES = 128 << 20
 PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes
 TLS_PER_BYTE = 0.7e-9  # CPU seconds a byte delivered excuses: its decryption, no more
 RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
-SLICE = 8 << 10  # of them given to TLS at once, from a pod whose records cost too much
-PASS_CPU = 0.002  # CPU seconds after which such a pass leaves the rest to the next
-CAREFUL_FOR = 30.0  # seconds a pod is read in slices after a costly, empty pass
+SLICE = RAW_READ // 3 + 1  # to TLS at once: 8 KiB slowed bulk reads, 64 held the loop
+PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
@@ -163,28 +162,22 @@ class _Pipe:
         while len(self._plain) < n:
             raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
-            # In slices only after a costly pass: one read handles all its KeyUpdates.
-            step = SLICE if time.monotonic() < self._pace.careful else len(raw)
-            for i in range(0, len(raw), step):
-                self._in.write(raw[i : i + step])
+            for i in range(0, len(raw), SLICE):
+                self._in.write(raw[i : i + SLICE])
                 with contextlib.suppress(ssl.SSLWantReadError):
                     while True:
                         chunk = self.tls.read(RAW_READ)  # a record at a time
                         if not chunk:
                             raise ConnectionResetError("execd ended the TLS session")
                         self._plain += chunk
-                if step < len(raw) and time.thread_time() - began > PASS_CPU:
-                    self._rest = raw[i + step :]
+                if i + SLICE < len(raw) and time.thread_time() - began > PASS_CPU:
+                    self._rest = raw[i + SLICE :]
                     break
             else:
                 self._rest = b""
             # TCP bytes this pass took
             used = held + len(raw) - len(self._rest) - self._in.pending
-            delivered = len(self._plain) - had
-            # Costly, and mostly bytes that delivered nothing: not a read a GC ran in.
-            if (used - delivered) * 4 > used and time.thread_time() - began > PASS_CPU:
-                self._pace.careful = time.monotonic() + CAREFUL_FOR
-            await self._charge(began, delivered, used)
+            await self._charge(began, len(self._plain) - had, used)
         data = bytes(self._plain[:n])
         del self._plain[:n]
         return data
@@ -291,7 +284,6 @@ class Pace:
     frames: int = 0
     size: int = 0
     tls: float = 0.0
-    careful: float = float("-inf")  # until then its reads go to TLS in slices
 
     async def take(self, n: int, frames: int = 1, tls: float = 0.0) -> None:
         now = time.monotonic()
