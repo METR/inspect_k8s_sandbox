@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Wait for every Pod of the chart's StatefulSets before handing over a sandbox, not only
+  those labelled `inspect/service`: a StatefulSet from `additionalResources` whose Pod
+  did not exist yet was not waited for.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

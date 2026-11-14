@@ -240,6 +240,8 @@ class Release:
         self._extra_values = dict(extra_values) if extra_values else {}
         # The sandboxes the rendered chart declares; set by _install().
         self._expected_services: frozenset[str] = frozenset()
+        # The pods the rendered chart's StatefulSets make; set by _install().
+        self._expected_pods: frozenset[str] = frozenset()
         # The names of everything the chart rendered; set by _install(). A sandbox
         # whose controller cannot create a pod is only explained by an event on that
         # controller, which carries no pod name to be found by.
@@ -388,6 +390,7 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
+        self._expected_pods = frozenset(_stateful_set_pods(docs))
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
@@ -458,7 +461,12 @@ class Release:
         # A terminally failed pod is replaced by its controller; a bare one that
         # cannot be replaced just leaves its sandbox missing until the deadline.
         live = [pod for pod in pods if pod.phase != "Failed"]
-        return not self._missing_services(pods) and all(map(_pod_ready, live))
+        return (
+            not self._missing_services(pods)
+            and all(map(_pod_ready, live))
+            # A pod its controller has yet to create is not in `live` to be judged.
+            and self._expected_pods <= {pod.name for pod in live}
+        )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
         """Wait for the release's pods to report Ready.
@@ -838,6 +846,15 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             )
         else:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
+
+
+def _stateful_set_pods(docs: Iterable[Any]) -> Iterator[str]:
+    """The name of each pod the StatefulSets of a rendered manifest make."""
+    for doc in docs:
+        if _dig(doc, "kind") == "StatefulSet":
+            replicas = _dig(doc, "spec", "replicas")
+            for ordinal in range(1 if replicas is None else replicas):
+                yield f"{_dig(doc, 'metadata', 'name')}-{ordinal}"
 
 
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:

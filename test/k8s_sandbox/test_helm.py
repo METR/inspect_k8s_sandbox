@@ -915,7 +915,7 @@ def _pod(
     *,
     ready: bool = True,
     phase: str = "Running",
-    name: str = "p",
+    name: str = "default-0",
     service: str | None = "default",
 ) -> PodSnapshot:
     return PodSnapshot(
@@ -1096,6 +1096,63 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
     await _wait(release, polls, monkeypatch)
 
 
+def _helper(spec: str = "") -> str:
+    return (
+        "kind: StatefulSet\nmetadata: {name: helper}\n"
+        f"spec:\n{spec}  template: {{}}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("docs", "short", "enough"),
+    [
+        pytest.param(
+            [_STATEFUL_SET, _helper()],
+            [_pod()],
+            [_pod(), _pod(name="helper-0", service=None)],
+            id="a-pod-that-is-no-sandbox",
+        ),
+        pytest.param(
+            [_stateful_set(replicas=2)],
+            [_pod()],
+            [_pod(), _pod(name="default-1")],
+            id="every-replica",
+        ),
+        # Its replacement takes the same name.
+        pytest.param(
+            [_STATEFUL_SET, _helper()],
+            [_pod(), _pod(name="helper-0", service=None, ready=False, phase="Failed")],
+            [_pod(), _pod(name="helper-0", service=None)],
+            id="a-pod-that-failed",
+        ),
+    ],
+)
+async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(
+    docs: list[str],
+    short: list[PodSnapshot],
+    enough: list[PodSnapshot],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A pod its controller has not created yet is in no poll to be found unready.
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, *docs)
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    await _wait(release, [short, short, enough, enough], monkeypatch)
+
+
+async def test_wait_until_ready_does_not_wait_for_a_stateful_set_scaled_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, _STATEFUL_SET, _helper("  replicas: 0\n"))
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    await _wait(release, [[_pod()]] * 2, monkeypatch)
+
+
 async def test_wait_until_ready_keeps_waiting_while_no_pods_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1239,8 +1296,8 @@ async def test_install_takes_the_pod_count_from_helm_and_waits_off_the_subproces
 ) -> None:
     release = Release(__file__, None, ValuesSource.none(), None)
     _mock_release_pods.return_value = [
-        _pod(name="a", service="default"),
-        _pod(name="b", service="victim"),
+        _pod(name="default-0", service="default"),
+        _pod(name="victim-0", service="victim"),
     ]
 
     with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
