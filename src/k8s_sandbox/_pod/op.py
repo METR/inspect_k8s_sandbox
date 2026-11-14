@@ -3,9 +3,10 @@ import logging
 import threading
 from abc import ABC
 from dataclasses import dataclass
-from typing import Generator, Literal
+from typing import Any, Generator, Literal
 
-from kubernetes.stream import stream  # type: ignore
+import websocket
+from kubernetes.stream import stream, ws_client  # type: ignore
 from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
 
 from k8s_sandbox._kubernetes_api import k8s_client
@@ -17,6 +18,17 @@ from k8s_sandbox._pod.snapshot import read_pod
 # long-running commands will not be affected by this timeout.
 # https://github.com/kubernetes-client/python/blob/master/examples/watch/timeout-settings.md
 API_TIMEOUT = 60
+
+
+class _ConnectsInTime(websocket.WebSocket):
+    """kubernetes' websocket, whose connect and upgrade it gives no timeout at all."""
+
+    def connect(self, url: str, **options: Any) -> None:
+        super().connect(url, **{"timeout": API_TIMEOUT, **options})
+        self.settimeout(None)  # as kubernetes leaves it: each read sets its own
+
+
+ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
 
 # Interval between WebSocket keepalive frames. Containerd's CRI streaming server
 # enforces a stream_idle_timeout (default 4h [1]) that closes connections with no
