@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import shlex
-import socket
 import ssl
 import struct
 import time
@@ -79,6 +78,9 @@ RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 SLICE = RAW_READ // 3 + 1  # to TLS at once: 8 KiB slowed bulk reads, 64 held the loop
 PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
+# shortcut for aws/containers-roadmap#2913: drop the gap and the cap with its fix
+MESSAGE_GAP = 0.001
+MESSAGE_SIZE = 64 << 10
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -129,8 +131,8 @@ class _Pipe:
 
     def __init__(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader | _Stdio,
+        writer: asyncio.StreamWriter | _Stdio,
         context: ssl.SSLContext,
         pace: Pace,
     ) -> None:
@@ -215,47 +217,72 @@ class _Pipe:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
-_relays: set[asyncio.Task[None]] = set()  # held until their connections end
+_closing: set[asyncio.Future[None]] = set()  # held until their execs have closed
 
 
-async def _through(
-    stdio: ByteStream,
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """A socket whose far end is an exec's stdio, for _Pipe to read and write as TCP."""
-    near, far = socket.socketpair()
-    far.setblocking(False)
-    loop = asyncio.get_running_loop()
-    reader, writer = await asyncio.open_connection(sock=near)
+class _Stdio:
+    """An exec's stdio, as the reader, writer and transport _Pipe has of TCP."""
 
-    async def out() -> None:
-        while data := await loop.sock_recv(far, RAW_READ):
-            await stdio.send(data)
+    def __init__(self, stdio: ByteStream) -> None:
+        self._stdio = stdio
+        self._out = bytearray()
+        self._written, self._taken = asyncio.Event(), asyncio.Event()
+        self._closed = False
+        self.transport = self
+        self._sender = asyncio.ensure_future(self._send())
 
-    pace = Pace()  # a backstop: a message costs a pass here before _Pipe counts it
-
-    async def back() -> None:
-        while True:
-            data = await stdio.receive(RAW_READ)
-            await pace.take(len(data))
-            await loop.sock_sendall(far, data)
-
-    async def relay() -> None:
-        # _Pipe's closing too: out() may be waiting on an exec that takes no more.
-        ends = (out(), back(), writer.wait_closed())
-        ways = [asyncio.create_task(end) for end in ends]
+    async def read(self, n: int) -> bytes:
         try:
-            await asyncio.wait(ways, return_when=asyncio.FIRST_COMPLETED)
-        finally:  # any of them ending ends all: _Pipe reads end-of-file, the exec ends
-            for way in ways:
-                way.cancel()
-            await asyncio.gather(*ways, return_exceptions=True)
-            far.close()
-            await stdio.aclose()
+            return await self._stdio.receive(n)
+        except (
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ):
+            return b""  # as a socket reads its end
 
-    task = asyncio.create_task(relay())
-    _relays.add(task)
-    task.add_done_callback(_relays.discard)
-    return reader, writer
+    def write(self, data: bytes) -> None:
+        self._out += data
+        self._written.set()
+
+    async def drain(self) -> None:
+        while len(self._out) > RAW_READ and not self._closed:
+            self._taken.clear()
+            await self._taken.wait()
+        if self._closed:
+            raise ConnectionResetError("the exec that reaches execd ended")
+
+    async def _send(self) -> None:
+        """A message at a time: what is written meanwhile goes in the next ones."""
+        try:
+            while True:
+                await self._written.wait()
+                self._written.clear()
+                while self._out:
+                    data = bytes(self._out[:MESSAGE_SIZE])
+                    del self._out[:MESSAGE_SIZE]
+                    self._taken.set()
+                    await self._stdio.send(data)
+                    await asyncio.sleep(MESSAGE_GAP)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            self.abort()  # the reader sees the end, as of a port reset under a write
+
+    def pause_reading(self) -> None:
+        """Nothing to pause: an exec is read only when read() asks."""
+
+    resume_reading = pause_reading
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._sender.cancel()
+            self._taken.set()
+            closing = asyncio.ensure_future(self._stdio.aclose())
+            _closing.add(closing)
+            closing.add_done_callback(_closing.discard)
 
 
 async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
@@ -268,10 +295,14 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context.set_ecdh_curve("prime256v1")
 
     # Before the timeout: its exec waits its turn among the pod's operations.
-    stdio = None if daemon.stdio is None else await _through(await daemon.stdio())
+    stdio = None if daemon.stdio is None else _Stdio(await daemon.stdio())
 
     async def handshake() -> _Pipe:
-        reader, writer = stdio or await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        reader, writer = (
+            (stdio, stdio)
+            if stdio
+            else await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        )
         pipe = _Pipe(reader, writer, context, pace)
         try:
             await pipe.handshake()
@@ -720,10 +751,12 @@ class ExecdClient:
             try:
                 if not finished:
                     # Left by its caller: stopped now, and again on each new connection.
-                    self._unkilled = [*self._left(), (time.monotonic(), call.id)]
                     to = link if not link.closed else self._link
                     if to is not None and not to.closed:
+                        # Cut off, an old one would still be owed its RELEASE.
+                        self._unkilled = self._left()
                         to.send_last(call.id, KILL, RELEASE)
+                    self._unkilled.append((time.monotonic(), call.id))
             finally:
                 link.calls.pop(call.id, None)
 
