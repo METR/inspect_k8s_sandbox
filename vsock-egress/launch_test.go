@@ -211,7 +211,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	addSandbox(t, l, id("b"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+1)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
-			w.end()
+			w.end(budget)
 		}
 	})
 	if err := l.pass(); err != nil {
@@ -328,10 +328,48 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 	}
 }
 
-func TestEndSaysWhenItsReaperFailed(t *testing.T) {
+// A reaper can fail, and a process of its uid outside this namespace can stop it: neither holds up the launcher, nor lets its worker go on.
+func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 	alone(t)
-	c := &child{uid: reaperUID} // a uid the reaper refuses
-	if err := c.end(); err == nil {
-		t.Fatal("end said nothing of a reaper that killed no process")
+	for _, how := range []string{"stops", "fails"} {
+		t.Run("a reaper that "+how, func(t *testing.T) {
+			const uid = vmUID + 3 // no other test's processes run as it
+			l := fakeNode(t)
+			l.reap = time.Millisecond
+			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			w := l.workers[id("a")]
+			if w == nil {
+				t.Fatal("no worker for a sandbox that names a proxy")
+			}
+			listening(t, l, id("a"))
+
+			os.Remove(record) // the sandbox is deleted
+			t.Setenv(brokenReaper, how)
+			passed := make(chan error, 1)
+			go func() { passed <- l.pass() }()
+			if err := within(t, passed, "return from the launcher's pass: no sandbox on the node gets or loses a worker now"); err != nil {
+				t.Fatal(err)
+			}
+			if l.workers[id("a")] != w || w.exited() {
+				t.Fatal("the launcher let go of a worker that nothing had ended")
+			}
+
+			t.Setenv(brokenReaper, "")
+			for deadline := time.Now().Add(budget); len(l.workers) > 0; time.Sleep(time.Millisecond) {
+				if w.reaper != nil {
+					syscall.Kill(w.reaper.cmd.Process.Pid, syscall.SIGCONT) // whoever stopped it lets it go on
+				}
+				if err := l.pass(); err != nil {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("no later pass ended the worker")
+				}
+			}
+			ended(t, w)
+		})
 	}
 }

@@ -558,8 +558,17 @@ func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 // hostileWorker, in the environment, names a signal: this binary as a worker then sends it to all of its uid, again and again.
 const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
 
+// brokenReaper, in the environment, makes this binary as a reaper stop itself ("stops") or end having done nothing ("fails").
+const brokenReaper = "VSOCK_EGRESS_TEST_BROKEN_REAPER"
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+		switch how := os.Getenv(brokenReaper); {
+		case os.Args[1] == "reap" && how == "fails":
+			os.Exit(1)
+		case os.Args[1] == "reap" && how == "stops":
+			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+		}
 		if signal, err := strconv.Atoi(os.Getenv(hostileWorker)); err == nil && os.Args[1] == "work" {
 			os.WriteFile(filepath.Join(filepath.Dir(os.Args[5]), "signalling"), nil, 0o600) // beside the socket -vsock names
 			// On eight threads: a reaper it could signal would not outrun them all.
