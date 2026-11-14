@@ -3318,6 +3318,41 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
     server.close()
 
 
+async def test_an_exec_that_just_ends_is_a_connection_execd_closed(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+
+    async def ends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write_eof()  # as `execd connect` ends where no daemon listens
+        await r.read()
+        w.close()
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    gone = await asyncio.start_server(ends, "127.0.0.1", 0)
+    server = await asyncio.start_server(runs, "127.0.0.1", 0, ssl=context)
+    starts: list[bool] = []
+
+    async def start(replace: bool) -> execd.Daemon:
+        address = (server if starts else gone).sockets[0].getsockname()
+        starts.append(replace)
+        return execd.Daemon("", pin, b"key", lambda: anyio.connect_tcp(*address))
+
+    call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    # Read as a port that closed: execd is started again, with no --replace.
+    assert (result.returncode, starts[:2]) == (0, [True, False])
+    gone.close()
+    server.close()
+
+
 async def test_a_connection_closed_under_a_silent_exec_closes_the_exec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3377,21 +3412,12 @@ async def refused(
     server.close()
 
 
-async def test_an_exec_the_api_refuses_reads_as_a_refused_connection(
-    refused: list[bytes],
-) -> None:
-    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise", "stdio")
-
-    with pytest.raises(ConnectionError):  # which the client's reconnect waits out
-        await asyncio.wait_for(pod._execd_stdio(), 30)
-
-
 async def test_the_exec_that_reaches_execd_asks_for_no_stderr(
     refused: list[bytes],
 ) -> None:
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise", "stdio")
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(ConnectionError):  # which the client's reconnect waits out
         await asyncio.wait_for(pod._execd_stdio(), 30)
 
     # Nothing would pace that channel, were a guest to flood it.
