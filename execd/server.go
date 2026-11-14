@@ -279,7 +279,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out = true, [2]fifo{}
+		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl for six minutes
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}

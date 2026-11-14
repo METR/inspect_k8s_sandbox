@@ -1296,6 +1296,33 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 	}
 }
 
+func TestStdinACommandLeftUnreadIsLetGoWhenItsCallIsReleased(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Stdin: true, Tag: "queued"})
+	c := testConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 37, payload: req})
+	cl := s.get(37)
+	s.dispatch(c, frame{kind: fStdin, id: 37, payload: make([]byte, 1<<20)}) // more than a pipe holds: its writer waits
+	chunk := make([]byte, 1<<20)
+	queued := weak.Make(&chunk[0])
+	s.dispatch(c, frame{kind: fStdin, id: 37, payload: chunk})
+
+	s.detach(c) // its timer holds the call for six minutes
+	cl.kill()
+	exitCode(t, cl)
+	s.release(37)
+
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if runtime.GC(); queued.Value() == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("execd still holds the stdin of a call that is released")
+		}
+	}
+}
+
 func TestStdinACommandHasReadIsLetGoWhileItRuns(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "cat >/dev/null"}, Env: map[string]string{}, Stdin: true, Tag: "read"})
