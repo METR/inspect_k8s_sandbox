@@ -16,23 +16,22 @@ func redirect([]string) error {
 	if err != nil {
 		return err
 	}
-	// captureRange becomes this machine's own, as 127.0.0.0/8 is. Nothing else gets a route.
+	// As an address of lo, captureRange is this machine's own, as 127.0.0.0/8 is, and glibc's AI_ADDRCONFIG sees IPv4.
 	route, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		return err
 	}
 	defer route.Close()
 	attributes := netlink.NewAttributeEncoder()
-	attributes.Bytes(unix.RTA_DST, captureRange.Addr().AsSlice())
-	attributes.Uint32(unix.RTA_OIF, uint32(lo.Index))
+	attributes.Bytes(unix.IFA_LOCAL, captureRange.Addr().AsSlice())
 	local, err := attributes.Encode()
 	if err != nil {
 		return err
 	}
+	ifaddrmsg := binary.NativeEndian.AppendUint32([]byte{unix.AF_INET, byte(captureRange.Bits()), 0, unix.RT_SCOPE_HOST}, uint32(lo.Index))
 	if _, err := route.Execute(netlink.Message{
-		Header: netlink.Header{Type: unix.RTM_NEWROUTE, Flags: netlink.Request | netlink.Acknowledge | netlink.Create | netlink.Replace},
-		Data: append([]byte{unix.AF_INET, byte(captureRange.Bits()), 0, 0, unix.RT_TABLE_LOCAL, unix.RTPROT_STATIC,
-			unix.RT_SCOPE_HOST, unix.RTN_LOCAL, 0, 0, 0, 0}, local...), // struct rtmsg, then its attributes
+		Header: netlink.Header{Type: unix.RTM_NEWADDR, Flags: netlink.Request | netlink.Acknowledge | netlink.Create | netlink.Replace},
+		Data:   append(ifaddrmsg, local...),
 	}); err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -64,10 +67,26 @@ func TestNameKeepsItsAddressWhenTheForwarderIsRestarted(t *testing.T) {
 	}
 }
 
-// asked sends n one question as a resolver does and returns the reply's header and answers.
-func asked(t *testing.T, n *names, name string, kind dnsmessage.Type) (dnsmessage.Header, []dnsmessage.Resource) {
+func TestNameHalfWrittenWhenTheForwarderWasKilledIsDropped(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "names")
+	if err := os.WriteFile(file, []byte("pypi.org\nfiles.py"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := loadedNames(t, file)
+	pypi, _ := n.address("pypi.org")
+	next, _ := n.address("next.example")
+	if next != pypi.Next() {
+		t.Fatalf("the name after pypi.org got %v, want %v: the half-written one was given to no program", next, pypi.Next())
+	}
+	if name, ok := loadedNames(t, file).name(next); !ok || name != "next.example" {
+		t.Fatalf("after another restart %v is %q, %v: want next.example", next, name, ok)
+	}
+}
+
+// question is one DNS message that asks for name, or with answered set, a reply to one.
+func question(t *testing.T, name string, kind dnsmessage.Type, answered bool) []byte {
 	t.Helper()
-	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 7, RecursionDesired: true})
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 7, RecursionDesired: true, Response: answered})
 	b.StartQuestions()
 	if err := b.Question(dnsmessage.Question{Name: dnsmessage.MustNewName(name), Type: kind, Class: dnsmessage.ClassINET}); err != nil {
 		t.Fatal(err)
@@ -76,8 +95,14 @@ func asked(t *testing.T, n *names, name string, kind dnsmessage.Type) (dnsmessag
 	if err != nil {
 		t.Fatal(err)
 	}
+	return query
+}
+
+// asked sends n one question as a resolver does and returns the reply's header and answers.
+func asked(t *testing.T, n *names, name string, kind dnsmessage.Type) (dnsmessage.Header, []dnsmessage.Resource) {
+	t.Helper()
 	var p dnsmessage.Parser
-	h, err := p.Start(n.answer(query))
+	h, err := p.Start(n.answer(question(t, name, kind, false)))
 	if err != nil {
 		t.Fatalf("the reply to %s: %v", name, err)
 	}
@@ -104,8 +129,16 @@ func TestLookupGetsTheNamesAddressAndNoIPv6(t *testing.T) {
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+	// What is no query gets no answer and does not end the resolver: the forwarder would end with it.
+	other, err := net.Dial("udp4", queries.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.Write([]byte("no DNS message"))
+	other.Write(question(t, "pypi.org.", dnsmessage.TypeA, true))
 
-	got, err := resolver.LookupNetIP(ctx, "ip", "PyPI.org") // IPv4 and IPv6, as getaddrinfo asks
+	got, err := resolver.LookupNetIP(ctx, "ip", "PyPI.org.") // IPv4 and IPv6, as getaddrinfo asks; rooted, so no search list is tried
 	want, _ := n.address("pypi.org")
 	if err != nil || len(got) != 1 || got[0] != want {
 		t.Fatalf("the lookup got %v, %v: want %v alone", got, err, want)
@@ -144,6 +177,12 @@ func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 	}
 	if h, answers := asked(t, n, "host-0.example.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeSuccess || len(answers) != 1 {
 		t.Fatalf("a name that has its address got %v and %d answers", h.RCode, len(answers))
+	}
+
+	unwritten := loadedNames(t, filepath.Join(t.TempDir(), "names"))
+	unwritten.kept.Close()
+	if h, answers := asked(t, unwritten, "pypi.org.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 || len(unwritten.list) != 0 {
+		t.Fatalf("a name that could not be written down got %v and %d answers: its address would not outlast a restart", h.RCode, len(answers))
 	}
 }
 
@@ -235,29 +274,62 @@ func TestCapturedConnectionAsksTheProxyForItsName(t *testing.T) {
 }
 
 func TestForwarderWithoutItsCapturePortIsNotReady(t *testing.T) {
-	taken, err := net.Listen("tcp4", captureAddr)
-	if err != nil {
-		t.Fatal(err)
+	if taken, err := net.Listen("tcp4", captureAddr); err == nil { // else another process holds it, which serves as well
+		defer taken.Close()
 	}
-	defer taken.Close()
 	file := filepath.Join(t.TempDir(), "key")
 	failed := make(chan error, 1)
 	go func() { failed <- forward([]string{"-listen", "127.0.0.1:0", "-key", file, "-capture"}) }()
-	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
-		if ready([]string{"-key", file}) == nil {
-			t.Fatal("ready passed for a forwarder that does not hold its capture port")
+	select {
+	case err := <-failed:
+		if err == nil {
+			t.Fatal("forward returned without an error")
 		}
-		select {
-		case err := <-failed:
-			if err == nil {
-				t.Fatal("forward returned without an error")
+	case <-time.After(budget):
+		t.Fatal("forward went on without its capture port")
+	}
+	if ready([]string{"-key", file}) == nil {
+		t.Fatal("ready passed for a forwarder that does not hold its capture port")
+	}
+}
+
+func TestTunnelReadsTheProxysReplyFrameByFrame(t *testing.T) {
+	for name, tc := range map[string]struct {
+		frames []string // the proxy's bytes, as the worker cut them into frames; the stream stays open after them
+		opened bool
+		rest   string // what the program is handed ahead of the tunnel's own bytes
+	}{
+		"a reply in one frame":                    {[]string{"HTTP/1.1 200 Connection established\r\n\r\n"}, true, ""},
+		"a reply cut in two, and what follows it": {[]string{"HTTP/1.1 200 Connec", "tion established\r\n\r\nhello"}, true, "hello"},
+		"a refusal": {[]string{"HTTP/1.1 403 Forbidden\r\n\r\nno"}, false, ""},
+		"a proxy that ends its side with no reply": {[]string{"HTTP/1.1 200 Connec", ""}, false, ""},
+		"a reply longer than a frame":              {[]string{"HTTP/1.1 200 " + strings.Repeat("x", maxFrame-13), "x\r\n\r\n"}, false, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fromProxy, proxy := io.Pipe()
+			t.Cleanup(func() { proxy.Close() })
+			go func() {
+				for _, f := range tc.frames {
+					proxy.Write(frame(f))
+				}
+			}()
+			var program bytes.Buffer
+			opened := make(chan bool, 1)
+			go func() {
+				opened <- tunnel(struct {
+					io.Reader
+					io.Writer
+				}{fromProxy, io.Discard}, &program, "pypi.org:443")
+			}()
+			select {
+			case got := <-opened:
+				if got != tc.opened || program.String() != tc.rest {
+					t.Fatalf("the tunnel opened: %v, and the program was handed %q; want %v and %q", got, program.String(), tc.opened, tc.rest)
+				}
+			case <-time.After(budget):
+				t.Fatal("the forwarder still waits for the proxy, and holds a stream's place while it does")
 			}
-			return
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("forward neither failed nor became ready")
-		}
+		})
 	}
 }
 
@@ -292,6 +364,10 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 			t.Fatalf("run %d: %v", run+1, err)
 		}
 	}
+	configured, _ := net.InterfaceAddrs()
+	if !slices.ContainsFunc(configured, func(a net.Addr) bool { return a.String() == captureRange.String() }) {
+		t.Fatalf("the addresses are %v: glibc asks for a name's IPv4 address alone only where one other than 127.0.0.1 is configured", configured)
+	}
 	n := loadedNames(t, filepath.Join(t.TempDir(), "names"))
 	queries, err := net.ListenPacket("udp4", captureAddr)
 	if err != nil {
@@ -311,7 +387,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return new(net.Dialer).DialContext(ctx, "udp4", "127.0.0.1:53") // where a pod's resolv.conf points
 	}}
-	got, err := resolver.LookupNetIP(ctx, "ip4", "pypi.org")
+	got, err := resolver.LookupNetIP(ctx, "ip4", "pypi.org.")
 	if err != nil || len(got) != 1 || !captureRange.Contains(got[0]) {
 		t.Fatalf("a lookup at port 53 got %v, %v: want the forwarder's answer", got, err)
 	}

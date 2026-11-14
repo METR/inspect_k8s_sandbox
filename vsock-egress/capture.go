@@ -38,18 +38,21 @@ type names struct {
 func loadNames(file string, own []string) (*names, error) {
 	n := &names{own: map[string]bool{}, byName: map[string]int{}}
 	for _, name := range own {
-		n.own[name] = true
+		n.own[strings.ToLower(strings.TrimSuffix(name, "."))] = true
 	}
 	kept, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	kept = kept[:bytes.LastIndexByte(kept, '\n')+1] // a name half written when the forwarder was killed was given to no program
 	for _, name := range strings.Fields(string(kept)) {
 		n.byName[name] = len(n.list)
 		n.list = append(n.list, name)
 	}
-	n.kept, err = os.OpenFile(file, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	return n, err
+	if n.kept, err = os.OpenFile(file, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600); err != nil {
+		return nil, err
+	}
+	return n, n.kept.Truncate(int64(len(kept)))
 }
 
 // address is the one name has, the next free one if it had none. It reports false when none is left.

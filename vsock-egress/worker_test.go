@@ -401,12 +401,13 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 
 // handTimer stands in for a stream's idle timer: a test sees it wound back, and fires it.
 type handTimer struct {
-	end   func()
-	wound atomic.Int32
+	end     func()
+	wound   atomic.Int32
+	stopped chan struct{}
 }
 
 func (h *handTimer) Reset(time.Duration) bool { h.wound.Add(1); return true }
-func (h *handTimer) Stop() bool               { return true }
+func (h *handTimer) Stop() bool               { close(h.stopped); return true }
 
 func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	key := newKey()
@@ -414,7 +415,7 @@ func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
 	timers := make(chan *handTimer, 1)
 	w.idle = func(_ time.Duration, end func()) idleTimer {
-		h := &handTimer{end: end}
+		h := &handTimer{end: end, stopped: make(chan struct{})}
 		timers <- h
 		return h
 	}
@@ -450,6 +451,11 @@ func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	}
 	if err := fromFrames(io.Discard, guest, nil); err == nil {
 		t.Fatal("the guest's side of an idle stream that was ended closed as a stream that ends cleanly")
+	}
+	select {
+	case <-idle.stopped:
+	case <-time.After(budget):
+		t.Fatal("the timer of a stream that is over was left to run: each would hold the stream's connections for the wait")
 	}
 }
 
