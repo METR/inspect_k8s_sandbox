@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -24,7 +25,7 @@ import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
 
-from k8s_sandbox import _helm
+from k8s_sandbox import _helm, _sandbox_environment
 from k8s_sandbox._pod import error, execd, op, snapshot
 from k8s_sandbox._pod import pod as pod_module
 
@@ -811,6 +812,52 @@ async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
     assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12), reason="there a replay is written in one step"
+)
+async def test_a_command_sent_during_a_replay_follows_what_is_owed(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it went out between the frames owed, as each upload would."""
+    got: list[list[int]] = []  # the kinds each connection got
+    drop = False  # the first connection, under the next command sent
+    replaying = asyncio.Event()
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        mine: list[int] = []
+        got.append(mine)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop and len(got) == 1:
+                break
+            mine.append(kind)
+            if len(got) == 2:
+                replaying.set()
+            if kind == execd.START and len(got) == 2:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    left = [call("sleep", "600") for _ in range(64)]
+    await until(lambda: bool(got) and got[0].count(execd.START) == 64)
+    for running in left:
+        running.cancel()
+    await until(lambda: got[0].count(execd.RELEASE) == 64)
+    drop = True
+    reopens = call()
+    await asyncio.wait_for(replaying.wait(), 30)
+    during = call()
+    await asyncio.wait_for(asyncio.gather(reopens, during), 30)
+
+    assert got[1].index(execd.PING) < got[1].index(execd.START)
+
+
 async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
     tls_daemon: TlsDaemon, clock: types.SimpleNamespace
 ) -> None:
@@ -1261,6 +1308,40 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     # Its last frames still go out, once its upload has let go of the connection.
     await until(lambda: got[-1:] == [execd.RELEASE])
     assert (execd.KILL in got) is not exits
+
+
+async def test_a_calls_last_frames_wait_behind_one_start_or_upload_at_most(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: a call's KILL and RELEASE waited behind every START and upload."""
+    got: list[int] = []
+    reads = asyncio.Event()
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            if got.count(execd.START) == 9:  # unread, the tenth's write waits
+                await reads.wait()
+            got.append((await read_frame(r))[0])
+
+    def call(*argv: str, stdin: bytes | None = None) -> asyncio.Future[object]:
+        run = client.exec(list(argv), stdin, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(records)
+    left = call("sleep", "600")
+    uploads = [call("cat", stdin=b"x") for _ in range(8)]
+    # More than the socket buffers hold: the uploads' stdin waits behind this START.
+    uploads.append(call("echo", "x" * (16 << 20)))
+    await until(lambda: got.count(execd.START) == 9)
+    left.cancel()
+    await asyncio.wait({left}, timeout=30)
+    reads.set()
+    await until(lambda: execd.RELEASE in got)
+
+    # The KILL follows the START being written; its RELEASE, one frame more at most.
+    assert (got.index(execd.KILL), got.index(execd.RELEASE)) in [(10, 11), (10, 12)]
+    for running in uploads:
+        running.cancel()
 
 
 async def test_an_empty_user_is_refused_not_run_as_the_containers(
@@ -2589,6 +2670,55 @@ async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
         await asyncio.wait_for(operation(client), 30)
     # Not a command's lost result, which is never retried: the sample would fail.
     assert type(lost.value) is error.PodError
+
+
+@pytest.mark.parametrize(
+    "reached", [True, False], ids=["the next answers", "the next answers too late"]
+)
+async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
+    tls: tuple[ssl.SSLContext, str],
+    monkeypatch: pytest.MonkeyPatch,
+    clock: types.SimpleNamespace,
+    reached: bool,
+) -> None:
+    """Regression: it was read again, from the container that had replaced its own."""
+    context, pin = tls
+    servers: list[asyncio.Server] = []
+    starts: list[int] = []
+    attempts = 0
+
+    async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        if len(servers) == 2 and not reached and attempts == 1:
+            return w.close()  # started, and not reached while the read reconnects
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) == 1:  # gone, as with its container: its port refuses
+                    servers[0].close()
+                    return w.close()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    async def start(replace: bool) -> execd.Daemon:
+        if len(servers) == 2:
+            raise execd.DaemonRunning("address already in use")
+        server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
+        servers.append(server)
+        monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    client = execd.ExecdClient(start)
+
+    with pytest.raises(error.ExecdStoppedError):
+        async for attempt in _sandbox_environment._retry():  # the provider's own
+            with attempt:
+                attempts += 1
+                read = client.read_file(pathlib.Path("/x"), io.BytesIO())
+                await asyncio.wait_for(read, 30)  # only bounds a hang
+    assert len(starts) == 1
+    servers[1].close()
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(

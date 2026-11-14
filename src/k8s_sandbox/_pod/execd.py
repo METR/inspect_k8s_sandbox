@@ -28,6 +28,7 @@ from k8s_sandbox._logger import log_trace, log_warn
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import (
     ExecdResultUnknownError,
+    ExecdStoppedError,
     ExecResultUnknownError,
     PodError,
 )
@@ -403,6 +404,7 @@ class Link:
         self.closed = False
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
+        self.bulk = asyncio.Lock()
         self._last_rx = time.monotonic()
         self._tasks = [
             asyncio.create_task(self._read()),
@@ -411,7 +413,9 @@ class Link:
         self._last: set[asyncio.Task[None]] = set()  # held until sent
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
-        async with self._wlock:
+        # Only a START or STDIN waits its turn: any other frame has one ahead at most.
+        turn = self.bulk if kind in (START, STDIN) else contextlib.nullcontext()
+        async with turn, self._wlock:
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
@@ -572,7 +576,8 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
-                await self._replay(link)
+                async with link.bulk:  # no START or STDIN goes between what is owed
+                    await self._replay(link)
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 self._failed = e
@@ -706,7 +711,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         link = await asyncio.wait_for(self._get(stale=link), left())
                         if link.daemon is not call.daemon:
-                            raise ExecdResultUnknownError(
+                            raise ExecdStoppedError(
                                 "execd stopped while it ran the command",
                                 pod=link.daemon.ip,
                             )
@@ -776,7 +781,8 @@ class ExecdClient:
             except Exception as e:  # a lost connection, or a restart that failed
                 if sender is None and isinstance(e, NotSent):
                     raise  # the START never left, so nothing ran: it is retried
-                raise ExecdResultUnknownError(
+                stopped = self._daemon is not call.daemon  # another was started since
+                raise (ExecdStoppedError if stopped else ExecdResultUnknownError)(
                     f"execd connection lost during the command: {e!r}",
                     pod=link.daemon.ip,
                 ) from e
@@ -939,6 +945,8 @@ class ExecdClient:
                             limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                             truncated_output=None,
                         )
+        except ExecdStoppedError:
+            raise  # run again, it may reach a container that replaced its own
         except ExecResultUnknownError as e:
             # Unlike a command, a file operation may be run again.
             raise PodError(str(e)) from e
