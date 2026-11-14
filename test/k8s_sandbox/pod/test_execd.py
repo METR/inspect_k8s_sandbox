@@ -22,7 +22,7 @@ import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
 
-from k8s_sandbox import _helm
+from k8s_sandbox import _helm, _sandbox_environment
 from k8s_sandbox._pod import error, execd, op, snapshot
 from k8s_sandbox._pod import pod as pod_module
 
@@ -2587,6 +2587,43 @@ async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
         await asyncio.wait_for(operation(client), 30)
     # Not a command's lost result, which is never retried: the sample would fail.
     assert type(lost.value) is error.PodError
+
+
+async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: it was read again, from the container that had replaced its own."""
+    context, pin = tls
+    servers: list[asyncio.Server] = []
+    starts: list[int] = []
+
+    async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) == 1:  # gone, as with its container: its port refuses
+                    servers[0].close()
+                    return w.close()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    async def start(replace: bool) -> execd.Daemon:
+        server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
+        servers.append(server)
+        monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    client = execd.ExecdClient(start)
+
+    with pytest.raises(error.ExecdResultUnknownError):
+        async for attempt in _sandbox_environment._retry():  # the provider's own
+            with attempt:
+                read = client.read_file(pathlib.Path("/x"), io.BytesIO())
+                await asyncio.wait_for(read, 30)  # only bounds a hang
+    assert len(starts) == 1
+    servers[1].close()
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
