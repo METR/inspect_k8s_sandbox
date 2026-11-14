@@ -715,20 +715,21 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
-async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_the_next(
+async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     daemons: Daemons,
 ) -> None:
     """Regression: cancelled over a connection dead unnoticed, the command ran on."""
     left: list[int] = []
-    first: list[asyncio.StreamWriter] = []
+    dead: list[asyncio.StreamWriter] = []
     got: list[tuple[int, int]] = []
 
-    async def swallows_the_first(
+    async def swallows_the_first_two(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
-        if not first:  # as a network that drops everything: nothing it is sent arrives
-            first.append(w)
-            left.append((await read_frame(r))[1])  # START
+        if len(dead) < 2:  # as a network that drops everything: nothing sent arrives
+            dead.append(w)
+            if not left:
+                left.append((await read_frame(r))[1])  # START
             await r.read()
             return
         while True:
@@ -739,7 +740,7 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_the_next(
             elif kind == execd.START:
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
-    await daemons.serve(swallows_the_first)
+    await daemons.serve(swallows_the_first_two)
     client = daemons.client()
     run = client.exec(["sleep", "600"], None, None, {}, None, None)
     call = asyncio.ensure_future(run)
@@ -747,7 +748,8 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_the_next(
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
         await call
-    first[0].close()  # only now does the client learn the connection is gone
+    await client._get(stale=client._link)  # the next takes the KILL, and is dead too
+    dead[1].close()  # only now does the client learn that one is gone
 
     await client.exec(["true"], None, None, {}, None, None)
 

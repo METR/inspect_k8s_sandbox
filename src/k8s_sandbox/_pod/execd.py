@@ -452,7 +452,7 @@ class ExecdClient:
         self._opened = float("-inf")
         self._backoff = 0.0
         self._failed: BaseException | None = None  # why the open under way last failed
-        self._unkilled: list[tuple[float, Daemon, int]] = []  # when, and which call
+        self._unkilled: list[tuple[float, int]] = []  # when a call was left, its id
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -503,17 +503,11 @@ class ExecdClient:
                     self._failed = failed  # the daemon may run on: its calls can resume
 
     async def _kill_left(self, link: Link) -> None:
-        """KILL and RELEASE, on a new connection, the calls their callers left."""
-        while self._unkilled:
-            left = self._unkilled[0]
-            if left[1] is link.daemon:
-                try:
-                    await link.send(KILL, left[2])
-                    await link.send(RELEASE, left[2])
-                except OSError:
-                    return  # dropped again: the next connection sends it
-            if self._unkilled[:1] == [left]:
-                del self._unkilled[0]
+        """KILL and RELEASE again, on each new connection, the calls lately left."""
+        with contextlib.suppress(OSError):  # dropped again: the next one sends them
+            for _, call_id in list(self._unkilled):  # a daemon ignores ids not its own
+                await link.send(KILL, call_id)
+                await link.send(RELEASE, call_id)
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link
@@ -684,12 +678,12 @@ class ExecdClient:
                 sender.cancel()
             try:
                 if not finished:
-                    # Abandoned by the caller: stop it, and at the next open again.
+                    # Left by its caller: stopped now, and again on each new connection.
                     now = time.monotonic()
                     kept = [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
-                    self._unkilled = [*kept, (now, call.daemon, call.id)]
+                    self._unkilled = [*kept, (now, call.id)]
                     to = link if not link.closed else self._link
-                    if to is not None and not to.closed and to.daemon is call.daemon:
+                    if to is not None and not to.closed:
                         await to.send_last(call.id, KILL, RELEASE)
             finally:
                 link.calls.pop(call.id, None)
