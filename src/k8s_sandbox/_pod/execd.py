@@ -733,6 +733,7 @@ class ExecdClient:
         out = {STDOUT: LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)}
         out[STDERR] = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
         status = None
+        timeout = timeout or None  # 0 is none, as `timeout 0` is over Kubernetes exec
         run = self.run(cmd, env=env, cwd=cwd, user=user, stdin=data, timeout=timeout)
         async with contextlib.aclosing(run) as chunks:
             async for kind, payload in chunks:

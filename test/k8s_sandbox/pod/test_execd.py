@@ -938,6 +938,19 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     assert (execd.KILL in got) is not exits
 
 
+async def test_a_timeout_of_zero_is_no_timeout(daemons: Daemons) -> None:
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(exits)
+
+    result = await daemons.client().exec(["true"], None, None, {}, None, 0)
+
+    assert result.returncode == 0
+
+
 async def test_a_timed_out_call_frees_what_execd_holds(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
