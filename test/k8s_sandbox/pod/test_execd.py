@@ -619,6 +619,54 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     assert (result.returncode, starts) == (7, 1)
 
 
+async def test_a_connection_dropped_as_a_resume_is_written_is_left_once(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Such a drop reaches the call twice: taking the second for the next's reopens."""
+    connections: list[asyncio.StreamWriter] = []
+    started, resuming = asyncio.Event(), asyncio.Event()
+
+    class HoldsTheSecondResume(Plain):
+        async def write(self, data: bytes) -> None:
+            if data[0] == execd.RESUME and len(connections) == 2:
+                resuming.set()
+                await until(self._writer.transport.is_closing)
+            await super().write(data)
+
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
+        return HoldsTheSecondResume(r, w)
+
+    async def resumes_on_the_third(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        connections.append(w)
+        nth = len(connections)
+        if nth == 1:
+            await read_frame(r)  # START
+            started.set()
+        if nth < 3:  # the test drops the first two
+            await r.read()
+            return
+        _, call_id, _ = await read_frame(r)  # RESUME
+        w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+        await r.read()
+
+    monkeypatch.setattr(execd, "_connect", connect)
+    await daemons.serve(resumes_on_the_third)
+    call = asyncio.ensure_future(
+        daemons.client().exec(["sleep", "1"], None, None, {}, None, None)
+    )
+    await asyncio.wait_for(started.wait(), 30)
+    connections[0].transport.abort()
+    await asyncio.wait_for(resuming.wait(), 30)
+    connections[1].transport.abort()  # as its RESUME is written
+
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert (result.returncode, len(connections)) == (7, 3)
+
+
 async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     daemons: Daemons,
 ) -> None:
@@ -2415,7 +2463,7 @@ async def test_the_client_offers_one_key_exchange_group(
     server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
 
-    with pytest.raises(OSError):  # no group in common: the handshake ends
+    with pytest.raises(ConnectionResetError):  # no group in common: it hangs up
         await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
     server.close()
 
