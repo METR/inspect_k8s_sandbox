@@ -43,5 +43,4 @@ mind that these operations are routed through the Kubernetes API server.
 
 Inspect's console output shows the number of Pod operations currently in progress.
 
-On a Pod with execd, these operations go to the Pod directly: they are neither limited
-nor shown.
+On a Pod with execd, these operations are neither limited nor shown.
