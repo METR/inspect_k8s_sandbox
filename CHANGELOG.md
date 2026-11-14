@@ -13,6 +13,13 @@
   run `vsock-egress launch` and hold the seccomp profile `profiles/vsock-egress.json`
   (the runtime's default plus `socket(AF_VSOCK)`). Point the pod's programs at the proxy
   yourself, with `HTTPS_PROXY` and `HTTP_PROXY`.
+- A pod that names an egress proxy and is also annotated
+  `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that
+  ignore proxy settings: a name the pod looks up gets an address in `198.18.0.0/15`, and
+  a TCP connection to that address reaches the proxy as `CONNECT <name>:<port>`. A
+  connection to any other address still has no route, and IPv6 and UDP other than DNS
+  are not carried. The pod gets an init container that runs as root with `NET_ADMIN`,
+  which a namespace at the `baseline` Pod Security Standard refuses.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

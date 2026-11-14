@@ -814,6 +814,67 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> N
     assert "egressForwarderImage" in exc_info.value.stderr
 
 
+_EGRESS_CAPTURE = "inspect-k8s-sandbox/egress-capture=true"
+
+
+@pytest.mark.parametrize(
+    ("dns_record", "own_names"),
+    [
+        pytest.param(
+            "true", ["-own", "default,agent-env-my-release-default"], id="own"
+        ),
+        pytest.param("false", [], id="no record"),
+    ],
+)
+def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
+    chart_dir: Path, dns_record: str, own_names: list[str]
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,"
+        f"services.default.dnsRecord={dns_record},"
+        "services.default.initContainers[0].name=setup,"
+        "services.default.initContainers[0].image=busybox",
+        set_string=f"services.default.podAnnotations.{_EGRESS_PROXY},"
+        f"services.default.podAnnotations.{_EGRESS_CAPTURE}",
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    # After the forwarder listens, before `setup` and the service; it has ended by then.
+    forwarder, capture, setup = pod["initContainers"]
+    assert setup["name"] == "setup"
+    # The forwarder is the pod's resolver: a service's own names lead to its pod.
+    assert forwarder["command"] == [
+        *["/vsock-egress", "forward", "-key", "/key/key", "-capture"],
+        *own_names,
+    ]
+    assert capture == {
+        "name": "egress-capture",
+        "image": "vsock-egress:1",
+        "command": ["/vsock-egress", "redirect"],
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]},
+            "readOnlyRootFilesystem": True,
+            "runAsUser": 0,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+    }
+    # Room for the names the pod looks up, beside the key.
+    assert {
+        "name": "egress-forwarder-key",
+        "emptyDir": {"medium": "Memory", "sizeLimit": "8Mi"},
+    } in pod["volumes"]
+
+
+def test_egress_capture_annotation_needs_an_egress_proxy(chart_dir: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir, set_string=f"services.default.podAnnotations.{_EGRESS_CAPTURE}"
+        )
+    assert "inspect-k8s-sandbox/egress-proxy" in exc_info.value.stderr
+
+
 @pytest.mark.parametrize(
     "proxy",
     [

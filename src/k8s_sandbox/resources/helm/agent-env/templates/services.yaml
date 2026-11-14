@@ -50,6 +50,10 @@ spec:
         {{- toYaml $podAnnotations | nindent 8 }}
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
       {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
+      {{- $egressCapture := eq (get $podAnnotations "inspect-k8s-sandbox/egress-capture") "true" }}
+      {{- if and $egressCapture (not $egressProxy) }}
+      {{- fail "the annotation inspect-k8s-sandbox/egress-capture needs inspect-k8s-sandbox/egress-proxy: the forwarder carries what is captured" }}
+      {{- end }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -84,7 +88,19 @@ spec:
         {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
         - name: egress-forwarder
           image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", "forward", "-key", "/key/key"]
+          command:
+            - /vsock-egress
+            - forward
+            - -key
+            - /key/key
+            {{- if $egressCapture }}
+            - -capture
+            {{- if include "shouldCreateDnsRecord" $service }}
+            {{- /* The forwarder is the pod's resolver: the service's own names lead to the pod itself. */}}
+            - -own
+            - {{ printf "%s,%s-%s" $name (include "agentEnv.fullname" $) $name | quote }}
+            {{- end }}
+            {{- end }}
           restartPolicy: Always
           {{- /* The next container starts once the forwarder listens. An exec: no probe reaches a port of a pod with no network device. */}}
           startupProbe:
@@ -107,6 +123,21 @@ spec:
             seccompProfile:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
+      {{- if $egressCapture }}
+        {{- /* Once, before any program of the service: none of them holds NET_ADMIN to undo it. */}}
+        - name: egress-capture
+          image: {{ $.Values.egressForwarderImage | quote }}
+          command: ["/vsock-egress", "redirect"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN"]
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            seccompProfile:
+              type: RuntimeDefault
+      {{- end }}
       {{- end }}
       {{- range $service.initContainers }}
         - name: {{ .name }}
@@ -295,7 +326,8 @@ spec:
         - name: egress-forwarder-key
           emptyDir:
             medium: Memory
-            sizeLimit: 1Mi
+            {{- /* With capture it also holds the names the pod looked up: 16,384 of at most 254 bytes. */}}
+            sizeLimit: {{ ternary "8Mi" "1Mi" $egressCapture }}
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:

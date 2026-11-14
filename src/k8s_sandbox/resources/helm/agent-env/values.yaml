@@ -48,7 +48,13 @@ extraContainers: []
 # allows only that name's DNS record and that port on the release's pods. The node must
 # run vsock-egress's launcher and hold the seccomp profile `profiles/vsock-egress.json`,
 # the runtime's default plus `socket(AF_VSOCK)`. The sidecar has no resource requests,
-# so the pod is not of the Guaranteed QoS class.
+# so the pod is not of the Guaranteed QoS class. A pod also annotated
+# `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that
+# ignore proxy settings too: the sidecar answers the pod's DNS queries at `127.0.0.1`
+# with an address of `198.18.0.0/15` for each name (and `127.0.0.1` for the service's
+# own names), and a TCP connection to such an address reaches the proxy as
+# `CONNECT <name>:<port>`. That adds an init container that runs as root with
+# `NET_ADMIN` alone, which a namespace at the `baseline` Pod Security Standard refuses.
 # @default -- Empty (required once a pod carries the annotation)
 egressForwarderImage: ""
 # -- References to pre-existing secrets that contain registry credentials.
