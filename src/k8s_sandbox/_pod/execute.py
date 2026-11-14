@@ -78,10 +78,9 @@ def _shell_command(
     normalizes HOME, SHELL, USER, LOGNAME and PATH, which the skip path
     inherits from the container instead.
 
-    `switch` is whether a probe of the container (ExecuteOperation.probe_switch)
-    found that it needs `runuser` for this user, and that `runuser` works; otherwise
-    the shell checks for itself. `sh -c` takes its script from argv, so stdin reaches
-    the command it execs unread, and the caller's protocol is unchanged.
+    `switch` is whether a probe found that this user needs `runuser`, and that it works.
+    `sh -c` takes its script from argv, so stdin reaches the command it execs
+    unread, and the caller's protocol is unchanged.
     """
     if user is None:
         return list(command)

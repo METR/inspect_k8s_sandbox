@@ -44,7 +44,7 @@ var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and 
 
 var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
 
-// Tests hold a reader here with output it has taken and not counted, and an exit each time it has checked its pipes.
+// Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
 var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
@@ -59,7 +59,7 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu, held through writes
+	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu
 	pid int
 	// where the reaper sends its command's exit status
 	status chan int
@@ -303,7 +303,7 @@ func (s *server) start(c *conn, f frame) {
 	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
-	if s.current != nil && s.current != c { // replaced since dispatch looked: its client may have run this call again by now
+	if s.current != nil && s.current != c { // its client may have run this call again since dispatch looked
 		s.mu.Unlock()
 		return
 	}
@@ -339,7 +339,7 @@ func (s *server) resume(c *conn, f frame) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	s.mu.Lock()
-	replaced := s.current != nil && s.current != c // since dispatch looked: the call is the new connection's to resume
+	replaced := s.current != nil && s.current != c // the call is the new connection's to resume
 	s.mu.Unlock()
 	if replaced {
 		return
@@ -376,7 +376,7 @@ func (cl *call) run(req startRequest) error {
 			return err
 		}
 		if cred != nil {
-			// execd itself becomes the user, then the shell: a child Go switched would be theirs to stop before it execs, with execd waiting on it.
+			// A child Go switched to the user would be theirs to stop before it execs, with execd waiting on it.
 			argv = append([]string{"/proc/self/exe", "as", dir, fmt.Sprint(cred.Uid), fmt.Sprint(cred.Gid), strings.Trim(fmt.Sprint(cred.Groups), "[]")}, argv...)
 			as, dir = cred, ""
 			// As runuser sets them, unless the caller did.
@@ -387,7 +387,7 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
-	// By its path, as Kubernetes exec does: a command may have replaced the directory. A user who can't enter it that way stays in it.
+	// By its path, as Kubernetes exec does; a user who cannot enter it that way stays in it.
 	if err := os.Chdir(workdir); err != nil && !errors.Is(err, syscall.EACCES) && !strings.HasPrefix(req.Cwd, "/") {
 		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
 	}
@@ -402,7 +402,7 @@ func (cl *call) run(req startRequest) error {
 	errR, errW, _ := os.Pipe()
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
-	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it (GODEBUG)
+	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it
 		envR, envW, _ := os.Pipe()
 		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
 		for i, kv := range env {
@@ -410,7 +410,7 @@ func (cl *call) run(req startRequest) error {
 		}
 		go func() { json.NewEncoder(envW).Encode(raw); envW.Close() }()
 		defer envR.Close()
-		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // the launcher's: each thread it starts takes a PID of the pod's
+		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // each launcher thread takes a PID of the pod's
 	}
 	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
 	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
@@ -433,7 +433,7 @@ func (cl *call) run(req startRequest) error {
 	cl.pid, cl.as, cl.status = p.Pid, as, exited // before Release, which sets it to -1
 	killed := cl.killed
 	cl.kmu.Unlock()
-	if killed { // while it started: nothing is reaped under this lock, so the id is its own, though it may have ended
+	if killed { // while it started: nothing is reaped under this lock, so the id is its own
 		syscall.Kill(-p.Pid, syscall.SIGKILL)
 	}
 	reaper.mu.Unlock()
@@ -585,7 +585,7 @@ func (cl *call) feedStdin(w *os.File) {
 // Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
 const maxUnacked, streamUnacked = 4 << 20, 1 << 20
 
-// fifo is a stream's unacked output, kept in a ring: an ack frees its front without a copy, and it takes no more memory than it holds.
+// fifo is a stream's unacked output, kept in a ring: an ack frees its front without a copy.
 type fifo struct {
 	buf     []byte
 	head, n int // where its first byte is in buf, and how many it holds
@@ -639,7 +639,7 @@ func (cl *call) output(stream int, data []byte) {
 	cl.flushSoon()
 }
 
-// When the next call may send output, since start: calls take turns, so together they keep within the client's frame pace.
+// When the next call may send output: calls take turns, to keep within the client's frame pace.
 var slot atomic.Int64
 
 var epoch = time.Now() // turns are measured from here, on the monotonic clock
@@ -715,19 +715,19 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
-// stop is kill; a timeout's notes that it found the command running, so only then does the exit say "timed out".
+// stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
 func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
-	var ended [128]byte // a siginfo_t: waitid sets its first field while the child has exited and is not yet reaped
+	var ended [128]byte // a siginfo_t: waitid sets its first field for a child exited and not yet reaped
 	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
 	if pid <= 0 || ended[0] != 0 {
 		return
 	}
-	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is the command's own
+	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own
 	running := reaper.waiting[pid] == status
 	if running {
 		cl.kmu.Lock()
@@ -756,7 +756,7 @@ type search struct {
 
 var searches = make(chan search)
 
-// startSearcher starts, once, the thread that searches as other users: at execd's start, as a pod out of PIDs can start none.
+// startSearcher starts the searching thread at execd's start: a pod out of PIDs can start none.
 var startSearcher = sync.OnceFunc(func() {
 	go func() {
 		runtime.LockOSThread() // the identities it takes are this thread's alone
@@ -825,7 +825,7 @@ func childEnv(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	if _, given := extra["PATH"]; !given {
-		if _, inherited := os.LookupEnv("PATH"); !inherited { // or the shell's own applies, and bash's ends in the working directory
+		if _, inherited := os.LookupEnv("PATH"); !inherited { // else bash's own ends in the working directory
 			env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 		}
 	}
@@ -897,7 +897,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper reaps every child, orphans included, under mu, so an id is never reused before its status is sent.
+// The reaper reaps every child under mu, so an id is never reused before its status is sent.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int

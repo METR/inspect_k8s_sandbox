@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// run() starts this binary, as it starts execd, to become another user; tests start it as execd itself, and as a pod's first process.
+// run() starts this binary, as it starts execd, to become another user.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 2 && os.Args[1] == "first" {
 		firstProcess(os.Args[2:])
@@ -208,7 +208,8 @@ func TestAUidWithNoPasswdEntryIsUnknownUnlessItIsRootOrExecdsOwn(t *testing.T) {
 func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	t.Cleanup(func() { killTagged("stream") })
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Stdin: true, Tag: "stream", Stream: true}) // it never ends by itself
+	// It never ends by itself.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Stdin: true, Tag: "stream", Stream: true})
 	c := testConn(t)
 	s.start(c, frame{kind: fStart, id: 36, payload: req})
 	cl := s.get(36)
@@ -316,7 +317,7 @@ func TestStdinFromADroppedConnectionIsNotWrittenAgain(t *testing.T) {
 	s.detach(first)
 	s.dispatch(again, frame{kind: fResume, id: 3, payload: []byte(`{"stdout":0,"stderr":0}`)})
 
-	s.get(3).writeStdin(first, []byte("BBBB"))                             // still in flight on the dropped connection
+	s.get(3).writeStdin(first, []byte("BBBB"))                             // in flight on the dropped connection
 	s.dispatch(again, frame{kind: fStdin, id: 3, payload: []byte("BBBB")}) // resent from RESUMED's count
 	s.dispatch(again, frame{kind: fStdin, id: 3})
 
@@ -386,7 +387,7 @@ func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 
 func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
-	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: a repeat's kill may still be looking for the last one's
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
 	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag, Timeout: 0.05})
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -480,7 +481,7 @@ func TestACommandKilledBeforeItsTimeoutIsNotTimedOut(t *testing.T) {
 	}
 }
 
-// exitStatus waits for a call's EXIT and returns it under the keys the client reads: a struct would match them in any case.
+// exitStatus returns a call's EXIT under the keys the client reads: a struct would match them in any case.
 func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 	t.Helper()
 	for {
@@ -573,11 +574,11 @@ func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	}
 }
 
-// onItsOwnClock runs a test of the turns in a bubble, where time passes only while every goroutine waits: with none taken as it starts.
+// onItsOwnClock runs a test of the turns in a bubble, where time passes only while every goroutine waits.
 func onItsOwnClock(t *testing.T, test func(t *testing.T)) {
 	ahead := time.Now().Add(time.Hour)
 	synctest.Test(t, func(t *testing.T) {
-		time.Sleep(time.Until(ahead))        // past the real clock: a turn an earlier test's command takes as it ends can't move these
+		time.Sleep(time.Until(ahead))        // past the real clock: an earlier test's late turn can't move these
 		slot.Store(int64(time.Since(epoch))) // the turns are shared, and counted from execd's start
 		defer slot.Store(0)
 		test(t)
@@ -805,7 +806,7 @@ func TestACommandNamedLikeAnOptionIsNotFound(t *testing.T) {
 
 	s.start(testConn(t), frame{kind: fStart, id: 34, payload: req})
 
-	// bash would run `true` with no environment and busybox nothing, both as options of their exec: the shell isn't asked.
+	// bash would run `true` with no environment, as an option of its exec: the shell isn't asked.
 	cl := s.get(34)
 	if code := exitCode(t, cl); code != 127 || cl.startErr == "" {
 		t.Fatalf("exit %d, start error %q: want 127 from execd itself", code, cl.startErr)
@@ -833,7 +834,7 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if code := exitCode(t, s.get(21)); code != 7 {
 		t.Fatalf("exit %d, want 7 from the tool the user can run", code)
 	}
-	// A child of execd that switched user would share its memory till it execs: the flag is reset, and execd waits on a child that user can stop.
+	// A child of execd that switched user would share its memory till it execs: the flag is reset.
 	if dumpable() {
 		t.Fatal("dumpable once it has run a command as another user")
 	}
@@ -847,7 +848,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	t.Setenv("RAW", "\xff") // execd's own environment, which a command inherits, need not be text
-	// GODEBUG has a Go program trace its start on stderr, execd sets a GOMAXPROCS of its own for its start as another user, and BIG is as long as the kernel lets a variable be.
+	// GODEBUG has a Go program trace its start on stderr.
 	env := map[string]string{"GODEBUG": "inittrace=1", "GOMAXPROCS": "7", "BIG": strings.Repeat("x", 128<<10-len("BIG=")-1)}
 	script := "id -u; id -g; id -G; echo $GODEBUG $GOMAXPROCS ${#BIG} $RAW; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: env, User: "65534", Tag: "e"})
@@ -865,7 +866,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 			if f.kind != fExit {
 				continue
 			}
-			// execd, a Go program, becomes the user itself: none of root's groups stay, and the environment isn't its own to read or to mark.
+			// execd, a Go program, becomes the user itself: the environment isn't its own to read or to mark.
 			if string(out) != "65534\n65534\n65534\ninittrace=1 7 131067 \xff\n" {
 				t.Fatalf("the command's output was %q", out)
 			}
@@ -881,7 +882,7 @@ func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
 		t.Skip("only root runs a command as another user")
 	}
 
-	// As run() starts it, but with no pipe to read the environment from, as when execd has no descriptor to spare.
+	// With no pipe to read the environment from, as when execd has no descriptor to spare.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "/proc/self/exe", "as", "", "65534", "65534", "", "/bin/echo", "RAN").CombinedOutput()
@@ -915,7 +916,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
-	detach := "setsid sh -c 'echo $$; kill -STOP $$' & wait" // it names itself once out of the group a kill signals
+	detach := "setsid sh -c 'echo $$; kill -STOP $$' & wait" // out of the group a kill signals, it names itself
 	victims := map[uint64]int{}
 	for id := uint64(100); id < 120; id++ {
 		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached" + strconv.Itoa(int(id))})
@@ -947,7 +948,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		}
 	}
 	var searched sync.WaitGroup
-	for range 200 { // many more searches, each with a collection under way: that moves a goroutine not held to its thread
+	for range 200 { // a collection under way moves a goroutine not held to its thread
 		searched.Add(1)
 		go func() { defer searched.Done(); searches <- search{"none", &syscall.Credential{Uid: 65534, Gid: 65534}} }()
 		runtime.GC()
@@ -959,7 +960,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the searches were never taken")
 	}
-	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable, for an instant each time.
+	// Taking the user's identity resets the flag to the host's fs.suid_dumpable, for an instant each time.
 	for deadline := time.Now().Add(30 * time.Second); dumpable(); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("dumpable once it has killed a command run as another user")
@@ -1011,7 +1012,8 @@ func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
 	t.Cleanup(func() { killTagged("early") })
 	cl := &call{id: 30, tag: "early"}
 	cl.room = sync.NewCond(&cl.mu)
-	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"} // it never ends by itself
+	// It never ends by itself.
+	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"}
 
 	cl.kill() // from another connection, while this one's START is still at work
 	if err := cl.run(req); err != nil {
@@ -1030,7 +1032,7 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	cl := &call{id: 33, tag: "ended"}
 	cl.room = sync.NewCond(&cl.mu)
 	pids := filepath.Join(t.TempDir(), "pids")
-	// It leaves two processes running, says which, and ends: one in its group with no tag, one with its tag in a session of its own.
+	// It leaves two processes: one in its group with no tag, one with its tag in a session of its own.
 	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
@@ -1060,7 +1062,7 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 		t.Fatal(err)
 	}
 
-	// The first is reached by the signal to the command's group alone, the second by the search for its tag alone.
+	// Only the signal to its group reaches the first, only the search for its tag the second.
 	for _, left := range []int{grouped, detached} {
 		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(left, 0) == nil; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
@@ -1083,7 +1085,7 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	c := testConn(t)
 	s.start(c, frame{kind: fStart, id: 28, payload: req})
 	cl := s.get(28)
-	cl.output(0, make([]byte, maxUnacked+1)) // all that execd holds for a client: what it prints now waits, and its exit with that
+	cl.output(0, make([]byte, maxUnacked+1)) // all execd holds for a client: its exit waits on what it prints
 	os.WriteFile(alive+".go", nil, 0o644)
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		cl.kmu.Lock()
@@ -1160,7 +1162,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	s.dispatch(c, frame{kind: fStart, id: 35, payload: req})
-	s.dispatch(c, frame{kind: fStdin, id: 35, payload: make([]byte, 1<<20)}) // more than a pipe holds: execd's writer waits
+	s.dispatch(c, frame{kind: fStdin, id: 35, payload: make([]byte, 1<<20)}) // more than a pipe holds
 	var pipe string
 	for exited := false; !exited; {
 		select {
@@ -1245,7 +1247,8 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "a"}) // it never ends by itself
+	// It never ends by itself.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "a"})
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 23, payload: req})
 	s.detach(first)
@@ -1329,9 +1332,10 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 		t.Fatal("no reader took the output")
 	}
 	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "b" and exits
-	check()                                                          // the exit has worked out how much to wait for, "a" not counted
+	// The exit has worked out how much to wait for, "a" not counted.
+	check()
 	close(count)
-	for deadline := time.Now().Add(30 * time.Second); !check(); { // a slow client: it acks only once the exit's grace is over
+	for deadline := time.Now().Add(30 * time.Second); !check(); { // a slow client acks after the exit's grace
 		if time.Now().After(deadline) {
 			t.Fatal("the exit's grace never ended")
 		}

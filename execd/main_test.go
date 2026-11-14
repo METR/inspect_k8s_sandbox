@@ -18,7 +18,7 @@ import (
 func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
 	defer cancel()
-	first := exec.CommandContext(ctx, os.Args[0], "listen", "--key-sha256", strings.Repeat("00", 32)) // on any free port
+	first := exec.CommandContext(ctx, os.Args[0], "listen", "--key-sha256", strings.Repeat("00", 32)) // any port
 	// The daemon it leaves running.
 	t.Cleanup(stopOthers)
 
@@ -32,7 +32,7 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	}
 	w.Close()
 	r.SetReadDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
-	out, err := io.ReadAll(r)                           // ends once the exec and the daemon it left have both let go of it
+	out, err := io.ReadAll(r)                           // ends once the exec and its daemon have both let go
 	first.Wait()                                        // its exit status may go to another test's reaper
 
 	if err != nil {
@@ -43,7 +43,7 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	}
 }
 
-// firstProcess runs execd as a pod's first process that reaps nothing would, then prints the children it is left with.
+// firstProcess runs execd as a pod's first process that reaps nothing would.
 func firstProcess(argv []string) {
 	prctl(prSetChildSubreaper, 1)
 	start := exec.Command(os.Args[0], argv...)

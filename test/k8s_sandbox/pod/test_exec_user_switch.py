@@ -127,10 +127,7 @@ async def test_a_replaced_pod_is_probed_again() -> None:
 
 
 async def test_a_probe_that_times_out_fails_the_exec() -> None:
-    """The shell's own check would wait on the same container, with no bound.
-
-    A PodError, so the call is retried rather than reported as the command timing out.
-    """
+    """The shell's own check would wait on the same container, with no bound."""
     pod = _make_pod()
     with (
         mock.patch("k8s_sandbox._pod.op.k8s_client", autospec=True) as client,
