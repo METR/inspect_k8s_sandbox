@@ -391,8 +391,10 @@ func (cl *call) run(req startRequest) error {
 	if err := os.Chdir(workdir); err != nil && !errors.Is(err, syscall.EACCES) && !strings.HasPrefix(req.Cwd, "/") {
 		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
 	}
-	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
-		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
+	if req.Cwd != "" { // a directory this user can enter: else it is the cd that fails, not the command
+		if err := syscall.Access(req.Cwd+"/.", 0); err != nil {
+			return fmt.Errorf("cd: %s: %w", req.Cwd, err)
+		}
 	}
 	stdinR, stdinW, err := stdinPipe(req.Stdin)
 	if err != nil {

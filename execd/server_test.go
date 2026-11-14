@@ -541,6 +541,29 @@ func TestAVariableNameShWouldDropFailsTheCall(t *testing.T) {
 	}
 }
 
+func TestACwdThatCannotBeEnteredFailsAsItsCdNotAsTheCommand(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(file, nil, 0o644)
+	closed := filepath.Join(t.TempDir(), "closed")
+	os.Mkdir(closed, 0)
+	for _, cwd := range []string{file, closed} {
+		if cwd == closed && os.Getuid() == 0 {
+			continue // root enters it all the same
+		}
+		s, _ := newServer(strings.Repeat("00", 32))
+		c, frames := recordedConn(t)
+		s.authenticated(c)
+		req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: cwd, Tag: "c"})
+
+		s.dispatch(c, frame{kind: fStart, id: 43, payload: req})
+
+		// 126 would read to the client as a command it may not execute.
+		if status := exitStatus(t, frames); status["code"] != 1.0 {
+			t.Fatalf("cwd %s: EXIT %v, want a failed cd's 1", cwd, status)
+		}
+	}
+}
+
 func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
