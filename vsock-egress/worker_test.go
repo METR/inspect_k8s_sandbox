@@ -214,6 +214,9 @@ func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 	const streams = 2 * newStreams
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	if w.accepts == nil {
+		t.Fatal("a worker has no pacer for new streams")
+	}
 	w.accepts.now = func() time.Time {
 		mu.Lock()
 		defer mu.Unlock()

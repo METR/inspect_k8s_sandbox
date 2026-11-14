@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,12 +47,7 @@ func loopback(t *testing.T) (*vsockListener, uint32) {
 func TestRestartedForwarderKeepsItsKey(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "key")
 	var first, second, elsewhere forwarder
-	for f, file := range map[*forwarder]string{&first: file, &elsewhere: file + ".other"} {
-		if err := f.loadKey(file); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := second.loadKey(file); err != nil {
+	if err := errors.Join(first.loadKey(file), elsewhere.loadKey(file+".other"), second.loadKey(file)); err != nil {
 		t.Fatal(err)
 	}
 	if first.key != second.key || first.key == elsewhere.key || first.key == [keySize]byte{} {
@@ -235,13 +231,13 @@ func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 	}
 }
 
-func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
-	f := keyedForwarder(0, 0)
-	for range maxStreams { // it carries all it may,
-		f.slots <- struct{}{}
-	}
-	for range maxStreams + maxWaiting { // and holds back all it may
-		f.queue <- struct{}{}
+// refused serves f, dials it once, and reports how that connection ended and how many streams f opened to the node.
+func refused(t *testing.T, f *forwarder) (ended error, streams int32) {
+	t.Helper()
+	var connects atomic.Int32
+	f.connect = func(uint32, uint32) (*os.File, error) {
+		connects.Add(1)
+		return nil, errors.New("no node in this test")
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -249,14 +245,33 @@ func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
 	}
 	t.Cleanup(func() { l.Close() })
 	go f.serve(l)
-	c, err := net.Dial("tcp", l.Addr().String()) // the reset may be there before the dial returns
+	c, err := net.Dial("tcp", l.Addr().String()) // a reset may be there before the dial returns
 	if err == nil {
 		t.Cleanup(func() { c.Close() })
-		c.SetReadDeadline(time.Now().Add(handshakeWait / 2)) // a connection held back is reset as well, after handshakeWait
+		c.SetReadDeadline(time.Now().Add(budget))
 		_, err = c.Read(make([]byte, 1))
 	}
-	if !errors.Is(err, unix.ECONNRESET) {
-		t.Fatalf("a connection past the %d held back ended with %v: want a reset at once", maxWaiting, err)
+	return err, connects.Load()
+}
+
+func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
+	f := keyedForwarder(0, 0)
+	f.wait = time.Millisecond
+	for range maxStreams { // it carries all it may
+		f.slots <- struct{}{}
+	}
+	if err, streams := refused(t, f); !errors.Is(err, unix.ECONNRESET) || streams != 0 {
+		t.Fatalf("connection %d ended with %v after %d streams to the node: want a reset and none", maxStreams+1, err, streams)
+	}
+}
+
+func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
+	f := keyedForwarder(0, 0)
+	for range maxStreams + maxWaiting { // it holds back all it may, with a place free for the next it takes
+		f.queue <- struct{}{}
+	}
+	if err, streams := refused(t, f); !errors.Is(err, unix.ECONNRESET) || streams != 0 {
+		t.Fatalf("a connection past the %d held back ended with %v after %d streams to the node: want a reset and none", maxWaiting, err, streams)
 	}
 }
 

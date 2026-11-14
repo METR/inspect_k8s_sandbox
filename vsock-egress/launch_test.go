@@ -189,7 +189,7 @@ func status(t *testing.T, pid int, field string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if strings.HasPrefix(line, field+":") {
 			return strings.Join(strings.Fields(line)[1:], " ")
 		}
