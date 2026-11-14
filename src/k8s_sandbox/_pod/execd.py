@@ -403,6 +403,7 @@ class Link:
         self.closed = True
         if not self.ready.done():
             self.ready.set_exception(Dropped("connection closed before auth"))
+            self.ready.exception()  # retrieved: an open that timed out no longer waits
         for c in self.calls.values():
             c.queue.put_nowait(Dropped(self))
             c.stdin_room.set()  # a sender waiting for room sees the close
