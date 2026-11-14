@@ -14,16 +14,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
+// As early as it can be; only a binary its exec can't read (mode 111, and no CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH) closes the window.
 func init() { prctl(prSetDumpable, 0) }
 
 func main() {
@@ -65,6 +67,19 @@ func connect(name string) {
 	go func() { io.Copy(c, os.Stdin); os.Exit(0) }()
 	io.Copy(os.Stdout, c)
 	os.Exit(0)
+}
+
+// memoryLimit is half the container's memory limit, or 32 MiB if that is more or the limit can't be read; none where the container has none.
+func memoryLimit(cgroupMax []byte, err error) int64 {
+	limit := strings.TrimSpace(string(cgroupMax))
+	if limit == "max" {
+		return math.MaxInt64
+	}
+	n, bad := strconv.ParseInt(limit, 10, 64)
+	if err != nil || bad != nil {
+		return 32 << 20
+	}
+	return max(n/2, 32<<20)
 }
 
 // become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
@@ -156,6 +171,7 @@ func run(network, address, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
+	debug.SetMemoryLimit(memoryLimit(os.ReadFile("/sys/fs/cgroup/memory.max"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())

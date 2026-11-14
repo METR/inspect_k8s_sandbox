@@ -1626,6 +1626,34 @@ class TestRunuserErrorMessages:
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
 
 
+@pytest.mark.parametrize(
+    ("said", "raises"),
+    [
+        ("runuser: user agent does not exist", True),
+        ("runuser: may not be used by non-root users", False),
+        ("runuser: cannot set groups: Operation not permitted", False),
+        ("/bin/sh: 1: exec: runuser: not found", False),
+    ],
+)
+def test_a_user_switch_that_failed_is_told_with_only_the_end_of_stderr(
+    said: str, raises: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: a command that filled stderr had 10 MiB logged by each call."""
+    info = op_module.PodInfo("p", "ns", None, "default", "u", 0, "warn")
+    executor = execute_module.ExecuteOperation(info)
+    stderr = "x" * (1 << 20) + said
+
+    if raises:
+        with pytest.raises(RuntimeError) as unknown_user:
+            executor._check_for_runuser_error(stderr, "agent")
+        told = str(unknown_user.value)
+    else:
+        executor._check_for_runuser_error(stderr, "agent")
+        told = caplog.text
+
+    assert said in told and len(told) < 8192
+
+
 def _stdio(
     client: ssl.SSLSocket,
     stopped: Callable[[], None] | None = None,
