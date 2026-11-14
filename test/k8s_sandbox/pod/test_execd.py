@@ -867,6 +867,28 @@ async def test_closing_a_stream_ends_a_send_waiting_for_room(daemons: Daemons) -
         await asyncio.wait_for(send, 30)
 
 
+async def test_a_send_cancelled_partway_ends_the_stream(daemons: Daemons) -> None:
+    """Regression: the part it had sent stayed, and the next item followed it."""
+
+    async def never_acks_stdin(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        while True:
+            await read_frame(r)
+
+    await daemons.serve(never_acks_stdin)
+    stream = await daemons.client().open_stream(["cat"], None)
+    send = asyncio.create_task(stream.send(b"x" * (2 * execd.STDIN_WINDOW)))
+    await until(lambda: stream._sent >= execd.STDIN_WINDOW)  # it waits for room
+
+    send.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await send
+    with pytest.raises(anyio.ClosedResourceError):
+        await asyncio.wait_for(stream.send(b"next"), 30)
+
+
 async def test_a_daemon_that_is_not_ours_is_replaced(
     daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:

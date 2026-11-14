@@ -930,6 +930,9 @@ class ExecdStream(ByteStream):
                     self._call.stdin_sent = self._sent
             except OSError as e:
                 raise anyio.BrokenResourceError(repr(e)) from e
+            except asyncio.CancelledError:
+                await self.aclose()  # an item cut short would corrupt the next
+                raise
 
     async def send_eof(self) -> None:
         with contextlib.suppress(OSError):
