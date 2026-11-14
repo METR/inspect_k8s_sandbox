@@ -486,7 +486,7 @@ class ExecdClient:
         stdin: bytes | None,
         timeout: float | None,
     ) -> AsyncGenerator[tuple[int, Any], None]:
-        """Yield (STDOUT|STDERR, bytes), then (EXIT, status), None if it timed out."""
+        """Yield (STDOUT|STDERR, bytes), then (EXIT, status), None at our timeout."""
         tag = os.urandom(8).hex()
         request: dict[str, Any] = {
             "argv": argv,
