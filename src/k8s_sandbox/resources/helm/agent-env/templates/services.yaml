@@ -46,9 +46,9 @@ spec:
       {{- if $egressProxy }}
       {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
       {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
-      {{- range concat (list $service) (default (list) $service.initContainers) }}
+      {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
       {{- range .volumeMounts }}
-      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
       {{- end }}
       {{- end }}
       {{- end }}

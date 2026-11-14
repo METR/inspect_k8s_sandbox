@@ -821,10 +821,11 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
 
 
 @pytest.mark.parametrize(
-    "mount", ["volumeMounts[0]", "initContainers[0].volumeMounts[0]"]
+    "container",
+    ["services.default", "services.default.initContainers[0]", "extraContainers[0]"],
 )
-def test_a_service_cannot_mount_the_egress_forwarders_key(
-    chart_dir: pathlib.Path, mount: str
+def test_no_other_container_can_mount_the_egress_forwarders_key(
+    chart_dir: pathlib.Path, container: str
 ) -> None:
     # Whoever reads the key can open streams to the node as the forwarder.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
@@ -833,8 +834,9 @@ def test_a_service_cannot_mount_the_egress_forwarders_key(
             set_str="egressForwarderImage=vsock-egress:1,"
             "services.default.initContainers[0].name=setup,"
             "services.default.initContainers[0].image=busybox,"
-            f"services.default.{mount}.name=egress-forwarder-key,"
-            f"services.default.{mount}.mountPath=/key",
+            "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+            f"{container}.volumeMounts[0].name=egress-forwarder-key,"
+            f"{container}.volumeMounts[0].mountPath=/key",
             set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
         )
     assert "egress-forwarder-key" in exc_info.value.stderr
