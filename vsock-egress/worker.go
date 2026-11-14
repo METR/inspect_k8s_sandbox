@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +68,8 @@ func work(args []string) error {
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
+	// It waits on sockets, where more threads only wake each other, and one holds it to one of the node's CPUs.
+	runtime.GOMAXPROCS(1)
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
