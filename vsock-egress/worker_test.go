@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -65,10 +67,15 @@ func proxy(t *testing.T) (address string, accepted chan net.Conn) {
 // served starts a worker for a VM whose forwarder holds key, and returns a dial for the guest's side.
 func served(t *testing.T, key []byte, target string, pace *pacer) (dial func() net.Conn) {
 	t.Helper()
-	vsock := firecracker(t, map[uint32]string{keyPort: string(key)})
-	w := newWorker(vsock, target, 0)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
 	w.pace = pace
-	streams := fmt.Sprintf("%s_%d", vsock, streamPort)
+	return serve(t, w)
+}
+
+// serve starts w at its VM's stream socket, and returns a dial for the guest's side.
+func serve(t *testing.T, w *worker) (dial func() net.Conn) {
+	t.Helper()
+	streams := fmt.Sprintf("%s_%d", w.vsock, streamPort)
 	l, err := net.Listen("unix", streams)
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +135,56 @@ func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
 		}
 	case <-time.After(budget):
 		t.Fatal("a stream that opened with the key did not reach the proxy")
+	}
+}
+
+func TestProxyNamedByHostIsLookedUp(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	_, port, _ := net.SplitHostPort(target)
+	c := served(t, key, net.JoinHostPort("localhost", port), nil)()
+
+	c.Write(key)
+	select {
+	case <-accepted:
+	case <-closed(c):
+		t.Fatal("a stream for a proxy named by host was closed")
+	case <-time.After(budget):
+		t.Fatal("a stream for a proxy named by host reached nothing")
+	}
+}
+
+func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	_, port, _ := net.SplitHostPort(target)
+	// The proxy's pod was replaced: its name first gives an address where nothing listens any more.
+	answers := []string{"127.0.0.2", "127.0.0.1"}
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		answer := netip.MustParseAddr(answers[0])
+		answers = answers[min(1, len(answers)-1):]
+		return []netip.Addr{answer}, nil
+	}
+	dial := serve(t, w)
+
+	first := dial()
+	first.Write(key)
+	select {
+	case <-accepted:
+		t.Fatal("the first stream reached the proxy at an address it has left")
+	case <-closed(first):
+	case <-time.After(budget):
+		t.Fatal("the first stream was neither joined nor closed")
+	}
+	second := dial()
+	second.Write(key)
+	select {
+	case <-accepted:
+	case <-closed(second):
+		t.Fatal("the worker kept the address where nothing listens")
+	case <-time.After(budget):
+		t.Fatal("the second stream was neither joined nor closed")
 	}
 }
 

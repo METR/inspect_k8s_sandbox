@@ -63,12 +63,13 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 
 func id(c string) string { return strings.Repeat(c, 64) }
 
-func TestOnlySandboxesThatNameAProxyAddressAreWanted(t *testing.T) {
+func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 	l := fakeNode(t)
 	addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID)
 	addSandbox(t, l, id("a"), "lo", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID)
 	addSandbox(t, l, id("b"), "eth0", map[string]string{"other": "annotation"}, vmUID)
-	addSandbox(t, l, id("c"), "eth0", map[string]string{proxyAnnotation: "proxy.example:3128"}, vmUID)
+	addSandbox(t, l, id("c"), "eth0", map[string]string{proxyAnnotation: "http://10.0.0.9:3128 -rate=1"}, vmUID)
+	addSandbox(t, l, id("e"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}, vmUID)
 	if os.Geteuid() == 0 {
 		addSandbox(t, l, id("d"), "eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, 0)
 	}
@@ -77,8 +78,8 @@ func TestOnlySandboxesThatNameAProxyAddressAreWanted(t *testing.T) {
 		t.Fatal(err)
 	}
 	sb, ok := wanted[id("a")]
-	if len(wanted) != 1 || !ok {
-		t.Fatalf("wanted %v: want only the sandbox whose pod names an ip:port and whose VM has a uid of its own", wanted)
+	if _, named := wanted[id("e")]; len(wanted) != 2 || !ok || !named {
+		t.Fatalf("wanted %v: want only the sandboxes whose pod names a host:port and whose VM has a uid of its own", wanted)
 	}
 	want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net", target: "10.0.0.9:3128"}
 	want.uid, want.gid = sb.uid, sb.gid

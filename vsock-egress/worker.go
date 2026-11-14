@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"errors"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
@@ -26,17 +28,22 @@ type worker struct {
 	mu      sync.Mutex
 	key     []byte // the forwarder's
 	fetched time.Time
+
+	looked sync.Mutex
+	addr   string // the target's address, once looked up
+	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, maxStreams)}
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, maxStreams),
+		lookup: net.DefaultResolver.LookupNetIP}
 }
 
 func work(args []string) error {
 	fs := flag.NewFlagSet("work", flag.ExitOnError)
 	pod := fs.String("pod", "", "the pod, for the log")
 	vsock := fs.String("vsock", "", "Firecracker's socket for the VM")
-	target := fs.String("target", "", "ip:port every stream is joined to")
+	target := fs.String("target", "", "host:port every stream is joined to")
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
@@ -86,12 +93,44 @@ func (w *worker) stream(c net.Conn) {
 		return
 	}
 	c.SetReadDeadline(time.Time{})
-	t, err := net.DialTimeout("tcp", w.target, dialWait)
+	t, err := w.dial()
 	if err != nil {
 		log.Print(err)
 		return
 	}
 	join(c, t.(*net.TCPConn), w.pace)
+}
+
+// dial connects to the pod's proxy. A name is looked up from inside the pod's namespace, so under the pod's own
+// network policy, and its address is kept until a dial to it fails: a Service keeps its address, a pod that
+// is replaced does not.
+func (w *worker) dial() (net.Conn, error) {
+	w.looked.Lock()
+	addr := w.addr
+	if addr == "" {
+		host, port, err := net.SplitHostPort(w.target)
+		if err != nil {
+			w.looked.Unlock()
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), dialWait)
+		ips, err := w.lookup(ctx, "ip4", host)
+		cancel()
+		if err != nil {
+			w.looked.Unlock()
+			return nil, err
+		}
+		addr = net.JoinHostPort(ips[0].String(), port)
+		w.addr = addr
+	}
+	w.looked.Unlock()
+	c, err := net.DialTimeout("tcp", addr, dialWait)
+	if err != nil {
+		w.looked.Lock()
+		w.addr = ""
+		w.looked.Unlock()
+	}
+	return c, err
 }
 
 // holds reports whether key is the forwarder's. A forwarder that restarted has a new one, so a key that does
