@@ -23,6 +23,7 @@ func TestMain(m *testing.M) {
 		main()
 		return
 	}
+	startReaper()
 	os.Exit(m.Run())
 }
 
@@ -37,7 +38,6 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "10"}, Env: map[string]string{}, Tag: "t"})
 	first := testConn(t)
@@ -67,7 +67,6 @@ func abandoned(cl *call) bool {
 }
 
 func TestARelativePathEntryUnderARelativeCwdRuns(t *testing.T) {
-	startReaper()
 	dir, _ := filepath.EvalSymlinks(t.TempDir())
 	os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755)
 	os.WriteFile(filepath.Join(dir, "work", "bin", "hello"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
@@ -100,7 +99,6 @@ func exitCode(t *testing.T, cl *call) int {
 }
 
 func TestStdinFromADroppedConnectionIsNotWrittenAgain(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	out := filepath.Join(t.TempDir(), "stdin")
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "cat > " + out}, Env: map[string]string{}, Stdin: true, Tag: "s"})
@@ -139,7 +137,6 @@ func TestALateStartOnAReplacedConnectionDoesNotRun(t *testing.T) {
 }
 
 func TestALateResumeOnAReplacedConnectionLeavesTheCallToTheNewOne(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "s"})
 	first, second := testConn(t), testConn(t)
@@ -166,7 +163,6 @@ func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 		os.Unsetenv("PATH")
 		t.Cleanup(func() { os.Setenv("PATH", path) })
 	}
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	out := filepath.Join(t.TempDir(), "env")
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `env >"$0"`, out}, Env: map[string]string{}, Tag: "p"})
@@ -181,7 +177,6 @@ func TestWithNoPathAnywhereACommandGetsTheUsualOne(t *testing.T) {
 }
 
 func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "sleep 0.2; exit 3"}, Env: map[string]string{}, Tag: "h", Timeout: 1e18})
 	c := testConn(t)
@@ -195,7 +190,6 @@ func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 }
 
 func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: a repeat's kill may still be looking for the last one's
 	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag, Timeout: 0.05})
@@ -216,7 +210,6 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 		return fired
 	}
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "exit 3"}, Env: map[string]string{}, Tag: "e", Timeout: 60})
 	c, frames := recordedConn(t)
@@ -230,7 +223,6 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 }
 
 func TestACommandKilledBeforeItsTimeoutIsNotTimedOut(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -9 $$"}, Env: map[string]string{}, Tag: "k", Timeout: 60})
 	c, frames := recordedConn(t)
@@ -310,7 +302,6 @@ func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 }
 
 func TestManySmallWritesMakeFewFrames(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -475,7 +466,6 @@ func TestAChargeNeverGivesBackTurnsTaken(t *testing.T) {
 }
 
 func TestAScriptWithNoInterpreterLineRuns(t *testing.T) {
-	startReaper()
 	script := filepath.Join(t.TempDir(), "seven")
 	os.WriteFile(script, []byte("exit 7\n"), 0o755)
 	s, _ := newServer(strings.Repeat("00", 32))
@@ -490,7 +480,6 @@ func TestAScriptWithNoInterpreterLineRuns(t *testing.T) {
 }
 
 func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -522,7 +511,6 @@ func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
 }
 
 func TestACommandNamedLikeAShellBuiltinIsTheOneOnThePath(t *testing.T) {
-	startReaper()
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "printf"), []byte("#!/bin/sh\nexit 7\n"), 0o755)
 	s, _ := newServer(strings.Repeat("00", 32))
@@ -537,7 +525,6 @@ func TestACommandNamedLikeAShellBuiltinIsTheOneOnThePath(t *testing.T) {
 }
 
 func TestACommandNamedLikeAnOptionIsNotFound(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"-c", "true"}, Env: map[string]string{}, Tag: "o"})
 
@@ -554,7 +541,6 @@ func TestACommandIsFoundOnThePathAsItsUser(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
 	}
-	startReaper()
 	dir := t.TempDir()
 	os.Chmod(filepath.Dir(dir), 0o755) // so the other user reaches it
 	for name, script := range map[string]string{"roots": "#!/bin/sh\nexit 3\n", "anyones": "#!/bin/sh\nexit 7\n"} {
@@ -582,7 +568,6 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
 	}
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -634,7 +619,6 @@ func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
 	}
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: t.TempDir(), User: "65534", Tag: "d"})
 
@@ -652,7 +636,6 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	}
 	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -743,7 +726,6 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 }
 
 func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
-	startReaper()
 	t.Cleanup(func() { killTagged("early") })
 	cl := &call{id: 30, tag: "early"}
 	cl.room = sync.NewCond(&cl.mu)
@@ -762,7 +744,6 @@ func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
 func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *testing.T) {
 	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
-	startReaper()
 	t.Cleanup(func() { killTagged("ended") })
 	cl := &call{id: 33, tag: "ended"}
 	cl.room = sync.NewCond(&cl.mu)
@@ -807,7 +788,6 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	t.Cleanup(func() { killTagged("left") })
@@ -847,7 +827,6 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 }
 
 func TestAKillAsACommandsEndIsBeingNotedLeavesWhatItLeftRunning(t *testing.T) {
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	t.Cleanup(func() { killTagged("noted") })
@@ -887,7 +866,6 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "a"}) // it never ends by itself
 	first := testConn(t)
@@ -930,7 +908,6 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { afterRead, afterDrainCheck = func() {}, func(bool) {} })
-	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
