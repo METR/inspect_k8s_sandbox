@@ -848,7 +848,7 @@ class ExecdClient:
             "argv": argv,
             "env": {},
             "cwd": "",
-            "user": user or "",
+            "user": user,
             "stdin": True,
             "tag": os.urandom(8).hex(),
             "stream": True,  # never resumed: execd kills it if the connection drops
@@ -1002,5 +1002,4 @@ class ExecdStream(ByteStream):
         self._call.stdin_room.set()  # a send waiting for room sees the close
         self._call.queue.put_nowait(Dropped())  # and so does a receive
         self._link.calls.pop(self._call.id, None)
-        # EOF first: the command may end itself
-        self._link.send_last(self._call.id, STDIN, KILL, RELEASE)
+        self._link.send_last(self._call.id, KILL, RELEASE)

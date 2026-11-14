@@ -1708,7 +1708,7 @@ async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> No
             await stream.aclose()
     await until(lambda: execd.RELEASE in got)
 
-    assert got[-3:] == [execd.STDIN, execd.KILL, execd.RELEASE]
+    assert got[-2:] == [execd.KILL, execd.RELEASE]
 
 
 async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
