@@ -625,23 +625,39 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     assert (result.returncode, starts) == (7, 1)
 
 
-async def test_a_connection_dropped_as_a_resume_is_written_is_left_once(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "before", [False, True], ids=["as its RESUME is written", "before its RESUME"]
+)
+async def test_a_connection_lost_while_a_call_resumes_on_it_is_left_once(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, before: bool
 ) -> None:
-    """Such a drop reaches the call twice: taking the second for the next's reopens."""
+    """The call hears of it twice, or only from its own send: it reopens once."""
     connections: list[asyncio.StreamWriter] = []
     started, resuming = asyncio.Event(), asyncio.Event()
+    opened = 0
 
-    class HoldsTheSecondResume(Plain):
+    class SecondIsLost(Plain):
+        nth = reads = 0
+
+        async def readexactly(self, n: int) -> bytes:
+            self.reads += 1
+            if before and self.nth == 2 and self.reads > 2:  # right behind its OK
+                raise ConnectionResetError
+            return await super().readexactly(n)
+
         async def write(self, data: bytes) -> None:
-            if data[0] == execd.RESUME and len(connections) == 2:
+            if not before and self.nth == 2 and data[0] == execd.RESUME:
                 resuming.set()
                 await until(self._writer.transport.is_closing)
             await super().write(data)
 
     async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        nonlocal opened
         r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
-        return HoldsTheSecondResume(r, w)
+        opened += 1
+        pipe = SecondIsLost(r, w)
+        pipe.nth = opened
+        return pipe
 
     async def resumes_on_the_third(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -665,8 +681,9 @@ async def test_a_connection_dropped_as_a_resume_is_written_is_left_once(
     )
     await asyncio.wait_for(started.wait(), 30)
     connections[0].transport.abort()
-    await asyncio.wait_for(resuming.wait(), 30)
-    connections[1].transport.abort()  # as its RESUME is written
+    if not before:
+        await asyncio.wait_for(resuming.wait(), 30)
+        connections[1].transport.abort()
 
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
@@ -964,15 +981,50 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
         )
 
 
+async def test_a_reconnect_waits_only_for_what_is_left_of_the_timeout(
+    daemons: Daemons, clock: types.SimpleNamespace
+) -> None:
+    """Regression: a command cut off late in its timeout waited that long again."""
+    started = asyncio.Event()
+    peers: list[asyncio.StreamWriter] = []
+
+    async def takes_the_start(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        peers.append(w)
+        await read_frame(r)  # START
+        started.set()
+        await r.read()
+
+    server = await daemons.serve(takes_the_start)
+    run = daemons.client().exec(["sleep", "999"], None, None, {}, None, 1000)
+    call = asyncio.ensure_future(run)
+    await asyncio.wait_for(started.wait(), 30)
+    clock.now += 2000  # past its timeout: only then is it cut off
+    server.close()
+    peers[0].transport.abort()
+
+    with pytest.raises(TimeoutError, match="Command timed out after 1000s"):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+
+
+RESTARTED = error.ContainerRestartedError(
+    pod_name="p", container_name="default", restart_count=1, last_reason="Error"
+)
+
+
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "raised"),
     [
-        error.PodError("execd did not start"),
-        kubernetes.client.exceptions.ApiException(status=404),  # the pod is deleted
+        (execd.NotStarted("execd did not start"), error.ExecdResultUnknownError),
+        pytest.param(
+            kubernetes.client.exceptions.ApiException(status=404),
+            error.ExecdResultUnknownError,
+            id="the pod is deleted",
+        ),
+        (RESTARTED, error.ContainerRestartedError),
     ],
 )
 async def test_a_failed_restart_after_start_is_not_retryable(
-    daemons: Daemons, failure: Exception
+    daemons: Daemons, failure: Exception, raised: type[Exception]
 ) -> None:
     """Regression: a start that could never succeed was tried again for 5 minutes."""
 
@@ -991,13 +1043,20 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     sandbox = daemons.client()
 
     # PodError is retried too, which would run the command again.
-    with pytest.raises(error.ExecdResultUnknownError):
+    with pytest.raises(raised):
         call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
         await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        kubernetes.client.exceptions.ApiException(status=503),
+        error.PodError("/execd/execd timed out"),  # the start's exec got no answer
+    ],
+)
 async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
     """Regression: one failed pod read ended the reconnect, and with it the command."""
     dropped = probed = False
@@ -1013,7 +1072,7 @@ async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
     async def unavailable(replace: bool) -> execd.Daemon:
         nonlocal probed
         probed = True
-        raise kubernetes.client.exceptions.ApiException(status=503)
+        raise failure
 
     async def drops_then_resumes(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -1377,12 +1436,11 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise ConnectionRefusedError
 
-    starts = 0
+    replaced: list[bool] = []
 
     async def start(replace: bool) -> execd.Daemon:
-        nonlocal starts
-        starts += 1
-        return execd.Daemon("127.0.0.1", f"cert-{starts}", b"key")
+        replaced.append(replace)
+        return execd.Daemon("127.0.0.1", f"cert-{len(replaced)}", b"key")
 
     monkeypatch.setattr(execd, "_connect", refused)
     monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 1.0)
@@ -1391,7 +1449,32 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
         await execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
 
     # Paced: a handful in the second, where an unpaced loop runs hundreds.
-    assert starts <= 10
+    assert 1 < len(replaced) <= 10
+    # Only the first replaces what it finds: the rest would kill the daemon it started.
+    assert replaced[0] and not any(replaced[1:])
+
+
+async def test_a_restart_that_fails_on_a_first_open_ends_it_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        raise ConnectionRefusedError
+
+    starts = 0
+
+    async def start(replace: bool) -> execd.Daemon:
+        nonlocal starts
+        starts += 1
+        if starts > 1:
+            raise RuntimeError("the node is gone")
+        return execd.Daemon("127.0.0.1", "cert", b"key")
+
+    monkeypatch.setattr(execd, "_connect", refused)
+
+    # What the start said, at once: not "execd unreachable" 30 s later.
+    with pytest.raises(RuntimeError, match="the node is gone"):
+        call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
 async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> None:

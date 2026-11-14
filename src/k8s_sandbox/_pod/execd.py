@@ -110,6 +110,10 @@ class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
 
 
+class NotStarted(PodError):
+    """A start ran and failed: no daemon runs, so no call can be resumed."""
+
+
 def _port_held() -> RuntimeError:
     return RuntimeError(
         f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
@@ -487,17 +491,14 @@ class ExecdClient:
                 # a start tells gone from unreachable; a daemon not ours is replaced
                 not_ours = isinstance(e, NotOurDaemon)
                 try:
-                    self._daemon = await self._start(self._link is None or not_ours)
+                    self._daemon = await self._start(not_ours)
                 except DaemonRunning:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
                 except Exception as failed:
                     # A deleted pod, or a start that ran and failed: nothing to resume.
                     gone = isinstance(failed, ApiException) and failed.status == 404
-                    gone = gone or (
-                        isinstance(failed, PodError)
-                        and not isinstance(failed, ExecResultUnknownError)
-                    )
+                    gone = gone or isinstance(failed, NotStarted)
                     if self._link is None or gone or isinstance(failed, K8sError):
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
@@ -552,6 +553,10 @@ class ExecdClient:
         start = json.dumps(request).encode()
         link = await self._get()
         deadline = None if timeout is None else time.monotonic() + timeout
+
+        def left() -> float | None:  # of the command's timeout
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
+
         call = Call(int.from_bytes(os.urandom(8), "big") >> 1, link.daemon)
         link.calls[call.id] = call
         sender: asyncio.Task[None] | None = None
@@ -569,13 +574,8 @@ class ExecdClient:
                     call.queue.put_nowait(Dropped(link))
                 sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                 while True:
-                    left = (
-                        None
-                        if deadline is None
-                        else max(0.0, deadline - time.monotonic())
-                    )
                     try:
-                        item = await _next(call.queue, left)
+                        item = await _next(call.queue, left())
                     except asyncio.TimeoutError:
                         try:
                             await asyncio.wait_for(
@@ -592,7 +592,7 @@ class ExecdClient:
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
-                        link = await asyncio.wait_for(self._get(stale=link), left)
+                        link = await asyncio.wait_for(self._get(stale=link), left())
                         if link.daemon is not call.daemon:
                             raise ExecdResultUnknownError(
                                 "execd stopped while it ran the command",
