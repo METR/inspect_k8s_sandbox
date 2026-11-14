@@ -572,15 +572,17 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
-        end = time.monotonic() + CONNECT_TIMEOUT
+        # One end across connections.
+        end = time.monotonic() + DEAD_AFTER + PING_EVERY + CONNECT_TIMEOUT
         while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
             if not link.closed:  # else it is set for good, and the next one is opened
                 link.confirmed.clear()
             try:
                 await asyncio.wait_for(link.confirmed.wait(), end - time.monotonic())
+                if link.closed:
+                    link = await asyncio.wait_for(self._get(), end - time.monotonic())
             except asyncio.TimeoutError:  # a peer that answers no PING is not execd
                 raise ConnectionError("execd has not confirmed its calls") from None
-            link = await self._get()
         deadline = None if timeout is None else time.monotonic() + timeout
 
         def left() -> float | None:  # of the command's timeout
