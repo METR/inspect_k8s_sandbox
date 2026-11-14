@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -486,74 +487,89 @@ func TestExecdIsNotDumpableFromItsStart(t *testing.T) {
 	}
 }
 
-func TestManySmallWritesMakeFewFrames(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	lines := "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done"
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", lines}, Env: map[string]string{}, Tag: "w"})
+// onItsOwnClock runs a test of the turns in a bubble, where time passes only while every goroutine waits: with none taken as it starts.
+func onItsOwnClock(t *testing.T, test func(t *testing.T)) {
+	ahead := time.Now().Add(time.Hour)
+	synctest.Test(t, func(t *testing.T) {
+		time.Sleep(time.Until(ahead))        // past the real clock: a turn an earlier test's command takes as it ends can't move these
+		slot.Store(int64(time.Since(epoch))) // the turns are shared, and counted from execd's start
+		defer slot.Store(0)
+		test(t)
+	})
+}
 
-	began := time.Now()
-	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
+func TestManySmallWritesMakeFewFramesAndTakeFewTurns(t *testing.T) {
+	onItsOwnClock(t, func(t *testing.T) {
+		c, frames := recordedConn(t)
+		cl := &call{id: 7, sub: c}
+		cl.room = sync.NewCond(&cl.mu)
+		other, others := recordedConn(t)
+		next := &call{id: 8, sub: other}
+		next.room = sync.NewCond(&next.mu)
+		began := time.Now()
 
-	outputs := 0
-	for {
-		select {
-		case f := <-frames:
-			switch f.kind {
-			case fStdout:
-				outputs++
-			case fExit:
-				// The client paces frames at 4,096 a second: a frame a line would crawl.
-				if took := time.Since(began); outputs > int(took/time.Millisecond)+2 {
-					t.Fatalf("%d frames for 20,000 lines in %v: more than one a millisecond", outputs, took)
-				}
-				return
-			}
-		case <-time.After(30 * time.Second):
-			t.Fatal("no EXIT")
+		for range 50 {
+			cl.output(0, []byte("line\n")) // as its reader takes each small write
 		}
-	}
+		next.output(0, []byte("x"))
+
+		<-others
+		if held := time.Since(began); held > 0 {
+			t.Fatalf("another call's output waited %v behind the turns 50 writes took", held)
+		}
+		outputs := 0
+		for got := 0; got < 50*len("line\n"); outputs++ {
+			got += len((<-frames).payload)
+		}
+		// The client paces frames at 4,096 a second: a frame a write would crawl.
+		if outputs > 2 {
+			t.Fatalf("%d frames for 50 writes made at once, want the first and one a millisecond on", outputs)
+		}
+	})
 }
 
 func TestCallsTakeTurnsToSend(t *testing.T) {
-	var sent []<-chan frame
-	began := time.Now()
-	for i := range 20 {
-		c, frames := recordedConn(t)
-		cl := &call{id: uint64(10 + i), sub: c}
-		cl.room = sync.NewCond(&cl.mu)
-		cl.output(0, []byte("x")) // each call's first: only the turns hold it
-		sent = append(sent, frames)
-	}
+	onItsOwnClock(t, func(t *testing.T) {
+		var sent []<-chan frame
+		began := time.Now()
+		for i := range 20 {
+			c, frames := recordedConn(t)
+			cl := &call{id: uint64(10 + i), sub: c}
+			cl.room = sync.NewCond(&cl.mu)
+			cl.output(0, []byte("x")) // each call's first: only the turns hold it
+			sent = append(sent, frames)
+		}
 
-	for _, frames := range sent {
-		<-frames
-	}
+		for _, frames := range sent {
+			<-frames
+		}
 
-	// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
-	if took := time.Since(began); took < 6*time.Millisecond {
-		t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
-	}
+		// Many calls sending at once would pass the client's frame pace, and others' calls wait behind them.
+		if took := time.Since(began); took < 6*time.Millisecond {
+			t.Fatalf("20 calls sent within %v, not a turn each past the burst", took)
+		}
+	})
 }
 
 func TestCallsWithNoConnectionTakeNoTurns(t *testing.T) {
-	for i := range 200 {
-		cl := &call{id: uint64(100 + i)} // its connection dropped: the resume sends what it has
+	onItsOwnClock(t, func(t *testing.T) {
+		for i := range 200 {
+			cl := &call{id: uint64(100 + i)} // its connection dropped: the resume sends what it has
+			cl.room = sync.NewCond(&cl.mu)
+			cl.output(0, []byte("x"))
+		}
+		c, frames := recordedConn(t)
+		cl := &call{id: 99, sub: c}
 		cl.room = sync.NewCond(&cl.mu)
+		began := time.Now()
+
 		cl.output(0, []byte("x"))
-	}
-	c, frames := recordedConn(t)
-	cl := &call{id: 99, sub: c}
-	cl.room = sync.NewCond(&cl.mu)
-	began := time.Now()
 
-	cl.output(0, []byte("x"))
-
-	<-frames
-	if took := time.Since(began); took > 30*time.Millisecond {
-		t.Fatalf("a live call waited %v behind calls with nowhere to send", took)
-	}
+		<-frames
+		if took := time.Since(began); took > 0 {
+			t.Fatalf("a live call waited %v behind calls with nowhere to send", took)
+		}
+	})
 }
 
 func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
@@ -574,20 +590,22 @@ func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
 }
 
 func TestExitsHoldOthersOutputBackOnlySoLong(t *testing.T) {
-	for range 100_000 {
-		charge(3) // calls ending faster than turns come: three minutes of turns
-	}
-	c, frames := recordedConn(t)
-	cl := &call{id: 97, sub: c}
-	cl.room = sync.NewCond(&cl.mu)
+	onItsOwnClock(t, func(t *testing.T) {
+		for range 100_000 {
+			charge(3) // calls ending faster than turns come: three minutes of turns
+		}
+		c, frames := recordedConn(t)
+		cl := &call{id: 97, sub: c}
+		cl.room = sync.NewCond(&cl.mu)
 
-	cl.output(0, []byte("x"))
+		cl.output(0, []byte("x"))
 
-	select {
-	case <-frames:
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("output held over 50 ms behind exits' turns")
-	}
+		select {
+		case <-frames:
+		case <-time.After(50 * time.Millisecond):
+			t.Fatal("output held over 50 ms behind exits' turns")
+		}
+	})
 }
 
 func TestCallsThatEndBeforeTheirTurnHoldOthersOutputBackOnlySoLong(t *testing.T) {

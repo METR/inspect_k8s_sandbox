@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import io
+import itertools
 import json
 import logging
 import os
@@ -863,19 +864,19 @@ def test_output_after_the_markers_does_not_hold_the_exec_open(
 ) -> None:
     """A background process that keeps writing, so TLS always holds more."""
     markers = _frame(STDOUT, b"out" + _marker(0)) + _frame(STDERR, _marker(0))
-    # For at least 3 seconds.
-    records = _straddling(markers, _frame(STDOUT, b"late"), 3000)
+    late = _frame(STDOUT, b"late")
+    # Until the test ends, each record ending one byte into the next frame.
+    records = itertools.chain(
+        [markers + late[:1]], itertools.repeat(late[1:] + late[:1])
+    )
     ws = _SocketWSClient(tls_sockets[0])
     pool = concurrent.futures.ThreadPoolExecutor(1)
 
     with _sending(tls_sockets, records, pause=0.001):
-        start = time.monotonic()
-        result = pool.submit(_handle, ws).result(timeout=10)
-        elapsed = time.monotonic() - start
+        result = pool.submit(_handle, ws).result(timeout=30)  # only bounds a hang
     pool.shutdown()
 
     assert (result.returncode, result.stdout) == (0, "out")
-    assert elapsed < 1
 
 
 def test_a_frame_cut_off_after_the_markers_does_not_hold_the_exec_open(

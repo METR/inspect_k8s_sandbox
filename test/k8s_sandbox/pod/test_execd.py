@@ -3,6 +3,7 @@ import contextlib
 import gc
 import hashlib
 import io
+import itertools
 import json
 import os
 import shutil
@@ -110,6 +111,32 @@ async def until(condition: Callable[[], bool]) -> None:
 def held(stream: execd.ExecdStream) -> int:
     queued = list(stream._call.queue._queue)  # type: ignore[attr-defined]
     return sum(len(item[1]) for item in queued if isinstance(item, tuple))
+
+
+def waiting(link: execd.Link) -> bool:
+    """Whether a frame waits to be sent, behind another call's write."""
+    return bool(link._wlock._waiters)
+
+
+@pytest.fixture
+def clock(monkeypatch: MonkeyPatch) -> types.SimpleNamespace:
+    """Stand in for execd's clocks and sleeps: a sleep only moves the clock on."""
+    fake = types.SimpleNamespace(now=0.0, cpu=lambda: 0.0)
+
+    async def sleep(seconds: float) -> None:
+        if seconds >= execd.PING_EVERY:  # a connection's pings never come
+            await asyncio.Event().wait()
+        fake.now += max(seconds, 0.0)
+        await asyncio.sleep(0)
+
+    clocks = types.SimpleNamespace(
+        monotonic=lambda: fake.now, thread_time=lambda: fake.cpu()
+    )
+    monkeypatch.setattr(execd, "time", clocks)
+    monkeypatch.setattr(
+        execd, "asyncio", types.SimpleNamespace(**{**vars(asyncio), "sleep": sleep})
+    )
+    return fake
 
 
 async def test_an_annotated_pod_runs_every_operation_over_execd(
@@ -436,44 +463,39 @@ async def test_command_is_not_run_again_once_its_daemon_is_gone(
 
 
 async def test_stdin_in_flight_stays_within_the_window(
-    daemons: Daemons,
+    tls_daemon: TlsDaemon,
 ) -> None:
-    most_in_flight = 0
+    most_in_flight = received = 0
 
-    async def acks_when_the_client_waits(
+    async def acks_at_each_ping(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
-        nonlocal most_in_flight
+        nonlocal most_in_flight, received
         _, call_id, _ = await read_frame(r)  # START
-        frames: asyncio.Queue[tuple[int, int, bytes]] = asyncio.Queue()
-
-        async def pump() -> None:
-            while True:
-                frames.put_nowait(await read_frame(r))
-
-        reader = asyncio.create_task(pump())
-        received = written = 0
+        written = 0
         while True:
-            try:
-                kind, _, payload = await asyncio.wait_for(frames.get(), 0.3)
-            except asyncio.TimeoutError:
-                # The client has stopped sending: all it has sent is in.
-                most_in_flight = max(most_in_flight, received - written)
-                written = received
-                put = json.dumps({"stdin": written}).encode()
-                w.write(frame(execd.STDIN_ACK, call_id, put))
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN and payload:
+                received += len(payload)
                 continue
-            if kind == execd.STDIN and not payload:
-                most_in_flight = max(most_in_flight, received - written)
+            # A ping, or stdin's end: all the client sent before it is in.
+            most_in_flight = max(most_in_flight, received - written)
+            written = received
+            if kind == execd.STDIN:
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
-                reader.cancel()
                 return
-            received += len(payload) if kind == execd.STDIN else 0
+            put = json.dumps({"stdin": written}).encode()
+            w.write(frame(execd.STDIN_ACK, call_id, put))
 
-    await daemons.serve(acks_when_the_client_waits)
+    client = await tls_daemon(acks_at_each_ping)
     stdin = b"x" * (3 * execd.STDIN_WINDOW)
 
-    result = await daemons.client().exec(["cat"], stdin, None, {}, None, 30)
+    call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, None))
+    for windows in (1, 2):
+        await until(lambda: received >= windows * execd.STDIN_WINDOW)
+        assert client._link is not None
+        await client._link.send(execd.PING, 0)  # behind the stdin sent so far
+    result = await asyncio.wait_for(call, 30)
 
     assert result.returncode == 0
     assert most_in_flight <= execd.STDIN_WINDOW
@@ -499,7 +521,8 @@ async def test_connection_lost_after_start_is_not_retryable(
 
     # A ConnectionError would be retried, running the command again.
     with pytest.raises(ExecdResultUnknownError):
-        await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+        call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
 async def test_a_command_whose_connection_closed_before_it_was_sent_is_retryable(
@@ -575,14 +598,17 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
             await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
 
     task = asyncio.ensure_future(times_out())
-    done, _ = await asyncio.wait({task}, timeout=15)
+    done, _ = await asyncio.wait({task}, timeout=30)
     for peer in peers:  # frees a hung client, so a failure ends here
         peer.transport.abort()
     assert done, "the blocked write held up the timeout"
     await task
 
 
-async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None:
+async def test_a_timed_out_call_frees_what_execd_holds(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its exit ends the wait
     released = asyncio.Event()
 
     async def full_after_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -598,14 +624,16 @@ async def test_a_timed_out_call_frees_what_execd_holds(daemons: Daemons) -> None
                 released.set()
 
     await daemons.serve(full_after_kill)
-    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
-        await asyncio.wait_for(
-            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
-        )
-    await asyncio.wait_for(released.wait(), 5)
+    with pytest.raises(TimeoutError, match="Command timed out"):
+        call = daemons.client().exec(["yes"], None, None, {}, None, 1)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+    await asyncio.wait_for(released.wait(), 30)
 
 
-async def test_a_timed_out_call_takes_no_more_than_its_hold(daemons: Daemons) -> None:
+async def test_a_timed_out_call_takes_no_more_than_its_hold(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its hold ends the wait
     acked = 0
 
     async def sends_while_acked(
@@ -622,26 +650,26 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(daemons: Daemons) ->
                 w.write(more)
 
     await daemons.serve(sends_while_acked)
-    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
-        await asyncio.wait_for(
-            daemons.client().exec(["yes"], None, None, {}, None, 1), 5
-        )
+    with pytest.raises(TimeoutError, match="Command timed out"):
+        call = daemons.client().exec(["yes"], None, None, {}, None, 1)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
     assert 0 < acked <= execd.HOLD
 
 
 async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
-    daemons: Daemons,
+    daemons: Daemons, monkeypatch: MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only the drop ends the wait
+
     async def drops_on_kill(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while (await read_frame(r))[0] != execd.KILL:
             pass
         w.transport.abort()
 
     await daemons.serve(drops_on_kill)
-    with pytest.raises(TimeoutError, match="Command timed out"):  # not KILL_WAIT later
-        await asyncio.wait_for(
-            daemons.client().exec(["sleep", "9"], None, None, {}, None, 1), 5
-        )
+    with pytest.raises(TimeoutError, match="Command timed out"):
+        call = daemons.client().exec(["sleep", "9"], None, None, {}, None, 1)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
 async def test_a_timed_out_call_is_released_with_no_exit(
@@ -658,7 +686,7 @@ async def test_a_timed_out_call_is_released_with_no_exit(
     await daemons.serve(never_exits)
     with pytest.raises(TimeoutError):
         await daemons.client().exec(["sleep", "9"], None, None, {}, None, 1)
-    await asyncio.wait_for(released.wait(), 5)
+    await asyncio.wait_for(released.wait(), 30)
 
 
 async def test_a_command_execd_killed_at_its_timeout_raises(
@@ -841,7 +869,7 @@ async def test_a_large_control_frame_drops_the_connection(
         _, call_id, _ = await read_frame(r)  # START
         # JSON, so only its size can drop the connection
         w.write(frame(kind, call_id, b'{"stdin": 0}'.ljust(size)))
-        await asyncio.sleep(3600)
+        await r.read()
 
     await daemons.serve(large)
     stream = await daemons.client().open_stream(["cat"], None)
@@ -1152,37 +1180,31 @@ async def test_concurrent_sends_on_a_stream_stay_whole(
 
 
 async def test_a_stream_cancelled_as_it_starts_is_killed(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    tls_daemon: TlsDaemon,
 ) -> None:
     got: list[int] = []
+    reads = asyncio.Event()
 
     async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await reads.wait()  # unread, the START backs up: its write waits
         while True:
             got.append((await read_frame(r))[0])
 
-    await daemons.serve(records)
-    send = execd.Link.send
+    client = await tls_daemon(records)
+    link = await client._get()
     scope = anyio.CancelScope()
-    writers: list[asyncio.Task[None]] = []
+    argv = ["echo", "x" * (16 << 20)]  # more than the socket buffers hold
 
-    async def writes(link: execd.Link) -> None:  # another call's
-        async with link._wlock:
-            await asyncio.sleep(0.1)
+    async def opens() -> None:
+        with scope:
+            await client.open_stream(argv, None)
 
-    async def cancelled_after_start(
-        link: execd.Link, kind: int, call_id: int, payload: bytes = b""
-    ) -> None:
-        await send(link, kind, call_id, payload)
-        if kind == execd.START:
-            writers.append(asyncio.create_task(writes(link)))
-            scope.cancel()  # anyio cancels again at each await, unlike asyncio
-            await asyncio.sleep(1)
-
-    monkeypatch.setattr(execd.Link, "send", cancelled_after_start)
-
-    with scope:
-        await daemons.client().open_stream(["cat"], None)
-    await writers[0]
+    opening = asyncio.ensure_future(opens())
+    unsent = link.pipe._writer.transport.get_write_buffer_size
+    await until(lambda: unsent() > 0)  # its START is on its way
+    scope.cancel()  # anyio cancels again at each await, unlike asyncio
+    await asyncio.wait_for(opening, 30)
+    reads.set()
     await until(lambda: execd.RELEASE in got)
 
     assert scope.cancelled_caught
@@ -1212,19 +1234,16 @@ async def test_a_call_cancelled_while_another_writes_is_killed(
     assert link is not None
     async with link._wlock:  # another call's write
         scope.cancel()  # anyio cancels again at each await, unlike asyncio
-        await asyncio.sleep(0.1)
-    await task
+        await asyncio.wait_for(task, 30)  # it ends at once: its last frames wait
     await until(lambda: execd.RELEASE in got)
 
     assert execd.KILL in got
     assert not link.calls
 
 
-async def test_a_call_cancelled_as_it_exits_is_released(
-    daemons: Daemons, monkeypatch: MonkeyPatch
-) -> None:
+async def test_a_call_cancelled_as_it_exits_is_released(daemons: Daemons) -> None:
     got: list[int] = []
-    go, releasing = asyncio.Event(), asyncio.Event()
+    go = asyncio.Event()
 
     async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
@@ -1235,16 +1254,6 @@ async def test_a_call_cancelled_as_it_exits_is_released(
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
     await daemons.serve(exits)
-    send = execd.Link.send
-
-    async def signals_release(
-        link: execd.Link, kind: int, call_id: int, payload: bytes = b""
-    ) -> None:
-        if kind == execd.RELEASE:
-            releasing.set()
-        await send(link, kind, call_id, payload)
-
-    monkeypatch.setattr(execd.Link, "send", signals_release)
     client = daemons.client()
     scope = anyio.CancelScope()
 
@@ -1258,10 +1267,9 @@ async def test_a_call_cancelled_as_it_exits_is_released(
     assert link is not None
     async with link._wlock:  # another call's write
         go.set()
-        await releasing.wait()
+        await until(lambda: waiting(link))  # it has exited: its RELEASE waits
         scope.cancel()
-        await asyncio.sleep(0.1)
-    await task
+        await asyncio.wait_for(task, 30)
     await until(lambda: execd.RELEASE in got)
 
     assert execd.KILL not in got  # it exited: a KILL would end what it left running
@@ -1276,19 +1284,11 @@ async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> No
 
     await daemons.serve(records)
     stream = await daemons.client().open_stream(["cat"], None)
-    writing = asyncio.Event()
 
-    async def writes() -> None:  # another call's
-        async with stream._link._wlock:
-            writing.set()
-            await asyncio.sleep(0.1)
-
-    writer = asyncio.create_task(writes())
-    await writing.wait()
-    with anyio.CancelScope() as scope:
-        scope.cancel()
-        await stream.aclose()
-    await writer
+    async with stream._link._wlock:  # another call's write
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
     await until(lambda: execd.RELEASE in got)
 
     assert got[-3:] == [execd.STDIN, execd.KILL, execd.RELEASE]
@@ -1352,7 +1352,12 @@ async def test_frames_a_call_does_not_use_count_as_stray(
     ids=["frames", "bytes"],
 )
 async def test_what_a_pod_delivers_is_paced(
-    daemons: Daemons, monkeypatch: MonkeyPatch, limit: str, value: int, payload: bytes
+    daemons: Daemons,
+    clock: types.SimpleNamespace,
+    monkeypatch: MonkeyPatch,
+    limit: str,
+    value: int,
+    payload: bytes,
 ) -> None:
     monkeypatch.setattr(execd, limit, value)
 
@@ -1363,12 +1368,12 @@ async def test_what_a_pod_delivers_is_paced(
         await r.read()
 
     await daemons.serve(floods)
-    start = time.monotonic()
 
-    await daemons.client().exec(["yes"], None, None, {}, None, 30)
+    call = daemons.client().exec(["yes"], None, None, {}, None, None)
+    await asyncio.wait_for(call, 30)
 
-    # Three times the second's allowance, so two waits; unpaced, it takes milliseconds.
-    assert time.monotonic() - start >= 2
+    # Three times the second's allowance: twice, reading waits for the next second.
+    assert clock.now == 2.0
 
 
 async def test_the_stray_count_spans_reconnects(
@@ -1846,8 +1851,7 @@ async def test_a_command_times_out_while_its_daemon_is_restarted(
     first: asyncio.Server
 
     async def stuck(replace: bool) -> execd.Daemon:
-        await asyncio.sleep(3600)
-        raise AssertionError
+        return await asyncio.get_running_loop().create_future()
 
     async def dies_after_start(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -2016,16 +2020,17 @@ def stub_pipe(
     )
 
 
-async def test_a_trickle_of_short_reads_waits_its_turn() -> None:
+async def test_a_trickle_of_short_reads_waits_its_turn(
+    clock: types.SimpleNamespace,
+) -> None:
     reading: list[bool] = []
     pipe = stub_pipe(0.5, reading)
-    began = time.monotonic()
 
     for _ in range(execd.SMALL_READS + 20):
         await pipe._raw()
 
     # Past the burst, about one a millisecond.
-    assert 0.015 <= time.monotonic() - began < 0.15
+    assert 0.015 <= clock.now <= 0.02
     assert not reading[-1]  # between reads, bytes wait in the kernel
 
 
@@ -2039,11 +2044,11 @@ async def test_full_reads_spend_no_turns() -> None:
 
 
 async def test_what_a_pass_delivers_pays_for_its_decryption(
-    monkeypatch: MonkeyPatch,
+    clock: types.SimpleNamespace, monkeypatch: MonkeyPatch
 ) -> None:
     pace = execd.Pace()
     pipe = stub_pipe(1.0, [], pace)
-    monkeypatch.setattr(execd.time, "thread_time", lambda: 1.0)
+    clock.cpu = lambda: 1.0
     monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
 
     # Cheaper than its credit, finishing a record begun before: nothing carried over.
@@ -2135,39 +2140,30 @@ async def test_the_client_offers_one_key_exchange_group(
 
 
 async def test_what_tls_decryption_costs_is_paced(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls_daemon: TlsDaemon, clock: types.SimpleNamespace
 ) -> None:
-    context, pin = tls
-
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await read_frame(r)  # AUTH
-        w.write(frame(execd.OK, 0))
         _, call_id, _ = await read_frame(r)  # START
         w.write(frame(execd.STDOUT, call_id, b"x" * (256 << 10)))
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         await r.read()
 
-    server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
-    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
-
-    async def start(replace: bool) -> execd.Daemon:
-        return execd.Daemon("127.0.0.1", pin, b"key")
-
-    client = execd.ExecdClient(start)
-    began = time.monotonic()
+    client = await tls_daemon(answers)
     await client._get()  # opened at full speed: the costs below are the reads'
-    cpu = iter([0.0, 10.0, 10.0, 20.0])  # the first two passes take 10 s each
-    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 20.0))
+    began = clock.now
+    clock.cpu = itertools.count().__next__  # a second of CPU for each pass
 
-    await client.exec(["yes"], None, None, {}, None, 30)
+    call = client.exec(["yes"], None, None, {}, None, None)
+    await asyncio.wait_for(call, 30)
 
-    # Each is over a second's allowance, so two waits; unpaced, it takes milliseconds.
-    assert time.monotonic() - began >= 2
-    server.close()
+    # Each pass is over the second's allowance: the next waits for the next second.
+    assert clock.now - began >= 2
 
 
 async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls: tuple[ssl.SSLContext, str],
+    clock: types.SimpleNamespace,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     context, pin = tls
 
@@ -2181,7 +2177,7 @@ async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
 
     server = await asyncio.start_server(answers, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
-    monkeypatch.setattr(execd.time, "thread_time", lambda: 0.0)  # charge bytes only
+    clock.cpu = lambda: 0.0  # charge bytes only
     charged: list[float] = []
 
     async def take(_: execd.Pace, n: int, frames: int = 1, tls: float = 0.0) -> None:
@@ -2204,13 +2200,15 @@ async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
 
 
 async def test_a_handshake_s_decryption_is_paced_too(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls: tuple[ssl.SSLContext, str],
+    clock: types.SimpleNamespace,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     context, pin = tls
     server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
     cpu = iter([0.0, 5.0])  # the first pass takes 5 s
-    monkeypatch.setattr(execd.time, "thread_time", lambda: next(cpu, 5.0))
+    clock.cpu = lambda: next(cpu, 5.0)
     monkeypatch.setattr(execd, "PACE_TLS", 10.0)  # counted, without a wait
     monkeypatch.setattr(execd, "RAW_READ", 64)  # the server's flight takes many passes
     pace = execd.Pace()
