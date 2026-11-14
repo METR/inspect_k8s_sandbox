@@ -16,6 +16,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -136,6 +137,7 @@ func run(port int, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
+	debug.SetMemoryLimit(32 << 20) // past it garbage is collected at once: it counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())

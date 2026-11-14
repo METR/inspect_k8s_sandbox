@@ -75,7 +75,8 @@ def sandbox() -> collections.abc.Iterator[Sandbox]:
     built = docker("build", "-q", "-t", name, "-", stdin=dockerfile, timeout=600)
     assert built.returncode == 0, built.stderr
     try:
-        started = docker("run", "-d", "--name", name, name, "sleep", "3600")
+        small = ["--memory", "64m", "--memory-swap", "64m", "--cpus", "1"]
+        started = docker("run", "-d", "--name", name, *small, name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
         yield Sandbox(name, docker("inspect", "-f", address, name).stdout.strip())
@@ -208,3 +209,16 @@ async def test_a_streams_command_is_killed_when_its_connection_drops(
     relay.drop()
 
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
+
+
+async def test_commands_printing_at_once_fit_in_a_small_sandbox(
+    client: execd.ExecdClient,
+) -> None:
+    """Regression: execd's garbage took the container past 64 MiB: it was killed."""
+    size = 9 << 20
+    argv = ["head", "-c", str(size), "/dev/zero"]
+    prints = [client.exec(argv, None, None, {}, None, None) for _ in range(8)]
+
+    results = await asyncio.wait_for(asyncio.gather(*prints), 30)
+
+    assert [len(result.stdout) for result in results] == [size] * 8
