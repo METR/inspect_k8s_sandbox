@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // firecracker stands in for a VM's vsock socket on the node: it answers CONNECT for a guest port with what a guest process listening there would say first.
@@ -674,6 +676,23 @@ func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	for deadline := time.Now().Add(budget); clock.left() > 0; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("the timer of a stream that is over still runs: each would hold the stream's connections for the wait")
+		}
+	}
+
+	guest = dial()
+	guest.Write(key)
+	go within(t, accepted, "third stream at the proxy").Write(make([]byte, 8<<20)) // more than a guest that reads none of it takes
+	unread, _ := guest.(*net.UnixConn).SyscallConn()
+	for deadline, waiting := time.Now().Add(budget), 0; waiting < 64<<10; time.Sleep(time.Millisecond) {
+		unread.Control(func(fd uintptr) { waiting, _ = unix.IoctlGetInt(int(fd), unix.SIOCINQ) })
+		if time.Now().After(deadline) {
+			t.Fatalf("%d bytes wait at the guest: the proxy's did not arrive", waiting)
+		}
+	}
+	clock.pass(idleWait)
+	for deadline := time.Now().Add(budget); len(w.slots) > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a stream whose guest stopped reading kept its place after the wait")
 		}
 	}
 }

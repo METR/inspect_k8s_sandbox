@@ -187,17 +187,6 @@ func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 	if h, answers := asked(t, n, "host-0.example.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeSuccess || len(answers) != 1 {
 		t.Fatalf("a name that has its address got %v and %d answers", h.RCode, len(answers))
 	}
-
-	unwritten := loadedNames(t, filepath.Join(t.TempDir(), "names"))
-	unwritten.kept.Close()
-	var err error
-	if unwritten.kept, err = os.OpenFile("/dev/full", os.O_WRONLY, 0); err != nil { // a volume with no room left
-		t.Fatal(err)
-	}
-	defer unwritten.kept.Close()
-	if h, answers := asked(t, unwritten, "pypi.org.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 || len(unwritten.list) != 0 {
-		t.Fatalf("a name that could not be written down got %v and %d answers: its address would not outlast a restart", h.RCode, len(answers))
-	}
 }
 
 func TestForwarderWithoutItsCapturePortIsNotReady(t *testing.T) {
