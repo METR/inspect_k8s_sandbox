@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -1137,19 +1136,23 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 }
 
 func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *testing.T) {
-	signal.Reset(syscall.SIGCHLD) // no child is reaped until the reaper is started again
-	t.Cleanup(func() { startReaper(); syscall.Kill(os.Getpid(), syscall.SIGCHLD) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	t.Cleanup(func() { killTagged("unreaped") })
-	// It leaves a loop running that keeps putting a file back, and ends.
-	left := `(while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "unreaped"})
-	s.start(testConn(t), frame{kind: fStart, id: 34, payload: req})
+	// Once let go, it leaves a loop running that keeps putting a file back, and ends.
+	left := `read x; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Stdin: true, Tag: "unreaped"})
+	c := testConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 34, payload: req})
 	cl := s.get(34)
 	cl.kmu.Lock()
 	pid := cl.pid
 	cl.kmu.Unlock()
+	reaper.mu.Lock() // the command ends, and nothing reaps it
+	reaped := sync.OnceFunc(reaper.mu.Unlock)
+	t.Cleanup(reaped)
+	s.dispatch(c, frame{kind: fStdin, id: 34, payload: []byte("\n")})
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 		if strings.Contains(string(stat), ") Z ") {
@@ -1159,9 +1162,15 @@ func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *tes
 			t.Fatal("the command never ended")
 		}
 	}
+	killed := make(chan struct{})
 
-	cl.kill() // as its timeout does
+	go func() { cl.kill(); close(killed) }() // as its timeout does
 
+	select {
+	case <-killed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a kill of a command that had ended went on to signal its group, once it was reaped")
+	}
 	os.Remove(alive)
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		if _, err := os.Stat(alive); err == nil {
