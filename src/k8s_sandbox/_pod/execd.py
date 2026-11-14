@@ -212,7 +212,8 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     context.minimum_version = ssl.TLSVersion.TLSv1_3
-    context.set_ecdh_curve("X25519")  # a stand-in can't pick a group that costs 150 ms
+    # One group: a stand-in can't pick a 150 ms one. Python 3.10 can't set X25519.
+    context.set_ecdh_curve("prime256v1")
 
     async def handshake() -> _Pipe:
         reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
