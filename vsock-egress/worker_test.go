@@ -487,6 +487,14 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
 		if signal, err := strconv.Atoi(os.Getenv(hostileWorker)); err == nil && os.Args[1] == "work" {
 			os.WriteFile(filepath.Join(filepath.Dir(os.Args[5]), "signalling"), nil, 0o600) // beside the socket -vsock names
+			// On eight threads: a reaper it could signal would not outrun them all.
+			for range 7 {
+				go func() {
+					for {
+						syscall.Kill(-1, syscall.Signal(signal))
+					}
+				}()
+			}
 			for {
 				syscall.Kill(-1, syscall.Signal(signal))
 			}
