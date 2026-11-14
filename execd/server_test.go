@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -472,6 +473,18 @@ func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 	}
 }
 
+// nextFrame takes the next frame sent; its budget only bounds a hang.
+func nextFrame(t *testing.T, frames <-chan frame) frame {
+	t.Helper()
+	select {
+	case f := <-frames:
+		return f
+	case <-time.After(30 * time.Second):
+		t.Fatal("no frame")
+		return frame{}
+	}
+}
+
 // recordedConn is a connection whose sent frames arrive on the channel.
 func recordedConn(t *testing.T) (*conn, <-chan frame) {
 	a, b := net.Pipe()
@@ -631,8 +644,8 @@ func TestAnExitTakesTurnsForWhatItSends(t *testing.T) {
 
 	cl.finish(0, "")
 
-	<-frames
-	<-frames // the output, then the exit
+	nextFrame(t, frames)
+	nextFrame(t, frames) // the output, then the exit
 	// Exits sent without turns, many calls ending at once, would pass the client's frame pace.
 	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
 		t.Fatalf("turns moved %v for the two frames an exit sent", moved)
@@ -683,9 +696,9 @@ func TestAResumeTakesTurnsForWhatItSends(t *testing.T) {
 
 	s.resume(c, frame{kind: fResume, id: 13, payload: []byte(`{"stdout":0,"stderr":0}`)})
 
-	<-frames
-	<-frames
-	<-frames // RESUMED, then what each stream has waiting
+	nextFrame(t, frames)
+	nextFrame(t, frames)
+	nextFrame(t, frames) // RESUMED, then what each stream has waiting
 	// Resumes sent without turns, many calls resuming at once, would pass the client's frame pace.
 	if moved := time.Duration(slot.Load()) - before; moved < 2*slotEvery {
 		t.Fatalf("turns moved %v for the two frames a resume sent", moved)
@@ -846,7 +859,9 @@ func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
 	}
 
 	// As run() starts it, but with no pipe to read the environment from, as when execd has no descriptor to spare.
-	out, _ := exec.Command("/proc/self/exe", "as", "", "65534", "65534", "", "/bin/echo", "RAN").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "/proc/self/exe", "as", "", "65534", "65534", "", "/bin/echo", "RAN").CombinedOutput()
 
 	if !strings.HasPrefix(string(out), "execd: ") || strings.Contains(string(out), "RAN") {
 		t.Fatalf("with no environment to read, its output was %q", out)
@@ -914,7 +929,13 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		go func() { defer searched.Done(); searches <- search{"none", &syscall.Credential{Uid: 65534, Gid: 65534}} }()
 		runtime.GC()
 	}
-	searched.Wait()
+	done := make(chan struct{})
+	go func() { searched.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the searches were never taken")
+	}
 	// Taking the user's identity to look for it resets the flag to the host's fs.suid_dumpable, for an instant each time.
 	for deadline := time.Now().Add(30 * time.Second); dumpable(); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -1271,7 +1292,10 @@ func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 	s.dispatch(c, frame{kind: fStdin, id: 9, payload: []byte("\n")}) // it writes "b" and exits
 	check()                                                          // the exit has worked out how much to wait for, "a" not counted
 	close(count)
-	for !check() { // a slow client: it acks only once the exit's grace is over
+	for deadline := time.Now().Add(30 * time.Second); !check(); { // a slow client: it acks only once the exit's grace is over
+		if time.Now().After(deadline) {
+			t.Fatal("the exit's grace never ended")
+		}
 	}
 	close(acked)
 	s.dispatch(c, frame{kind: fAck, id: 9, payload: []byte(`{"stdout":` + strconv.Itoa(head) + `}`)})
