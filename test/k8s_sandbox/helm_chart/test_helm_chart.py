@@ -753,6 +753,20 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     assert "initContainers" not in pods["agent-env-my-release-server"]
 
 
+def test_egress_proxy_annotation_can_name_a_service_of_the_release(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "egress-proxy-values.yaml"
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]
+    assert pod["metadata"]["annotations"]["inspect-k8s-sandbox/egress-proxy"] == (
+        "agent-env-my-release-egress-proxy.default.svc.cluster.local.:3128"
+    )
+    assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
+
+
 def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(chart_dir, set_string=_EGRESS_PROXY)

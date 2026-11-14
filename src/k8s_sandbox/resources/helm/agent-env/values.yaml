@@ -40,9 +40,10 @@ networkPolicy:
 # `securityContext`: none of the service's hardening applies to it.
 extraContainers: []
 # -- The vsock-egress image (built from `vsock-egress/`). A pod annotated
-# `inspect-k8s-sandbox/egress-proxy: "<ip>:<port>"` runs its forwarder as a sidecar,
+# `inspect-k8s-sandbox/egress-proxy: "<host>:<port>"` runs its forwarder as a sidecar,
 # which serves `127.0.0.1:3128` in the pod and carries each connection over the VM's
-# vsock to that address: an HTTP proxy for a pod with no network device. The node must
+# vsock to that host: an HTTP proxy for a pod with no network device. The annotation
+# is rendered as a template, so it can name a Service of the release. The node must
 # run vsock-egress's launcher and hold the seccomp profile `profiles/vsock-egress.json`,
 # the runtime's default plus `socket(AF_VSOCK)`. The sidecar has no resource requests,
 # so the pod is not of the Guaranteed QoS class.

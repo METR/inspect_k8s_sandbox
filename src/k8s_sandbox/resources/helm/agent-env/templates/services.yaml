@@ -42,6 +42,10 @@ spec:
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
+      {{- /* A template here can name a Service of this release, whose name no values file knows. */}}
+      {{- with get $podAnnotations "inspect-k8s-sandbox/egress-proxy" }}
+      {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" (tpl . $) }}
+      {{- end }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
     spec:

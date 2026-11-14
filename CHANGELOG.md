@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- A pod annotated `inspect-k8s-sandbox/egress-proxy: "<ip>:<port>"` gets a sidecar that
+- A pod annotated `inspect-k8s-sandbox/egress-proxy: "<host>:<port>"` gets a sidecar that
   serves an HTTP proxy at `127.0.0.1:3128` and carries each connection over the VM's
-  vsock to that address, for an AWS Nitro Sandbox with no network device. Set the new
+  vsock to that host, for an AWS Nitro Sandbox with no network device. The annotation
+  is rendered as a template, so it can name a Service of the release. Set the new
   `egressForwarderImage` value to an image built from `vsock-egress/`. Each node must
   run `vsock-egress launch` and hold the seccomp profile `profiles/vsock-egress.json`
   (the runtime's default plus `socket(AF_VSOCK)`). Point the pod's programs at the proxy
