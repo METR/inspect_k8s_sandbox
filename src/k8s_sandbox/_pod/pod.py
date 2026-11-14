@@ -148,8 +148,7 @@ class Pod:
         """The current cached pod identity.
 
         Note that ``uid`` and ``initial_restart_count`` may be replaced by
-        ``check_for_pod_restart`` if a replacement or restart is observed in
-        ``"warn"`` mode.
+        ``check_for_pod_restart`` if a replacement or restart is observed.
         """
         return self._info
 

@@ -78,10 +78,9 @@ def _shell_command(
     normalizes HOME, SHELL, USER, LOGNAME and PATH, which the skip path
     inherits from the container instead.
 
-    `switch` is whether a probe of the container (ExecuteOperation.probe_switch)
-    found that it needs `runuser` for this user, and that `runuser` works; otherwise
-    the shell checks for itself. `sh -c` takes its script from argv, so stdin reaches
-    the command it execs unread, and the caller's protocol is unchanged.
+    `switch` is whether a probe found that this user needs `runuser`, and that it works.
+    `sh -c` takes its script from argv, so stdin reaches the command it execs
+    unread, and the caller's protocol is unchanged.
     """
     if user is None:
         return list(command)
@@ -248,7 +247,9 @@ class ExecuteOperation(PodOperation):
             # The markers end each stream when a background process keeps the exec open.
             yield f"printf '{marker}%d>' \"$returncode\"\n"
             yield f"printf '{marker}%d>' \"$returncode\" >&2\n"
-            # Exit the shell: the websocket closes only once stdout and stderr do.
+            # Exit the shell. This won't actually close the websocket connection until
+            # stdout and stderr (which have been inherited by the user command) are
+            # closed.
             yield 'exit "$returncode"\n'
             yield _CLOSE_GROUP
 

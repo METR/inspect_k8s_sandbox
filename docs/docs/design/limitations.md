@@ -49,7 +49,7 @@ the eval will fail the sample immediately on detection, even if `exec()` has not
 and a `read_file()` or `write_file()` over Kubernetes exec that fails checks for a
 restart too.
 Every later `exec()`, `read_file()` and `write_file()` in that sandbox raises the same
-error, so a solver that catches it cannot carry on in the restarted container.
+error.
 
 ??? question "Why not use Jobs over StatefulSets?"
 
@@ -192,12 +192,12 @@ switch goes through `runuser`, which calls `setgroups(2)`. A container with
 `runuser`: execd switches users itself.
 
 Naming the user the container already runs as needs none of those: that case skips
-`runuser` entirely (it checks the user with `id`, from `/usr/bin` or `/bin`), so it works on a capability-dropped or non-root container, and on an
+`runuser` entirely, so it works on a capability-dropped or non-root container, and on an
 image with no `runuser` installed.
 
 `user="root"` and `user="0"` both mean uid 0, whatever the image's `/etc/passwd` says,
-and need neither `runuser` nor `id`. A container that does not run as uid 0, or whose
-`/proc` cannot be read, fails them as it fails a switch it cannot make.
+and need neither `runuser` nor `id`. A container that does not run as uid 0 fails them
+as it fails a switch it cannot make.
 
 When the switch cannot be made, what happens depends on why. A container that is not
 root, one that has had `CAP_SETGID` dropped, and one without `runuser` installed are all

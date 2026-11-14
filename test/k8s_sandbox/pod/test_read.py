@@ -35,7 +35,8 @@ def _exec_kwargs(monkeypatch: pytest.MonkeyPatch, src: Path) -> dict[str, Any]:
 
 
 def test_read_file_opens_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Without stdin, Kata hangs or cuts the read (kata-containers/kata-containers#9071).
+    # A read exec without stdin hangs or truncates on Kata Containers' Go shim
+    # (kata-containers/kata-containers#9071).
     exec_kwargs = _exec_kwargs(monkeypatch, Path("/tmp/src"))
 
     assert exec_kwargs["stdin"] is True
