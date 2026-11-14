@@ -647,8 +647,10 @@ func (cl *call) kill() {
 	cl.killed = true
 	pid, as := cl.pid, cl.as
 	cl.mu.Unlock()
-	// Not started, or ended (reaped, if not yet noted as such): what it left running is not the call's to kill.
-	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH {
+	var ended [128]byte // a siginfo_t: waitid sets its first field while the child has exited and is not yet reaped
+	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+	// Not started, or ended (even if not yet reaped, or noted as such): what it left running is not the call's to kill.
+	if pid <= 0 || syscall.Kill(pid, 0) == syscall.ESRCH || ended[0] != 0 {
 		return
 	}
 	cl.end(pid, as)

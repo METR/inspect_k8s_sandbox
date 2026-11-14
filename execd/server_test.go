@@ -862,6 +862,55 @@ func TestAKillAsACommandsEndIsBeingNotedLeavesWhatItLeftRunning(t *testing.T) {
 	}
 }
 
+func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	t.Cleanup(func() { killTagged("unreaped") })
+	// Once let go, it leaves a loop running that keeps putting a file back, and ends.
+	left := `until [ -e "$0.go" ]; do sleep 0.01; done; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "unreaped"})
+	s.start(testConn(t), frame{kind: fStart, id: 34, payload: req})
+	cl := s.get(34)
+	cl.mu.Lock()
+	pid := cl.pid
+	cl.mu.Unlock()
+	reaper.mu.Lock() // the reaper waits here to note another child's end, and collects none meanwhile
+	noted := sync.OnceFunc(reaper.mu.Unlock)
+	t.Cleanup(noted)
+	other := exec.Command("true")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(other.Process.Pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the reaper never collected the other child")
+		}
+	}
+	os.WriteFile(alive+".go", nil, 0o644)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") Z ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+
+	cl.kill() // as its timeout does
+
+	noted()
+	os.Remove(alive)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(alive); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("what the command left running was killed after it ended")
+		}
+	}
+}
+
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
