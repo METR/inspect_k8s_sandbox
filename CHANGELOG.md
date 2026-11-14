@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A newline in a service or init container's `image`, `runtimeClassName`, `workingDir`,
+  `imagePullPolicy`, name, env name or port `protocol` no longer splices a field into the
+  rendered manifest; the agent-env chart now quotes these, which it rendered unquoted.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
