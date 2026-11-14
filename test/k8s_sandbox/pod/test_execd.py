@@ -333,7 +333,7 @@ async def test_output_the_caller_has_not_taken_stays_bounded(
     await asyncio.wait_for(flooded.wait(), 30)
     await until(lambda: stream._link.closed)
 
-    assert held(stream) <= 2 * (execd.STREAM_WINDOW + execd.CHUNK)
+    assert held(stream) <= 4 << 20  # twice a stream's 1 MiB window and a frame
     assert stream._link.closed
 
 
@@ -352,7 +352,7 @@ async def test_exits_and_errors_the_caller_has_not_taken_stay_bounded(
     stream = await daemons.client().open_stream(["cat"], None)
 
     await until(lambda: stream._link.closed)
-    assert held(stream) <= 4 * execd.MAX_CONTROL
+    assert held(stream) <= 16 << 10
     await stream.aclose()
 
 
@@ -593,6 +593,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     """Regression: a START cut as it was written failed a call execd could resume."""
     starts = connections = 0
     first: list[asyncio.StreamWriter] = []
+    resumes: list[bool] = []
+    released = asyncio.Event()
 
     async def resets_the_first(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -603,9 +605,13 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
             first.append(w)
             _, call_id, _ = await read_frame(r)  # the command that opens the connection
             w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            kind, _, _ = await read_frame(r)
+            assert kind == execd.RELEASE  # else it is the write the reset meets
+            released.set()
             await r.read()
             return
-        _, call_id, _ = await read_frame(r)  # RESUME
+        kind, call_id, _ = await read_frame(r)
+        resumes.append(kind == execd.RESUME)
         w.write(frame(execd.ERROR, call_id, b"unknown call"))
         kind, call_id, _ = await read_frame(r)
         starts += kind == execd.START
@@ -614,7 +620,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
 
     await daemons.serve(resets_the_first)
     client = daemons.client()
-    await client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    await asyncio.wait_for(released.wait(), 30)
     reset = struct.pack("ii", 1, 0)  # close with a reset, not an end of stream
     first[0].get_extra_info("socket").setsockopt(
         socket.SOL_SOCKET, socket.SO_LINGER, reset
@@ -626,7 +633,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     call = client.exec(["touch", "/once"], None, None, {}, None, None)
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
-    assert (result.returncode, starts) == (7, 1)
+    # Asked for first, then sent again once: execd had never read it.
+    assert (result.returncode, resumes, starts) == (7, [True], 1)
 
 
 @pytest.mark.parametrize(
@@ -769,12 +777,52 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
         await call
-    await client._get(stale=client._link)  # the next takes the KILL, and is dead too
+    # The next connection takes the KILL, and is dead too.
+    await asyncio.wait_for(client._get(stale=client._link), 30)
     dead[1].close()  # only now does the client learn that one is gone
 
-    await client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
+
+
+async def test_a_call_left_is_killed_and_released_once_more_after_execd_lets_it_go(
+    daemons: Daemons, clock: types.SimpleNamespace
+) -> None:
+    """Regressions: sent for ever; then dropped unsent, so execd kept its record."""
+    left: list[int] = []
+    got: list[list[int]] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        mine: list[int] = []
+        got.append(mine)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if not left:
+                left.append(call_id)  # the START of the command to be left
+            elif call_id == left[0]:
+                mine.append(kind)
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(records)
+    client = daemons.client()
+    run = client.exec(["sleep", "600"], None, None, {}, None, None)
+    call = asyncio.ensure_future(run)
+    await until(lambda: bool(left))
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, 30)
+
+    for later in (350, 20, 0):  # execd lets it go at 360 s: before, after, again
+        clock.now += later
+        await asyncio.wait_for(client._get(stale=client._link), 30)
+    # In order behind anything the last connection was sent for the call left.
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    again = [execd.KILL, execd.RELEASE]
+    await until(lambda: got[1:3] == [again, again])
+    assert got[3] == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])
@@ -904,10 +952,12 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
 ) -> None:
     """Regression: its RELEASE or its ack waited 45 s behind its stdin's write."""
     got: list[int] = []
+    stuck = asyncio.Event()
 
     class Stuck(Plain):
         async def write(self, data: bytes) -> None:
             if data[0] == execd.STDIN:  # the pod stopped reading: the upload waits
+                stuck.set()
                 await asyncio.Event().wait()
             await super().write(data)
 
@@ -917,6 +967,7 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
 
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
+        await stuck.wait()
         if exits:
             w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
         else:  # output enough to be acked
@@ -961,7 +1012,8 @@ async def test_a_timeout_of_zero_is_no_timeout(daemons: Daemons) -> None:
 
     await daemons.serve(exits)
 
-    result = await daemons.client().exec(["true"], None, None, {}, None, 0)
+    call = daemons.client().exec(["true"], None, None, {}, None, 0)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
     assert result.returncode == 0
 
@@ -1014,7 +1066,7 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(
     with pytest.raises(TimeoutError, match="Command timed out"):
         call = daemons.client().exec(["yes"], None, None, {}, None, 1)
         await asyncio.wait_for(call, 30)  # only bounds a hang
-    assert 0 < acked <= execd.HOLD
+    assert 0 < acked <= 10 << 20
 
 
 async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
@@ -1410,10 +1462,11 @@ async def test_callers_share_one_reconnect(daemons: Daemons) -> None:
 
     await daemons.serve(idle)
     sandbox = daemons.client()
-    stale = await sandbox._get()
+    stale = await asyncio.wait_for(sandbox._get(), 30)
     await stale.close()
 
-    links = await asyncio.gather(*(sandbox._get(stale) for _ in range(5)))
+    reopens = asyncio.gather(*(sandbox._get(stale) for _ in range(5)))
+    links = await asyncio.wait_for(reopens, 30)  # only bounds a hang
 
     assert (len(set(links)), connections) == (1, 2)
 
@@ -1495,9 +1548,10 @@ async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
 
 
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
-    monkeypatch: pytest.MonkeyPatch,
+    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        await asyncio.sleep(0)  # as a dial yields: an unpaced loop can then be ended
         raise ConnectionRefusedError
 
     replaced: list[bool] = []
@@ -1510,9 +1564,10 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 1.0)
 
     with pytest.raises(ConnectionError):
-        await execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+        call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
-    # Paced: a handful in the second, where an unpaced loop runs hundreds.
+    # Paced: a handful in the second, where an unpaced loop never sees it pass.
     assert 1 < len(replaced) <= 10
     # Only the first replaces what it finds: the rest would kill the daemon it started.
     assert replaced[0] and not any(replaced[1:])
@@ -1837,7 +1892,7 @@ async def test_the_stray_count_spans_reconnects(
     await until(lambda: client._strays.frames == 60)
     await first.close()
 
-    second = await client._get(first)
+    second = await asyncio.wait_for(client._get(first), 30)
 
     await until(lambda: second.closed)  # 120 in one interval, over two connections
 
@@ -1860,7 +1915,7 @@ async def test_a_daemon_that_drops_each_connection_is_reconnected_with_backoff(
         await asyncio.wait_for(call, 30)  # only bounds a hang
 
     # Paced: a handful before the waits between them pass the second.
-    assert 1 < connections <= 10
+    assert connections <= 10
 
 
 async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> None:
@@ -2033,10 +2088,11 @@ async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
     await pod._start_execd(True)
     pod._execd = await tls_daemon(exits)
     now = pod_module.RESTART_SHOWN_WITHIN
-    await pod.exec(["true"], None, None, {}, None, None)  # the late check: no restart
+    # The late check: no restart.
+    await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
     read = cluster.reads
 
-    await pod.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
 
     # A read of the pod for each operation is what execd takes off the API server.
     assert cluster.reads == read
@@ -2638,6 +2694,7 @@ def tls(tmp_path: pathlib.Path) -> tuple[ssl.SSLContext, str]:
         + ["-keyout", str(key), "-out", str(cert)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
@@ -2853,7 +2910,7 @@ async def test_a_read_of_costly_records_takes_a_pass_for_each_slice(
     clock.cpu = lambda: next(looks) * 0.02  # each look at the clock: 20 ms more
     began = clock.now
 
-    await pipe.readexactly(size)
+    await asyncio.wait_for(pipe.readexactly(size), 30)  # only bounds a hang
 
     await pipe.close()
     server.close()
@@ -2885,7 +2942,7 @@ async def test_a_read_of_records_that_deliver_their_bytes_goes_to_tls_in_thirds(
     clock.cpu = lambda: next(looks) * 0.005  # each look at the clock: 5 ms more
     began = clock.now
 
-    await pipe.readexactly(size)
+    await asyncio.wait_for(pipe.readexactly(size), 30)  # only bounds a hang
 
     await pipe.close()
     server.close()

@@ -12,7 +12,6 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import WebSocketConnectionClosedException
 
-import k8s_sandbox._pod.read as readfile_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.read import ReadFileOperation
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
@@ -69,17 +68,11 @@ def test_read_file_command_is_all_strings(monkeypatch: pytest.MonkeyPatch) -> No
         pytest.param(2, PodError, id="failed"),
     ],
 )
-def test_a_255_is_a_stopped_container(
-    monkeypatch: pytest.MonkeyPatch, returncode: int, error: type[Exception]
-) -> None:
-    monkeypatch.setattr(readfile_module, "get_returncode", lambda _ws: returncode)
-    op = ReadFileOperation(MagicMock())
-    ws = MagicMock(spec=WSClient)
-    ws.is_open.return_value = False
-    ws.read_stderr.return_value = ""
+def test_a_255_is_a_stopped_container(returncode: int, error: type[Exception]) -> None:
+    ws = _FakeWSClient([_status(returncode)])
 
     with pytest.raises(error) as raised:
-        op._handle_stream_output(ws, io.BytesIO())
+        ReadFileOperation(MagicMock())._handle_stream_output(ws, io.BytesIO())
 
     assert type(raised.value) is error
 

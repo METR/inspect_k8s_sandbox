@@ -62,7 +62,7 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
-var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
+var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
 var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
@@ -407,11 +407,14 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
-	// By its path, as Kubernetes exec does; a user who cannot enter it that way stays in it.
-	if err := os.Chdir(workdir); err != nil && !errors.Is(err, syscall.EACCES) && !strings.HasPrefix(req.Cwd, "/") {
-		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+	// By its path, as Kubernetes exec does: a command may have replaced the directory.
+	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
+		// A user who cannot enter it by its path stays in it, while that path is still this directory.
+		if here, _ := syscall.Getwd(); !errors.Is(err, syscall.EACCES) || here != workdir {
+			return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+		}
 	}
-	if req.Cwd != "" { // a directory this user can enter: else it is the cd that fails, not the command
+	if req.Cwd != "" && as == nil { // one execd's user can enter, else the cd fails, not the command; another user's cd is its launcher's
 		if err := syscall.Access(req.Cwd+"/.", 0); err != nil {
 			return fmt.Errorf("cd: %s: %w", req.Cwd, err)
 		}
@@ -420,12 +423,22 @@ func (cl *call) run(req startRequest) error {
 	if err != nil {
 		return err
 	}
-	outR, outW, _ := os.Pipe()
-	errR, errW, _ := os.Pipe()
+	outR, outW, noOut := os.Pipe()
+	errR, errW, noErr := os.Pipe()
+	var envR, envW *os.File
+	var noEnv error
+	if as != nil {
+		envR, envW, noEnv = os.Pipe()
+	}
+	if err := errors.Join(noOut, noErr, noEnv); err != nil { // out of descriptors: it would run with a stream missing
+		for _, f := range []*os.File{stdinR, stdinW, outR, outW, errR, errW, envR, envW} {
+			f.Close()
+		}
+		return err
+	}
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
 	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it
-		envR, envW, _ := os.Pipe()
 		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
 		for i, kv := range env {
 			raw[i] = []byte(kv)
@@ -783,17 +796,23 @@ var startSearcher = sync.OnceFunc(func() {
 	go func() {
 		runtime.LockOSThread() // the identities it takes are this thread's alone
 		for s := range searches {
-			setfs(s.as.Uid, s.as.Gid)
+			setids(s.as.Uid, s.as.Gid) // its kills are then the user's own: root may lack CAP_KILL
 			killTagged(s.tag)
-			setfs(uint32(os.Geteuid()), uint32(os.Getegid()))
+			setids(uint32(os.Getuid()), uint32(os.Getgid()))
 		}
 	}()
 })
 
-// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks.
-func setfs(uid, gid uint32) {
-	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
-	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
+// setids gives this thread an effective identity; its real and saved ones stay, to come back to.
+func setids(uid, gid uint32) {
+	keep := ^uintptr(0)
+	if uid != 0 { // the group first while still root, and root first on the way back
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
+	syscall.RawSyscall(syscall.SYS_SETRESUID, keep, uintptr(uid), keep)
+	if uid == 0 {
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
 	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
 }
 

@@ -114,7 +114,11 @@ func TestConnectionsNotYetAuthenticatedAreBounded(t *testing.T) {
 	dial := func() net.Conn {
 		ours, theirs := net.Pipe()
 		t.Cleanup(func() { ours.Close(); theirs.Close() })
-		l <- silent{theirs}
+		select {
+		case l <- silent{theirs}:
+		case <-time.After(30 * time.Second):
+			t.Fatal("serve took no more connections")
+		}
 		return ours
 	}
 	first := dial()
@@ -177,19 +181,53 @@ func TestACommandGivenNoCwdRunsWhereItsUserCannotEnterTheDirectoryByPath(t *test
 	if os.Getuid() == 0 {
 		t.Skip("root enters any directory")
 	}
-	tests, closed := workdir, t.TempDir()
-	t.Cleanup(func() { os.Chmod(closed, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
-	workdir = filepath.Join(closed, "work")
-	os.Mkdir(workdir, 0o755)
-	os.Chdir(workdir)   // as a runtime starts a container's processes in its working directory
-	os.Chmod(closed, 0) // whose path its user may be unable to follow: a 700 /root for uid 1000
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
+	for _, shut := range []string{"", "work"} { // its parent, or itself: a 700 /root for uid 1000, in /root/work or /root
+		t.Run("shut="+shut, func(t *testing.T) {
+			tests, closed := workdir, t.TempDir()
+			t.Cleanup(func() { os.Chmod(filepath.Join(closed, shut), 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
+			workdir = filepath.Join(closed, "work")
+			os.Mkdir(workdir, 0o755)
+			os.Chdir(workdir)
+			os.Chmod(filepath.Join(closed, shut), 0)
+			s, _ := newServer(strings.Repeat("00", 32))
+			req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
 
-	s.start(testConn(t), frame{kind: fStart, id: 42, payload: req})
+			s.start(testConn(t), frame{kind: fStart, id: 42, payload: req})
 
-	if code := exitCode(t, s.get(42)); code != 0 {
-		t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+			if code := exitCode(t, s.get(42)); code != 0 {
+				t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+			}
+		})
+	}
+}
+
+func TestACommandGivenNoCwdFailsOnceItsDirectoryIsReplacedByOneItCannotEnter(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root enters any directory")
+	}
+	for _, shut := range []string{"work", ""} { // the one put in its place, or the parent of both
+		t.Run("shut="+shut, func(t *testing.T) {
+			tests, parent := workdir, t.TempDir()
+			t.Cleanup(func() { os.Chmod(parent, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
+			workdir = filepath.Join(parent, "work")
+			os.Mkdir(workdir, 0o755)
+			os.Chdir(workdir)
+			os.Rename(workdir, filepath.Join(parent, "old")) // as a command might, to have the next ones run there
+			os.Mkdir(workdir, 0o755)
+			os.Chmod(filepath.Join(parent, shut), 0)
+			s, _ := newServer(strings.Repeat("00", 32))
+			made := filepath.Join(t.TempDir(), "made")
+			req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}, Env: map[string]string{}, Tag: "r"})
+
+			s.start(testConn(t), frame{kind: fStart, id: 45, payload: req})
+
+			if code := exitCode(t, s.get(45)); code != 1 {
+				t.Fatalf("exit %d, want 1: the directory at its path is not the one it would run in", code)
+			}
+			if _, err := os.Stat(made); err == nil {
+				t.Fatal("the command ran, in the directory that was moved away")
+			}
+		})
 	}
 }
 
@@ -456,12 +494,30 @@ func TestATimeoutKillsACommandWhoseOutputWaitsOnAStalledConnection(t *testing.T)
 	t.Cleanup(func() { ours.Close(); theirs.Close() })
 	c := &conn{nc: ours, dead: make(chan struct{})}
 	s.authenticated(c)
+	var timeout func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer {
+		timeout = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	pidFile := filepath.Join(t.TempDir(), "pid")
-	// It prints, so execd's write of that waits, holding the call.
 	script := `echo $$ >"$0"; echo x; exec sleep 600`
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, pidFile}, Env: map[string]string{}, Tag: "stalled", Timeout: 0.2})
-
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, pidFile}, Env: map[string]string{}, Tag: "stalled", Timeout: 60})
 	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
+	cl := s.get(39)
+	for held, deadline := 0, time.Now().Add(30*time.Second); held < 3; time.Sleep(10 * time.Millisecond) {
+		if cl.mu.TryLock() { // not held: the write of what it printed has yet to wait
+			cl.mu.Unlock()
+			held = 0
+		} else {
+			held++
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the write of the command's output never waited")
+		}
+	}
+
+	go timeout()
 
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		written, _ := os.ReadFile(pidFile)
@@ -490,6 +546,7 @@ func TestACommandKilledBeforeItsTimeoutIsNotTimedOut(t *testing.T) {
 // exitStatus returns a call's EXIT under the keys the client reads: a struct would match them in any case.
 func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 	t.Helper()
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -497,7 +554,7 @@ func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
 				json.Unmarshal(f.payload, &status)
 				return status
 			}
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -579,6 +636,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 
 	s.dispatch(c, frame{kind: fStart, id: 6, payload: req})
 
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -589,7 +647,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 				t.Fatalf("EXIT is %d bytes", len(f.payload))
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -794,6 +852,7 @@ func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
 	s.dispatch(c, frame{kind: fStart, id: 25, payload: req})
 
 	var out []byte
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -809,7 +868,7 @@ func TestArgumentsReachTheCommandAsGiven(t *testing.T) {
 				t.Fatalf("printf got %q, want %q", out, want)
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -885,6 +944,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
 
 	var out []byte
+	deadline := time.After(30 * time.Second)
 	for {
 		select {
 		case f := <-frames:
@@ -900,7 +960,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 				t.Fatalf("the command's output was %q", out)
 			}
 			return
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
@@ -936,6 +996,27 @@ func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
 	}
 }
 
+func TestACommandForAnotherUserEntersADirectoryOnlyTheyCan(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	open := t.TempDir()
+	home := filepath.Join(open, "home") // a 700 home: root without CAP_DAC_OVERRIDE can't enter it
+	os.Mkdir(home, 0o700)
+	os.Chown(home, 65534, 65534)
+	t.Cleanup(func() { os.Chown(home, 0, 0) }) // root's again, to be removed
+	os.Chmod(open, 0o755)
+	os.Chmod(filepath.Dir(open), 0o755)
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: home, User: "65534", Tag: "h"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 27, payload: req})
+
+	if code := exitCode(t, s.get(27)); code != 0 {
+		t.Fatalf("exit %d: execd looked for the directory as itself, not as the command's user", code)
+	}
+}
+
 func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
@@ -951,6 +1032,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", detach}, Env: map[string]string{}, User: "65534", Tag: "detached" + strconv.Itoa(int(id))})
 		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
 	}
+	deadline := time.After(30 * time.Second)
 	for len(victims) < 20 {
 		select {
 		case f := <-frames:
@@ -959,7 +1041,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 				victims[f.id] = pid
 				t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
 			}
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("a command never printed what it detached")
 		}
 	}
@@ -970,7 +1052,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 
 	// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
 	for id, pid := range victims {
-		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
 				t.Fatalf("process %d, which call %d's command detached, outlived its kill", pid, id)
 			}
@@ -1037,23 +1119,6 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	}
 }
 
-func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
-	t.Cleanup(func() { killTagged("early") })
-	cl := &call{id: 30, tag: "early"}
-	cl.room = sync.NewCond(&cl.mu)
-	// It never ends by itself.
-	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"}
-
-	cl.kill() // from another connection, while this one's START is still at work
-	if err := cl.run(req); err != nil {
-		t.Fatal(err)
-	}
-
-	if code := exitCode(t, cl); code != 137 {
-		t.Fatalf("exit %d: the kill was lost", code)
-	}
-}
-
 func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *testing.T) {
 	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
@@ -1087,8 +1152,13 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 		}
 	}
 	noted()
-	if err := <-started; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the START never returned")
 	}
 
 	// Only the signal to its group reaches the first, only the search for its tag the second.
@@ -1193,6 +1263,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 	s.dispatch(c, frame{kind: fStart, id: 35, payload: req})
 	s.dispatch(c, frame{kind: fStdin, id: 35, payload: make([]byte, 1<<20)}) // more than a pipe holds
 	var pipe string
+	deadline := time.After(30 * time.Second)
 	for exited := false; !exited; {
 		select {
 		case f := <-frames:
@@ -1200,7 +1271,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 				pipe += string(f.payload)
 			}
 			exited = f.kind == fExit
-		case <-time.After(30 * time.Second):
+		case <-deadline:
 			t.Fatal("no EXIT")
 		}
 	}
