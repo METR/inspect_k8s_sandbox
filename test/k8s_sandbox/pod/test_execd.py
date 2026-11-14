@@ -944,10 +944,12 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
 ) -> None:
     """Regression: its RELEASE or its ack waited 45 s behind its stdin's write."""
     got: list[int] = []
+    stuck = asyncio.Event()
 
     class Stuck(Plain):
         async def write(self, data: bytes) -> None:
             if data[0] == execd.STDIN:  # the pod stopped reading: the upload waits
+                stuck.set()
                 await asyncio.Event().wait()
             await super().write(data)
 
@@ -957,6 +959,7 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
 
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
+        await stuck.wait()
         if exits:
             w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
         else:  # output enough to be acked
@@ -1001,7 +1004,8 @@ async def test_a_timeout_of_zero_is_no_timeout(daemons: Daemons) -> None:
 
     await daemons.serve(exits)
 
-    result = await daemons.client().exec(["true"], None, None, {}, None, 0)
+    call = daemons.client().exec(["true"], None, None, {}, None, 0)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
     assert result.returncode == 0
 
@@ -1450,10 +1454,11 @@ async def test_callers_share_one_reconnect(daemons: Daemons) -> None:
 
     await daemons.serve(idle)
     sandbox = daemons.client()
-    stale = await sandbox._get()
+    stale = await asyncio.wait_for(sandbox._get(), 30)
     await stale.close()
 
-    links = await asyncio.gather(*(sandbox._get(stale) for _ in range(5)))
+    reopens = asyncio.gather(*(sandbox._get(stale) for _ in range(5)))
+    links = await asyncio.wait_for(reopens, 30)  # only bounds a hang
 
     assert (len(set(links)), connections) == (1, 2)
 
@@ -1535,9 +1540,12 @@ async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
 
 
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
-    monkeypatch: pytest.MonkeyPatch,
+    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        await asyncio.sleep(
+            0
+        )  # as a dial yields: a loop with no wait can then be ended
         raise ConnectionRefusedError
 
     replaced: list[bool] = []
@@ -1550,9 +1558,10 @@ async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
     monkeypatch.setattr(execd, "FIRST_OPEN_FOR", 1.0)
 
     with pytest.raises(ConnectionError):
-        await execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+        call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
-    # Paced: a handful in the second, where an unpaced loop runs hundreds.
+    # Paced: a handful in the second, where an unpaced loop never sees it pass.
     assert 1 < len(replaced) <= 10
     # Only the first replaces what it finds: the rest would kill the daemon it started.
     assert replaced[0] and not any(replaced[1:])
@@ -2073,10 +2082,11 @@ async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
     await pod._start_execd(True)
     pod._execd = await tls_daemon(exits)
     now = pod_module.RESTART_SHOWN_WITHIN
-    await pod.exec(["true"], None, None, {}, None, None)  # the late check: no restart
+    # The late check: no restart.
+    await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
     read = cluster.reads
 
-    await pod.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
 
     # A read of the pod for each operation is what execd takes off the API server.
     assert cluster.reads == read
@@ -2791,7 +2801,7 @@ async def test_a_read_of_costly_records_takes_a_pass_for_each_slice(
     clock.cpu = lambda: next(looks) * 0.02  # each look at the clock: 20 ms more
     began = clock.now
 
-    await pipe.readexactly(size)
+    await asyncio.wait_for(pipe.readexactly(size), 30)  # only bounds a hang
 
     await pipe.close()
     server.close()
@@ -2823,7 +2833,7 @@ async def test_a_read_of_records_that_deliver_their_bytes_goes_to_tls_in_thirds(
     clock.cpu = lambda: next(looks) * 0.005  # each look at the clock: 5 ms more
     began = clock.now
 
-    await pipe.readexactly(size)
+    await asyncio.wait_for(pipe.readexactly(size), 30)  # only bounds a hang
 
     await pipe.close()
     server.close()

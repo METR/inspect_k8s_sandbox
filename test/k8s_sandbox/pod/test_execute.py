@@ -1191,8 +1191,9 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
     op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
 
     opened.assert_called_once_with(["/bin/sh"])
-    check = execute_module._ROOT_CHECK if checked else ""
-    assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
+    before, _, rest = "".join(writes).partition("cd /w || exit $?\nexport K=v\n")
+    # The uid is read from /proc before anything the caller asked for: for root.
+    assert rest and ("/proc/self/status" in before) is checked
 
 
 def _exec_writing_to(

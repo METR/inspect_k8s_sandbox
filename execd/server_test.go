@@ -481,12 +481,30 @@ func TestATimeoutKillsACommandWhoseOutputWaitsOnAStalledConnection(t *testing.T)
 	t.Cleanup(func() { ours.Close(); theirs.Close() })
 	c := &conn{nc: ours, dead: make(chan struct{})}
 	s.authenticated(c)
+	var timeout func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer {
+		timeout = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	pidFile := filepath.Join(t.TempDir(), "pid")
-	// It prints, so execd's write of that waits, holding the call.
 	script := `echo $$ >"$0"; echo x; exec sleep 600`
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, pidFile}, Env: map[string]string{}, Tag: "stalled", Timeout: 0.2})
-
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, pidFile}, Env: map[string]string{}, Tag: "stalled", Timeout: 60})
 	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
+	cl := s.get(39)
+	for held, deadline := 0, time.Now().Add(30*time.Second); held < 3; time.Sleep(10 * time.Millisecond) {
+		if cl.mu.TryLock() { // not held: the write of what it printed has yet to wait
+			cl.mu.Unlock()
+			held = 0
+		} else {
+			held++
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the write of the command's output never waited")
+		}
+	}
+
+	go timeout()
 
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		written, _ := os.ReadFile(pidFile)

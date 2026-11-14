@@ -44,14 +44,14 @@ func TestACallsUnreadOutputTakesLittleMoreMemoryThanItHolds(t *testing.T) {
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 
-	for cl.out[0].Len() <= maxUnacked { // all execd holds for a client that reads nothing
+	for range maxUnacked/len(read) + 1 { // all execd holds for a client that reads nothing
 		cl.output(0, read)
 	}
 
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 	// A buffer that doubles as it fills holds twice this, for every stream of every command that prints.
-	if took := int(after.HeapAlloc) - int(before.HeapAlloc); took > maxUnacked*3/2 {
+	if took := int(after.HeapAlloc) - int(before.HeapAlloc); cl.out[0].Len() <= maxUnacked || took > maxUnacked*3/2 {
 		t.Fatalf("%d MiB of unread output took %d MiB", cl.out[0].Len()>>20, took>>20)
 	}
 	runtime.KeepAlive(cl)
