@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,39 +20,48 @@ func probeCommand(args []string) {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
 	timeout := fs.Duration("timeout", time.Second, "the longest the probe may take")
 	fs.Parse(args)
-	if fs.NArg() == 0 {
-		fail("usage: execd probe [--timeout DURATION] URL [HEADER...]")
-	}
-	if err := probe(fs.Arg(0), fs.Args()[1:], *timeout); err != nil {
+	if err := probe(fs.Args(), *timeout); err != nil {
 		fmt.Fprintln(os.Stderr, "execd:", err)
 		os.Exit(1)
 	}
 	os.Exit(0)
 }
 
-// probe checks target once as the kubelet's tcpSocket or httpGet probe would (pkg/probe in kubernetes).
-func probe(target string, headers []string, timeout time.Duration) error {
-	u, err := url.Parse(target)
+// probe checks a port of 127.0.0.1 once, as the kubelet's tcpSocket or httpGet probe checks a pod's (pkg/probe in kubernetes).
+func probe(args []string, timeout time.Duration) error {
+	switch {
+	case len(args) == 2 && args[0] == "tcp":
+	case len(args) > 2 && (args[0] == "http" || args[0] == "https"):
+	default:
+		return errors.New("usage: execd probe [--timeout DURATION] (tcp PORT | http|https PORT PATH [NAME:VALUE...])")
+	}
+	port, err := strconv.Atoi(args[1])
 	if err != nil {
 		return err
 	}
-	if u.Scheme == "tcp" {
-		c, err := net.DialTimeout("tcp", u.Host, timeout)
+	host := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	if args[0] == "tcp" {
+		c, err := net.DialTimeout("tcp", host, timeout)
 		if err != nil {
 			return err
 		}
 		return c.Close()
 	}
+	u, err := url.Parse(args[2])
+	if err != nil { // the kubelet passes on a path it can't parse
+		u = &url.URL{Path: args[2]}
+	}
+	u.Scheme, u.Host = args[0], host
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return err
 	}
-	for _, h := range headers {
+	for _, h := range args[3:] {
 		name, value, _ := strings.Cut(h, ":")
-		req.Header.Add(name, strings.TrimSpace(value))
+		req.Header.Add(name, value)
 	}
 	if _, ok := req.Header["User-Agent"]; !ok {
-		req.Header.Set("User-Agent", "kube-probe/execd")
+		req.Header.Set("User-Agent", "kube-probe/1.36") // the kubelet's own, at the release this follows
 	}
 	if _, ok := req.Header["Accept"]; !ok {
 		req.Header.Set("Accept", "*/*")
@@ -64,6 +74,7 @@ func probe(target string, headers []string, timeout time.Duration) error {
 		Transport: &http.Transport{
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 			ForceAttemptHTTP2:  true,
+			DisableKeepAlives:  true,
 			DisableCompression: true,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
