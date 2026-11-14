@@ -513,6 +513,16 @@ class PodStdio(ByteStream):
                 self._end(e)
             else:
                 await self._turn()
+        # Frames already here come with it, within the turn: each cost a pass alone.
+        while self._unyielded < _STEPS_PER_TURN and len(self._stdout) < max_bytes:
+            try:
+                self._take(self._ws.sock.recv_frame())
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                break
+            except (OSError, websocket.WebSocketException) as e:
+                self._end(e)
+                break
+            self._unyielded += 1
         # Also for a reply that came while this waited.
         self._drop_if_restarted()
         data = bytes(self._stdout[:max_bytes])

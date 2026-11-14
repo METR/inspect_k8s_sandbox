@@ -42,7 +42,8 @@ class _ConnectsInTime(websocket.WebSocket):
         while not over.wait(0.05):  # the socket is None until TCP and TLS are up
             if (sock := self.sock) is not None:
                 with contextlib.suppress(OSError):
-                    sock.shutdown(socket.SHUT_RDWR)  # wakes a read: close need not
+                    # Not ssl's, which drops TLS first; close need not wake a read.
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
 
 
 ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec

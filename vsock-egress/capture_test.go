@@ -189,7 +189,9 @@ func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 func TestCapturedConnectionAsksTheProxyForItsName(t *testing.T) {
 	target, accepted := proxy(t)
 	f := keyedForwarder(0, 0)
-	viaUnix(t, f, newWorker(firecracker(t, map[uint32]string{keyPort: string(f.key[:])}), target, 0))
+	now := make(chan struct{}) // the node learns of a stream's end at once
+	close(now)
+	lagging(t, f, newWorker(firecracker(t, map[uint32]string{keyPort: string(f.key[:])}), target, 0), now)
 	f.names = loadedNames(t, filepath.Join(t.TempDir(), "names"))
 	pypi, _ := f.names.address("pypi.org")
 	going := make(chan netip.AddrPort, 1) // where the next connection was going, or nowhere the kernel knows of

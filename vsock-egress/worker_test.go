@@ -118,6 +118,18 @@ func closed(c net.Conn) chan struct{} {
 	return done
 }
 
+// within returns what ch gives, and fails the test once the budget has passed with nothing.
+func within[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(budget):
+		t.Fatalf("no %s in %v", what, budget)
+		panic("unreachable")
+	}
+}
+
 func newKey() []byte {
 	key := make([]byte, keySize)
 	rand.Read(key)
@@ -183,12 +195,11 @@ func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
 			t.Fatal("a stream without the key was not closed")
 		}
 	}
-	// Other tests' workers may still be writing to the log: only lines about refusals count.
 	out.Lock()
-	lines := strings.Count(out.String(), "refused")
+	written := out.String()
 	out.Unlock()
-	if lines != 0 {
-		t.Fatalf("%d lines about refused streams were written as they came", lines)
+	if written != "" {
+		t.Fatalf("%d lines were written as the streams were refused: %q", strings.Count(written, "\n"), written)
 	}
 	w.report()
 	out.Lock()
@@ -201,18 +212,19 @@ func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
 func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 	var mu sync.Mutex
 	clock, slept := time.Unix(0, 0), time.Duration(0)
-	const rate, streams = 10, 100
+	const streams = 2 * newStreams
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
-	w.accepts = &pacer{rate: rate, now: func() time.Time {
+	w.accepts.now = func() time.Time {
 		mu.Lock()
 		defer mu.Unlock()
 		return clock
-	}, sleep: func(d time.Duration) {
+	}
+	w.accepts.sleep = func(d time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
 		clock, slept = clock.Add(d), slept+d
-	}}
+	}
 	dial := serve(t, w)
 
 	for range streams {
@@ -226,8 +238,8 @@ func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if least := (streams/rate - 1) * time.Second; slept < least {
-		t.Fatalf("taking %d streams at %d a second waited %v: want at least %v", streams, rate, slept, least)
+	if least := streams/newStreams*time.Second - 3*paceSlack; slept < least {
+		t.Fatalf("taking %d streams at %d a second waited %v: want at least %v", streams, newStreams, slept, least)
 	}
 }
 
@@ -295,6 +307,65 @@ func TestKeyIsFetchedOnceForAWorker(t *testing.T) {
 	}
 }
 
+func TestKeyIsAskedForAtMostOnceASecond(t *testing.T) {
+	var asked, clock atomic.Int64
+	target, _ := proxy(t)
+	w := newWorker(firecrackerThat(t, func(uint32) (string, bool) {
+		asked.Add(1)
+		return "", false // no forwarder holds the key port yet
+	}), target, 0)
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	dial := serve(t, w)
+	stream := func() {
+		c := dial()
+		c.Write(newKey())
+		select {
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream was not closed while there was no key to fetch")
+		}
+	}
+
+	for range 5 {
+		stream()
+	}
+	if n := asked.Load(); n != 1 {
+		t.Fatalf("5 streams within a second asked the guest for its key %d times: want once", n)
+	}
+	clock.Add(1)
+	stream()
+	if n := asked.Load(); n != 2 {
+		t.Fatalf("a stream a second later brought the asks to %d: want 2", n)
+	}
+}
+
+func TestStreamsDoNotWaitForEachOthersLookup(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	_, port, _ := net.SplitHostPort(target)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+	asked, answer := make(chan struct{}, 3), make(chan struct{})
+	var answered sync.Once
+	t.Cleanup(func() { answered.Do(func() { close(answer) }) })
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		asked <- struct{}{}
+		<-answer // the cluster's DNS is slow
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serve(t, w)
+
+	for range cap(asked) {
+		dial().Write(key)
+	}
+	for range cap(asked) {
+		within(t, asked, "lookup for a stream while another's had no answer")
+	}
+	answered.Do(func() { close(answer) })
+	for range cap(asked) {
+		within(t, accepted, "stream at the proxy once its lookup was answered")
+	}
+}
+
 func TestProxyNamedByHostIsLookedUp(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)
@@ -348,7 +419,8 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)
-	dial := served(t, key, target, nil)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	dial := serve(t, w)
 
 	for range workerStreams { // a workload process dials and says nothing
 		dial()
@@ -361,6 +433,9 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 		t.Fatal("the forwarder's stream was refused while silent connections were open")
 	case <-time.After(budget):
 		t.Fatal("the forwarder's stream reached nothing")
+	}
+	if held := len(w.slots); held != 1 {
+		t.Fatalf("%d connections hold a stream's place: want the forwarder's alone", held)
 	}
 }
 
@@ -420,9 +495,9 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 
 	cancelled := dial()
 	cancelled.Write(key)
-	up := <-accepted
+	up := within(t, accepted, "stream at the proxy")
 	up.Write([]byte("reply"))
-	<-asleep
+	within(t, asleep, "sleep in the pacer")
 	cancelled.Close()
 	up.SetDeadline(time.Now().Add(budget))
 	io.Copy(io.Discard, up) // the worker has seen the cancel once it closes the proxy's connection
@@ -525,7 +600,7 @@ func TestWorkerHoldsItsStreamsToTheRate(t *testing.T) {
 		c.Write(key)
 		toFrames(c, io.LimitReader(zeros{}, sent), nil)
 	}()
-	up := <-accepted
+	up := within(t, accepted, "stream at the proxy")
 	up.SetDeadline(time.Now().Add(budget))
 	if n, err := io.Copy(io.Discard, up); n != sent || err != nil {
 		t.Fatalf("the proxy read %d bytes, %v: want %d", n, err, sent)
@@ -544,8 +619,17 @@ func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 // hostileWorker, in the environment, names a signal: this binary as a worker then sends it to all of its uid, again and again.
 const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
 
+// brokenReaper, in the environment, makes this binary as a reaper stop itself ("stops") or end having done nothing ("fails").
+const brokenReaper = "VSOCK_EGRESS_TEST_BROKEN_REAPER"
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+		switch how := os.Getenv(brokenReaper); {
+		case os.Args[1] == "reap" && how == "fails":
+			os.Exit(1)
+		case os.Args[1] == "reap" && how == "stops":
+			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+		}
 		if signal, err := strconv.Atoi(os.Getenv(hostileWorker)); err == nil && os.Args[1] == "work" {
 			os.WriteFile(filepath.Join(filepath.Dir(os.Args[5]), "signalling"), nil, 0o600) // beside the socket -vsock names
 			// On eight threads: a reaper it could signal would not outrun them all.

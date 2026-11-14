@@ -112,6 +112,8 @@ type child struct {
 	cmd      *exec.Cmd
 	uid, gid uint32
 	done     chan struct{} // closed when the process has ended
+	reaper   *child        // a worker's, from when its end began until that reaper has ended
+	unended  bool          // a worker's failed end is in the log
 }
 
 func (c *child) exited() bool {
@@ -142,7 +144,7 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &child{cmd, uid, gid, make(chan struct{})}
+	c := &child{cmd: cmd, uid: uid, gid: gid, done: make(chan struct{})}
 	go func() {
 		cmd.Wait()
 		close(c.done)
@@ -151,12 +153,23 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 }
 
 // end stops a worker and whatever else runs as its uid here, through a reaper: the launcher may not signal another uid.
-func (c *child) end() error {
-	reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
-	if err != nil {
-		return err
+func (c *child) end(wait time.Duration) error {
+	if c.reaper == nil {
+		reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
+		if err != nil {
+			return err
+		}
+		c.reaper = reaper
+		select { // a process of the reaper's uid outside this namespace can stop it: the launcher goes on, and looks again on its next pass
+		case <-reaper.done:
+		case <-time.After(wait):
+		}
 	}
-	<-reaper.done
+	if !c.reaper.exited() {
+		return fmt.Errorf("its reaper, process %d, has not ended", c.reaper.cmd.Process.Pid)
+	}
+	reaper := c.reaper
+	c.reaper = nil
 	if !reaper.cmd.ProcessState.Success() {
 		return fmt.Errorf("its reaper ended with %v", reaper.cmd.ProcessState)
 	}
@@ -209,13 +222,14 @@ type launcher struct {
 	node
 	rate     int
 	retry    time.Duration        // the least time between two starts of one sandbox's worker
+	reap     time.Duration        // how long a pass waits for a worker's reaper
 	workers  map[string]*child    // by sandbox id
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]bool      // sandboxes whose fault is already in the log
 }
 
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]bool{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]bool{}}
 }
 
 func launch(args []string) error {
@@ -281,8 +295,12 @@ func (l *launcher) pass() error {
 	}
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
-			if err := w.end(); err != nil {
-				log.Printf("uid %d: its processes are not ended: %v", w.uid, err)
+			if err := w.end(l.reap); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
+				if !w.unended {
+					w.unended = true
+					log.Printf("uid %d: its processes are not ended yet: %v", w.uid, err)
+				}
+				continue
 			}
 			delete(l.workers, id)
 		}

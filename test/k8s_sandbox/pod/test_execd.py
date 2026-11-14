@@ -744,6 +744,58 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
+async def test_calls_left_while_cut_off_are_all_killed_however_far_apart(
+    daemons: Daemons, clock: types.SimpleNamespace
+) -> None:
+    """Regression: the second one left dropped the first, once six minutes old."""
+    auths = 0
+    answer = asyncio.Event()
+    started: list[int] = []
+    got: list[tuple[int, int]] = []
+
+    async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal auths
+        await read_frame(r)  # AUTH
+        auths += 1
+        if auths == 1:
+            w.write(frame(execd.OK, 0))
+            for _ in range(2):
+                started.append((await read_frame(r))[1])  # START
+            w.close()  # the connection drops under both commands
+            return
+        await answer.wait()  # the client is still reconnecting
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:  # the next command: what was kept came before
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                break
+            got.append((kind, call_id))
+        await r.read()
+
+    server = await asyncio.start_server(connection, "127.0.0.1", 0)
+    daemon = execd.Daemon("127.0.0.1", "cert", b"key")
+    daemons.ports[daemon] = server.sockets[0].getsockname()[1]
+    daemons.unstarted.append(daemon)
+    client = daemons.client()
+    sleep = ["sleep", "600"]
+    first = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
+    await until(lambda: len(started) == 1)
+    second = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
+    await until(lambda: auths == 2)
+
+    for call, later in ((first, 361), (second, 0)):  # execd lets a call go at 360 s
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, 30)
+        clock.now += later
+    answer.set()
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    both = (execd.KILL, execd.RELEASE)
+    assert got == [(kind, call) for call in started for kind in both]
+
+
 async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     daemons: Daemons,
 ) -> None:
@@ -2782,15 +2834,124 @@ async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
     server.close()
 
 
-async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> None:
-    sending, closed = asyncio.Event(), asyncio.Event()
+async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
+    clock: types.SimpleNamespace,
+) -> None:
+    """Regression: a message a write, of any size: AWS's guest agent reordered them."""
+    sent: list[bytes] = []
+    at: list[float] = []
+
+    class Records(anyio.abc.ByteStream):
+        """An exec's stdio that keeps each message written to it, and when."""
+
+        async def send(self, item: bytes) -> None:
+            sent.append(item)
+            at.append(clock.now)
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    stdio = execd._Stdio(Records())
+    stdio.write(b"first")
+    await until(lambda: sent == [b"first"])
+    stdio.write(b"while it ")
+    stdio.write(b"is on its way")
+    await until(lambda: len(sent) == 2)
+    upload = bytes(range(251)) * 612  # 150 KiB, and no two messages of it alike
+    stdio.write(upload)
+    await asyncio.wait_for(stdio.drain(), 30)  # room again once most of it has gone
+    await until(lambda: sum(map(len, sent[2:])) == len(upload))
+    stdio.abort()
+
+    assert sent[1] == b"while it is on its way"
+    assert b"".join(sent[2:]) == upload and max(map(len, sent)) <= 65536
+    # On the fake clock: every message a millisecond or more after the one before.
+    assert all(later - earlier >= 0.001 for earlier, later in zip(at, at[1:]))
+
+
+async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+
+    class Ended(anyio.abc.ByteStream):
+        """An exec's stdio that refuses writes once it has ended, with nothing read."""
+
+        def __init__(self, inner: anyio.abc.ByteStream) -> None:
+            self.inner, self.ended = inner, False
+
+        async def send(self, item: bytes) -> None:
+            if self.ended:
+                raise anyio.BrokenResourceError
+            await self.inner.send(item)
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            return await self.inner.receive(max_bytes)
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            await self.inner.aclose()
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(asyncio.IncompleteReadError):
+            await read_frame(r)  # AUTH
+            w.write(frame(execd.OK, 0))
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.RESUME:  # of a START the ended exec never took
+                    w.write(frame(execd.ERROR, call_id, b"unknown call"))
+                elif kind == execd.START:
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    server = await asyncio.start_server(runs, "127.0.0.1", 0, ssl=context)
+    execs: list[Ended] = []
+
+    async def stdio() -> Ended:
+        address = server.sockets[0].getsockname()
+        execs.append(Ended(await anyio.connect_tcp(*address)))
+        return execs[-1]
+
+    daemon = execd.Daemon("", pin, b"key", stdio)
+
+    async def start(replace: bool) -> execd.Daemon:
+        return daemon
+
+    client = execd.ExecdClient(start)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    execs[0].ended = True
+
+    call = client.exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    # Resumed through another exec, as a call over a port that was reset is.
+    assert (result.returncode, len(execs)) == (0, 2)
+    server.close()
+
+
+async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execd, "CONNECT_TIMEOUT", None)  # or a stalled machine ends it
+    writing, closed, left = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class Stalled(anyio.abc.ByteStream):
         """An exec whose guest has stopped reading its stdin."""
 
         async def send(self, item: bytes) -> None:
-            sending.set()
-            await asyncio.Event().wait()
+            writing.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                left.set()
 
         async def receive(self, max_bytes: int = 65536) -> bytes:
             await asyncio.Event().wait()
@@ -2802,46 +2963,17 @@ async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> Non
         async def aclose(self) -> None:
             closed.set()
 
-    _, writer = await execd._through(Stalled())
-    writer.write(b"more than the exec takes")
-    await asyncio.wait_for(sending.wait(), 30)  # only bounds a hang
-    writer.transport.abort()  # as the client closes a connection
+    async def stdio() -> Stalled:
+        return Stalled()
 
-    await asyncio.wait_for(closed.wait(), 30)
+    connecting = asyncio.ensure_future(
+        execd._connect(execd.Daemon("", "0" * 64, b"key", stdio), execd.Pace())
+    )
+    await asyncio.wait_for(writing.wait(), 30)  # the handshake's first bytes never go
+    connecting.cancel()
 
-
-async def test_what_a_guest_writes_to_its_exec_is_paced(
-    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(execd, "PACE_FRAMES", 50)
-
-    class Floods(anyio.abc.ByteStream):
-        """An exec that delivers a guest's bytes faster than the cap."""
-
-        left = 150
-
-        async def send(self, item: bytes) -> None:
-            await asyncio.Event().wait()
-
-        async def receive(self, max_bytes: int = 65536) -> bytes:
-            if not self.left:
-                await asyncio.Event().wait()
-            self.left -= 1
-            return b"x"
-
-        async def send_eof(self) -> None:
-            pass
-
-        async def aclose(self) -> None:
-            pass
-
-    reader, writer = await execd._through(Floods())
-
-    await asyncio.wait_for(reader.readexactly(150), 30)  # only bounds a hang
-
-    # Three times the second's allowance: twice, reading waits for the next second.
-    assert clock.now == 2.0
-    writer.transport.abort()
+    # The exec is closed, and nothing is left writing to it.
+    await asyncio.wait_for(asyncio.gather(closed.wait(), left.wait()), 30)
 
 
 @pytest.fixture

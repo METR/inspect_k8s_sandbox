@@ -606,6 +606,7 @@ def test_a_pod_with_no_network_card_has_no_coredns_sidecar(
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
     assert [c["name"] for c in pod_spec["containers"]] == ["default"]
     assert [v["name"] for v in pod_spec["volumes"]] == ["resolv-conf"]
+    assert "hostAliases" not in pod_spec  # its service asked for no DNS record
 
 
 def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
@@ -890,6 +891,20 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
             f"inspect-k8s-sandbox/egress-proxy={proxy}",
         )
     assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
+
+
+def test_an_isolated_service_cannot_name_an_egress_proxy(
+    chart_dir: pathlib.Path,
+) -> None:
+    # Its deny of all egress would stand beside the policy that lets it reach the proxy.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1,"
+            "services.default.networkIsolated=true",
+            set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
+        )
+    assert "services.default.networkIsolated" in exc_info.value.stderr
 
 
 @pytest.mark.parametrize(
