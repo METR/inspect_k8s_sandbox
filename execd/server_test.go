@@ -862,6 +862,48 @@ func TestAKillAsACommandsEndIsBeingNotedLeavesWhatItLeftRunning(t *testing.T) {
 	}
 }
 
+func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	t.Cleanup(func() { killTagged("unread") })
+	// It leaves a process holding its stdin, says which pipe that is, and ends.
+	left := `exec 3<&0; sleep 600 <&3 >/dev/null 2>&1 & readlink /proc/$$/fd/0`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left}, Env: map[string]string{}, Stdin: true, Tag: "unread"})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 35, payload: req})
+	s.dispatch(c, frame{kind: fStdin, id: 35, payload: make([]byte, 1<<20)}) // more than a pipe holds: execd's writer waits
+	var pipe string
+	for exited := false; !exited; {
+		select {
+		case f := <-frames:
+			if f.kind == fStdout {
+				pipe += string(f.payload)
+			}
+			exited = f.kind == fExit
+		case <-time.After(30 * time.Second):
+			t.Fatal("no EXIT")
+		}
+	}
+	if pipe = strings.TrimSpace(pipe); !strings.HasPrefix(pipe, "pipe:") {
+		t.Fatalf("the command's stdin was %q, want a pipe", pipe)
+	}
+
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		held := false
+		fds, _ := os.ReadDir("/proc/self/fd")
+		for _, fd := range fds {
+			link, _ := os.Readlink("/proc/self/fd/" + fd.Name())
+			held = held || link == pipe
+		}
+		if !held {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("execd still holds %s, the stdin of a command that has ended", pipe)
+		}
+	}
+}
+
 func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")

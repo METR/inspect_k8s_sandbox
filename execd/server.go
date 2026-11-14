@@ -446,6 +446,9 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		code := <-exited
+		if stdinW != nil {
+			stdinW.Close() // or its writer waits for ever on what the command left holding its stdin
+		}
 		cl.mu.Lock()
 		cl.pid = 0 // reaped: its id may now be another group's
 		// Not a command that ended by itself as its timer fired: the kill found it gone.
