@@ -6,6 +6,7 @@ import io
 import itertools
 import json
 import os
+import pathlib
 import shutil
 import ssl
 import subprocess
@@ -13,20 +14,15 @@ import threading
 import time
 import types
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from pathlib import Path
 
 import anyio
+import inspect_ai.util
+import kubernetes.client.exceptions
 import pytest
-from inspect_ai.util import OutputLimitExceededError
-from kubernetes.client.exceptions import ApiException
-from pytest import MonkeyPatch
 
-from k8s_sandbox._helm import Release, ValuesSource
-from k8s_sandbox._pod import error, execd, op
+from k8s_sandbox import _helm
+from k8s_sandbox._pod import error, execd, op, snapshot
 from k8s_sandbox._pod import pod as pod_module
-from k8s_sandbox._pod.error import ExecdResultUnknownError, PodError
-from k8s_sandbox._pod.pod import Pod
-from k8s_sandbox._pod.snapshot import _parse_pod
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 TlsDaemon = Callable[[Handler], Awaitable[execd.ExecdClient]]
@@ -87,7 +83,7 @@ class Plain(execd._Pipe):
 
 
 @pytest.fixture
-def daemons(monkeypatch: MonkeyPatch) -> Daemons:
+def daemons(monkeypatch: pytest.MonkeyPatch) -> Daemons:
     stand_ins = Daemons()
 
     async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
@@ -119,7 +115,7 @@ def waiting(link: execd.Link) -> bool:
 
 
 @pytest.fixture
-def clock(monkeypatch: MonkeyPatch) -> types.SimpleNamespace:
+def clock(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """Stand in for execd's clocks and sleeps: a sleep only moves the clock on."""
     fake = types.SimpleNamespace(now=0.0, cpu=lambda: 0.0)
 
@@ -140,7 +136,7 @@ def clock(monkeypatch: MonkeyPatch) -> types.SimpleNamespace:
 
 
 async def test_an_annotated_pod_runs_every_operation_over_execd(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     starts = 0
 
@@ -155,19 +151,17 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
     await daemons.serve(exits)
     # As in test_helm.py: no cluster config needed.
     monkeypatch.setattr("k8s_sandbox._helm.get_default_namespace", lambda _: "default")
-    release = Release(__file__, None, ValuesSource.none(), None)
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
     release._ready_pods = [
-        _parse_pod(
-            {
-                "metadata": {
-                    "name": "p",
-                    "uid": "u",
-                    "labels": {"inspect/service": "default"},
-                    "annotations": {execd.ANNOTATION: "true"},
-                },
-                "spec": {"containers": [{"name": "default"}]},
-                "status": {"phase": "Running", "podIP": "10.0.0.1"},
-            }
+        snapshot.PodSnapshot(
+            name="p",
+            uid="u",
+            labels={"inspect/service": "default"},
+            container_names=("default",),
+            container_statuses=None,
+            phase="Running",
+            ip="10.0.0.1",
+            annotations={execd.ANNOTATION: "true"},
         )
     ]
     pod = (await release.get_sandbox_pods())["default"]
@@ -175,8 +169,8 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
     pod._execd._start = daemons.client()._start
 
     await pod.exec(["true"], None, None, {}, None, 10)
-    await pod.write_file(b"x", Path("/tmp/x"))
-    await pod.read_file(Path("/tmp/x"), io.BytesIO())
+    await pod.write_file(b"x", pathlib.Path("/tmp/x"))
+    await pod.read_file(pathlib.Path("/tmp/x"), io.BytesIO())
     await (await pod.exec_stdio(["cat"], None)).aclose()
 
     await until(lambda: starts == 4)
@@ -192,7 +186,7 @@ class Cluster:
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
         if self.unavailable:
             self.unavailable = False
-            raise ApiException(status=503)
+            raise kubernetes.client.exceptions.ApiException(status=503)
         container = {
             "name": "default",
             "restartCount": self.restarts,
@@ -206,7 +200,7 @@ class Cluster:
 
 
 @pytest.fixture
-def cluster(monkeypatch: MonkeyPatch) -> Cluster:
+def cluster(monkeypatch: pytest.MonkeyPatch) -> Cluster:
     shown = Cluster()
     monkeypatch.setattr(op, "k8s_client", lambda _: shown)
     monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
@@ -217,8 +211,12 @@ def cluster(monkeypatch: MonkeyPatch) -> Cluster:
     "operation",
     [
         pytest.param(lambda p: p.exec(["true"], None, None, {}, None, None), id="exec"),
-        pytest.param(lambda p: p.write_file(b"x", Path("/tmp/x")), id="write_file"),
-        pytest.param(lambda p: p.read_file(Path("/x"), io.BytesIO()), id="read_file"),
+        pytest.param(
+            lambda p: p.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
+        ),
+        pytest.param(
+            lambda p: p.read_file(pathlib.Path("/x"), io.BytesIO()), id="read_file"
+        ),
     ],
 )
 async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
@@ -457,7 +455,7 @@ async def test_command_is_not_run_again_once_its_daemon_is_gone(
     first = await daemons.serve(dies_after_start)
     await daemons.serve(new_daemon)
 
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
     assert len(starts) == 1
 
@@ -502,7 +500,7 @@ async def test_stdin_in_flight_stays_within_the_window(
 
 
 async def test_connection_lost_after_start_is_not_retryable(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def unreachable(replace: bool) -> execd.Daemon:
         raise ConnectionError("no route to the pod")
@@ -520,7 +518,7 @@ async def test_connection_lost_after_start_is_not_retryable(
     monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
 
     # A ConnectionError would be retried, running the command again.
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
         await asyncio.wait_for(call, 30)  # only bounds a hang
 
@@ -578,7 +576,7 @@ async def test_a_command_whose_connection_closed_after_it_was_sent_is_resumed(
 
 
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     peers: list[asyncio.StreamWriter] = []
 
@@ -594,7 +592,7 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     sandbox = daemons.client()
 
     async def times_out() -> None:
-        with pytest.raises((TimeoutError, ExecdResultUnknownError)):
+        with pytest.raises((TimeoutError, error.ExecdResultUnknownError)):
             await sandbox.exec(["cat"], b"x" * (64 << 20), None, {}, None, 1)
 
     task = asyncio.ensure_future(times_out())
@@ -606,7 +604,7 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
 
 
 async def test_a_timed_out_call_frees_what_execd_holds(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its exit ends the wait
     released = asyncio.Event()
@@ -631,7 +629,7 @@ async def test_a_timed_out_call_frees_what_execd_holds(
 
 
 async def test_a_timed_out_call_takes_no_more_than_its_hold(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its hold ends the wait
     acked = 0
@@ -657,7 +655,7 @@ async def test_a_timed_out_call_takes_no_more_than_its_hold(
 
 
 async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only the drop ends the wait
 
@@ -673,7 +671,7 @@ async def test_a_timed_out_call_whose_connection_drops_returns_at_once(
 
 
 async def test_a_timed_out_call_is_released_with_no_exit(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "KILL_WAIT", 0.5)
     released = asyncio.Event()
@@ -705,10 +703,10 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
 
 
 async def test_a_failed_restart_after_start_is_not_retryable(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def start_fails(replace: bool) -> execd.Daemon:
-        raise PodError("execd did not start")
+        raise error.PodError("execd did not start")
 
     async def dies_after_start(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -723,13 +721,13 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
 
     # PodError is retried too, which would run the command again.
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
         await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
 async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: one failed pod read ended the reconnect, and with it the command."""
     dropped = probed = False
@@ -745,7 +743,7 @@ async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
     async def unavailable(replace: bool) -> execd.Daemon:
         nonlocal probed
         probed = True
-        raise ApiException(status=503)
+        raise kubernetes.client.exceptions.ApiException(status=503)
 
     async def drops_then_resumes(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -785,7 +783,7 @@ async def test_an_exit_status_that_is_not_one_is_a_lost_result(
 
     await daemons.serve(exits)
 
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         call = daemons.client().exec(["true"], None, None, {}, None, None)
         await asyncio.wait_for(call, 30)
 
@@ -821,7 +819,7 @@ async def test_a_stdin_ack_that_is_not_one_ends_the_connection_quietly(
 
 
 async def test_a_port_held_by_another_process_fails_at_once(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def squatted(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise execd.NotOurDaemon("certificate mismatch")
@@ -920,7 +918,7 @@ async def test_a_send_cancelled_partway_ends_the_stream(daemons: Daemons) -> Non
 
 
 async def test_a_daemon_that_is_not_ours_is_replaced(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
@@ -981,7 +979,7 @@ async def test_many_small_frames_arrive_without_dropping_the_connection(
 
 
 async def test_callers_share_one_reconnect(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
@@ -1024,7 +1022,7 @@ async def test_callers_share_one_reconnect(
 
 
 async def test_only_a_resume_waits_out_a_reconnect(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
@@ -1062,7 +1060,7 @@ async def test_only_a_resume_waits_out_a_reconnect(
 
 
 async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     started = 0
 
@@ -1100,7 +1098,7 @@ async def test_a_call_cancelled_as_its_connection_reopens_starts_nothing(
 
 
 async def test_a_daemon_that_cannot_be_reached_is_not_restarted_in_a_loop(
-    monkeypatch: MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise ConnectionRefusedError
@@ -1151,7 +1149,7 @@ async def test_unasked_resumed_replies_send_no_stdin_twice(daemons: Daemons) -> 
 
 
 async def test_concurrent_sends_on_a_stream_stay_whole(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "STDIN_WINDOW", 1 << 30)  # only the socket holds sends
     size = 16 << 20  # more than the socket buffers, so the first send waits partway
@@ -1306,7 +1304,7 @@ async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
 
 
 async def test_stray_bytes_end_the_connection(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY_BYTES", execd.CHUNK)
 
@@ -1331,7 +1329,7 @@ async def test_stray_bytes_end_the_connection(
     ],
 )
 async def test_frames_a_call_does_not_use_count_as_stray(
-    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int, payload: bytes
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, kind: int, payload: bytes
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
 
@@ -1354,7 +1352,7 @@ async def test_frames_a_call_does_not_use_count_as_stray(
 async def test_what_a_pod_delivers_is_paced(
     daemons: Daemons,
     clock: types.SimpleNamespace,
-    monkeypatch: MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
     limit: str,
     value: int,
     payload: bytes,
@@ -1377,7 +1375,7 @@ async def test_what_a_pod_delivers_is_paced(
 
 
 async def test_the_stray_count_spans_reconnects(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
 
@@ -1429,7 +1427,9 @@ async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> 
     assert client._link is link
 
 
-async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) -> None:
+async def test_only_one_fingerprint_line_starts_execd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     printed = b"0" * 64 + b"\n"
 
     class Execute:
@@ -1449,17 +1449,19 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
     monkeypatch.setattr(pod_module, "k8s_client", lambda _: None)
     ip = types.SimpleNamespace(ip="10.0.0.1")
     monkeypatch.setattr(pod_module, "read_pod", lambda *_: ip)
-    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
     monkeypatch.setattr(pod, "check_for_pod_restart", no_restart)
     monkeypatch.setattr(pod, "_run_async", run)
     assert (await pod._start_execd(False)).fingerprint == "0" * 64
 
     printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
-    with pytest.raises(PodError, match="execd did not start"):
+    with pytest.raises(error.PodError, match="execd did not start"):
         await pod._start_execd(False)
 
 
-def execd_starts(monkeypatch: MonkeyPatch, meanwhile: Callable[[], None]) -> None:
+def execd_starts(
+    monkeypatch: pytest.MonkeyPatch, meanwhile: Callable[[], None]
+) -> None:
     """Stand in for the exec that starts execd: meanwhile() runs as it does."""
     running = False
 
@@ -1479,7 +1481,7 @@ def execd_starts(monkeypatch: MonkeyPatch, meanwhile: Callable[[], None]) -> Non
 
 
 async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
-    cluster: Cluster, monkeypatch: MonkeyPatch
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: a container that restarted as execd started served the sample."""
     execd_starts(monkeypatch, lambda: setattr(cluster, "restarts", 1))
@@ -1490,7 +1492,7 @@ async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
 
 
 async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
-    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: MonkeyPatch
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: over execd no later operation read the pod: the sample ran on."""
     starts = 0
@@ -1515,7 +1517,7 @@ async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
 
 
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
-    cluster: Cluster, monkeypatch: MonkeyPatch
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: in warn mode the client dialed the address of the pod replaced."""
     execd_starts(monkeypatch, lambda: vars(cluster).update(uid="v", ip="10.0.0.2"))
@@ -1525,7 +1527,7 @@ async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
 
 
 async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
-    cluster: Cluster, monkeypatch: MonkeyPatch
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: in warn mode its key was lost, and its port stayed taken."""
     fails = iter([True])
@@ -1533,14 +1535,14 @@ async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
         monkeypatch, lambda: setattr(cluster, "unavailable", next(fails, False))
     )
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
-    with pytest.raises(ApiException):
+    with pytest.raises(kubernetes.client.exceptions.ApiException):
         await pod._start_execd(False)
 
     assert (await pod._start_execd(False)).ip == "10.0.0.1"
 
 
 async def test_the_read_of_execds_address_uses_a_client_of_its_own_thread(
-    cluster: Cluster, monkeypatch: MonkeyPatch
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: the event loop's thread-local client was used on a worker thread."""
     made: list[int] = []
@@ -1565,7 +1567,7 @@ async def test_the_read_of_execds_address_uses_a_client_of_its_own_thread(
 
 
 async def test_a_resume_resends_only_stdin_execd_has_not_written(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     upload = execd.ExecdClient._upload
 
@@ -1635,7 +1637,7 @@ async def test_an_unknown_call_whose_stdin_execd_wrote_is_not_started_again(
 
     await daemons.serve(acks_then_forgets)
 
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         await daemons.client().exec(["cat"], "abc", None, {}, None, 10)
     assert starts == 1
 
@@ -1673,7 +1675,7 @@ async def test_an_unknown_call_whose_output_arrived_is_not_started_again(
 
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
 async def test_a_file_write_stops_at_the_output_limit(
-    daemons: Daemons, monkeypatch: MonkeyPatch, kind: int
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, kind: int
 ) -> None:
     monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
 
@@ -1685,15 +1687,19 @@ async def test_a_file_write_stops_at_the_output_limit(
 
     await daemons.serve(chatters)
 
-    with pytest.raises(OutputLimitExceededError):
-        await daemons.client().write_file(b"data", Path("/tmp/f"))
+    with pytest.raises(inspect_ai.util.OutputLimitExceededError):
+        await daemons.client().write_file(b"data", pathlib.Path("/tmp/f"))
 
 
 @pytest.mark.parametrize(
     "operation",
     [
-        pytest.param(lambda c: c.write_file(b"x", Path("/tmp/x")), id="write_file"),
-        pytest.param(lambda c: c.read_file(Path("/x"), io.BytesIO()), id="read_file"),
+        pytest.param(
+            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
+        ),
+        pytest.param(
+            lambda c: c.read_file(pathlib.Path("/x"), io.BytesIO()), id="read_file"
+        ),
     ],
 )
 async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
@@ -1714,7 +1720,7 @@ async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
-    tls_daemon: TlsDaemon, tmp_path: Path
+    tls_daemon: TlsDaemon, tmp_path: pathlib.Path
 ) -> None:
     """They run as the container's user."""
     started: list[list[str]] = []
@@ -1749,7 +1755,7 @@ async def test_a_port_held_at_the_first_start_says_so() -> None:
 
 
 async def test_stray_frames_are_counted_per_ping_interval(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
     monkeypatch.setattr(execd, "PING_EVERY", 0.01)
@@ -1817,7 +1823,7 @@ async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     timeouts = []
 
@@ -1868,7 +1874,7 @@ async def test_a_command_times_out_while_its_daemon_is_restarted(
 
 
 async def test_stdin_acks_that_report_progress_keep_the_connection(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
 
@@ -1892,7 +1898,7 @@ async def test_stdin_acks_that_report_progress_keep_the_connection(
 
 
 async def test_stdin_acks_beyond_what_was_sent_count_as_stray(
-    daemons: Daemons, monkeypatch: MonkeyPatch
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
 
@@ -1941,7 +1947,7 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
 
     await daemons.serve(denies_every_call)
 
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 5)
     assert starts == 1
 
@@ -1965,7 +1971,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
 
     await daemons.serve(abandons)
 
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
     assert starts == 1
 
@@ -2026,7 +2032,7 @@ async def test_full_reads_spend_no_turns() -> None:
 
 
 async def test_what_a_pass_delivers_pays_for_its_decryption(
-    clock: types.SimpleNamespace, monkeypatch: MonkeyPatch
+    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pace = execd.Pace()
     pipe = stub_pipe(1.0, [], pace)
@@ -2042,7 +2048,7 @@ async def test_what_a_pass_delivers_pays_for_its_decryption(
 
 
 @pytest.fixture
-def tls(tmp_path: Path) -> tuple[ssl.SSLContext, str]:
+def tls(tmp_path: pathlib.Path) -> tuple[ssl.SSLContext, str]:
     """A server's TLS context, with a self-signed certificate, and the pin for it."""
     if shutil.which("openssl") is None:
         pytest.skip("needs openssl")
@@ -2062,7 +2068,7 @@ def tls(tmp_path: Path) -> tuple[ssl.SSLContext, str]:
 
 @pytest.fixture
 async def tls_daemon(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
 ) -> AsyncGenerator[TlsDaemon, None]:
     """Serves a stand-in for execd over TLS; gives the client that pins it."""
     context, pin = tls
@@ -2094,7 +2100,7 @@ def test_a_daemons_key_stays_out_of_its_repr() -> None:
 
 
 async def test_only_the_pinned_certificate_is_trusted(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     context, pin = tls
     server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)
@@ -2108,7 +2114,7 @@ async def test_only_the_pinned_certificate_is_trusted(
 
 
 async def test_the_client_offers_one_key_exchange_group(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: a stand-in chose a group whose handshake held the loop 150 ms."""
     context, pin = tls
@@ -2145,7 +2151,7 @@ async def test_what_tls_decryption_costs_is_paced(
 async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
     tls: tuple[ssl.SSLContext, str],
     clock: types.SimpleNamespace,
-    monkeypatch: MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context, pin = tls
 
@@ -2184,7 +2190,7 @@ async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
 async def test_a_handshake_s_decryption_is_paced_too(
     tls: tuple[ssl.SSLContext, str],
     clock: types.SimpleNamespace,
-    monkeypatch: MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context, pin = tls
     server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0, ssl=context)

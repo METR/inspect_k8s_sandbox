@@ -9,8 +9,8 @@ from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
-from k8s_sandbox import _sandbox_environment
-from k8s_sandbox._pod import pod
+from k8s_sandbox import _helm, _sandbox_environment
+from k8s_sandbox._pod import op, pod
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
     ExecdResultUnknownError,
@@ -48,12 +48,18 @@ def _make_sandbox() -> tuple[K8sSandboxEnvironment, MagicMock]:
     sandbox = object.__new__(K8sSandboxEnvironment)
     mock_pod = mock.create_autospec(pod.Pod, instance=True)
     sandbox._pod = mock_pod
-    mock_pod.info = MagicMock()
-    mock_pod.info.name = "test-pod"
-    sandbox._config = MagicMock()
-    sandbox._config.default_user = None
-    sandbox.release = MagicMock()
-    sandbox.release.task_name = "test-task"
+    mock_pod.info = op.PodInfo("test-pod", "ns", None, "default", "uid", 0, "raise")
+    sandbox._config = _sandbox_environment._ResolvedConfig(
+        chart=None,
+        values=None,
+        context=None,
+        default_user=None,
+        restarted_container_behavior="raise",
+        max_pod_ops=None,
+    )
+    sandbox.release = mock.create_autospec(
+        _helm.Release, instance=True, task_name="test-task"
+    )
     return sandbox, mock_pod
 
 
@@ -452,7 +458,7 @@ class TestExecStdioRetry:
         self, user: str | None, expected: str
     ) -> None:
         sandbox, mock_pod = _make_sandbox()
-        sandbox._config = MagicMock(default_user="agent")
+        sandbox._config = sandbox._config.model_copy(update={"default_user": "agent"})
 
         await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
 
