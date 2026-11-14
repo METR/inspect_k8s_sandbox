@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -23,6 +24,7 @@ func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
 	fs.Parse(args)
+	runtime.GOMAXPROCS(1) // a relay waits on sockets: more threads only wake each other, on the sandbox's own CPUs
 	f := &forwarder{host: hostCID, port: streamPort}
 	rand.Read(f.key[:])
 	keys, err := vsockListen(keyPort)
@@ -41,11 +43,13 @@ func forward(args []string) error {
 func (f *forwarder) serveKey(l *vsockListener) {
 	for {
 		c, peer, err := l.accept()
-		if err != nil {
-			if !errors.Is(err, os.ErrClosed) {
-				log.Printf("key port: %v", err)
-			}
+		if errors.Is(err, os.ErrClosed) {
 			return
+		}
+		if err != nil { // a connection that ended before it was accepted, say: not the end of the key port
+			log.Printf("key port: %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 		if peer == f.host {
 			c.Write(f.key[:])

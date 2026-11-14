@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -9,10 +10,16 @@ import (
 	"time"
 )
 
-// maxFrame bounds a frame's payload, so that a peer's length never sizes a buffer.
-const maxFrame = 64 << 10
+// maxFrame bounds a frame's payload. With its 4-byte length, a full frame is one 64 KiB vsock packet.
+const maxFrame = 64<<10 - 4
 
 var errFrame = errors.New("frame longer than the bound")
+
+// A stream holds one of each while it lasts: without the pools every connection would allocate 128 KiB.
+var (
+	chunks  = sync.Pool{New: func() any { return new([4 + maxFrame]byte) }}
+	readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4+maxFrame) }}
+)
 
 // join carries one TCP connection over a vsock connection, as frames. Firecracker passes no half-close on,
 // so each direction ends with an empty frame and the vsock connection closes only when both have ended.
@@ -40,18 +47,19 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 
 // toFrames copies src to dst as frames, each a 4-byte length and that many bytes, then an empty frame.
 func toFrames(dst io.Writer, src io.Reader, pace *pacer) error {
-	buf := make([]byte, 4+maxFrame)
+	buf := chunks.Get().(*[4 + maxFrame]byte)
+	defer chunks.Put(buf)
 	for {
 		n, err := src.Read(buf[4:])
 		if n > 0 {
 			pace.wait(n)
-			binary.BigEndian.PutUint32(buf, uint32(n))
+			binary.BigEndian.PutUint32(buf[:], uint32(n))
 			if _, err := dst.Write(buf[:4+n]); err != nil {
 				return err
 			}
 		}
 		if err == io.EOF {
-			_, err = dst.Write(make([]byte, 4))
+			_, err = dst.Write([]byte{0, 0, 0, 0})
 			return err
 		}
 		if err != nil {
@@ -60,26 +68,39 @@ func toFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 	}
 }
 
-// fromFrames copies frames from src to dst until the empty frame. A stream that ends before it is an error.
+// fromFrames copies frames from src to dst until the empty frame, each part of a frame as it arrives.
+// A stream that ends before the empty frame is an error.
 func fromFrames(dst io.Writer, src io.Reader, pace *pacer) error {
-	buf := make([]byte, maxFrame)
+	r := readers.Get().(*bufio.Reader)
+	r.Reset(src)
+	defer func() {
+		r.Reset(nil)
+		readers.Put(r)
+	}()
 	for {
-		if _, err := io.ReadFull(src, buf[:4]); err != nil {
+		length, err := r.Peek(4)
+		if err != nil {
 			return err
 		}
-		n := binary.BigEndian.Uint32(buf)
-		if n == 0 {
+		left := binary.BigEndian.Uint32(length)
+		r.Discard(4)
+		if left == 0 {
 			return nil
 		}
-		if n > maxFrame {
+		if left > maxFrame {
 			return errFrame
 		}
-		if _, err := io.ReadFull(src, buf[:n]); err != nil {
-			return err
-		}
-		pace.wait(int(n))
-		if _, err := dst.Write(buf[:n]); err != nil {
-			return err
+		for left > 0 {
+			if _, err := r.Peek(1); err != nil { // waits for more of the frame
+				return err
+			}
+			part, _ := r.Peek(min(int(left), r.Buffered()))
+			pace.wait(len(part))
+			if _, err := dst.Write(part); err != nil {
+				return err
+			}
+			r.Discard(len(part))
+			left -= uint32(len(part))
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -39,6 +40,7 @@ func work(args []string) error {
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
+	runtime.GOMAXPROCS(1) // one sandbox's streams take at most one of the node's CPUs
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
