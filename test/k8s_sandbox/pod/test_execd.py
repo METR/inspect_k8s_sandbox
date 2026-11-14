@@ -886,9 +886,12 @@ async def test_a_commands_timeout_bounds_its_start_behind_a_blocked_write(
 
     task = asyncio.ensure_future(times_out())
     done, _ = await asyncio.wait({task}, timeout=30)
+    link = sandbox._link
     upload.cancel()
     assert done, "the blocked write held up another command's START past its timeout"
     await task
+    # Still open: closing it would send the pod's other calls to reconnect.
+    assert link is not None and not link.closed
 
 
 async def test_a_timed_out_call_frees_what_execd_holds(

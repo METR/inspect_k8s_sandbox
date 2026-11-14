@@ -341,19 +341,17 @@ class Link:
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
 
-    async def send_last(self, call_id: int, *kinds: int) -> None:
-        """Send a call's last empty frames, even if the caller is cancelled."""
+    def send_last(self, call_id: int, *kinds: int) -> None:
+        """Send a call's last empty frames in a task of their own: no caller waits."""
 
         async def send() -> None:
             with contextlib.suppress(OSError):
                 for kind in kinds:
                     await self.send(kind, call_id)
 
-        # A task of its own: anyio cancels a cancelled caller again at each await.
         task = asyncio.create_task(send())
         self._last.add(task)
         task.add_done_callback(self._last.discard)
-        await asyncio.shield(task)
 
     async def _read(self) -> None:
         reader = self.pipe
@@ -567,8 +565,7 @@ class ExecdClient:
                     await asyncio.wait_for(link.send(START, call.id, start), timeout)
                 except NotSent:
                     raise
-                except asyncio.TimeoutError:  # behind a write its peer won't read
-                    await link.close()
+                except asyncio.TimeoutError:  # out of time behind a write: not a drop
                     raise
                 except OSError:  # it may have left: the resume asks execd
                     call.queue.put_nowait(Dropped(link))
@@ -618,7 +615,7 @@ class ExecdClient:
                             with contextlib.suppress(OSError):
                                 await link.send(RELEASE, call.id)
                         except BaseException:  # cut off: it may not have gone out
-                            await link.send_last(call.id, RELEASE)
+                            link.send_last(call.id, RELEASE)
                             raise
                         status = json.loads(payload)
                         code, why = status.get("code"), status.get("error", "")
@@ -684,7 +681,7 @@ class ExecdClient:
                     self._unkilled = [*kept, (now, call.id)]
                     to = link if not link.closed else self._link
                     if to is not None and not to.closed:
-                        await to.send_last(call.id, KILL, RELEASE)
+                        to.send_last(call.id, KILL, RELEASE)
             finally:
                 link.calls.pop(call.id, None)
 
@@ -872,7 +869,7 @@ class ExecdClient:
             await link.send(START, call.id, json.dumps(request).encode())
         except BaseException:
             link.calls.pop(call.id, None)
-            await link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
+            link.send_last(call.id, KILL, RELEASE)  # the START may have gone out
             raise
         return ExecdStream(link, call, restarted)
 
@@ -1007,4 +1004,4 @@ class ExecdStream(ByteStream):
         self._call.queue.put_nowait(Dropped())  # and so does a receive
         self._link.calls.pop(self._call.id, None)
         # EOF first: the command may end itself
-        await self._link.send_last(self._call.id, STDIN, KILL, RELEASE)
+        self._link.send_last(self._call.id, STDIN, KILL, RELEASE)
