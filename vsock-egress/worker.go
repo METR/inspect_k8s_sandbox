@@ -33,6 +33,7 @@ type worker struct {
 	addr   string // the target's address, once looked up
 	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 
+	idle    func(time.Duration, func()) idleTimer
 	accepts *pacer       // new streams a second
 	refused atomic.Int64 // streams turned away since the last report: without the key, or past the cap
 	failed  atomic.Int64 // streams that did not reach the proxy since the last report
@@ -48,7 +49,33 @@ const newStreams = 2000
 
 func newWorker(vsock, target string, rate int) *worker {
 	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
-		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
+		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams),
+		idle: func(d time.Duration, end func()) idleTimer { return time.AfterFunc(d, end) }}
+}
+
+// idleTimer ends a stream when it fires. Tests fire one by hand.
+type idleTimer interface {
+	Reset(time.Duration) bool
+	Stop() bool
+}
+
+// moving is a stream's vsock connection, which winds the stream's idle timer back as a byte passes either way.
+type moving struct {
+	net.Conn
+	idle idleTimer
+}
+
+func (m moving) Read(p []byte) (int, error) {
+	n, err := m.Conn.Read(p)
+	if n > 0 {
+		m.idle.Reset(idleWait)
+	}
+	return n, err
+}
+
+func (m moving) Write(p []byte) (int, error) {
+	m.idle.Reset(idleWait)
+	return m.Conn.Write(p)
 }
 
 // report writes what went wrong since the last report as one line: a guest must not be able to fill the
@@ -124,7 +151,13 @@ func (w *worker) stream(c net.Conn) {
 		}
 		return
 	}
-	join(c, t.(*net.TCPConn), w.pace)
+	idle := w.idle(idleWait, func() { // the stream ends as a cut one does
+		t.(*net.TCPConn).SetLinger(0)
+		t.Close()
+		c.Close()
+	})
+	defer idle.Stop()
+	join(moving{c, idle}, t.(*net.TCPConn), w.pace)
 }
 
 // dial connects to the pod's proxy. A name is looked up from inside the pod's namespace, so under the pod's own

@@ -23,6 +23,7 @@ const (
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second
+	idleWait      = 300 * time.Second // a stream that moves no byte either way for this long is ended: it holds a place
 
 	capturePort = 3127 // redirect sends the sandbox's DNS queries and its TCP connections here, on loopback
 	captureAddr = "127.0.0.1:3127"

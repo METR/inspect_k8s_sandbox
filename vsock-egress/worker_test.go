@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -393,6 +396,60 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 	}
 	if admitted != workerStreams-1 {
 		t.Fatalf("%d streams were let in beside one that had not stopped: want %d", admitted, workerStreams-1)
+	}
+}
+
+// handTimer stands in for a stream's idle timer: a test sees it wound back, and fires it.
+type handTimer struct {
+	end   func()
+	wound atomic.Int32
+}
+
+func (h *handTimer) Reset(time.Duration) bool { h.wound.Add(1); return true }
+func (h *handTimer) Stop() bool               { return true }
+
+func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	timers := make(chan *handTimer, 1)
+	w.idle = func(_ time.Duration, end func()) idleTimer {
+		h := &handTimer{end: end}
+		timers <- h
+		return h
+	}
+	guest := serve(t, w)()
+	guest.Write(append(key, frame("to the proxy")...))
+	var atProxy net.Conn
+	select {
+	case atProxy = <-accepted:
+	case <-time.After(budget):
+		t.Fatal("the stream did not reach the proxy")
+	}
+	atProxy.SetDeadline(time.Now().Add(budget))
+	got := make([]byte, 12)
+	if _, err := io.ReadFull(atProxy, got); err != nil {
+		t.Fatal(err)
+	}
+	idle := <-timers
+	fromGuest := idle.wound.Load()
+	if fromGuest == 0 {
+		t.Fatal("bytes from the guest did not wind the stream's idle timer back")
+	}
+	atProxy.Write([]byte("to the guest"))
+	if _, err := io.ReadFull(guest, make([]byte, 4+12)); err != nil {
+		t.Fatal(err)
+	}
+	if idle.wound.Load() == fromGuest {
+		t.Fatal("bytes from the proxy did not wind the stream's idle timer back: a download would end after the wait")
+	}
+
+	idle.end()
+	if n, err := atProxy.Read(got); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("the proxy read %d bytes, %v from an idle stream that was ended: want a reset", n, err)
+	}
+	if err := fromFrames(io.Discard, guest, nil); err == nil {
+		t.Fatal("the guest's side of an idle stream that was ended closed as a stream that ends cleanly")
 	}
 }
 
