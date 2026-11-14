@@ -75,10 +75,10 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 	}
 }
 
-// peerBuffer is what Firecracker holds of a connection's bytes from the guest (its CONN_TX_BUF_SIZE, src/vmm/src/devices/virtio/vsock/csm/mod.rs): the guest's kernel sends no more until it has passed them on.
+// peerBuffer is what Firecracker holds of a connection's bytes from the guest (its CONN_TX_BUF_SIZE, src/vmm/src/devices/virtio/vsock/csm/mod.rs): the guest's kernel sends no more until Firecracker tells it of room.
 const peerBuffer = 64 << 10
 
-// fitted is a dialled vsock connection whose frames end where the peer's buffer ends: a full frame that starts part-way through the buffer goes in two packets with a wait between, and so does every full frame after it.
+// fitted is a dialled vsock connection whose frames end where the peer's buffer ends: a full frame that starts part-way through the buffer goes in two packets, and so does every full frame after it.
 type fitted struct {
 	*os.File
 	room int // bytes the peer's buffer takes before it is full, known once a write has found it full
