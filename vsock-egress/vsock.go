@@ -36,7 +36,7 @@ func (l *vsockListener) accept() (*os.File, uint32, error) {
 	var errno error
 	if err := raw.Read(func(listener uintptr) bool {
 		fd, peer, errno = unix.Accept4(int(listener), unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
-		return errno != unix.EAGAIN
+		return errno != unix.EAGAIN && errno != unix.EINTR // the kernel says EINTR, not EAGAIN, while a signal is pending
 	}); err != nil { // the listener was closed while this waited
 		return nil, 0, os.ErrClosed
 	}
