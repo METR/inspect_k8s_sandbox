@@ -314,6 +314,7 @@ class Link:
         self.strays = strays
         self.pace = pace
         self.owed = owed
+        self.confirmed = asyncio.Event()  # set by each PONG, and when this closes
         self._released: list[int] = []  # ids, since the last PING
         self._pinged: list[list[int]] = []  # those each unanswered PING followed
         self.calls: dict[int, Call] = {}
@@ -379,6 +380,7 @@ class Link:
                 if kind == PONG and self._pinged:  # execd read what its PING followed
                     for released in self._pinged.pop(0):
                         self.owed.pop(released, None)
+                    self.confirmed.set()
                 if kind == OK and not self.ready.done():
                     self.ready.set_result(None)
                 elif (
@@ -435,6 +437,7 @@ class Link:
         if self.closed:
             return
         self.closed = True
+        self.confirmed.set()
         if not self.ready.done():
             self.ready.set_exception(Dropped("connection closed before auth"))
             self.ready.exception()  # retrieved: an open that timed out no longer waits
@@ -569,8 +572,14 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
-        if len(self._owed) >= MAX_OWED:  # a peer that answers no PING is not execd
-            raise ConnectionError("execd has not confirmed the calls already made")
+        end = time.monotonic() + CONNECT_TIMEOUT
+        while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
+            link.confirmed.clear()
+            try:
+                await asyncio.wait_for(link.confirmed.wait(), end - time.monotonic())
+            except asyncio.TimeoutError:  # a peer that answers no PING is not execd
+                raise ConnectionError("execd has not confirmed its calls") from None
+            link = await self._get()
         deadline = None if timeout is None else time.monotonic() + timeout
 
         def left() -> float | None:  # of the command's timeout
