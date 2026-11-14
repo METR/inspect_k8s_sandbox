@@ -21,8 +21,12 @@ import (
 	"time"
 )
 
-// run() starts this binary, as it starts execd, to become another user; a test starts it as execd itself.
+// run() starts this binary, as it starts execd, to become another user; tests start it as execd itself, and as a pod's first process.
 func TestMain(m *testing.M) {
+	if len(os.Args) > 2 && os.Args[1] == "first" {
+		firstProcess(os.Args[2:])
+		return
+	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve") {
 		main()
 		return

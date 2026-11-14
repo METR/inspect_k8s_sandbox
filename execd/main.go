@@ -111,7 +111,7 @@ func start() {
 	}
 	r, w := os.NewFile(uintptr(fds[0]), "status"), os.NewFile(uintptr(fds[1]), "status")
 	devnull, _ := os.Open(os.DevNull)
-	_, err = os.StartProcess("/proc/self/exe", append([]string{os.Args[0], "serve"}, os.Args[2:]...), &os.ProcAttr{
+	daemon, err := os.StartProcess("/proc/self/exe", append([]string{os.Args[0], "serve"}, os.Args[2:]...), &os.ProcAttr{
 		Files: []*os.File{devnull, devnull, devnull, w},
 		Sys:   &syscall.SysProcAttr{Setsid: true},
 	})
@@ -123,6 +123,7 @@ func start() {
 	msg := strings.TrimSpace(string(line))
 	fingerprint, ok := strings.CutPrefix(msg, "ok ")
 	if !ok {
+		daemon.Wait() // it has exited: no zombie is left to a first process that reaps none
 		fail("daemon did not start: " + msg)
 	}
 	fmt.Println(fingerprint)
