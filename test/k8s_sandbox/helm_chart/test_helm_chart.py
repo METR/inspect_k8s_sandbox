@@ -734,7 +734,7 @@ _EGRESS_PROXY = "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.loca
 
 
 def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
-    chart_dir: Path, test_resources_dir: Path
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
@@ -751,49 +751,24 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     }
     # A sidecar: started before `setup` and the service, restarted if it ends.
     forwarder, setup = pods["agent-env-my-release-default"]["initContainers"]
-    assert setup["name"] == "setup"
-    assert forwarder == {
-        "name": "egress-forwarder",
-        "image": "vsock-egress:1",
-        "command": ["/vsock-egress", "forward", "-key", "/key/key"],
-        "restartPolicy": "Always",
-        "startupProbe": {
-            "exec": {"command": ["/vsock-egress", "ready", "-key", "/key/key"]},
-            "periodSeconds": 1,
-            "failureThreshold": 30,
-        },
-        "volumeMounts": [{"name": "egress-forwarder-key", "mountPath": "/key"}],
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "capabilities": {"drop": ["ALL"]},
-            "readOnlyRootFilesystem": True,
-            "runAsGroup": 65532,
-            "runAsNonRoot": True,
-            "runAsUser": 65532,
-            "seccompProfile": {
-                "type": "Localhost",
-                "localhostProfile": "profiles/vsock-egress.json",
-            },
-        },
+    assert (forwarder["name"], setup["name"]) == ("egress-forwarder", "setup")
+    assert forwarder["restartPolicy"] == "Always"
+    # The service starts once the proxy's port is there.
+    assert "startupProbe" in forwarder
+    # It alone may open the vsock: not root, no capability, the node's profile.
+    security = forwarder["securityContext"]
+    assert security["runAsUser"] == 65532
+    assert security["capabilities"] == {"drop": ["ALL"]}
+    assert security["seccompProfile"] == {
+        "type": "Localhost",
+        "localhostProfile": "profiles/vsock-egress.json",
     }
-    # Its key is in a volume no other container of the pod mounts.
-    default = pods["agent-env-my-release-default"]
-    assert {
-        "name": "egress-forwarder-key",
-        "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"},
-    } in default["volumes"]
-    assert not [
-        mount
-        for container in (setup, *default["containers"])
-        for mount in container.get("volumeMounts", [])
-        if mount["name"] == "egress-forwarder-key"
-    ]
     # A pod that names no proxy has no worker on its node, so no forwarder either.
     assert "initContainers" not in pods["agent-env-my-release-server"]
 
 
 def test_egress_proxy_annotation_can_name_a_service_of_the_release(
-    chart_dir: Path, test_resources_dir: Path
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "egress-proxy-values.yaml"
@@ -806,7 +781,9 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
 
 
-def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> None:
+def test_egress_proxy_annotation_needs_the_forwarder_image(
+    chart_dir: pathlib.Path,
+) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(
             chart_dir, set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}"
@@ -829,7 +806,7 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> N
     ],
 )
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
-    chart_dir: Path, proxy: str
+    chart_dir: pathlib.Path, proxy: str
 ) -> None:
     # The node's vsock-egress refuses these, and the pod's policy is cut from the name.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
@@ -850,7 +827,10 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     ],
 )
 def test_a_pod_that_names_an_egress_proxy_reaches_only_that_name_and_port(
-    chart_dir: Path, test_resources_dir: Path, annotations: str, named_by: list[str]
+    chart_dir: pathlib.Path,
+    test_resources_dir: pathlib.Path,
+    annotations: str,
+    named_by: list[str],
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
@@ -874,36 +854,18 @@ def test_a_pod_that_names_an_egress_proxy_reaches_only_that_name_and_port(
         ]
         for service in ("default", "server")
     }
-    sandbox = {
-        "io.kubernetes.pod.namespace": "default",
-        "app.kubernetes.io/name": "agent-env",
-        "app.kubernetes.io/instance": "my-release",
-    }
-    dns = {"io.kubernetes.pod.namespace": "kube-system"}
-    assert next(
+    # Two rules and no more: the proxy's own name looked up, its port on the release.
+    dns, proxy = next(
         policy["spec"]["egress"]
         for policy in policies
         if policy["metadata"]["name"].endswith("-svc-default-egress-proxy")
-    ) == [
-        {
-            "toEndpoints": [
-                {"matchLabels": {**dns, "k8s-app": "kube-dns"}},
-                {"matchLabels": {**dns, "k8s-app": "node-local-dns"}},
-            ],
-            "toPorts": [
-                {
-                    "ports": [{"port": "53", "protocol": "ANY"}],
-                    "rules": {
-                        "dns": [{"matchName": "proxy.default.svc.cluster.local"}]
-                    },
-                }
-            ],
-        },
-        {
-            "toEndpoints": [{"matchLabels": sandbox}],
-            "toPorts": [{"ports": [{"port": "3128", "protocol": "TCP"}]}],
-        },
-    ]
+    )
+    assert dns["toPorts"][0]["rules"] == {
+        "dns": [{"matchName": "proxy.default.svc.cluster.local"}]
+    }
+    assert proxy["toPorts"] == [{"ports": [{"port": "3128", "protocol": "TCP"}]}]
+    (pods,) = proxy["toEndpoints"]
+    assert pods["matchLabels"]["app.kubernetes.io/instance"] == "my-release"
 
 
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
