@@ -734,8 +734,14 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     assert forwarder == {
         "name": "egress-forwarder",
         "image": "vsock-egress:1",
-        "command": ["/vsock-egress", "forward"],
+        "command": ["/vsock-egress", "forward", "-key", "/key/key"],
         "restartPolicy": "Always",
+        "startupProbe": {
+            "exec": {"command": ["/vsock-egress", "ready", "-key", "/key/key"]},
+            "periodSeconds": 1,
+            "failureThreshold": 30,
+        },
+        "volumeMounts": [{"name": "egress-forwarder-key", "mountPath": "/key"}],
         "securityContext": {
             "allowPrivilegeEscalation": False,
             "capabilities": {"drop": ["ALL"]},
@@ -749,6 +755,18 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
             },
         },
     }
+    # Its key is in a volume no other container of the pod mounts.
+    default = pods["agent-env-my-release-default"]
+    assert {
+        "name": "egress-forwarder-key",
+        "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"},
+    } in default["volumes"]
+    assert not [
+        mount
+        for container in (setup, *default["containers"])
+        for mount in container.get("volumeMounts", [])
+        if mount["name"] == "egress-forwarder-key"
+    ]
     # A pod that names no proxy has no worker on its node, so no forwarder either.
     assert "initContainers" not in pods["agent-env-my-release-server"]
 

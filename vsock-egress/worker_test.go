@@ -138,6 +138,34 @@ func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
 	}
 }
 
+func TestKeyIsFetchedOnceForAWorker(t *testing.T) {
+	key, other := newKey(), newKey()
+	target, accepted := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	dial := serve(t, w)
+	dial().Write(key)
+	select {
+	case <-accepted:
+	case <-time.After(budget):
+		t.Fatal("the forwarder's stream reached nothing")
+	}
+
+	// The forwarder has died and a workload process holds the guest's key port, with a key of its own.
+	squatted := firecracker(t, map[uint32]string{keyPort: string(other)})
+	w.mu.Lock()
+	w.vsock = squatted
+	w.mu.Unlock()
+	intruder := dial()
+	intruder.Write(other)
+	select {
+	case <-accepted:
+		t.Fatal("a stream reached the proxy with a key the worker fetched after its first")
+	case <-closed(intruder):
+	case <-time.After(budget):
+		t.Fatal("the stream was neither refused nor joined")
+	}
+}
+
 func TestProxyNamedByHostIsLookedUp(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)

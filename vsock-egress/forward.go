@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -15,7 +14,7 @@ import (
 
 // forwarder is the sandbox's side. It reads nothing of what it carries and names no destination.
 type forwarder struct {
-	key  [keySize]byte // minted at start and kept in memory: the node fetches it, and refuses a stream without it
+	key  [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
 	host uint32        // the node's CID
 	port uint32        // the node's vsock port for streams
 }
@@ -23,10 +22,13 @@ type forwarder struct {
 func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
+	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
-	runtime.GOMAXPROCS(1) // a relay waits on sockets: more threads only wake each other, on the sandbox's own CPUs
+	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
 	f := &forwarder{host: hostCID, port: streamPort}
-	rand.Read(f.key[:])
+	if err := f.loadKey(*keyFile); err != nil {
+		return err
+	}
 	keys, err := vsockListen(keyPort)
 	if err != nil {
 		return err
@@ -36,7 +38,33 @@ func forward(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
+		return err
+	}
 	return f.serve(l)
+}
+
+// readySuffix names the file beside the key that is there while the forwarder listens on both of its ports.
+const readySuffix = ".ready"
+
+// ready is the forwarder's startup probe: the kubelet can reach no port of a pod with no network device.
+func ready(args []string) error {
+	fs := flag.NewFlagSet("ready", flag.ExitOnError)
+	keyFile := fs.String("key", "", "where the forwarder keeps its key")
+	fs.Parse(args)
+	_, err := os.Stat(*keyFile + readySuffix)
+	return err
+}
+
+// loadKey takes the key from file, minting it there first if the file holds none: the worker fetches the
+// key once, so a forwarder that is restarted must come back with the same one.
+func (f *forwarder) loadKey(file string) error {
+	if kept, err := os.ReadFile(file); err == nil && len(kept) == keySize {
+		copy(f.key[:], kept)
+		return nil
+	}
+	rand.Read(f.key[:])
+	return os.WriteFile(file, f.key[:], 0o600)
 }
 
 // serveKey gives the key to each peer the kernel says is the node: a process in this VM cannot claim that CID.

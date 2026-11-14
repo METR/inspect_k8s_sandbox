@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +39,39 @@ func loopback(t *testing.T) (*vsockListener, uint32) {
 	}
 	c.Close()
 	return l, port
+}
+
+func TestRestartedForwarderKeepsItsKey(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "key")
+	var first, second, elsewhere forwarder
+	for f, file := range map[*forwarder]string{&first: file, &elsewhere: file + ".other"} {
+		if err := f.loadKey(file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := second.loadKey(file); err != nil {
+		t.Fatal(err)
+	}
+	if first.key != second.key || first.key == elsewhere.key || first.key == [keySize]byte{} {
+		t.Fatal("want one random key for each key file, the same every time the file is loaded")
+	}
+}
+
+func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	file := filepath.Join(t.TempDir(), "key")
+	os.WriteFile(file+readySuffix, nil, 0o600) // left by the forwarder before this one
+
+	if err := forward([]string{"-listen", taken.Addr().String(), "-key", file}); err == nil {
+		t.Fatal("forward returned without an error on an address that is taken")
+	}
+	if err := ready([]string{"-key", file}); err == nil {
+		t.Fatal("ready passed for a forwarder that does not listen")
+	}
 }
 
 func newForwarder(host, port uint32) *forwarder {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -25,8 +26,11 @@ const (
 
 func main() {
 	log.SetFlags(0)
+	// Each command waits on sockets, where more threads only wake each other. It also holds a sandbox's
+	// forwarder to one of its own CPUs and its worker to one of the node's.
+	runtime.GOMAXPROCS(1)
 	commands := map[string]func([]string) error{
-		"forward": forward, "canary": canary, // in the sandbox
+		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
 		"launch": launch, "check": check, // on the node
 		"work": work, "probe": probe, // started by launch and check, as a VM's uid
 	}

@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -47,7 +46,6 @@ func work(args []string) error {
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
-	runtime.GOMAXPROCS(1) // one sandbox's streams take at most one of the node's CPUs
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
@@ -133,24 +131,20 @@ func (w *worker) dial() (net.Conn, error) {
 	return c, err
 }
 
-// holds reports whether key is the forwarder's. A forwarder that restarted has a new one, so a key that does
-// not match is checked against the guest's once more, at most once a second.
+// holds reports whether key is the forwarder's, which a worker fetches once: whoever holds the guest's key
+// port later cannot give it another. Until a forwarder answers, it asks at most once a second.
 func (w *worker) holds(key []byte) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if subtle.ConstantTimeCompare(key, w.key) == 1 {
-		return true
+	if w.key == nil && time.Since(w.fetched) >= time.Second {
+		w.fetched = time.Now()
+		fetched, err := fetchKey(w.vsock)
+		if err != nil {
+			log.Print(err)
+			return false
+		}
+		w.key = fetched
 	}
-	if time.Since(w.fetched) < time.Second {
-		return false
-	}
-	w.fetched = time.Now()
-	fresh, err := fetchKey(w.vsock)
-	if err != nil {
-		log.Print(err)
-		return false
-	}
-	w.key = fresh
 	return subtle.ConstantTimeCompare(key, w.key) == 1
 }
 

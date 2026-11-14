@@ -75,8 +75,17 @@ spec:
         {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
         - name: egress-forwarder
           image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", "forward"]
+          command: ["/vsock-egress", "forward", "-key", "/key/key"]
           restartPolicy: Always
+          {{- /* The next container starts once the forwarder listens. An exec: no probe reaches a port of a pod with no network device. */}}
+          startupProbe:
+            exec:
+              command: ["/vsock-egress", "ready", "-key", "/key/key"]
+            periodSeconds: 1
+            failureThreshold: 30
+          volumeMounts:
+            - name: egress-forwarder-key
+              mountPath: /key
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -267,6 +276,13 @@ spec:
         {{- else }}
         -  {{- toYaml . | nindent 10 }}
         {{- end }}
+      {{- end }}
+      {{- if $egressProxy }}
+        {{- /* Mounted by the forwarder alone: its key outlives a restart of it, and no other container reads it. */}}
+        - name: egress-forwarder-key
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
