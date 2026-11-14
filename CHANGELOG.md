@@ -9,7 +9,8 @@
   the pod's IP and from no other pod, runs `exec()`, `read_file()`, `write_file()` and
   `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
   a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
-  and its environment holds `HAWK_NEXT_EXEC`. A timed-out `exec()` whose command is
+  its environment holds `HAWK_NEXT_EXEC`, and with no `stdin` it reads end-of-file
+  where over Kubernetes exec it waits. A timed-out `exec()` whose command is
   still running gets SIGKILL at once, not SIGTERM, and so do its background processes;
   those of a command that has ended are left running, by a closed `exec_stdio()` too.
   One that leaves the command's process group can survive, for example by clearing its
@@ -18,7 +19,9 @@
   still running lose their timeout. Make execd mode 111, except where a container runs
   on gVisor as a user other than root: execd can't start there unless it can read its
   own file. A process running as execd's user with `CAP_DAC_OVERRIDE` or
-  `CAP_DAC_READ_SEARCH` can stand in for it while it starts.
+  `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
+  against the container's limit: about 6 MB idle, and about 70 MB while eight commands
+  print 10 MiB each at once.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
