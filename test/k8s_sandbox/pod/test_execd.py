@@ -771,12 +771,50 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
         await call
-    await client._get(stale=client._link)  # the next takes the KILL, and is dead too
+    # The next connection takes the KILL, and is dead too.
+    await asyncio.wait_for(client._get(stale=client._link), 30)
     dead[1].close()  # only now does the client learn that one is gone
 
-    await client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
+
+
+async def test_a_call_left_longer_ago_than_execd_keeps_it_is_killed_no_more(
+    daemons: Daemons, clock: types.SimpleNamespace
+) -> None:
+    left: list[int] = []
+    connections: list[asyncio.StreamWriter] = []
+    later: list[int] = []
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        connections.append(w)
+        nth = len(connections)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if nth == 1 and kind == execd.START:
+                left.append(call_id)
+            elif nth > 1:
+                later.append(kind)
+                if kind == execd.RESUME:  # of the next command, if it left on the first
+                    w.write(frame(execd.ERROR, call_id, b"unknown call"))
+                elif kind == execd.START:
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(records)
+    client = daemons.client()
+    run = client.exec(["sleep", "600"], None, None, {}, None, None)
+    call = asyncio.ensure_future(run)
+    await until(lambda: bool(left))
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    clock.now += execd.ABANDONED_AFTER  # execd has ended it by itself
+    connections[0].close()
+
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    assert later and execd.KILL not in later
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])

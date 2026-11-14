@@ -491,10 +491,16 @@ class ExecdClient:
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
 
+    def _left(self) -> list[tuple[float, int]]:
+        """The calls left that execd may still be running."""
+        now = time.monotonic()
+        return [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
+
     async def _kill_left(self, link: Link) -> None:
         """KILL and RELEASE again, on each new connection, the calls lately left."""
+        self._unkilled = self._left()
         with contextlib.suppress(OSError):  # dropped again: the next one sends them
-            for _, call_id in list(self._unkilled):  # a daemon ignores ids not its own
+            for _, call_id in self._unkilled:  # a daemon ignores ids not its own
                 await link.send(KILL, call_id)
                 await link.send(RELEASE, call_id)
 
@@ -662,9 +668,7 @@ class ExecdClient:
             try:
                 if not finished:
                     # Left by its caller: stopped now, and again on each new connection.
-                    now = time.monotonic()
-                    kept = [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
-                    self._unkilled = [*kept, (now, call.id)]
+                    self._unkilled = [*self._left(), (time.monotonic(), call.id)]
                     to = link if not link.closed else self._link
                     if to is not None and not to.closed:
                         to.send_last(call.id, KILL, RELEASE)
