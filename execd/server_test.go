@@ -1080,23 +1080,6 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	}
 }
 
-func TestAKillThatComesBeforeItsCommandHasStartedStopsIt(t *testing.T) {
-	t.Cleanup(func() { killTagged("early") })
-	cl := &call{id: 30, tag: "early"}
-	cl.room = sync.NewCond(&cl.mu)
-	// It never ends by itself.
-	req := startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Tag: "early"}
-
-	cl.kill() // from another connection, while this one's START is still at work
-	if err := cl.run(req); err != nil {
-		t.Fatal(err)
-	}
-
-	if code := exitCode(t, cl); code != 137 {
-		t.Fatalf("exit %d: the kill was lost", code)
-	}
-}
-
 func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *testing.T) {
 	prctl(prSetChildSubreaper, 1) // as execd: what the command leaves running is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
