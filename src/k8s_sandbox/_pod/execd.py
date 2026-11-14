@@ -775,7 +775,7 @@ class ExecdClient:
                 "cannot switch users. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                result.stderr,
+                result.stderr[-_STDERR_TAIL_BYTES:],
             )
         return result
 
