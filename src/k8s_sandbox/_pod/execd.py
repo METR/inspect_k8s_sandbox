@@ -745,7 +745,7 @@ class ExecdClient:
                     )
         if status is None or status.get("timeout"):  # our timer's, or execd's
             raise TimeoutError(f"Command timed out after {timeout}s.")
-        code = int(status["code"])
+        code = status["code"]
         result = ExecResult(
             success=code == 0,
             returncode=code,
@@ -813,7 +813,7 @@ class ExecdClient:
             async with contextlib.aclosing(run) as chunks:
                 async for kind, payload in chunks:
                     if kind == EXIT:
-                        return int(payload["code"])
+                        return payload["code"]
                     if kind == STDERR:
                         stderr.append(payload)
                     elif dst is not None and start is not None:
