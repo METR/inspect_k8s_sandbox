@@ -1,5 +1,7 @@
 import concurrent.futures
+import contextlib
 import socket
+import threading
 from unittest.mock import MagicMock
 
 import kubernetes.client
@@ -54,11 +56,24 @@ def test_write_stdin_chunked_default_chunk_size_splits_oversized_payload() -> No
     assert len(ws.write_stdin.call_args_list[0].args[0]) == op_module.STDIN_CHUNK_SIZE
 
 
+@pytest.mark.parametrize("answers", [False, True], ids=["nothing", "without end"])
 def test_an_exec_ends_when_the_api_server_never_answers(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, answers: bool
 ) -> None:
-    """Regression: its websocket connected with no timeout, and its thread waited."""
-    silent = socket.create_server(("127.0.0.1", 0))  # takes a connection, says nothing
+    """Regressions: its websocket connected with no timeout; then with one a byte."""
+    silent = socket.create_server(("127.0.0.1", 0))  # takes a connection
+    taken: list[socket.socket] = []
+
+    def answer() -> None:
+        connection, _ = silent.accept()
+        taken.append(connection)
+        with contextlib.suppress(OSError):  # until the client, or the test, ends it
+            while True:
+                connection.sendall(b"H" * 65536)  # one header line: no read ever waits
+
+    server = threading.Thread(target=answer, daemon=True)
+    if answers:
+        server.start()
     host = f"http://127.0.0.1:{silent.getsockname()[1]}"
     configuration = kubernetes.client.Configuration(host=host)
     api = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
@@ -73,5 +88,11 @@ def test_an_exec_ends_when_the_api_server_never_answers(
         with pytest.raises(kubernetes.client.exceptions.ApiException):
             exec_.result(timeout=30)  # only bounds a hang
     finally:
+        for connection in taken:
+            with contextlib.suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+            connection.close()
         silent.close()  # resets the connection, so a thread still waiting ends
         pool.shutdown(wait=False)
+        if answers:
+            server.join(30)
