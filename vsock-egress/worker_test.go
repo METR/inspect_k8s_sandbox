@@ -230,6 +230,44 @@ func TestStreamPastTheCapIsRefused(t *testing.T) {
 	}
 }
 
+func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
+	asleep, wake := make(chan struct{}, 1), make(chan struct{})
+	t.Cleanup(func() { close(wake) })
+	key := newKey()
+	target, accepted := proxy(t)
+	// Slow enough that one byte waits: the stream's goroutine sleeps in the pacer, holding its buffer.
+	pace := &pacer{rate: 1, now: time.Now, sleep: func(time.Duration) {
+		asleep <- struct{}{}
+		<-wake
+	}}
+	dial := served(t, key, target, pace)
+
+	cancelled := dial()
+	cancelled.Write(key)
+	up := <-accepted
+	up.Write([]byte("reply"))
+	<-asleep
+	cancelled.Close()
+	up.SetDeadline(time.Now().Add(budget))
+	io.Copy(io.Discard, up) // the worker has seen the cancel once it closes the proxy's connection
+
+	admitted := 0
+	for range maxStreams {
+		c := dial()
+		c.Write(key)
+		select {
+		case <-accepted:
+			admitted++
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream was neither refused nor joined")
+		}
+	}
+	if admitted != maxStreams-1 {
+		t.Fatalf("%d streams were let in beside one that had not stopped: want %d", admitted, maxStreams-1)
+	}
+}
+
 func TestWorkerHoldsItsStreamsToTheRate(t *testing.T) {
 	var mu sync.Mutex
 	clock, slept := time.Unix(0, 0), time.Duration(0)

@@ -82,6 +82,27 @@ func TestStreamCutShortIsNotACleanEnd(t *testing.T) {
 	}
 }
 
+func TestPeerThatGoesAwayAfterItsLastFrameEndsTheStream(t *testing.T) {
+	onNode, proxy := tcpPair(t)
+	guest, node := vsockPair(t)
+	ended := make(chan struct{})
+	go func() {
+		join(node, onNode, nil)
+		close(ended)
+	}()
+
+	guest.Write([]byte{0, 0, 0, 0}) // the guest's side has ended
+	if got, err := io.ReadAll(proxy); len(got) != 0 || err != nil {
+		t.Fatalf("the proxy read %q, %v: want the end of the request", got, err)
+	}
+	guest.Close() // and now the guest has gone, while the proxy says nothing
+	select {
+	case <-ended:
+	case <-time.After(budget):
+		t.Fatal("the stream outlived its vsock connection: it would hold its slot until the proxy gave up")
+	}
+}
+
 func TestFrameLongerThanTheBoundIsRefused(t *testing.T) {
 	long := binary.BigEndian.AppendUint32(nil, maxFrame+1)
 	if err := fromFrames(io.Discard, bytes.NewReader(long), nil); !errors.Is(err, errFrame) {

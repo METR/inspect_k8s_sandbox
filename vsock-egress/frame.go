@@ -23,26 +23,50 @@ var (
 
 // join carries one TCP connection over a vsock connection, as frames. Firecracker passes no half-close on,
 // so each direction ends with an empty frame and the vsock connection closes only when both have ended.
-// A stream cut short reaches the TCP peer as a reset, never as a clean end.
+// A stream cut short reaches the TCP peer as a reset, never as a clean end. Both directions have stopped,
+// and let go of their buffers, before join returns.
 func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
-	ended := make(chan error, 2)
-	go func() { ended <- toFrames(vsock, tcp, pace) }()
+	var running sync.WaitGroup
+	sent, received, gone := make(chan error, 1), make(chan error, 1), make(chan struct{})
+	running.Add(2)
 	go func() {
+		defer running.Done()
+		sent <- toFrames(vsock, tcp, pace)
+	}()
+	go func() {
+		defer running.Done()
 		err := fromFrames(tcp, vsock, pace)
 		if err == nil {
 			err = tcp.CloseWrite()
 		}
-		ended <- err
+		received <- err
+		if err == nil {
+			vsock.Read(make([]byte, 1)) // nothing follows the last frame: this returns when the vsock closes
+			close(gone)
+		}
 	}()
-	err := <-ended
-	if err == nil {
-		err = <-ended
+	var err error
+	select {
+	case err = <-sent:
+		if err == nil {
+			err = <-received
+		}
+	case err = <-received:
+		if err == nil {
+			select {
+			case err = <-sent:
+			case <-gone: // the peer has gone, unless this side's last frame had just reached it
+				tcp.SetReadDeadline(time.Now())
+				err = <-sent
+			}
+		}
 	}
 	if err != nil {
 		tcp.SetLinger(0)
 	}
 	tcp.Close()
 	vsock.Close()
+	running.Wait()
 }
 
 // toFrames copies src to dst as frames, each a 4-byte length and that many bytes, then an empty frame.
