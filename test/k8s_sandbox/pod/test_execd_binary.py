@@ -256,7 +256,8 @@ async def test_a_connection_from_the_sandbox_itself_is_closed(
 async def test_another_users_process_is_refused_at_execds_socket(
     execs: Execs, stdio_client: execd.ExecdClient
 ) -> None:
-    await stdio_client.exec(["true"], None, None, {}, None, None)  # execd runs
+    call = stdio_client.exec(["true"], None, None, {}, None, None)  # execd runs
+    await asyncio.wait_for(call, 30)  # only bounds a hang
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
     theirs = await execs.connect("-u", "65534")
