@@ -730,9 +730,7 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
     }
 
 
-_EGRESS_PROXY = (
-    "services.default.podAnnotations.inspect-k8s-sandbox/egress-proxy=10.0.0.9:3128"
-)
+_EGRESS_PROXY = "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local.:3128"
 
 
 def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
@@ -744,7 +742,7 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
         "egressForwarderImage=vsock-egress:1,"
         "services.default.initContainers[0].name=setup,"
         "services.default.initContainers[0].image=busybox",
-        _EGRESS_PROXY,
+        f"services.default.podAnnotations.{_EGRESS_PROXY}",
     )
 
     pods = {
@@ -810,8 +808,96 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
 
 def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _run_helm_template(chart_dir, set_string=_EGRESS_PROXY)
+        _run_helm_template(
+            chart_dir, set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}"
+        )
     assert "egressForwarderImage" in exc_info.value.stderr
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        pytest.param("10.0.0.9:3128", id="an address"),
+        pytest.param("proxy.other.svc.cluster.local:3128", id="another namespace"),
+        pytest.param("proxy.default.svc.cluster.local", id="no port"),
+    ],
+)
+def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
+    chart_dir: Path, proxy: str
+) -> None:
+    # The node's vsock-egress refuses these, and the pod's policy is cut from the name.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1",
+            set_string="services.default.podAnnotations."
+            f"inspect-k8s-sandbox/egress-proxy={proxy}",
+        )
+    assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
+
+
+@pytest.mark.parametrize(
+    ("annotations", "named_by"),
+    [
+        pytest.param("services.default.podAnnotations", ["default"], id="a service"),
+        pytest.param("annotations", ["default", "server"], id="every pod"),
+    ],
+)
+def test_a_pod_that_names_an_egress_proxy_reaches_only_that_name_and_port(
+    chart_dir: Path, test_resources_dir: Path, annotations: str, named_by: list[str]
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "egressForwarderImage=vsock-egress:1",
+        f"{annotations}.{_EGRESS_PROXY}",
+    )
+
+    policies = _get_documents(documents, "CiliumNetworkPolicy")
+    # Every egress policy that selects each pod: with none, Cilium allows all egress.
+    assert {
+        service: [
+            policy["metadata"]["name"].removeprefix("agent-env-my-release-")
+            for policy in policies
+            if "egress" in policy["spec"] and _selects(policy, service)
+        ]
+        for service in ("default", "server")
+    } == {
+        service: [
+            f"svc-{service}-egress-proxy" if service in named_by else "sandbox-egress"
+        ]
+        for service in ("default", "server")
+    }
+    sandbox = {
+        "io.kubernetes.pod.namespace": "default",
+        "app.kubernetes.io/name": "agent-env",
+        "app.kubernetes.io/instance": "my-release",
+    }
+    dns = {"io.kubernetes.pod.namespace": "kube-system"}
+    assert next(
+        policy["spec"]["egress"]
+        for policy in policies
+        if policy["metadata"]["name"].endswith("-svc-default-egress-proxy")
+    ) == [
+        {
+            "toEndpoints": [
+                {"matchLabels": {**dns, "k8s-app": "kube-dns"}},
+                {"matchLabels": {**dns, "k8s-app": "node-local-dns"}},
+            ],
+            "toPorts": [
+                {
+                    "ports": [{"port": "53", "protocol": "ANY"}],
+                    "rules": {
+                        "dns": [{"matchName": "proxy.default.svc.cluster.local"}]
+                    },
+                }
+            ],
+        },
+        {
+            "toEndpoints": [{"matchLabels": sandbox}],
+            "toPorts": [{"ports": [{"port": "3128", "protocol": "TCP"}]}],
+        },
+    ]
 
 
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
@@ -1202,6 +1288,16 @@ def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -
     """
     service_label = match_labels.get("inspect/service")
     return service_label is None or service_label == service_name
+
+
+def _selects(policy: dict[str, Any], service_name: str) -> bool:
+    """Whether a policy's endpointSelector selects `service_name`'s pod."""
+    selector = policy["spec"]["endpointSelector"]
+    return _selector_matches_service(selector["matchLabels"], service_name) and all(
+        expression["key"] == "inspect/service"
+        and (service_name in expression["values"]) == (expression["operator"] == "In")
+        for expression in selector.get("matchExpressions", [])
+    )
 
 
 def _assert_isolated(cnps: list[dict[str, Any]], service_name: str) -> None:

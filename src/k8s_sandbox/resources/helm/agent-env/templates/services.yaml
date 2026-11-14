@@ -42,9 +42,9 @@ spec:
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
-      {{- /* A template here can name a Service of this release, whose name no values file knows. */}}
-      {{- with get $podAnnotations "inspect-k8s-sandbox/egress-proxy" }}
-      {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" (tpl . $) }}
+      {{- $egressProxy := include "agentEnv.egressProxy" (dict "root" $ "service" $service) }}
+      {{- if $egressProxy }}
+      {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
       {{- end }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
@@ -78,7 +78,6 @@ spec:
             - {{ printf "%s-%s" (include "agentEnv.fullname" $) $name | quote }}
       {{- end }}
 
-      {{- $egressProxy := get $podAnnotations "inspect-k8s-sandbox/egress-proxy" }}
       {{- if or $service.initContainers $egressProxy }}
       initContainers:
       {{- if $egressProxy }}

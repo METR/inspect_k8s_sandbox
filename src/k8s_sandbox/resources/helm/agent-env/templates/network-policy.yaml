@@ -12,6 +12,11 @@
 {{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
 {{- end }}
 {{- else -}}
+{{- /* A pod that names an egress proxy takes the last policy of this file in place of sandbox-egress. */}}
+{{- $egressProxies := dict }}
+{{- range $svcName, $svc := .Values.services }}
+{{- with include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $_ := set $egressProxies $svcName . }}{{ end }}
+{{- end -}}
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -34,6 +39,12 @@ spec:
     matchLabels:
       io.kubernetes.pod.namespace: {{ .Release.Namespace }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+    {{- with keys $egressProxies | sortAlpha }}
+    matchExpressions:
+      - key: inspect/service
+        operator: NotIn
+        values: {{ toJson . }}
+    {{- end }}
   egress:
     - toEndpoints:
       - matchLabels:
@@ -276,5 +287,48 @@ spec:
     - toEntities:
         - all
 {{- end }}
+{{- end }}
+{{- range $svcName, $proxy := $egressProxies }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-egress-proxy
+  annotations:
+    {{- toYaml $.Values.annotations | nindent 4 }}
+  labels:
+    {{- toYaml $.Values.labels | nindent 4 }}
+spec:
+  description: |
+    Service "{{ $svcName }}" names an egress proxy: its pod reaches only that name's
+    DNS record and the proxy's port on the pods of this sandbox.
+  endpointSelector:
+    matchLabels:
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+      inspect/service: {{ $svcName }}
+  egress:
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: kube-system
+          k8s-app: kube-dns
+      - matchLabels:
+          io.kubernetes.pod.namespace: kube-system
+          k8s-app: node-local-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
+      toPorts:
+        - ports:
+            - port: {{ regexFind "[0-9]+$" $proxy | quote }}
+              protocol: TCP
 {{- end }}
 {{- end }}
