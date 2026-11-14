@@ -72,6 +72,9 @@
         "pattern": "^[a-z0-9](?:[-a-z0-9.]{0,53}[a-z0-9])?$"
       }
     },
+    "egressForwarderImage": {
+      "type": "string"
+    },
     "corednsImage": {
       "type": "string"
     },

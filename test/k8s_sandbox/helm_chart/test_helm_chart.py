@@ -707,6 +707,58 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
     }
 
 
+_EGRESS_PROXY = (
+    "services.default.podAnnotations.inspect-k8s-sandbox/egress-proxy=10.0.0.9:3128"
+)
+
+
+def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "egressForwarderImage=vsock-egress:1,"
+        "services.default.initContainers[0].name=setup,"
+        "services.default.initContainers[0].image=busybox",
+        _EGRESS_PROXY,
+    )
+
+    pods = {
+        stateful_set["metadata"]["name"]: stateful_set["spec"]["template"]["spec"]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    }
+    # A sidecar: started before `setup` and the service, restarted if it ends.
+    forwarder, setup = pods["agent-env-my-release-default"]["initContainers"]
+    assert setup["name"] == "setup"
+    assert forwarder == {
+        "name": "egress-forwarder",
+        "image": "vsock-egress:1",
+        "command": ["/vsock-egress", "forward"],
+        "restartPolicy": "Always",
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+            "readOnlyRootFilesystem": True,
+            "runAsGroup": 65532,
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+            "seccompProfile": {
+                "type": "Localhost",
+                "localhostProfile": "profiles/vsock-egress.json",
+            },
+        },
+    }
+    # A pod that names no proxy has no worker on its node, so no forwarder either.
+    assert "initContainers" not in pods["agent-env-my-release-server"]
+
+
+def test_egress_proxy_annotation_needs_the_forwarder_image(chart_dir: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_string=_EGRESS_PROXY)
+    assert "egressForwarderImage" in exc_info.value.stderr
+
+
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
     documents = _run_helm_template(
         chart_dir,

@@ -64,8 +64,28 @@ spec:
           - 127.0.0.1
       {{- end }}
 
-      {{- if $service.initContainers }}
+      {{- $egressProxy := get $podAnnotations "inspect-k8s-sandbox/egress-proxy" }}
+      {{- if or $service.initContainers $egressProxy }}
       initContainers:
+      {{- if $egressProxy }}
+        {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
+        - name: egress-forwarder
+          image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
+          command: ["/vsock-egress", "forward"]
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            {{- /* The runtime's default profile refuses the one thing the forwarder needs, socket(AF_VSOCK). */}}
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/vsock-egress.json
+      {{- end }}
       {{- range $service.initContainers }}
         - name: {{ .name }}
           image: {{ .image }}
