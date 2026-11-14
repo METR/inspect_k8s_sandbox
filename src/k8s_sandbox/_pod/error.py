@@ -29,6 +29,10 @@ class ExecdResultUnknownError(ExecResultUnknownError):
     """execd could not resume the command's call, which is never sent again."""
 
 
+class ExecdStoppedError(ExecdResultUnknownError):
+    """execd stopped under an operation, perhaps with its container."""
+
+
 class ContainerStoppedError(ExecResultUnknownError):
     """An operation's container stopped under it."""
 
