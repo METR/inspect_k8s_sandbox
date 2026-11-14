@@ -817,10 +817,11 @@ async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
     starts: list[int] = []
     killed: list[int] = []
     released: list[int] = []
+    pings = 0
     drop = False  # the connection, under the next command sent
 
     async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal drop
+        nonlocal drop, pings
         connections.append(w)
         second = len(connections) == 2
         while True:
@@ -835,6 +836,8 @@ async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
                 w.write(frame(execd.ERROR, call_id, b"unknown call"))
             elif kind == execd.KILL:
                 killed.append(call_id)
+            elif kind == execd.PING:
+                pings += 1
             elif kind == execd.RELEASE and second:
                 released.append(call_id)
         drop = False
@@ -862,6 +865,7 @@ async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
         await asyncio.wait_for(left, 30)
     await until(lambda: starts[1] in killed)
     waited = len(starts) == 2 + 2 * half
+    await until(lambda: pings == 4)  # the halves', the refused command's, and its own
     # One PONG; then the first command's exit, behind which the client has read it.
     exit_ = frame(execd.EXIT, starts[0], b'{"code": 0}')
     connections[0].write(frame(execd.PONG, 0) + exit_)

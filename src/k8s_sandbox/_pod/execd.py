@@ -572,14 +572,17 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
-        end = time.monotonic() + CONNECT_TIMEOUT
-        while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
+        while len(self._owed) >= MAX_OWED:
             if not link.closed:  # else it is set for good, and the next one is opened
                 link.confirmed.clear()
             try:
-                await asyncio.wait_for(link.confirmed.wait(), end - time.monotonic())
+                # Its own PING, behind what is queued: the wait starts once it is out.
+                await link.send(PING, 0)
+                await asyncio.wait_for(link.confirmed.wait(), CONNECT_TIMEOUT)
             except asyncio.TimeoutError:  # a peer that answers no PING is not execd
                 raise ConnectionError("execd has not confirmed its calls") from None
+            except OSError:  # closed under the PING: the next one is opened
+                pass
             link = await self._get()
         deadline = None if timeout is None else time.monotonic() + timeout
 
