@@ -74,13 +74,13 @@ k -n "$NS" get pod "$SANDBOX" -o jsonpath='{range .spec.initContainers[*]}{.name
 k -n "$LNS" get pod "$(launcher)" -o jsonpath='{.spec.containers[0].securityContext}' | grep -q '"localhostProfile":"profiles/vsock-egress-launcher.json"' \
   && pass "the launcher runs under profiles/vsock-egress-launcher.json" || fail "the launcher is not under profiles/vsock-egress-launcher.json"
 
-# A pod on that node, beside the runtime: it lists the VM directories and the node's processes, and can change neither.
+# A pod on that node, beside the runtime: it lists the VM directories and the node's processes as uid 65533, which is no reaper's and can signal none of them.
 cat <<EOF | k -n "$NS" apply -f - > /dev/null
 {"apiVersion":"v1","kind":"Pod","metadata":{"name":"$REL-peek","labels":$LABELS},
  "spec":{"nodeName":"$node","hostPID":true,"restartPolicy":"Never","terminationGracePeriodSeconds":1,"automountServiceAccountToken":false,
   "tolerations":[{"operator":"Exists"}],
   "containers":[{"name":"peek","image":"public.ecr.aws/docker/library/busybox:1.38-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6","command":["sleep","3600"],
-   "securityContext":{"runAsUser":65534,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
+   "securityContext":{"runAsUser":65533,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
    "volumeMounts":[{"name":"vms","mountPath":"/vms","readOnly":true}]}],
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
