@@ -1,0 +1,24 @@
+name: Test vsock-egress using Go
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vsock-egress
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: vsock-egress/go.sum
+      - run: sudo modprobe vsock_loopback || true  # without it the forwarder's tests skip
+      - run: go vet ./... && go test ./...
+      # As root, from a directory any uid can reach: the launcher's test starts a worker as another uid.
+      - run: mkdir -m 755 /tmp/ve && go test -c -o /tmp/ve/vsock-egress.test . && sudo /tmp/ve/vsock-egress.test
