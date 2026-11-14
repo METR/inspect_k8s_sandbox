@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"flag"
@@ -69,7 +70,9 @@ func (f *forwarder) capture(namesFile string, own []string) (err error) {
 	if f.names, err = loadNames(namesFile, own); err != nil {
 		return err
 	}
-	redirected, err := net.Listen("tcp4", captureAddr)
+	var plain net.ListenConfig
+	plain.SetMultipathTCP(false) // Go listens with MPTCP unless told, and such a connection does not say where it was going
+	redirected, err := plain.Listen(context.Background(), "tcp4", captureAddr)
 	if err != nil {
 		return err
 	}

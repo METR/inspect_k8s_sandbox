@@ -36,7 +36,7 @@ type names struct {
 }
 
 func loadNames(file string, own []string) (*names, error) {
-	n := &names{own: map[string]bool{}, byName: map[string]int{}}
+	n := &names{own: map[string]bool{"localhost": true}, byName: map[string]int{}}
 	for _, name := range own {
 		n.own[strings.ToLower(strings.TrimSuffix(name, "."))] = true
 	}

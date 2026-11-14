@@ -154,7 +154,7 @@ func TestLookupGetsTheNamesAddressAndNoIPv6(t *testing.T) {
 
 func TestLookupOfThePodsOwnNameLeadsToThePod(t *testing.T) {
 	n := loadedNames(t, filepath.Join(t.TempDir(), "names"), "default", "agent-env-x-default")
-	for _, name := range []string{"default.", "Agent-Env-X-Default."} {
+	for _, name := range []string{"default.", "Agent-Env-X-Default.", "localhost."} {
 		h, answers := asked(t, n, name, dnsmessage.TypeA)
 		if h.RCode != dnsmessage.RCodeSuccess || len(answers) != 1 || answers[0].Body.(*dnsmessage.AResource).A != [4]byte{127, 0, 0, 1} {
 			t.Fatalf("%s got %v and %v: want 127.0.0.1", name, h.RCode, answers)
@@ -190,6 +190,11 @@ func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 
 	unwritten := loadedNames(t, filepath.Join(t.TempDir(), "names"))
 	unwritten.kept.Close()
+	var err error
+	if unwritten.kept, err = os.OpenFile("/dev/full", os.O_WRONLY, 0); err != nil { // a volume with no room left
+		t.Fatal(err)
+	}
+	defer unwritten.kept.Close()
 	if h, answers := asked(t, unwritten, "pypi.org.", dnsmessage.TypeA); h.RCode != dnsmessage.RCodeServerFailure || len(answers) != 0 || len(unwritten.list) != 0 {
 		t.Fatalf("a name that could not be written down got %v and %d answers: its address would not outlast a restart", h.RCode, len(answers))
 	}
@@ -331,9 +336,11 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		t.Fatalf("a lookup at port 53 got %v, %v: want the forwarder's answer", got, err)
 	}
 	pypi := netip.AddrPortFrom(got[0], 8443).String()
-	// connected is a program's connection to an address, and the first thing it reads there.
+	// connected is a program's connection to an address, and the first thing it reads there. It asks for MPTCP, as some do.
+	program := net.Dialer{Timeout: budget}
+	program.SetMultipathTCP(true)
 	connected := func(to string, read []byte) (net.Conn, int, error) {
-		c, err := net.DialTimeout("tcp4", to, budget)
+		c, err := program.Dial("tcp4", to)
 		if err != nil { // a connection the forwarder resets at once may learn of it here
 			return nil, 0, err
 		}
