@@ -581,16 +581,29 @@ async def test_a_timed_out_call_is_released_with_no_exit(
     await asyncio.wait_for(released.wait(), 5)
 
 
-async def test_a_command_execd_killed_at_its_timeout_raises(daemons: Daemons) -> None:
+async def test_a_command_execd_killed_at_its_timeout_raises(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> None:
+    context, pin = tls
+
     async def times_out(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
         _, call_id, _ = await read_frame(r)  # START
         w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
+        await r.read()
 
-    await daemons.serve(times_out)
+    server = await asyncio.start_server(times_out, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
     with pytest.raises(TimeoutError, match="Command timed out after 60s"):
-        await asyncio.wait_for(  # well inside the client's own timeout
-            daemons.client().exec(["sleep", "99"], None, None, {}, None, 60), 30
+        await asyncio.wait_for(
+            execd.ExecdClient(start).exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
+    server.close()
 
 
 async def test_a_failed_restart_after_start_is_not_retryable(
