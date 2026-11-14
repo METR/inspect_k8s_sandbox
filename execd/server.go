@@ -54,6 +54,7 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
+	kmu sync.Mutex // guards pid, status, as and killed: a kill must not wait for mu, which output holds through a write to a stalled connection
 	pid int
 	// where the reaper sends its command's exit status: registered until then, so the id is still the command's
 	status chan int
@@ -419,10 +420,10 @@ func (cl *call) run(req startRequest) error {
 	}
 	exited := reaper.watch(p.Pid)
 	reaper.mu.Unlock()
-	cl.mu.Lock()
+	cl.kmu.Lock()
 	cl.pid, cl.as, cl.status = p.Pid, as, exited // before Release, which sets it to -1
 	killed := cl.killed
-	cl.mu.Unlock()
+	cl.kmu.Unlock()
 	if killed { // while it started: that holds even if it has ended since, for what it left running too
 		reaper.mu.Lock()
 		if ch, taken := reaper.waiting[p.Pid]; !taken || ch == exited { // not another command's id by now
@@ -466,8 +467,10 @@ func (cl *call) run(req startRequest) error {
 		if stdinW != nil {
 			stdinW.Close() // or its writer waits for ever on what the command left holding its stdin
 		}
-		cl.mu.Lock()
+		cl.kmu.Lock()
 		cl.pid = 0 // reaped: its id may now be another group's
+		cl.kmu.Unlock()
+		cl.mu.Lock()
 		// Not a command that ended by itself as its timer fired: the kill found it gone.
 		cl.timedOut = deadline != nil && !deadline.Stop() && code == 128+int(syscall.SIGKILL)
 		cl.mu.Unlock()
@@ -663,10 +666,10 @@ func (cl *call) ackLocked(req resumeRequest) {
 
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() {
-	cl.mu.Lock()
+	cl.kmu.Lock()
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
-	cl.mu.Unlock()
+	cl.kmu.Unlock()
 	var ended [128]byte // a siginfo_t: waitid sets its first field while the child has exited and is not yet reaped
 	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.

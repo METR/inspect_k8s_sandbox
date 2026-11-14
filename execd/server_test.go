@@ -355,9 +355,9 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 	s.authenticated(c)
 	s.dispatch(c, frame{kind: fStart, id: 8, payload: req})
 	cl := s.get(8)
-	cl.mu.Lock()
+	cl.kmu.Lock()
 	pid := cl.pid
-	cl.mu.Unlock()
+	cl.kmu.Unlock()
 	reaper.mu.Lock() // the command ends, and execd has yet to note it
 	noted := sync.OnceFunc(reaper.mu.Unlock)
 	t.Cleanup(noted)
@@ -377,6 +377,32 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 
 	if status := exitStatus(t, frames); status["code"] != 3.0 || status["timeout"] != nil {
 		t.Fatalf("EXIT %v, want code 3 and no timeout", status)
+	}
+}
+
+func TestATimeoutKillsACommandWhoseOutputWaitsOnAStalledConnection(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	t.Cleanup(func() { killTagged("stalled") })
+	ours, theirs := net.Pipe() // nobody reads theirs: a write to it waits, as to a partitioned network
+	t.Cleanup(func() { ours.Close(); theirs.Close() })
+	c := &conn{nc: ours, dead: make(chan struct{})}
+	s.authenticated(c)
+	alive := filepath.Join(t.TempDir(), "alive")
+	// It prints, so execd's write of that waits, holding the call; then it keeps putting a file back.
+	script := `echo x; while :; do : >"$0"; sleep 0.01; done`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, alive}, Env: map[string]string{}, Tag: "stalled", Timeout: 0.2})
+
+	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
+
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		os.Remove(alive)
+		time.Sleep(100 * time.Millisecond)
+		if _, err := os.Stat(alive); err != nil && time.Until(deadline) < 29*time.Second {
+			return // past its timeout, and nothing puts the file back
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command outlived its timeout: its kill waited for the write of its output")
+		}
 	}
 }
 
@@ -927,9 +953,9 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
-	cl.kill()    // from another connection, while this one's START is still at work
-	cl.mu.Lock() // and stays at work: the command has ended before the START can note its id
-	noted := sync.OnceFunc(cl.mu.Unlock)
+	cl.kill()     // from another connection, while this one's START is still at work
+	cl.kmu.Lock() // and stays at work: the command has ended before the START can note its id
+	noted := sync.OnceFunc(cl.kmu.Unlock)
 	t.Cleanup(noted)
 	started := make(chan error, 1)
 	go func() { started <- cl.run(req) }()
@@ -975,9 +1001,9 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	cl.output(0, make([]byte, maxUnacked+1)) // all that execd holds for a client: what it prints now waits, and its exit with that
 	os.WriteFile(alive+".go", nil, 0o644)
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		cl.mu.Lock()
+		cl.kmu.Lock()
 		ended := cl.pid == 0
-		cl.mu.Unlock()
+		cl.kmu.Unlock()
 		if ended {
 			break
 		}
@@ -1008,10 +1034,10 @@ func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.
 	s.start(testConn(t), frame{kind: fStart, id: 32, payload: req})
 	other := s.get(32)
 	t.Cleanup(other.kill)
-	other.mu.Lock()
+	other.kmu.Lock()
 	// A call whose command was reaped, its end not yet noted: the id it still holds is another command's by now.
 	cl := &call{id: 37, tag: "reaped", pid: other.pid, status: make(chan int, 1)}
-	other.mu.Unlock()
+	other.kmu.Unlock()
 
 	cl.kill()
 
@@ -1079,9 +1105,9 @@ func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *tes
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Tag: "unreaped"})
 	s.start(testConn(t), frame{kind: fStart, id: 34, payload: req})
 	cl := s.get(34)
-	cl.mu.Lock()
+	cl.kmu.Lock()
 	pid := cl.pid
-	cl.mu.Unlock()
+	cl.kmu.Unlock()
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 		if strings.Contains(string(stat), ") Z ") {
