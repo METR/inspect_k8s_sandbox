@@ -64,17 +64,18 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 func id(c string) string { return strings.Repeat(c, 64) }
 
 func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
-	proxied := map[string]string{proxyAnnotation: "10.0.0.9:3128"}
+	proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}
 	for name, tc := range map[string]struct {
 		ifName      string
 		annotations map[string]string
 		uid         int // of the VM's directory, where the test can choose it: as root
 		wanted      bool
 	}{
-		"a proxy by address":              {"eth0", proxied, vmUID, true},
-		"a proxy by name":                 {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}, vmUID, true},
+		"a Service of its namespace":      {"eth0", proxied, vmUID, true},
+		"an address":                      {"eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID, false},
+		"a Service of another namespace":  {"eth0", map[string]string{proxyAnnotation: "proxy.other.svc.cluster.local:3128"}, vmUID, false},
 		"no proxy":                        {"eth0", map[string]string{"other": "annotation"}, vmUID, false},
-		"more than host:port":             {"eth0", map[string]string{proxyAnnotation: "http://10.0.0.9:3128 -rate=1"}, vmUID, false},
+		"more than a name and a port":     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128 -rate=1"}, vmUID, false},
 		"the loopback interface's record": {"lo", proxied, vmUID, false},
 		"a VM directory that is root's":   {"eth0", proxied, 0, false},
 	} {
@@ -103,7 +104,7 @@ func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 
 func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 	l := fakeNode(t)
-	addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID)
+	addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
 	addSandbox(t, l, id("b"), "eth0", nil, vmUID) // names no proxy, and runs as the same uid
 	wanted, err := l.wanted()
 	if err != nil {
@@ -189,7 +190,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	}
 	l := fakeNode(t)
 	l.netns = podNetns(t)
-	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "127.0.0.1:9"}, vmUID)
+	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
 			w.end()

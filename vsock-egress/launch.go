@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,8 +23,9 @@ import (
 // proxyAnnotation names, as host:port, the one place a sandbox's streams are joined to: its sample's egress proxy.
 const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
 
-// A proxy is an address or a DNS name, and a port: nothing else reaches a worker's command line.
-var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?\.?:[0-9]{1,5}$`)
+// A proxy is a Service of the pod's own namespace, by its cluster name, and a port: a Service keeps its
+// address when its pod is replaced, and nothing else reaches a worker's command line.
+var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:[0-9]{1,5}$`)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
 type node struct {
@@ -244,8 +246,8 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 			continue
 		}
 		sb, err := l.sandbox(r)
-		if err == nil && !proxyTarget.MatchString(sb.target) {
-			err = fmt.Errorf("its annotation %s is %q, not host:port", proxyAnnotation, sb.target)
+		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0]) {
+			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port>", proxyAnnotation, sb.target)
 		}
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
