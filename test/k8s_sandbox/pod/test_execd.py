@@ -728,6 +728,44 @@ async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     await task
 
 
+async def test_a_commands_timeout_bounds_its_start_behind_a_blocked_write(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: another call's write to a peer that stopped reading held it 43 s."""
+    blocked = asyncio.Event()
+
+    class Stuck(Plain):
+        async def write(self, data: bytes) -> None:
+            if len(data) > execd.CHUNK:  # the upload's stdin: its peer won't read it
+                blocked.set()
+                await asyncio.Event().wait()
+            await super().write(data)
+
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
+        return Stuck(r, w)
+
+    async def answers_nothing(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await r.read()
+
+    monkeypatch.setattr(execd, "_connect", connect)
+    await daemons.serve(answers_nothing)
+    sandbox = daemons.client()
+    stdin = b"x" * execd.CHUNK
+    upload = asyncio.ensure_future(sandbox.exec(["cat"], stdin, None, {}, None, None))
+    await asyncio.wait_for(blocked.wait(), 30)
+
+    async def times_out() -> None:
+        with pytest.raises(TimeoutError):
+            await sandbox.exec(["true"], None, None, {}, None, 1)
+
+    task = asyncio.ensure_future(times_out())
+    done, _ = await asyncio.wait({task}, timeout=30)
+    upload.cancel()
+    assert done, "the blocked write held up another command's START past its timeout"
+    await task
+
+
 async def test_a_timed_out_call_frees_what_execd_holds(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -558,8 +558,11 @@ class ExecdClient:
         try:
             try:
                 try:
-                    await link.send(START, call.id, start)
+                    await asyncio.wait_for(link.send(START, call.id, start), timeout)
                 except NotSent:
+                    raise
+                except asyncio.TimeoutError:  # behind a write its peer won't read
+                    await link.close()
                     raise
                 except OSError:  # it may have left: the resume asks execd
                     call.queue.put_nowait(Dropped(link))
