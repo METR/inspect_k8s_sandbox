@@ -395,9 +395,10 @@ class TestExecStdioRetry:
     async def test_transient_error_is_retried(self) -> None:
         sandbox, mock_pod = _make_sandbox()
         stream = MagicMock()
-        mock_pod.exec_stdio = AsyncMock(
-            side_effect=[ApiException(status=503, reason="Unavailable"), stream]
-        )
+        mock_pod.exec_stdio.side_effect = [
+            ApiException(status=503, reason="Unavailable"),
+            stream,
+        ]
 
         opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
@@ -408,11 +409,9 @@ class TestExecStdioRetry:
         """Nothing checks the pod again while the stream lasts."""
         sandbox, mock_pod = _make_sandbox()
         stream = AsyncMock()
-        mock_pod.exec_stdio = AsyncMock(return_value=stream)
-        mock_pod.check_for_pod_restart = AsyncMock(
-            side_effect=PodReplacedError(
-                pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
-            )
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = PodReplacedError(
+            pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
         )
 
         with pytest.raises(K8sError) as error:
@@ -424,8 +423,8 @@ class TestExecStdioRetry:
     async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
         sandbox, mock_pod = _make_sandbox()
         stream = AsyncMock()
-        mock_pod.exec_stdio = AsyncMock(return_value=stream)
-        mock_pod.check_for_pod_restart = AsyncMock(side_effect=anyio.Event().wait)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = anyio.Event().wait
 
         with anyio.fail_after(30):
             async with anyio.create_task_group() as tasks:
@@ -438,10 +437,11 @@ class TestExecStdioRetry:
     async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
         sandbox, mock_pod = _make_sandbox()
         stream = MagicMock()
-        mock_pod.exec_stdio = AsyncMock(return_value=stream)
-        mock_pod.check_for_pod_restart = AsyncMock(
-            side_effect=[ApiException(status=503, reason="Unavailable"), None]
-        )
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = [
+            ApiException(status=503, reason="Unavailable"),
+            None,
+        ]
 
         await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
@@ -453,7 +453,6 @@ class TestExecStdioRetry:
     ) -> None:
         sandbox, mock_pod = _make_sandbox()
         sandbox._config = MagicMock(default_user="agent")
-        mock_pod.exec_stdio = AsyncMock()
 
         await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
 
