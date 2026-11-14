@@ -39,17 +39,9 @@ networkPolicy:
 # CoreDNS containers, e.g. a relay a runtime needs in the pod. Each carries its own
 # `securityContext`: none of the service's hardening applies to it.
 extraContainers: []
-# -- The vsock-egress image (built from `vsock-egress/`). A pod annotated
-# `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
-# runs its forwarder as a sidecar, which serves `127.0.0.1:3128` in the pod and carries
-# each connection over the VM's vsock to that Service of the pod's own namespace: an
-# HTTP proxy for a pod with no network device. The annotation is rendered as a
-# template, so it can name a Service of the release. The pod's network policy then
-# allows only that name's DNS record and that port on the release's pods. The node must
-# run vsock-egress's launcher and hold the seccomp profile `profiles/vsock-egress.json`,
-# the runtime's default plus `socket(AF_VSOCK)`. The sidecar has no resource requests,
-# so the pod is not of the Guaranteed QoS class.
-# @default -- Empty (required once a pod carries the annotation)
+# -- The vsock-egress image (built from `vsock-egress/`), required once a pod carries
+# the annotation `inspect-k8s-sandbox/egress-proxy`.
+# @default -- Empty
 egressForwarderImage: ""
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []
