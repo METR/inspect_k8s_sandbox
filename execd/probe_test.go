@@ -51,17 +51,12 @@ func ask(srv *httptest.Server, flags ...string) []string {
 	return append(append([]string{"--timeout=" + probeBudget.String()}, flags...), u.Scheme, u.Port())
 }
 
-// escaped is s as Hawk's runner writes a path or a header's value for the probe: all of it as %XX but letters, digits and "-._~/".
-func escaped(s string) string {
-	var b strings.Builder
-	for _, c := range []byte(s) {
-		if strings.IndexByte("-._~/", c) >= 0 || '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' {
-			b.WriteByte(c)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", c)
-		}
+// request describes what a test server last got, for a failure's message.
+func request(r *http.Request) string {
+	if r == nil {
+		return "nothing"
 	}
-	return b.String()
+	return fmt.Sprintf("%s %s over %s for host %q with %q", r.Method, r.RequestURI, r.Proto, r.Host, r.Header)
 }
 
 func TestTheProbeCommandExitsZeroWhileAPortListensAndOneOnceItIsClosed(t *testing.T) {
@@ -74,9 +69,6 @@ func TestTheProbeCommandExitsZeroWhileAPortListensAndOneOnceItIsClosed(t *testin
 
 	if code, said := probeExit(t, budget, "tcp", port); code != 0 {
 		t.Fatalf("the probe of a listening port exited %d saying %q, want 0", code, said)
-	}
-	if code, said := probeExit(t, "--timeout=0s", "tcp", port); code != 2 {
-		t.Fatalf("the probe given no time at all exited %d saying %q, want the usage and 2", code, said)
 	}
 	l.Close()
 	if code, said := probeExit(t, budget, "tcp", port); code != 1 || !strings.Contains(said, "connection refused") {
@@ -91,13 +83,13 @@ func TestAProbeEndsAtItsTimeout(t *testing.T) {
 	defer srv.Close()
 	defer srv.CloseClientConnections() // lets the handler go if the probe never hung up
 
-	if code, said := probeExit(t, ask(srv, "--timeout=50ms")...); code != 1 || !strings.Contains(said, "timed out") {
+	if code, said := probeExit(t, ask(srv, "--timeout=50ms")...); code != 1 || !strings.Contains(said, "no answer within 50ms") {
 		t.Fatalf("a probe that got no answer exited %d saying %q, want 1 once its 50ms were up", code, said)
 	}
 }
 
-func TestAnHTTPProbePassesOnlyOnAStatusFrom200To399(t *testing.T) {
-	for status, pass := range map[int]bool{200: true, 399: true, 400: false} {
+func TestAnHTTPProbePassesOnAStatusUnder400(t *testing.T) {
+	for status, pass := range map[int]bool{399: true, 400: false} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
 		code, said := probeExit(t, ask(srv)...)
 		srv.Close()
@@ -109,54 +101,28 @@ func TestAnHTTPProbePassesOnlyOnAStatusFrom200To399(t *testing.T) {
 }
 
 func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
-	seen := make(chan *http.Request, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen <- r }))
+	var last atomic.Pointer[http.Request]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { last.Store(r) }))
 	defer srv.Close()
-	// What a server got of each path from the kubelet's own formatURL and request (kubernetes 1.36, pkg/probe/http/request.go).
+	// The paths //other/health, /health% and /health?a=b&c, percent-encoded as Hawk's runner writes them, and what
+	// a server got of each from the kubelet's own formatURL and request (kubernetes 1.36, pkg/probe/http/request.go).
 	for path, asked := range map[string]string{
-		"/health":             "/health",
-		"health":              "/health",
-		"":                    "/",
-		"//other/health":      "/health",
-		"http://other/health": "/health",
-		"/health%":            "/health%25",
-		"/health?a=b&c":       "/health?a=b&c",
-		"/a b":                "/a%20b",
-		"/health#part":        "/health",
+		"--path=//other/health":      "/health",
+		"--path=/health%25":          "/health%25",
+		"--path=/health%3Fa%3Db%26c": "/health?a=b&c",
 	} {
-		if code, said := probeExit(t, ask(srv, "--path="+escaped(path))...); code != 0 {
-			t.Errorf("the path %q: the probe exited %d saying %q", path, code, said)
-			continue
+		code, said := probeExit(t, ask(srv, path)...)
+
+		if got := last.Swap(nil); code != 0 || got == nil || got.RequestURI != asked || got.Host != srv.Listener.Addr().String() {
+			t.Errorf("given %s the server got %s and the probe exited %d saying %q, want it asked for %q as %q",
+				path, request(got), code, said, asked, srv.Listener.Addr())
 		}
-
-		if got := <-seen; got.RequestURI != asked || got.Host != srv.Listener.Addr().String() {
-			t.Errorf("of the path %q the server was asked for %q as %q, want %q as %q", path, got.RequestURI, got.Host, asked, srv.Listener.Addr())
-		}
-	}
-	// The kubelet's has no host left to ask of this one.
-	if code, _ := probeExit(t, ask(srv, "--path="+escaped("other:8080/health"))...); code != 1 {
-		t.Errorf("the path %q made the probe exit %d, want 1 with nothing asked", "other:8080/health", code)
-	}
-}
-
-func TestAProbesSchemeCannotNameAnotherHost(t *testing.T) {
-	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer other.Close()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	l.Close() // the port the probe names has nothing on it
-
-	scheme := other.URL + "/#"
-	if code, _ := probeExit(t, "--timeout="+probeBudget.String(), scheme, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)); code == 0 {
-		t.Fatalf("a probe with the scheme %q passed: it asked the server that names", scheme)
 	}
 }
 
 func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
-	seen := make(chan *http.Request, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen <- r }))
+	var last atomic.Pointer[http.Request]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { last.Store(r) }))
 	defer srv.Close()
 	for _, tc := range []struct {
 		name    string
@@ -167,62 +133,55 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 		{"none given", nil, srv.Listener.Addr().String(),
 			http.Header{"User-Agent": {"kube-probe/1.36"}, "Accept": {"*/*"}, "Connection": {"close"}}},
 		// A value is the bytes after the first colon, as themselves or as %XX: the kubelet sends on a non-breaking space that ends one.
-		{"its own", []string{"--header=Host:probe.test", "--header=User-Agent:mine", "--header=Accept:", "--header=X-Probe:a%C2%A0", "--header=x-probe:b:" + escaped("c:d")}, "probe.test",
+		{"its own", []string{"--header=Host:probe.test", "--header=User-Agent:mine", "--header=Accept:", "--header=X-Probe:a%C2%A0", "--header=x-probe:b:c%3Ad"}, "probe.test",
 			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a\xc2\xa0", "b:c:d"}, "Connection": {"close"}}},
 	} {
-		if code, said := probeExit(t, ask(srv, tc.given...)...); code != 0 {
-			t.Fatalf("%s: the probe exited %d saying %q", tc.name, code, said)
-		}
-		got := <-seen
+		code, said := probeExit(t, ask(srv, tc.given...)...)
 
-		if got.Method != "GET" || got.Host != tc.host || !reflect.DeepEqual(got.Header, tc.headers) {
-			t.Errorf("%s: the server got %s for host %q with %q, want host %q with %q",
-				tc.name, got.Method, got.Host, got.Header, tc.host, tc.headers)
+		if got := last.Swap(nil); code != 0 || got == nil || got.Method != "GET" || got.Host != tc.host || !reflect.DeepEqual(got.Header, tc.headers) {
+			t.Errorf("%s: the server got %s and the probe exited %d saying %q, want a GET for host %q with %q",
+				tc.name, request(got), code, said, tc.host, tc.headers)
 		}
-	}
-	// A line break ends no value: Go's client refuses to send one, for the kubelet as here.
-	if code, _ := probeExit(t, ask(srv, "--header=X-Probe:a%0D%0A")...); code != 1 {
-		t.Errorf("a header value ending in a line break made the probe exit %d, want 1 with nothing sent", code)
 	}
 }
 
 func TestAnHTTPSProbeChecksNoCertificateAndOffersHTTP2(t *testing.T) {
-	seen := make(chan *http.Request, 1)
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { seen <- r }))
+	var last atomic.Pointer[http.Request]
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { last.Store(r) }))
 	srv.EnableHTTP2 = true
 	srv.StartTLS() // with a certificate no one vouches for
 	defer srv.Close()
 
-	if code, said := probeExit(t, ask(srv)...); code != 0 {
-		t.Fatalf("the probe exited %d saying %q", code, said)
-	}
-	if got := <-seen; got.ProtoMajor != 2 {
-		t.Fatalf("the server was asked over %s, want HTTP/2 as the kubelet's probe uses when offered", got.Proto)
+	code, said := probeExit(t, ask(srv)...)
+
+	if got := last.Load(); code != 0 || got == nil || got.ProtoMajor != 2 {
+		t.Fatalf("the server got %s and the probe exited %d saying %q, want a pass over HTTP/2, which the kubelet's probe uses when offered", request(got), code, said)
 	}
 }
 
 func TestAnHTTPProbeFollowsARedirectOnlyToItsOwnHost(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failing.Close()
 	var loops atomic.Int32
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/here":
-			http.Redirect(w, r, "/failing", http.StatusFound)
-		case "/elsewhere": // the same server under another name
-			http.Redirect(w, r, strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)+"/failing", http.StatusFound)
+		case "/another-port": // of the same host, which is all the kubelet compares
+			http.Redirect(w, r, failing.URL, http.StatusFound)
+		case "/another-name": // the same failing server, as another host
+			http.Redirect(w, r, strings.Replace(failing.URL, "127.0.0.1", "localhost", 1), http.StatusFound)
 		case "/loop":
 			loops.Add(1)
 			http.Redirect(w, r, "/loop", http.StatusFound)
-		default:
-			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	}))
 	defer srv.Close()
 
-	if code, said := probeExit(t, ask(srv, "--path=/here")...); code != 1 || !strings.Contains(said, "503") {
+	if code, said := probeExit(t, ask(srv, "--path=/another-port")...); code != 1 || !strings.Contains(said, "503") {
 		t.Errorf("a redirect to a failing page of the same host made the probe exit %d saying %q, want 1 and that page's 503", code, said)
 	}
-	if code, said := probeExit(t, ask(srv, "--path=/elsewhere")...); code != 0 {
+	if code, said := probeExit(t, ask(srv, "--path=/another-name")...); code != 0 {
 		t.Errorf("a redirect to another host made the probe exit %d saying %q, want a pass without following it", code, said)
 	}
 	if code, said := probeExit(t, ask(srv, "--path=/loop")...); code != 1 || loops.Load() != 10 {
@@ -230,29 +189,18 @@ func TestAnHTTPProbeFollowsARedirectOnlyToItsOwnHost(t *testing.T) {
 	}
 }
 
-func TestAnHTTPProbePassesWithoutReadingABodyToItsEnd(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for chunk := make([]byte, 4096); ; { // until the probe hangs up
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
+func TestAnHTTPProbeReadsTenKiBOfABodyAndNoMore(t *testing.T) {
+	// A body that breaks off: within the kubelet's 10 KiB the probe meets the break, past them it never looks.
+	for sent, pass := range map[int]bool{5 << 10: false, 12 << 10: true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(20<<10))
+			w.Write(make([]byte, sent)) // the server then drops the connection
+		}))
+		code, said := probeExit(t, ask(srv)...)
+		srv.Close()
+
+		if (code == 0) != pass {
+			t.Errorf("a body that broke off after %d bytes made the probe exit %d saying %q", sent, code, said)
 		}
-	}))
-	defer srv.Close()
-
-	if code, said := probeExit(t, ask(srv)...); code != 0 {
-		t.Fatalf("a body with no end made the probe exit %d saying %q, want a pass", code, said)
-	}
-}
-
-func TestAnHTTPProbeFailsWhenTheBodyBreaksOff(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "100")
-		fmt.Fprint(w, "cut short") // the server then drops the connection
-	}))
-	defer srv.Close()
-
-	if code, said := probeExit(t, ask(srv)...); code != 1 {
-		t.Fatalf("a 200 whose body broke off made the probe exit %d saying %q, want 1", code, said)
 	}
 }

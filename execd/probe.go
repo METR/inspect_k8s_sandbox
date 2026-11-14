@@ -10,14 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
 
 // probeCommand is a pod's exec probe where the kubelet's own can't reach: it exits 0 on a pass and 1 on a failure.
 func probeCommand(args []string) {
-	fs := flag.NewFlagSet("probe", flag.ExitOnError)
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError) // -h is refused too: exit 0 would be a probe that passed
 	timeout := fs.Duration("timeout", time.Second, "the longest the probe may take, over 0")
 	// Percent-encoded, a task's string passes whole through YAML, the kubelet's $(VAR) and an argument.
 	path := "/"
@@ -31,16 +30,15 @@ func probeCommand(args []string) {
 		headers = append(headers, h)
 		return err
 	})
-	fs.Parse(args)
-	if fs.NArg() != 2 || *timeout <= 0 {
+	if fs.Parse(args) != nil || fs.NArg() != 2 || *timeout <= 0 {
 		fail("usage: execd probe [--timeout=DURATION] [--path=PATH] [--header=NAME:VALUE]... tcp|http|https PORT, the DURATION over 0 and a % in PATH or VALUE as %25")
 	}
 	failed := func(err error) {
 		fmt.Fprintln(os.Stderr, "execd:", err)
 		os.Exit(1)
 	}
-	// The process ends itself: a server can hold Go's HTTP/2 client past a timeout of its own.
-	time.AfterFunc(*timeout, func() { failed(errors.New("timed out")) })
+	// The process ends itself, its one timeout: a server can hold Go's HTTP/2 client past the client's own.
+	time.AfterFunc(*timeout, func() { failed(fmt.Errorf("no answer within %s", *timeout)) })
 	if err := probe(fs.Arg(0), fs.Arg(1), path, headers); err != nil {
 		failed(err)
 	}
@@ -49,11 +47,7 @@ func probeCommand(args []string) {
 
 // probe checks a port of 127.0.0.1 once, as the kubelet's tcpSocket or httpGet probe checks a pod's (pkg/probe in kubernetes).
 func probe(scheme, port, path string, headers []string) error {
-	n, err := strconv.Atoi(port)
-	if err != nil {
-		return err
-	}
-	host := net.JoinHostPort("127.0.0.1", strconv.Itoa(n))
+	host := net.JoinHostPort("127.0.0.1", port)
 	switch scheme {
 	case "tcp":
 		c, err := net.Dial("tcp", host)
@@ -89,10 +83,11 @@ func probe(scheme, port, path string, headers []string) error {
 	req.Host = req.Header.Get("Host")
 	client := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
-			ForceAttemptHTTP2:  true,
-			DisableKeepAlives:  true,
-			DisableCompression: true,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			TLSHandshakeTimeout: 10 * time.Second,
+			ForceAttemptHTTP2:   true,
+			DisableKeepAlives:   true,
+			DisableCompression:  true,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if req.URL.Hostname() != via[0].URL.Hostname() {
