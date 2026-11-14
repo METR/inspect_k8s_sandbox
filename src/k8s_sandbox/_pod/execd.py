@@ -86,7 +86,7 @@ class Daemon:
 
     ip: str
     fingerprint: str
-    key: bytes
+    key: bytes = field(repr=False)
 
 
 class Dropped(Exception):

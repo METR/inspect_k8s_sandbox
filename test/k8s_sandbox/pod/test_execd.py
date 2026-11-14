@@ -1887,6 +1887,11 @@ async def tls_daemon(
         server.close()
 
 
+def test_a_daemons_key_stays_out_of_its_repr() -> None:
+    # A traceback that shows locals, or a log of the daemon, would give the key away.
+    assert "s3cret" not in repr(execd.Daemon("10.0.0.1", "f" * 64, b"s3cret"))
+
+
 async def test_only_the_pinned_certificate_is_trusted(
     tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
 ) -> None:
