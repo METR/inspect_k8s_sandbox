@@ -74,8 +74,8 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 	}
 }
 
-func newForwarder(host, port uint32) *forwarder {
-	f := &forwarder{host: host, port: port}
+func keyedForwarder(host, port uint32) *forwarder {
+	f := newForwarder(host, port)
 	rand.Read(f.key[:])
 	return f
 }
@@ -90,7 +90,7 @@ func TestKeyIsServedToTheNodeAlone(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			l, port := loopback(t)
-			f := newForwarder(tc.node, 0)
+			f := keyedForwarder(tc.node, 0)
 			go f.serveKey(l)
 			c, err := vsockDial(unix.VMADDR_CID_LOCAL, port)
 			if err != nil {
@@ -129,7 +129,7 @@ func proxyPort(t *testing.T, f *forwarder) *net.TCPConn {
 
 func TestConnectionOpensWithTheKeyAndEndsEachWayInTheStream(t *testing.T) {
 	node, port := loopback(t)
-	f := newForwarder(unix.VMADDR_CID_LOCAL, port)
+	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
 	client := proxyPort(t, f)
 	client.Write([]byte("request"))
 	client.CloseWrite()
@@ -156,10 +156,61 @@ func TestConnectionOpensWithTheKeyAndEndsEachWayInTheStream(t *testing.T) {
 	}
 }
 
+func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
+	node, port := loopback(t)
+	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go f.serve(l)
+	dialled := make(chan *os.File, 2*maxStreams)
+	go func() {
+		for {
+			c, _, err := node.accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+			dialled <- c
+		}
+	}()
+	client := func() net.Conn {
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		c.SetDeadline(time.Now().Add(budget))
+		return c
+	}
+
+	for range maxStreams {
+		client()
+		select {
+		case <-dialled:
+		case <-time.After(budget):
+			t.Fatalf("fewer than %d connections reached the node", maxStreams)
+		}
+	}
+	extra := client()
+	refused := make(chan struct{})
+	go func() {
+		extra.Read(make([]byte, 1))
+		close(refused)
+	}()
+	select {
+	case <-dialled:
+		t.Fatalf("connection %d reached the node", maxStreams+1)
+	case <-refused:
+	}
+}
+
 func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 	node, port := loopback(t)
 	node.f.Close() // no worker listens yet: a connection to the port is reset
-	f := newForwarder(unix.VMADDR_CID_LOCAL, port)
+	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
 	client := proxyPort(t, f)
 	client.Write([]byte("request"))
 	refused := make(chan error, 1)

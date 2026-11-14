@@ -14,9 +14,14 @@ import (
 
 // forwarder is the sandbox's side. It reads nothing of what it carries and names no destination.
 type forwarder struct {
-	key  [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
-	host uint32        // the node's CID
-	port uint32        // the node's vsock port for streams
+	key   [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
+	host  uint32        // the node's CID
+	port  uint32        // the node's vsock port for streams
+	slots chan struct{} // one for each connection it carries
+}
+
+func newForwarder(host, port uint32) *forwarder {
+	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams)}
 }
 
 func forward(args []string) error {
@@ -25,7 +30,7 @@ func forward(args []string) error {
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
 	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
-	f := &forwarder{host: hostCID, port: streamPort}
+	f := newForwarder(hostCID, streamPort)
 	if err := f.loadKey(*keyFile); err != nil {
 		return err
 	}
@@ -97,7 +102,16 @@ func (f *forwarder) serve(l net.Listener) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go f.stream(c.(*net.TCPConn))
+		select {
+		case f.slots <- struct{}{}:
+			go func() {
+				defer func() { <-f.slots }()
+				f.stream(c.(*net.TCPConn))
+			}()
+		default: // the worker joins no more: the rest would each hold a thread while its vsock connection is made
+			c.(*net.TCPConn).SetLinger(0)
+			c.Close()
+		}
 	}
 }
 
