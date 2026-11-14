@@ -914,6 +914,7 @@ class ExecdStream(ByteStream):
     def _drop_if_restarted(self) -> None:
         """Fail as a lost connection does if a restart was found, as PodStdio does."""
         if self._restarted is not None and (error := self._restarted()) is not None:
+            self._call.queue.put_nowait(Dropped())  # a waiting receive() ends too
             raise anyio.BrokenResourceError(repr(error)) from error
 
     async def send(self, item: bytes) -> None:
