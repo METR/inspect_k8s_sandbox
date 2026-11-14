@@ -387,9 +387,14 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
-	// By its path, as Kubernetes exec does; a user who cannot enter it that way stays in it.
-	if err := os.Chdir(workdir); err != nil && !errors.Is(err, syscall.EACCES) && !strings.HasPrefix(req.Cwd, "/") {
-		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+	// By its path, as Kubernetes exec does: a command may have replaced the directory.
+	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
+		here, _ := os.Stat(".")
+		there, unseen := os.Stat(workdir)
+		// A user who cannot enter it by its path stays in it, while that path is still this directory.
+		if !errors.Is(err, syscall.EACCES) || (unseen == nil && !os.SameFile(here, there)) {
+			return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+		}
 	}
 	if req.Cwd != "" { // a directory this user can enter: else it is the cd that fails, not the command
 		if err := syscall.Access(req.Cwd+"/.", 0); err != nil {

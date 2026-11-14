@@ -181,8 +181,8 @@ func TestACommandGivenNoCwdRunsWhereItsUserCannotEnterTheDirectoryByPath(t *test
 	t.Cleanup(func() { os.Chmod(closed, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
 	workdir = filepath.Join(closed, "work")
 	os.Mkdir(workdir, 0o755)
-	os.Chdir(workdir)   // as a runtime starts a container's processes in its working directory
-	os.Chmod(closed, 0) // whose path its user may be unable to follow: a 700 /root for uid 1000
+	os.Chdir(workdir)
+	os.Chmod(closed, 0) // its path can no longer be followed: a 700 /root for uid 1000
 	s, _ := newServer(strings.Repeat("00", 32))
 	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
 
@@ -190,6 +190,31 @@ func TestACommandGivenNoCwdRunsWhereItsUserCannotEnterTheDirectoryByPath(t *test
 
 	if code := exitCode(t, s.get(42)); code != 0 {
 		t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+	}
+}
+
+func TestACommandGivenNoCwdFailsOnceItsDirectoryIsReplacedByOneItCannotEnter(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root enters any directory")
+	}
+	tests, parent := workdir, t.TempDir()
+	t.Cleanup(func() { workdir = tests; os.Chdir(tests) }) // back where the tests run
+	workdir = filepath.Join(parent, "work")
+	os.Mkdir(workdir, 0o755)
+	os.Chdir(workdir)
+	os.Rename(workdir, filepath.Join(parent, "old")) // as a command might, to have the next ones run there
+	os.Mkdir(workdir, 0)
+	s, _ := newServer(strings.Repeat("00", 32))
+	made := filepath.Join(t.TempDir(), "made")
+	req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}, Env: map[string]string{}, Tag: "r"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 45, payload: req})
+
+	if code := exitCode(t, s.get(45)); code != 1 {
+		t.Fatalf("exit %d, want 1: the directory at its path is not the one it would run in", code)
+	}
+	if _, err := os.Stat(made); err == nil {
+		t.Fatal("the command ran, in the directory that was moved away")
 	}
 }
 
