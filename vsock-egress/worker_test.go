@@ -421,7 +421,7 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
 	dial := serve(t, w)
 
-	for range workerStreams { // a workload process dials and says nothing
+	for range workerStreams - 1 { // a guest process dials and says nothing
 		dial()
 	}
 	forwarder := dial()
@@ -436,6 +436,42 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	if held := len(w.slots); held != 1 {
 		t.Fatalf("%d connections hold a stream's place: want the forwarder's alone", held)
 	}
+}
+
+func TestConnectionPastThoseThatHaveShownNoKeyIsClosed(t *testing.T) {
+	target, _ := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	dial := serve(t, w)
+
+	for range workerStreams { // each holds its place until the handshake's own bound
+		dial()
+	}
+	extra := dial()
+	extra.SetReadDeadline(time.Now().Add(handshakeWait / 2)) // a silent connection is closed as well, after handshakeWait
+	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection %d that showed no key ended with %v: want it closed at once", workerStreams+1, err)
+	}
+}
+
+// The kernel takes twice what is asked. On loopback it never grows a buffer, so reading the option back is all a test can hold of the cap.
+func TestProxySocketIsCappedEachWay(t *testing.T) {
+	target, _ := proxy(t)
+	c, err := newWorker("", target, 0).dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	raw, err := c.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.Control(func(fd uintptr) {
+		for name, option := range map[string]int{"receive": syscall.SO_RCVBUF, "send": syscall.SO_SNDBUF} {
+			if got, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); got != 2*proxyBuffer || err != nil {
+				t.Errorf("the %s buffer is %d bytes (%v): want %d, the kernel's count of the cap", name, got, err, 2*proxyBuffer)
+			}
+		}
+	})
 }
 
 func TestStreamPastTheCapIsRefused(t *testing.T) {

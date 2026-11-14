@@ -20,10 +20,11 @@ import (
 
 // worker is the node's side for one VM: it runs as the VM's uid inside the pod's network namespace, so the pod's own network policy governs what it dials.
 type worker struct {
-	vsock  string        // Firecracker's socket for the VM
-	target string        // the pod's egress proxy: every stream is joined to it, and nothing a guest sends names another
-	pace   *pacer        // all of the sandbox's streams, both ways
-	slots  chan struct{} // one for each open stream
+	vsock   string        // Firecracker's socket for the VM
+	target  string        // the pod's egress proxy: every stream is joined to it, and nothing a guest sends names another
+	pace    *pacer        // all of the sandbox's streams, both ways
+	slots   chan struct{} // one for each open stream
+	unkeyed chan struct{} // one for each connection whose key has not been checked yet
 
 	mu      sync.Mutex
 	key     []byte // the forwarder's
@@ -49,7 +50,7 @@ const newStreams = 2000
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams),
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -96,7 +97,13 @@ func (w *worker) serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go w.stream(c)
+		select {
+		case w.unkeyed <- struct{}{}:
+			go w.stream(c)
+		default: // a guest that floods the port with connections that show no key is held to these, as to its streams
+			w.refused.Add(1)
+			c.Close()
+		}
 	}
 }
 
@@ -105,7 +112,10 @@ func (w *worker) stream(c net.Conn) {
 	defer c.Close()
 	key := make([]byte, keySize)
 	c.SetReadDeadline(time.Now().Add(handshakeWait))
-	if _, err := io.ReadFull(c, key); err != nil || !w.holds(key) {
+	_, err := io.ReadFull(c, key)
+	keyed := err == nil && w.holds(key)
+	<-w.unkeyed
+	if !keyed {
 		w.refused.Add(1)
 		return
 	}
