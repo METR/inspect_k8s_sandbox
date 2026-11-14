@@ -116,14 +116,14 @@ case "$answer" in closed*|reset*) pass "32 zero bytes for a key, then a request:
 code=$(in_sandbox curl -sS -o /dev/null -m 60 -w '%{http_code}' "$LISTED" 2>&1)
 [ "$code" = 200 ] && pass "the forwarder's own streams still pass: $code" || fail "after the refusal GET $LISTED -> $code"
 
-say "5. the service's own container may not open a vsock socket"
+say "5. the service's own container is refused socket(AF_VSOCK)"
 opened=$(in_sandbox python3 -c 'import socket
 try:
     socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM); print("opened")
 except PermissionError:
     print("refused")' 2>&1 | tail -1)
-[ "$opened" = refused ] && pass "socket(AF_VSOCK) is refused there: seccomp is applied in the guest" \
-  || fail "socket(AF_VSOCK) in the service's container: $opened. Only the key now keeps a workload from the node's port"
+[ "$opened" = refused ] && pass "the call is refused there: the default seccomp profile is applied in the guest" \
+  || fail "socket(AF_VSOCK) in the service's container: $opened. The default seccomp profile is not applied in the guest"
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!

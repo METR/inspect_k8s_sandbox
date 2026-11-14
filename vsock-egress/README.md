@@ -9,11 +9,10 @@ that Service of its own namespace. Its forwarder has no resource requests, so th
 Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
-  the default profile of Amazon Linux's containerd 2.3 for a container with no capability, less the three `io_uring`
-  calls it allows and upstream's does not, plus `socket(AF_VSOCK)`, for the pod's forwarder.
-- `profiles/<architecture>/vsock-egress-launcher.json`, beside it: the same, less the six calls that set a process's
-  scheduling or priority, by which a worker could slow the reaper that ends it, plus `setns` into a network
-  namespace in place of `socket(AF_VSOCK)`, for the launcher.
+  containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)`, for the pod's
+  forwarder.
+- `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
+  process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
   `SETGID` and no other, under the launcher's profile, with the node's `/var/lib/nitro-sandbox/firecracker` and
   `/run/netns` mounted with `HostToContainer` propagation and `/var/lib/cni/results` read-only. Every sandbox's worker
