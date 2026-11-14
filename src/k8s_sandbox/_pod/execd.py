@@ -726,9 +726,6 @@ class ExecdClient:
                     await _taken(link, call, item[0], len(item[1]))
         except (OSError, asyncio.TimeoutError):
             pass
-        # Even with no exit: it frees what execd holds for the call.
-        with contextlib.suppress(OSError):
-            await link.send(RELEASE, call.id)
 
     async def exec(
         self,
