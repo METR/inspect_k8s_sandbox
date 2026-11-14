@@ -877,9 +877,11 @@ name = "inspect-k8s-sandbox"
 version = "0.14.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "inspect-ai" },
     { name = "jsonschema" },
     { name = "kubernetes" },
+    { name = "semver" },
     { name = "tenacity" },
 ]
 
@@ -899,6 +901,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.14.0" },
     { name = "inspect-ai", specifier = ">=0.3.236" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "kubernetes", specifier = ">=35.0.0" },
@@ -910,6 +913,7 @@ requires-dist = [
     { name = "pytest-env", marker = "extra == 'dev'", specifier = ">=1.2.0" },
     { name = "pytest-repeat", marker = "extra == 'dev'", specifier = ">=0.9.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.6" },
+    { name = "semver", specifier = ">=3.0.0" },
     { name = "tenacity", specifier = ">=8.0.0" },
     { name = "types-jsonschema", marker = "extra == 'dev'", specifier = ">=4.23.0.20241208" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0.12" },

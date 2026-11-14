@@ -1,3 +1,4 @@
+import ipaddress
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,16 @@ def test_default_chart(chart_dir: Path) -> None:
     assert services[0]["spec"]["template"]["metadata"]["labels"][
         "aisi.gov.uk/k8s-sandbox-version"
     ] == _chart_version(chart_dir)
+    default_container = next(
+        c
+        for c in services[0]["spec"]["template"]["spec"]["containers"]
+        if c["name"] == "default"
+    )
+    assert default_container["command"] == [
+        "sh",
+        "-c",
+        "trap '' HUP INT QUIT TERM; while true; do sleep 3600 & wait; done",
+    ]
 
 
 def test_additional_resources(chart_dir: Path, test_resources_dir: Path) -> None:
@@ -162,6 +173,60 @@ def test_annotations(chart_dir: Path, test_resources_dir: Path) -> None:
         assert service["metadata"]["annotations"]["myValue"] == attr_value
     for deployment in _get_documents(documents, "Deployment"):
         assert deployment["metadata"]["annotations"]["myValue"] == attr_value
+
+
+def test_pod_annotations_reach_only_their_service_pod(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "annotations.shared=release,annotations.both=release,"
+        "services.default.dnsRecord=true,services.server.dnsRecord=true,"
+        "services.default.podAnnotations.both=default,"
+        "services.default.podAnnotations.mine=default,"
+        "services.server.podAnnotations.mine=server",
+    )
+
+    release = {"shared": "release", "both": "release"}
+    pods = {}
+    for stateful_set in _get_documents(documents, "StatefulSet"):
+        # The StatefulSet itself keeps the top-level annotations alone.
+        assert stateful_set["metadata"]["annotations"] == release
+        pods[stateful_set["metadata"]["name"]] = stateful_set["spec"]["template"]
+    for service in _get_documents(documents, "Service"):
+        assert service["metadata"]["annotations"] == release
+    assert pods["agent-env-my-release-default"]["metadata"]["annotations"] == {
+        "shared": "release",
+        "both": "default",
+        "mine": "default",
+    }
+    assert pods["agent-env-my-release-server"]["metadata"]["annotations"] == {
+        **release,
+        "mine": "server",
+    }
+
+
+def test_termination_grace_period_is_set_per_service(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "services.graceful.image=nginx,"
+        "services.graceful.terminationGracePeriodSeconds=1",
+    )
+
+    assert {
+        stateful_set["metadata"]["name"]: stateful_set["spec"]["template"]["spec"][
+            "terminationGracePeriodSeconds"
+        ]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    } == {
+        "agent-env-my-release-default": 0,
+        "agent-env-my-release-server": 0,
+        "agent-env-my-release-graceful": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -358,6 +423,13 @@ def test_init_containers_with_all_fields(
     )
     assert agent_env_var is not None
     assert "agent-env-my-release" in agent_env_var["value"]
+    assert {"name": "GREETING", "value": "hello"} in init_container["env"]
+
+    # Test volumeMounts, onto a volume the service declares
+    assert init_container["volumeMounts"] == [
+        {"name": "shared", "mountPath": "/shared"}
+    ]
+    assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
 
 
 def test_resource_requests_and_limits(
@@ -496,12 +568,112 @@ def test_coredns_container(
     }
     assert corends_container["volumeMounts"] == [
         {
-            "mountPath": "/etc/coredns/Corefile",
+            "mountPath": "/etc/coredns",
             "name": "coredns-config",
             "readOnly": True,
-            "subPath": "Corefile",
         }
     ]
+
+
+def test_coredns_upstream_replaces_the_resolv_conf_file_mount(chart_dir: Path) -> None:
+    documents = _run_helm_template(
+        chart_dir, set_str="corednsUpstream[0]=10.96.0.10,corednsUpstream[1]=fd00::a"
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    assert pod_spec["dnsPolicy"] == "None"
+    assert pod_spec["dnsConfig"] == {"nameservers": ["127.0.0.1"]}
+    mounts = [m for c in pod_spec["containers"] for m in c.get("volumeMounts") or []]
+    assert all("subPath" not in m for m in mounts)
+    assert "resolv-conf" not in [v["name"] for v in pod_spec["volumes"]]
+    config_maps = {
+        cm["metadata"]["name"]: cm for cm in _get_documents(documents, "ConfigMap")
+    }
+    assert "agent-env-my-release-resolv-conf" not in config_maps
+    corefile = config_maps["agent-env-my-release-coredns-configmap"]["data"]["Corefile"]
+    assert "forward . 10.96.0.10 fd00::a {" in corefile
+
+
+def test_coredns_upstream_defaults_to_the_kubelet_resolv_conf(chart_dir: Path) -> None:
+    documents = _run_helm_template(chart_dir)
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    assert "dnsPolicy" not in pod_spec
+    corefile = next(
+        cm["data"]["Corefile"]
+        for cm in _get_documents(documents, "ConfigMap")
+        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
+    )
+    assert "forward . /etc/resolv.conf {" in corefile
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        "10.96.0.10",
+        "fd00::a",
+        "::",
+        "fe80::1",
+        "1:2:3:4:5:6:7::",
+        "::ffff:10.0.0.1",
+        "64:ff9b::192.0.2.1",
+        # CoreDNS exits on the next two, and a sandbox would wait for it until timeout.
+        "999.999.999.999",
+        "..",
+        ":::",
+        "1:2:3:4:5:6:7::8:9",
+        "1::2::3",
+        "01.2.3.4",
+        "10.0.0",
+        "::ffff:999.0.0.1",
+        "evil}",
+    ],
+)
+def test_coredns_upstream_accepts_exactly_ip_addresses(
+    chart_dir: Path, upstream: str
+) -> None:
+    try:
+        ipaddress.ip_address(upstream)
+        is_address = True
+    except ValueError:
+        is_address = False
+
+    try:
+        _run_helm_template(chart_dir, set_string=f"corednsUpstream[0]={upstream}")
+        accepted = True
+    except subprocess.CalledProcessError as e:
+        assert "corednsUpstream" in e.stderr
+        accepted = False
+
+    assert accepted == is_address
+
+
+def test_coredns_startup_probe_uses_the_ready_port(chart_dir: Path) -> None:
+    documents = _run_helm_template(chart_dir, set_str="corednsReadyPort=19000")
+
+    containers = _get_documents(documents, "StatefulSet")[0]["spec"]["template"][
+        "spec"
+    ]["containers"]
+    coredns = next(c for c in containers if c["name"] == "coredns")
+    assert {"containerPort": 19000, "protocol": "TCP", "name": "dns-ready"} in coredns[
+        "ports"
+    ]
+    assert coredns["startupProbe"]["httpGet"] == {"path": "/ready", "port": "dns-ready"}
+    assert "readinessProbe" not in coredns
+    corefile = next(
+        cm["data"]["Corefile"]
+        for cm in _get_documents(documents, "ConfigMap")
+        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
+    )
+    assert "ready :19000\n" in corefile
+    assert "bind 127.0.0.1" in corefile
+
+
+@pytest.mark.parametrize("port", ["53", "0", "70000"])
+def test_coredns_ready_port_rejects_unusable_ports(chart_dir: Path, port: str) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_str=f"corednsReadyPort={port}")
+    assert "corednsReadyPort" in exc_info.value.stderr
 
 
 def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
@@ -529,6 +701,33 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
     }
 
 
+def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+        "extraContainers[0].securityContext.runAsUser=65534",
+    )
+
+    containers = _get_documents(documents, "StatefulSet")[0]["spec"]["template"][
+        "spec"
+    ]["containers"]
+    assert [c["name"] for c in containers] == ["default", "coredns", "relay"]
+    assert containers[-1] == {
+        "name": "relay",
+        "image": "relay:1",
+        "securityContext": {"runAsUser": 65534},
+    }
+
+
+def test_extra_containers_need_a_name_and_an_image(chart_dir: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_str="extraContainers[0].name=relay")
+    # Helm's two JSON Schema libraries word this differently ("image is required" vs
+    # "missing property 'image'"), so assert only on the names.
+    assert "extraContainers" in exc_info.value.stderr
+    assert "image" in exc_info.value.stderr
+
+
 @pytest.mark.parametrize(
     "values_file",
     [
@@ -551,6 +750,66 @@ def test_rejects_names_that_can_inject_rendered_configuration(
     assert "values don't meet the specifications of the schema" in excinfo.value.stderr
 
 
+def test_network_policies_render_by_default(chart_dir: Path) -> None:
+    default = _run_helm_template(chart_dir)
+    explicit = _run_helm_template(chart_dir, set_str="networkPolicy.enabled=true")
+
+    assert default == explicit
+    assert _get_documents(default, "CiliumNetworkPolicy")
+
+
+def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> None:
+    documents = _run_helm_template(chart_dir, set_str="networkPolicy.enabled=false")
+
+    assert not [
+        doc for doc in documents if doc["apiVersion"].split("/")[0] == "cilium.io"
+    ]
+    assert _get_documents(documents, "StatefulSet")
+
+
+@pytest.mark.parametrize(
+    ("restriction", "field"),
+    [
+        ("allowDomains[0]=example.com", "allowDomains"),
+        ("allowDomainsPorts[0].port=22", "allowDomainsPorts"),
+        ("allowEntities[0]=world", "allowEntities"),
+        ("allowCIDR[0]=10.0.0.0/8", "allowCIDR"),
+        ("networks.backend.driver=bridge", "networks"),
+        ("services.default.networks[0]=backend", "services.default.networks"),
+        ("services.default.networkIsolated=true", "services.default.networkIsolated"),
+    ],
+)
+def test_network_policy_disabled_refuses_unenforceable_restrictions(
+    chart_dir: Path, restriction: str, field: str
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir, set_str=f"networkPolicy.enabled=false,{restriction}"
+        )
+    assert "networkPolicy.enabled is false" in exc_info.value.stderr
+    assert f"nothing would enforce {field}" in exc_info.value.stderr
+
+
+def test_default_deny_ingress_selects_every_pod(chart_dir: Path) -> None:
+    documents = _run_helm_template(chart_dir)
+
+    cnps = _get_documents(documents, "CiliumNetworkPolicy")
+    default_deny = next(
+        cnp
+        for cnp in cnps
+        if cnp["metadata"]["name"].endswith("-sandbox-default-deny-ingress")
+    )
+
+    # Release-wide selector, not per-service: no inspect/service label, so this
+    # selects every sandbox pod (isolated or not).
+    match_labels = default_deny["spec"]["endpointSelector"]["matchLabels"]
+    assert "inspect/service" not in match_labels
+
+    # An empty ingress rule enables default-deny while allowing nothing -- this is
+    # the shape the whole subtractive-isolation model rests on.
+    assert default_deny["spec"]["ingress"] == [{}]
+
+
 def test_network_isolated_service(chart_dir: Path, test_resources_dir: Path) -> None:
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "network-isolated-values.yaml"
@@ -558,29 +817,45 @@ def test_network_isolated_service(chart_dir: Path, test_resources_dir: Path) -> 
 
     cnps = _get_documents(documents, "CiliumNetworkPolicy")
 
-    # Verify isolate-service has isolate policy
-    isolate_policy = next(
-        (cnp for cnp in cnps if cnp["metadata"]["name"].endswith("-isolate")), None
-    )
-    assert isolate_policy is not None
-    assert (
-        isolate_policy["metadata"]["name"]
-        == "agent-env-my-release-svc-isolated-service-isolate"
-    )
-    # ingressDeny and egressDeny deny all traffic from/to all entities
-    assert isolate_policy["spec"]["ingressDeny"] == [{"fromEntities": ["all"]}]
-    assert isolate_policy["spec"]["egressDeny"] == [{"toEntities": ["all"]}]
+    _assert_isolated(cnps, "isolated-service")
 
-    # Verify normal-service doesn't have isolate policy
+    # Verify normal-service doesn't have isolate policy, and still gets its ingress
+    # allow.
     normal_service_policies = [
         cnp for cnp in cnps if "normal-service" in cnp["metadata"]["name"]
     ]
     assert len(normal_service_policies) == 1
     assert "isolate" not in normal_service_policies[0]["metadata"]["name"]
+    assert normal_service_policies[0]["metadata"]["name"].endswith(
+        "-svc-normal-service-ingress"
+    )
 
-    normal_spec = normal_service_policies[0]["spec"]
-    assert normal_spec.get("ingress") != []
-    assert normal_spec.get("egress") != []
+    assert normal_service_policies[0]["spec"]["ingress"]
+
+
+def test_network_isolated_service_joining_a_global_network(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    # A service can be networkIsolated and still list `networks` (nothing in the chart
+    # rejects the combination), which renders through the .Values.networks branch
+    # rather than the no-networks branch covered by test_network_isolated_service. That
+    # branch's per-network ingress allow must also be skipped for an isolated service.
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "network-isolated-with-global-network-values.yaml",
+    )
+
+    cnps = _get_documents(documents, "CiliumNetworkPolicy")
+
+    _assert_isolated(cnps, "isolated-service")
+
+    normal_ingress_policies = [
+        cnp
+        for cnp in cnps
+        if cnp["metadata"]["name"].endswith("-svc-normal-service-tasknet-ingress")
+    ]
+    assert len(normal_ingress_policies) == 1
+    assert normal_ingress_policies[0]["spec"]["ingress"] != []
 
 
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
@@ -722,6 +997,59 @@ def test_allow_domains_wildcard_all_skips_identity_enforcement(
     assert "toPorts" not in fqdn_rule
 
 
+def test_service_args_render_as_a_list(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "service-args-values.yaml"
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    container = next(c for c in pod_spec["containers"] if c["name"] == "default")
+
+    # Rendering args without toYaml produces `args: [setarch -R /bin/echo hello]`,
+    # which YAML reads back as a one-element sequence because flow sequences are
+    # comma-delimited. The container then execs a single argv token instead of the
+    # four the caller asked for, so assert on the parsed list, not a substring.
+    assert container["args"] == ["setarch", "-R", "/bin/echo", "hello"]
+    assert container["command"] == ["/bin/sh", "-c"]
+
+
+def test_service_command_null_omits_entrypoint(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    # Compose `command:` without `entrypoint:` is converted to `command: null`
+    # plus `args`. Helm must delete the chart's default idle loop so the
+    # image ENTRYPOINT runs with the user's args as CMD.
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "service-command-null-values.yaml"
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    container = next(c for c in pod_spec["containers"] if c["name"] == "default")
+
+    assert "command" not in container
+    assert container["args"] == [
+        "sh",
+        "-c",
+        "touch /tmp/i-ran && tail -f /dev/null",
+    ]
+
+
+def test_pods_have_no_subdomain(chart_dir: Path, test_resources_dir: Path) -> None:
+    # A subdomain is what makes the kubelet write the pod's
+    # <pod>.<subdomain>.<namespace>.svc.cluster.local FQDN into /etc/hosts, handing an
+    # agent under evaluation whatever the namespace name gives away.
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "multiple-services-values.yaml"
+    )
+
+    services = _get_documents(documents, "StatefulSet")
+    assert len(services) == 2
+    for service in services:
+        assert not service["spec"]["serviceName"]
+
+
 def _run_helm_template(
     chart_dir: Path,
     values_file: Path | None = None,
@@ -751,6 +1079,49 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -> bool:
+    """Whether an endpointSelector's matchLabels selects `service_name`'s pod.
+
+    It selects the pod if it carries no inspect/service label (release-wide, e.g.
+    sandbox-default-deny-ingress) or if that label names this service.
+    """
+    service_label = match_labels.get("inspect/service")
+    return service_label is None or service_label == service_name
+
+
+def _assert_isolated(cnps: list[dict[str, Any]], service_name: str) -> None:
+    """Assert `service_name` is fully network-isolated.
+
+    Its isolate policy denies egress (without an ingressDeny, which would shadow a
+    layered-on allow), and -- walking every rendered policy by selector rather than
+    by name, so a stray allow under an unexpected name can't hide -- the only
+    ingress-bearing policy that selects it is the release-wide
+    sandbox-default-deny-ingress.
+    """
+    isolate_policy = next(
+        (
+            cnp
+            for cnp in cnps
+            if cnp["metadata"]["name"].endswith(f"-svc-{service_name}-isolate")
+        ),
+        None,
+    )
+    assert isolate_policy is not None
+    assert "ingressDeny" not in isolate_policy["spec"]
+    assert isolate_policy["spec"]["egressDeny"] == [{"toEntities": ["all"]}]
+
+    selecting_policies = [
+        cnp["metadata"]["name"]
+        for cnp in cnps
+        if "ingress" in cnp["spec"]
+        and _selector_matches_service(
+            cnp["spec"]["endpointSelector"]["matchLabels"], service_name
+        )
+    ]
+    assert len(selecting_policies) == 1
+    assert selecting_policies[0].endswith("-sandbox-default-deny-ingress")
 
 
 def _chart_version(chart_dir: Path) -> str:

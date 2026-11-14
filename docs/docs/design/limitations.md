@@ -41,10 +41,15 @@ chart](../helm//built-in-chart.md#resource-requests-and-limits).
 
 You can reduce the impact of a container restarting by using persistent volumes.
 
-The framework will issue a warning if a container restarts during an eval. If a
-subsequent `exec()` fails after a detected restart, the restart is raised as the cause
-regardless of mode. If you set the `restarted_container_behaviour` parameter to `raise`,
-the eval will fail the sample immediately on detection, even if `exec()` has not failed.
+The framework will issue a warning if a container restarts during an eval. If an
+`exec()` returns a failure or loses its result, and the check before or after it finds a
+restart, the restart is raised as the cause regardless of mode (on a Pod with execd, in
+`raise` mode only). If you set the `restarted_container_behavior` parameter to `raise`,
+the eval will fail the sample immediately on detection, even if `exec()` has not failed,
+and a `read_file()` or `write_file()` over Kubernetes exec that fails checks for a
+restart too.
+Every later `exec()`, `read_file()` and `write_file()` in that sandbox raises the same
+error.
 
 ??? question "Why not use Jobs over StatefulSets?"
 
@@ -58,8 +63,8 @@ the eval will fail the sample immediately on detection, even if `exec()` has not
     the cases where restarts are not desirable. However, this introduces some
     complexities:
 
-    1. The `--wait` flag passed to `helm install` does not wait for Pods belonging to
-    Jobs to be in a Running state. We'd have to implement our own waiting mechanism,
+    1. The readiness wait does not wait for Pods belonging to Jobs to be created
+    (nor did the `--wait` flag that preceded it). We'd have to implement our own waiting mechanism,
     possibly as a Helm post-install hook to avoid coupling the Python code to the Helm
     chart.
 
@@ -75,10 +80,9 @@ the eval will fail the sample immediately on detection, even if `exec()` has not
 
     What about bare Pods?
 
-    When using bare Pods (i.e. not managed by a workload controller),
-    `helm install --wait` will wait for all Pods to be in a Running state. However, if
-    a Pod enters a failed state, it will not be restarted and `helm install` will wait
-    indefinitely.
+    When using bare Pods (i.e. not managed by a workload controller), the readiness
+    wait covers them like any other Pod. However, if a Pod enters a failed state it
+    will not be restarted, and the install will wait until the timeout.
 
 
 ## Denied network requests behaviour
@@ -156,7 +160,10 @@ the `hostAliases` field in the Pod spec
 
 Transient network or infrastructure errors during `exec()`, `read_file()`, and `write_file()` are automatically retried (up to 5 times). These are typically caused by issues such as a node becoming unhealthy, a Pod being rescheduled, or the Kubernetes control plane being overloaded.
 
-Note that retries cannot guarantee idempotency — if a command partially executed before the error, it may run again on retry.
+Retries cannot guarantee idempotency: an `exec()` whose connection is lost once its
+command was sent is retried, so the command may run a second time. It is not retried if
+the container restarted or was replaced meanwhile. A Pod with execd resumes the command
+instead, and never runs it a second time.
 
 ## Must run as root to use the `user` parameter in `exec()` { #exec-user }
 
@@ -178,8 +185,26 @@ started with is **not recommended**. Generally, specifying users in tool definit
 result in undesirable coupling between your tools and sandbox.
 
 That said, if you need to run commands as different users, the `user` parameter to
-`exec()` is supported. However, you must run the container as root and ensure that
-`runuser` is installed in the container.
+`exec()` is supported. To switch to a *different* user, you must run the container as
+root, ensure that `runuser` is installed at `/sbin/runuser`, and keep `CAP_SETGID` — the
+switch goes through `runuser`, which calls `setgroups(2)`. A container with
+`capabilities: {drop: [ALL]}` therefore cannot switch users. A Pod with execd needs no
+`runuser`: execd switches users itself.
+
+Naming the user the container already runs as needs none of those: that case skips
+`runuser` entirely, so it works on a capability-dropped or non-root container, and on an
+image with no `runuser` installed.
+
+`user="root"` and `user="0"` both mean uid 0, whatever the image's `/etc/passwd` says,
+and need neither `runuser` nor `id`. A container that does not run as uid 0 fails them
+as it fails a switch it cannot make.
+
+When the switch cannot be made, what happens depends on why. A container that is not
+root, one that has had `CAP_SETGID` dropped, and one without `runuser` installed are all
+properties of the environment rather than bad arguments: each logs a warning and returns
+a failed `ExecResult`, so a caller which probes with a user can fall back to the
+container's own user. Only naming a user that does not exist raises, since no fallback
+makes an absent account work.
 
 ## Images are not automatically built, tagged or pushed
 

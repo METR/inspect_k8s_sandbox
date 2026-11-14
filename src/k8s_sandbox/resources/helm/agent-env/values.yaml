@@ -30,6 +30,15 @@ allowCIDR: []
 # allowed to access.
 # @default -- Empty list (no additional entities compared to default policies)
 allowEntities: []
+networkPolicy:
+  # -- Render the CiliumNetworkPolicies. Set false on a cluster without Cilium; the
+  # cluster or pod runtime must then enforce egress and isolation. While false, the
+  # allow* values, `networks` and `networkIsolated` are rejected.
+  enabled: true
+# -- Containers added, as written, to every service's pod beside the service and
+# CoreDNS containers, e.g. a relay a runtime needs in the pod. Each carries its own
+# `securityContext`: none of the service's hardening applies to it.
+extraContainers: []
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []
 # - name: "gcr-json-key"
@@ -46,6 +55,16 @@ corednsCommand:
   - /coredns
   - -conf
   - /etc/coredns/Corefile
+# -- Port, on the pod IP, of the CoreDNS sidecar's startup probe endpoint. Change it if
+# a service in the pod listens on this port.
+corednsReadyPort: 18181
+# -- DNS servers (IP addresses) the CoreDNS sidecar forwards to, e.g. the cluster DNS
+# Service IP. Set it for a runtime that cannot mount a single file over
+# `/etc/resolv.conf` with `subPath`: the pod then uses `dnsPolicy: None`
+# with the sidecar as its only nameserver. Init containers run before the sidecar
+# starts, so in that mode they cannot resolve names.
+# @default -- Empty list (forward to the node's cluster DNS via the kubelet's resolv.conf)
+corednsUpstream: []
 # -- Security context for the coredns container. Override only if a custom
 # `corednsImage` cannot run under the hardened default.
 # @default -- Non-root 65532, read-only root filesystem, RuntimeDefault seccomp, no privilege escalation, and no capability other than `NET_BIND_SERVICE`
@@ -77,8 +96,12 @@ services:
     runtimeClassName: gvisor
     # -- The container's image name.
     image: "python:3.12-bookworm"
-    # -- The container's entrypoint command.
-    command: ["tail", "-f", "/dev/null"]
+    # -- The container's entrypoint command. The default idle loop reaps orphaned
+    # processes and requires sh and sleep in the image.
+    command:
+      - sh
+      - -c
+      - "trap '' HUP INT QUIT TERM; while true; do sleep 3600 & wait; done"
     # -- The container's entrypoint arguments.
     args: []
     # -- The container's working directory.
@@ -102,7 +125,8 @@ services:
     # -- Init containers to run before the main container starts. Useful for waiting for
     # dependencies to become ready (e.g., database connectivity checks). Each init container
     # supports: `name` (required), `image` (required), `command`, `args`, `imagePullPolicy`,
-    # `workingDir`, `resources`, and `securityContext`. The `$AGENT_ENV` environment variable
+    # `workingDir`, `env` (`name`/`value` pairs), `volumeMounts` (of volumes in the service's
+    # `volumes:`), `resources`, and `securityContext`. The `$AGENT_ENV` environment variable
     # is automatically injected. Note: init containers cannot reliably access external domains
     # from `allowDomains` due to CoreDNS starting after init containers complete.
     initContainers: []
@@ -129,6 +153,10 @@ services:
     tolerations: []
     # -- Node selector settings for the Pod.
     nodeSelector: {}
+    # -- Annotations added to this service's Pod alone; on a clash they win over the top-level `annotations`.
+    podAnnotations: {}
+    # -- Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it.
+    terminationGracePeriodSeconds: 0
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"

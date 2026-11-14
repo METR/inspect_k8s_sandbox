@@ -5,6 +5,7 @@ from time import sleep
 from typing import Generator
 from unittest.mock import patch
 
+import anyio
 import pytest
 from pytest import MonkeyPatch
 
@@ -66,8 +67,15 @@ def test_parameter_conflicting_with_existing_executor_raises(
     with patch("os.cpu_count", return_value=4):
         PodOpExecutor.get_instance()
 
-    with pytest.raises(ValueError, match="already initialized with max_pod_ops=16"):
+    with pytest.raises(ValueError) as exc_info:
         PodOpExecutor.get_instance(max_pod_ops=64)
+
+    # The message names the source of the existing limit so that users can tell
+    # a default from an explicitly-configured value.
+    assert (
+        "already initialized with max_pod_ops=16 (from default (cpu_count=4 * 4))"
+        in str(exc_info.value)
+    )
 
 
 async def test_queue_operation(monkeypatch: MonkeyPatch) -> None:
@@ -115,3 +123,39 @@ async def test_queue_operation_propagates_caller_context(
 def _synchronous_operation(value: int) -> tuple[int, str]:
     sleep(1)
     return value, threading.current_thread().name
+
+
+async def test_a_result_in_as_its_caller_stops_waiting_is_discarded_off_the_loop() -> (
+    None
+):
+    """Discarding closes a connection, which can block for seconds."""
+    executor = PodOpExecutor.get_instance(max_pod_ops=1)
+    started, release, discarded = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    discarded_on: list[threading.Thread] = []
+
+    def operation() -> str:
+        started.set()
+        release.wait(30)
+        return "an open connection"
+
+    def discard(result: str) -> None:
+        discarded_on.append(threading.current_thread())
+        discarded.set()
+
+    task = asyncio.create_task(executor.queue_operation(operation, discard))
+    with anyio.fail_after(30):
+        while not started.is_set():
+            await asyncio.sleep(0)
+    # No await until the cancel: the result is in, by the pool's one thread, but unseen.
+    release.set()
+    executor._executor.submit(lambda: None).result(timeout=30)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert discarded.wait(timeout=30)
+    assert discarded_on[0] is not threading.current_thread()

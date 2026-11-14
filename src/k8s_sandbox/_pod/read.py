@@ -5,14 +5,32 @@ from typing import IO, Generator
 from inspect_ai.util import OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
+from websocket import WebSocketException
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import PodError
-from k8s_sandbox._pod.get_returncode import get_returncode
+from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.get_returncode import (
+    get_returncode,
+    raise_if_stopped_before_lost,
+)
 from k8s_sandbox._pod.op import (
+    SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
 )
+
+
+def read_command(src: Path) -> list[str]:
+    """The command that prints a file, read_file() on either transport."""
+    # A shell, so that `head` comes from SYSTEM_PATH; exec'd, so the errors are head's.
+    return [
+        "/bin/sh",
+        "-c",
+        f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
+        "sh",
+        str(limits.MAX_READ_FILE_SIZE + 1),
+        src.as_posix(),
+    ]
 
 
 class ReadFileOperation(PodOperation):
@@ -22,13 +40,13 @@ class ReadFileOperation(PodOperation):
 
     @contextmanager
     def _start_read_command(self, src: Path) -> Generator[WSClient, None, None]:
-        # Limit number of bytes read (-c) to 1 byte over the limit (to detect if the
-        # file is too large).
-        command = ["head", "-c", limits.MAX_READ_FILE_SIZE + 1, src.as_posix()]
         yield from self.create_websocket_client_for_exec(
-            command=command,
+            command=read_command(src),
             stderr=True,
-            stdin=False,
+            # Without stdin, kubelet closes the exec's input as soon as the stream
+            # opens, which races the stdout read in Kata Containers' Go shim and hangs
+            # or truncates the read (kata-containers/kata-containers#9071).
+            stdin=True,
             stdout=True,
             # Leave stdout (and stderr) as binary.
             binary=True,
@@ -40,16 +58,27 @@ class ReadFileOperation(PodOperation):
         start_position = dst.tell()
         # Stream the response, writing it to dst as we go to avoid holding the whole
         # response in memory.
-        while ws_client.is_open():
-            # `timeout=None` means `update` will block indefinitely until there is
-            # data to read.
-            ws_client.update(timeout=None)
-            if ws_client.peek_stdout():
-                dst.write(ws_client.read_stdout())
-                self._verify_output_limit(dst.tell() - start_position)
-            if ws_client.peek_stderr():
-                stderr.append(ws_client.read_stderr())
+        try:
+            while ws_client.is_open():
+                # `timeout=None` means `update` will block indefinitely until there is
+                # data to read.
+                ws_client.update(timeout=None)
+                if ws_client.peek_stdout():
+                    dst.write(ws_client.read_stdout())
+                    self._verify_output_limit(dst.tell() - start_position)
+                if ws_client.peek_stderr():
+                    stderr.append(ws_client.read_stderr())
+        except (OSError, WebSocketException) as e:
+            raise_if_stopped_before_lost(ws_client, e, self._pod.name)
+            raise
         returncode = get_returncode(ws_client)
+        # `head` never exits 255: Kata gives it when the VM stopped.
+        if returncode == 255:
+            raise ContainerStoppedError(
+                "The container stopped while reading the file.",
+                pod=self._pod.name,
+                returncode=returncode,
+            )
         if returncode != 0:
             stderr_str = str(stderr)
             raise_for_known_read_write_errors(stderr_str)

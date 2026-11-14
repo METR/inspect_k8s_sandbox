@@ -22,14 +22,19 @@ containers which you'd like `K8sSandboxEnvironment` to directly interact with (i
 `exec()`, `read_file()`, `write_file()`):
 
 * `sh`
-* `sync`
 * `echo`
+* `printf`
 * `head`
 * `cat`
 * `mkdir`
 * `timeout`
 * `base64`
-* `runuser`
+* `runuser`, at `/sbin/runuser`, for `exec(user=...)` to switch to another user
+* `id`, for `exec(user=...)` as a user other than root
+
+`head`, `cat`, `mkdir`, `timeout`, `base64` and `id` must be in `/usr/bin` or `/bin`, and
+so must `printf` where `/bin/sh` has no builtin one. A Pod with execd needs only `sh`,
+`head`, `cat` and `mkdir`.
 
 ## Cluster requirements
 
