@@ -572,7 +572,8 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
-        end = time.monotonic() + CONNECT_TIMEOUT
+        # One end across connections: a stalled one is kept that long, then one opens.
+        end = time.monotonic() + DEAD_AFTER + CONNECT_TIMEOUT
         while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
             if not link.closed:  # else it is set for good, and the next one is opened
                 link.confirmed.clear()
