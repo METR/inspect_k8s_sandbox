@@ -843,7 +843,16 @@ async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
 
 
 @pytest.mark.parametrize(
-    "status", [b"[]", b"null", b"{}", b'{"code": "0"}', b'{"code": 0, "error": 5}']
+    "status",
+    [
+        b"[]",
+        b"null",
+        b"{}",
+        b'{"code": "0"}',
+        b'{"code": 0, "error": 5}',
+        b'{"code": -1}',
+        b'{"code": 256}',
+    ],
 )
 async def test_an_exit_status_that_is_not_one_is_a_lost_result(
     daemons: Daemons, status: bytes

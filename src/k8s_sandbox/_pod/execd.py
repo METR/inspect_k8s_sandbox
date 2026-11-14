@@ -596,7 +596,11 @@ class ExecdClient:
                             raise
                         status = json.loads(payload)
                         code, why = status.get("code"), status.get("error", "")
-                        if type(code) is not int or type(why) is not str:
+                        if (
+                            type(code) is not int
+                            or not 0 <= code <= 255
+                            or type(why) is not str
+                        ):
                             raise ValueError(f"not an exit status: {payload!r}")
                         yield EXIT, status
                         return
