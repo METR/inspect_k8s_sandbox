@@ -1482,9 +1482,7 @@ class TestProbeSwitch:
 class TestProbeBounds:
     """A misbehaving `id` or `runuser` can hold the probe's output open or flood it."""
 
-    def test_gives_up_on_a_probe_that_never_ends(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_gives_up_on_a_probe_that_never_ends(self) -> None:
         op = ExecuteOperation(MagicMock())
         ws = _FakeWSClient([(STDOUT, b"x")], ends=False)
 

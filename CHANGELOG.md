@@ -19,8 +19,9 @@
   runs on gVisor as a user other than root it must be readable too (555). A process
   running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in
   for it while it starts. execd's memory counts against the container's limit: about 7
-  MB idle, and 9 to 13 MB for each stream (stdout, stderr) of a command that prints
-  faster than the client reads, most of it kept for minutes after the command ends.
+  MB idle, 9 to 16 MB for each stream (stdout, stderr) of a command that prints faster
+  than the client reads, and about 8 MB for each command that leaves its stdin unread,
+  most of it kept for minutes after the command ends.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
@@ -42,6 +43,8 @@
   replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead.
 - The pod read that checks for a restart no longer waits without end on an API server
   that sends nothing: the operation fails after about four minutes.
+- An operation over Kubernetes exec no longer waits without end on an API server that
+  never answers its websocket upgrade: it fails after 60 seconds.
 - An operation whose container stopped under it, which Kata reports with exit code 255
   when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`:
   `exec()` no longer returns 255 as the command's exit code, and `read_file()` and
