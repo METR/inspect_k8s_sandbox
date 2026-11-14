@@ -81,7 +81,7 @@ class Plain(execd._Pipe):
 
     async def readexactly(self, n: int) -> bytes:
         try:
-            return await self._reader.readexactly(n)
+            return await self._reader.readexactly(n)  # type: ignore[union-attr]
         except asyncio.IncompleteReadError:  # as execd's own pipe ends
             raise ConnectionResetError("execd closed the connection") from None
 
@@ -1726,7 +1726,7 @@ async def test_a_stream_cancelled_as_it_starts_is_killed(
             await client.open_stream(argv, None)
 
     opening = asyncio.ensure_future(opens())
-    unsent = link.pipe._writer.transport.get_write_buffer_size
+    unsent = link.pipe._writer.transport.get_write_buffer_size  # type: ignore[union-attr]
     await until(lambda: unsent() > 0)  # its START is on its way
     scope.cancel()  # anyio cancels again at each await, unlike asyncio
     await asyncio.wait_for(opening, 30)
@@ -2866,7 +2866,9 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     await until(lambda: len(sent) == 2)
     upload = bytes(range(251)) * 612  # 150 KiB, and no two messages of it alike
     stdio.write(upload)
-    await asyncio.wait_for(stdio.drain(), 30)  # room again once most of it has gone
+    with anyio.fail_after(30):
+        await stdio.drain()  # in this task: a write waits here until most has gone
+    assert len(upload) - sum(map(len, sent[2:])) <= 65536
     await until(lambda: sum(map(len, sent[2:])) == len(upload))
     stdio.abort()
 
@@ -2937,21 +2939,18 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
     server.close()
 
 
-async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
+async def test_a_connection_closed_under_a_silent_exec_closes_the_exec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(execd, "CONNECT_TIMEOUT", None)  # or a stalled machine ends it
-    writing, closed, left = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    closed = asyncio.Event()
+    senders: list[asyncio.Task[None] | None] = []
 
-    class Stalled(anyio.abc.ByteStream):
-        """An exec whose guest has stopped reading its stdin."""
+    class Silent(anyio.abc.ByteStream):
+        """An exec that takes what is written to it and answers nothing."""
 
         async def send(self, item: bytes) -> None:
-            writing.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                left.set()
+            senders.append(asyncio.current_task())
 
         async def receive(self, max_bytes: int = 65536) -> bytes:
             await asyncio.Event().wait()
@@ -2963,17 +2962,18 @@ async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
         async def aclose(self) -> None:
             closed.set()
 
-    async def stdio() -> Stalled:
-        return Stalled()
+    async def stdio() -> Silent:
+        return Silent()
 
     connecting = asyncio.ensure_future(
         execd._connect(execd.Daemon("", "0" * 64, b"key", stdio), execd.Pace())
     )
-    await asyncio.wait_for(writing.wait(), 30)  # the handshake's first bytes never go
+    await until(lambda: bool(senders))  # the handshake's first bytes have gone
     connecting.cancel()
 
-    # The exec is closed, and nothing is left writing to it.
-    await asyncio.wait_for(asyncio.gather(closed.wait(), left.wait()), 30)
+    # The exec is closed, and nothing is left that would write to it.
+    await asyncio.wait_for(closed.wait(), 30)
+    await until(lambda: senders[0] is not None and senders[0].done())
 
 
 @pytest.fixture
