@@ -514,6 +514,8 @@ class PodStdio(ByteStream):
                 self._end(e)
             else:
                 await self._turn()
+        # Also for a reply that came while this waited.
+        self._drop_if_restarted()
         # Frames already here come with it, within the turn: each cost a pass alone.
         while self._unyielded < _STEPS_PER_TURN and len(self._stdout) < max_bytes:
             try:
@@ -524,8 +526,6 @@ class PodStdio(ByteStream):
                 self._end(e)
                 break
             self._unyielded += 1
-        # Also for a reply that came while this waited.
-        self._drop_if_restarted()
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
@@ -571,6 +571,7 @@ class PodStdio(ByteStream):
             self._status = bytes(data)
             if self._stopped is not None and self._wrote and _is_255(self._status):
                 self._stopped()
+                self._restarted = None  # its own restart: the stream ends as usual
             self._end(None)
 
     async def send(self, item: bytes) -> None:

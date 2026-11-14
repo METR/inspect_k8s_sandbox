@@ -1715,14 +1715,19 @@ class TestExecStdio:
 
         assert dropped.value.__cause__ is restart
 
+    @pytest.mark.parametrize("status", [b"", _frame(*_status(255))], ids=["", "255"])
     async def test_a_restart_found_while_a_receive_waits_drops_the_reply(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], status: bytes
     ) -> None:
         """Where Inspect's reader usually is, while a request waits for its reply."""
         client, server = tls_sockets
         restart = RuntimeError("restarted")
         found: list[Exception] = []
-        stream = _stdio(client, restarted=lambda: found[0] if found else None)
+        stream = _stdio(
+            client,
+            stopped=lambda: None,  # the restart found first is the one kept
+            restarted=lambda: found[0] if found else None,
+        )
 
         with anyio.fail_after(30):
             receiving = asyncio.create_task(stream.receive())
@@ -1730,7 +1735,7 @@ class TestExecStdio:
                 await asyncio.sleep(0)
             assert not receiving.done()
             found.append(restart)
-            server.sendall(_frame(STDOUT, b"a reply\n"))
+            server.sendall(_frame(STDOUT, b"a reply\n") + status)
             with pytest.raises(anyio.BrokenResourceError) as dropped:
                 await receiving
 
@@ -1814,6 +1819,26 @@ class TestExecStdio:
                 pass
 
         assert told == ([True] if stopped else [])
+
+    async def test_stdout_is_received_though_a_255_came_in_the_same_turn(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Regression: taken in the turn, the status dropped the stdout, then raised."""
+        client, server = tls_sockets
+        kept: list[Exception] = []
+        stream = _stdio(
+            client,
+            stopped=lambda: kept.append(RuntimeError("stopped")),
+            restarted=lambda: kept[0] if kept else None,
+        )
+        server.sendall(_frame(STDOUT, b"ready\n") + _frame(*_status(255)))
+
+        with anyio.fail_after(30):
+            received = await stream.receive()
+            with pytest.raises(anyio.EndOfStream):  # as usual: later operations raise
+                await stream.receive()
+
+        assert received == b"ready\n"
 
     async def test_the_command_runs_as_the_user_with_stdin_unread(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
