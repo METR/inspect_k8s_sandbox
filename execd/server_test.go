@@ -21,6 +21,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"weak"
 )
 
 // run() starts this binary, as it starts execd, to become another user.
@@ -1293,6 +1294,30 @@ func TestStdinACommandLeftUnreadIsLetGoWhenTheCommandEnds(t *testing.T) {
 			t.Fatalf("execd still holds %s, the stdin of a command that has ended", pipe)
 		}
 	}
+}
+
+func TestStdinACommandHasReadIsLetGoWhileItRuns(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "cat >/dev/null"}, Env: map[string]string{}, Stdin: true, Tag: "read"})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 36, payload: req})
+	chunk := make([]byte, 1<<20)
+	sent := weak.Make(&chunk[0])
+	s.dispatch(c, frame{kind: fStdin, id: 36, payload: chunk})
+	for nextFrame(t, frames).kind != fStdinAck { // written to the command
+	}
+
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if runtime.GC(); sent.Value() == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("execd still holds stdin its command has read")
+		}
+	}
+	s.dispatch(c, frame{kind: fStdin, id: 36})
+	exitStatus(t, frames)
 }
 
 func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *testing.T) {

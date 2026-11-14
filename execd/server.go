@@ -581,6 +581,7 @@ func (cl *call) feedStdin(w *os.File) {
 			return
 		}
 		data := cl.stdinQ[0]
+		cl.stdinQ[0] = nil // or the queue's array keeps what the command has read
 		cl.stdinQ = cl.stdinQ[1:]
 		cl.mu.Unlock()
 		// A command that exits without reading its stdin makes this fail; that is not an error.
