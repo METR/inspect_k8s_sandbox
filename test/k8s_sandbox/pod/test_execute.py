@@ -18,7 +18,6 @@ import struct
 import subprocess
 import sys
 import threading
-import time
 import types
 from contextlib import contextmanager
 from importlib.metadata import version
@@ -90,6 +89,8 @@ class _FakeWSClient(WSClient):
         self._frames = list(frames)
         self._ends = ends
         self._error = error
+        self.now = 0.0  # its own clock: only its pauses and waits move it
+        self._waited = 0
 
     def update(self, timeout: float | None = 0) -> None:
         if not self.is_open():
@@ -97,10 +98,10 @@ class _FakeWSClient(WSClient):
         if self._frames and isinstance(self._frames[0], float):
             pause = self._frames[0]
             if timeout is not None and timeout < pause:
-                time.sleep(timeout)
+                self.now += timeout
                 self._frames[0] = pause - timeout
                 return
-            time.sleep(pause)
+            self.now += pause
             self._frames.pop(0)
         if self._frames:
             frame = self._frames.pop(0)
@@ -114,13 +115,27 @@ class _FakeWSClient(WSClient):
         elif timeout is None:
             raise AssertionError("update(timeout=None) would block forever")
         else:
-            time.sleep(timeout)
+            self.now += timeout
+            self._waited += 1
+            if self._waited > 10_000:  # so that code which never gives up fails
+                raise AssertionError("waited for ever on a client with no more to send")
+
+
+def _on_its_clock(ws: WSClient) -> contextlib.AbstractContextManager[object]:
+    """On a fake client's clock, which a stall of the machine does not move."""
+    if not isinstance(ws, _FakeWSClient):
+        return contextlib.nullcontext()
+    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
+    return patch.object(execute_module, "time", clock)
 
 
 def _handle(
     ws: WSClient, user: str | None = None, timeout: int | None = None
 ) -> ExecResult[str]:
-    return ExecuteOperation(MagicMock())._handle_shell_output(ws, user, timeout, MARKER)
+    with _on_its_clock(ws):
+        return ExecuteOperation(MagicMock())._handle_shell_output(
+            ws, user, timeout, MARKER
+        )
 
 
 @pytest.fixture
@@ -1462,14 +1477,14 @@ class TestProbeBounds:
     def test_gives_up_on_a_probe_that_never_ends(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.05)
         op = ExecuteOperation(MagicMock())
+        ws = _FakeWSClient([(STDOUT, b"x")], ends=False)
 
         @contextmanager
         def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
-            yield _FakeWSClient([(STDOUT, b"x")], ends=False)
+            yield ws
 
-        with patch.object(op, "_interactive_shell", fake_shell):
+        with patch.object(op, "_interactive_shell", fake_shell), _on_its_clock(ws):
             with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
 
