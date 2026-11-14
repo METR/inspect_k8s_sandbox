@@ -829,7 +829,11 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
     # After the forwarder listens, before `setup` and the service; it has ended by then.
     forwarder, capture, setup = pod["initContainers"]
     assert setup["name"] == "setup"
-    assert capture["command"] == ["/vsock-egress", "redirect"]
+    # It names the forwarder's own user, whose answers alone leave the forwarder's port.
+    assert capture["command"] == [
+        *["/vsock-egress", "redirect", "-forwarder"],
+        str(forwarder["securityContext"]["runAsUser"]),
+    ]
     assert "restartPolicy" not in capture
     # The forwarder is the resolver of every container, `setup` too.
     assert (pod["dnsPolicy"], pod["dnsConfig"]) == (

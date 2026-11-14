@@ -125,10 +125,10 @@ spec:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
       {{- if $egressCapture }}
-        {{- /* Once, before any program of the service. */}}
+        {{- /* Once, before any program of the service. It names the forwarder's user: no other's socket answers at the forwarder's port. */}}
         - name: egress-capture
           image: {{ $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", "redirect"]
+          command: ["/vsock-egress", "redirect", "-forwarder", "65532"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"net"
 
 	"github.com/google/nftables"
@@ -11,7 +12,10 @@ import (
 )
 
 // redirect sends the sandbox's DNS queries at 127.0.0.1 and its TCP connections to captureRange to the forwarder.
-func redirect([]string) error {
+func redirect(args []string) error {
+	fs := flag.NewFlagSet("redirect", flag.ExitOnError)
+	forwarder := fs.Uint("forwarder", 0, "the uid the pod's forwarder runs as")
+	fs.Parse(args)
 	lo, err := net.InterfaceByName("lo")
 	if err != nil {
 		return err
@@ -65,5 +69,18 @@ func redirect([]string) error {
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binary.BigEndian.AppendUint16(nil, 53)},
 	}, toForwarder...)})
+	// While the forwarder is down another user's process can bind its port: what such a socket sends from there is dropped, so it answers no lookup and takes no connection.
+	guard := c.AddChain(&nftables.Chain{Name: "guard", Table: table, Type: nftables.ChainTypeFilter,
+		Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityFilter})
+	// ip saddr 127.0.0.1 th sport 3127 meta skuid != <forwarder> drop
+	c.AddRule(&nftables.Rule{Table: table, Chain: guard, Exprs: []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{127, 0, 0, 1}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 0, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binary.BigEndian.AppendUint16(nil, capturePort)},
+		&expr.Meta{Key: expr.MetaKeySKUID, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binary.NativeEndian.AppendUint32(nil, uint32(*forwarder))},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	}})
 	return c.Flush()
 }

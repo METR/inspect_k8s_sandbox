@@ -13,7 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -277,7 +279,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		t.Fatalf("bring lo up: %v", err)
 	}
 	for run := range 2 { // an init container that is started again
-		if err := redirect(nil); err != nil {
+		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid())}); err != nil {
 			t.Fatalf("run %d: %v", run+1, err)
 		}
 	}
@@ -285,6 +287,31 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	if !slices.ContainsFunc(configured, func(a net.Addr) bool { return a.String() == captureRange.String() }) {
 		t.Fatalf("the addresses are %v: glibc asks for a name's IPv4 address alone only where one other than 127.0.0.1 is configured", configured)
 	}
+	// While the forwarder is down, another user's process can hold its port and is sent the lookups: it answers none.
+	runtime.LockOSThread()
+	unix.Setfsuid(1)
+	other, err := net.ListenPacket("udp4", captureAddr)
+	unix.Setfsuid(0)
+	runtime.UnlockOSThread()
+	if err != nil {
+		t.Fatal(err)
+	}
+	asker, err := net.Dial("udp4", "127.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	asker.Write(question(t, "pypi.org.", dnsmessage.TypeA, false))
+	other.SetDeadline(time.Now().Add(budget))
+	_, from, err := other.ReadFrom(make([]byte, 512))
+	if err != nil {
+		t.Fatalf("the lookup did not reach the holder of the forwarder's port: %v", err)
+	}
+	if _, err := other.WriteTo([]byte("an answer"), from); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("another user's process that holds the forwarder's port answered a lookup (%v): want its answer dropped", err)
+	}
+	asker.Close()
+	other.Close()
+
 	target, accepted := proxy(t)
 	f := keyedForwarder(0, 0)
 	now := make(chan struct{}) // the node learns of a stream's end at once
