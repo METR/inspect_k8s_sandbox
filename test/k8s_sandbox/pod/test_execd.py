@@ -645,10 +645,54 @@ async def test_a_failed_restart_after_start_is_not_retryable(
 
     server = await daemons.serve(dies_after_start)
     sandbox = daemons.client()
+    monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
 
     # PodError is retried too, which would run the command again.
     with pytest.raises(ExecdResultUnknownError):
-        await sandbox.exec(["touch", "/once"], None, None, {}, None, 10)
+        call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+
+
+async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(
+    daemons: Daemons, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: one failed pod read ended the reconnect, and with it the command."""
+    dropped = probed = False
+    connect = execd._connect
+
+    async def refused_until_probed(
+        daemon: execd.Daemon, pace: execd.Pace
+    ) -> execd._Pipe:
+        if dropped and not probed:
+            raise ConnectionRefusedError
+        return await connect(daemon, pace)
+
+    async def unavailable(replace: bool) -> execd.Daemon:
+        nonlocal probed
+        probed = True
+        raise ApiException(status=503)
+
+    async def drops_then_resumes(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal dropped
+        kind, call_id, _ = await read_frame(r)
+        if kind == execd.START:  # the command runs on in execd: the connection drops
+            dropped, sandbox._start = True, unavailable
+            w.close()
+            return
+        w.write(frame(execd.RESUMED, call_id, b'{"stdin": 0, "eof": true, "put": 0}'))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+        await r.read()
+
+    await daemons.serve(drops_then_resumes)
+    sandbox = daemons.client()
+    monkeypatch.setattr(execd, "_connect", refused_until_probed)
+
+    call = sandbox.exec(["touch", "/once"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)
+
+    assert (result.returncode, probed) == (7, True)
 
 
 @pytest.mark.parametrize(

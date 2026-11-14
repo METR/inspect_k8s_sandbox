@@ -461,6 +461,10 @@ class ExecdClient:
                 except DaemonRunning:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
+                except Exception as failed:
+                    if self._link is None or isinstance(failed, K8sError):
+                        raise
+                    self._failed = failed  # the daemon may run on: its calls can resume
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link
