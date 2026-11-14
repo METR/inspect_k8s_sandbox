@@ -77,9 +77,6 @@ func (n *names) address(name string) (netip.Addr, bool) {
 
 // name is the one addr was given to.
 func (n *names) name(addr netip.Addr) (string, bool) {
-	if !captureRange.Contains(addr) {
-		return "", false
-	}
 	first, a := captureRange.Addr().As4(), addr.As4()
 	i := int(binary.BigEndian.Uint32(a[:])-binary.BigEndian.Uint32(first[:])) - 1
 	n.mu.Lock()
@@ -150,7 +147,7 @@ func (n *names) resolve(c net.PacketConn) error {
 
 // captured carries a connection that redirect sent here to the name its address was given to, and resets any other.
 func (f *forwarder) captured(c *net.TCPConn) {
-	if to, err := f.original(c); err == nil {
+	if to, err := originalDst(c); err == nil {
 		if name, ok := f.names.name(to.Addr()); ok {
 			f.stream(c, fmt.Sprintf("%s:%d", name, to.Port()))
 			return

@@ -552,7 +552,7 @@ func TestStreamThatMovesNoByteEitherWayIsEnded(t *testing.T) {
 	if _, err := io.ReadFull(atProxy, got); err != nil {
 		t.Fatal(err)
 	}
-	idle := <-timers
+	idle := within(t, timers, "idle timer")
 	fromGuest := idle.wound.Load()
 	if fromGuest == 0 {
 		t.Fatal("bytes from the guest did not wind the stream's idle timer back")

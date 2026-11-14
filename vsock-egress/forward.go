@@ -6,7 +6,6 @@ import (
 	"flag"
 	"log"
 	"net"
-	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -23,13 +22,12 @@ type forwarder struct {
 	queue   chan struct{} // one for each connection it carries or holds back
 	connect func(cid, port uint32) (*os.File, error)
 
-	names    *names // with capture: the address each name the sandbox looked up was given
-	original func(*net.TCPConn) (netip.AddrPort, error)
+	names *names // with capture: the address each name the sandbox looked up was given
 }
 
 func newForwarder(host, port uint32) *forwarder {
 	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams),
-		queue: make(chan struct{}, maxStreams+maxWaiting), connect: vsockDial, original: originalDst}
+		queue: make(chan struct{}, maxStreams+maxWaiting), connect: vsockDial}
 }
 
 func forward(args []string) error {

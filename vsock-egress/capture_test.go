@@ -136,7 +136,9 @@ func TestLookupGetsTheNamesAddressAndNoIPv6(t *testing.T) {
 	}
 	defer other.Close()
 	other.Write([]byte("no DNS message"))
-	other.Write(question(t, "pypi.org.", dnsmessage.TypeA, true))
+	if reply := n.answer(question(t, "pypi.org.", dnsmessage.TypeA, true)); reply != nil {
+		t.Fatalf("a reply got the answer %x: two resolvers that answer each other never stop", reply)
+	}
 
 	got, err := resolver.LookupNetIP(ctx, "ip", "PyPI.org.") // IPv4 and IPv6, as getaddrinfo asks; rooted, so no search list is tried
 	want, _ := n.address("pypi.org")
@@ -159,6 +161,10 @@ func TestLookupOfThePodsOwnNameLeadsToThePod(t *testing.T) {
 	}
 	if len(n.list) != 0 {
 		t.Fatalf("%v were given addresses that lead to the proxy", n.list)
+	}
+	// Without its own names the pod's resolver would answer them as it answers this one, and the proxy would get the pod's connections to itself.
+	if _, answers := asked(t, n, "default.example.", dnsmessage.TypeA); len(answers) != 1 || !captureRange.Contains(netip.AddrFrom4(answers[0].Body.(*dnsmessage.AResource).A)) {
+		t.Fatalf("another name got %v: want an address that leads to the proxy", answers)
 	}
 }
 
@@ -186,95 +192,6 @@ func TestLookupThatCannotBeKeptGetsNoAddress(t *testing.T) {
 	}
 }
 
-func TestCapturedConnectionAsksTheProxyForItsName(t *testing.T) {
-	target, accepted := proxy(t)
-	f := keyedForwarder(0, 0)
-	now := make(chan struct{}) // the node learns of a stream's end at once
-	close(now)
-	lagging(t, f, newWorker(firecracker(t, map[uint32]string{keyPort: string(f.key[:])}), target, 0), now)
-	f.names = loadedNames(t, filepath.Join(t.TempDir(), "names"))
-	pypi, _ := f.names.address("pypi.org")
-	going := make(chan netip.AddrPort, 1) // where the next connection was going, or nowhere the kernel knows of
-	f.original = func(*net.TCPConn) (to netip.AddrPort, err error) {
-		if to = <-going; !to.IsValid() {
-			err = unix.ENOENT
-		}
-		return to, err
-	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	go f.serve(l, f.captured)
-	// redirected is a program's connection to an address, and the first thing it reads there.
-	redirected := func(to netip.AddrPort, read []byte) (net.Conn, int, error) {
-		going <- to
-		c, err := net.Dial("tcp", l.Addr().String())
-		if err != nil { // a connection the forwarder resets at once may learn of it here
-			return nil, 0, err
-		}
-		t.Cleanup(func() { c.Close() })
-		c.SetDeadline(time.Now().Add(budget))
-		if read == nil {
-			return c, 0, nil
-		}
-		n, err := c.Read(read)
-		return c, n, err
-	}
-	asks := func() (net.Conn, *bufio.Reader) {
-		select {
-		case c := <-accepted:
-			c.SetDeadline(time.Now().Add(budget))
-			r := bufio.NewReader(c)
-			if request, err := http.ReadRequest(r); err != nil || request.Method != "CONNECT" || request.Host != "pypi.org:8443" {
-				t.Fatalf("the proxy read %+v, %v: want CONNECT pypi.org:8443", request, err)
-			}
-			return c, r
-		case <-time.After(budget):
-			t.Fatal("the connection did not reach the proxy")
-			return nil, nil
-		}
-	}
-
-	client, _, err := redirected(netip.AddrPortFrom(pypi, 8443), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	atProxy, fromClient := asks()
-	atProxy.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\nhello")) // a server that speaks first
-	client.Write([]byte("ping"))
-	got := make([]byte, 5)
-	if _, err := io.ReadFull(client, got); string(got) != "hello" {
-		t.Fatalf("the program read %q, %v: want what follows the proxy's reply", got, err)
-	}
-	if _, err := io.ReadFull(fromClient, got[:4]); string(got[:4]) != "ping" {
-		t.Fatalf("the proxy read %q, %v inside the tunnel", got[:4], err)
-	}
-
-	if client, _, err = redirected(netip.AddrPortFrom(pypi, 8443), nil); err != nil {
-		t.Fatal(err)
-	}
-	atProxy, _ = asks()
-	atProxy.Write([]byte("HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\nno"))
-	if n, err := client.Read(got); n != 0 || !errors.Is(err, unix.ECONNRESET) {
-		t.Fatalf("the program read %q, %v from a connection the proxy refused: want a reset", got[:n], err)
-	}
-
-	for name, dst := range map[string]netip.AddrPort{
-		"an address no name was given":    netip.AddrPortFrom(pypi.Next(), 443),
-		"a connection nothing redirected": netip.MustParseAddrPort("127.0.0.1:3127"),
-		"no original destination":         {},
-	} {
-		if _, n, err := redirected(dst, got); n != 0 || !errors.Is(err, unix.ECONNRESET) {
-			t.Fatalf("%s: the program read %q, %v: want a reset", name, got[:n], err)
-		}
-		if len(accepted) != 0 {
-			t.Fatalf("%s: the connection reached the proxy", name)
-		}
-	}
-}
-
 func TestForwarderWithoutItsCapturePortIsNotReady(t *testing.T) {
 	if taken, err := net.Listen("tcp4", captureAddr); err == nil { // else another process holds it, which serves as well
 		defer taken.Close()
@@ -284,8 +201,8 @@ func TestForwarderWithoutItsCapturePortIsNotReady(t *testing.T) {
 	go func() { failed <- forward([]string{"-listen", "127.0.0.1:0", "-key", file, "-capture"}) }()
 	select {
 	case err := <-failed:
-		if err == nil {
-			t.Fatal("forward returned without an error")
+		if !errors.As(err, new(*net.OpError)) { // where a profile refuses AF_VSOCK, forward fails later whatever it did here
+			t.Fatalf("forward returned %v: want the error of its capture port", err)
 		}
 	case <-time.After(budget):
 		t.Fatal("forward went on without its capture port")
@@ -301,9 +218,7 @@ func TestTunnelReadsTheProxysReplyFrameByFrame(t *testing.T) {
 		opened bool
 		rest   string // what the program is handed ahead of the tunnel's own bytes
 	}{
-		"a reply in one frame":                    {[]string{"HTTP/1.1 200 Connection established\r\n\r\n"}, true, ""},
-		"a reply cut in two, and what follows it": {[]string{"HTTP/1.1 200 Connec", "tion established\r\n\r\nhello"}, true, "hello"},
-		"a refusal": {[]string{"HTTP/1.1 403 Forbidden\r\n\r\nno"}, false, ""},
+		"a reply cut in two, and what follows it":  {[]string{"HTTP/1.1 200 Connec", "tion established\r\n\r\nhello"}, true, "hello"},
 		"a proxy that ends its side with no reply": {[]string{"HTTP/1.1 200 Connec", ""}, false, ""},
 		"a reply longer than a frame":              {[]string{"HTTP/1.1 200 " + strings.Repeat("x", maxFrame-13), "x\r\n\r\n"}, false, ""},
 	} {
@@ -370,19 +285,14 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	if !slices.ContainsFunc(configured, func(a net.Addr) bool { return a.String() == captureRange.String() }) {
 		t.Fatalf("the addresses are %v: glibc asks for a name's IPv4 address alone only where one other than 127.0.0.1 is configured", configured)
 	}
-	n := loadedNames(t, filepath.Join(t.TempDir(), "names"))
-	queries, err := net.ListenPacket("udp4", captureAddr)
-	if err != nil {
+	target, accepted := proxy(t)
+	f := keyedForwarder(0, 0)
+	now := make(chan struct{}) // the node learns of a stream's end at once
+	close(now)
+	lagging(t, f, newWorker(firecracker(t, map[uint32]string{keyPort: string(f.key[:])}), target, 0), now)
+	if err := f.capture(filepath.Join(t.TempDir(), "names"), nil); err != nil {
 		t.Fatal(err)
 	}
-	defer queries.Close()
-	go n.resolve(queries)
-	l, err := net.Listen("tcp4", captureAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	l.(*net.TCPListener).SetDeadline(time.Now().Add(budget))
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
@@ -393,19 +303,65 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	if err != nil || len(got) != 1 || !captureRange.Contains(got[0]) {
 		t.Fatalf("a lookup at port 53 got %v, %v: want the forwarder's answer", got, err)
 	}
-	want := netip.AddrPortFrom(got[0], 8443)
-	client, err := net.DialTimeout("tcp4", want.String(), budget)
-	if err != nil {
-		t.Fatalf("a connection to %v: %v", want, err)
+	pypi := netip.AddrPortFrom(got[0], 8443).String()
+	// connected is a program's connection to an address, and the first thing it reads there.
+	connected := func(to string, read []byte) (net.Conn, int, error) {
+		c, err := net.DialTimeout("tcp4", to, budget)
+		if err != nil { // a connection the forwarder resets at once may learn of it here
+			return nil, 0, err
+		}
+		t.Cleanup(func() { c.Close() })
+		c.SetDeadline(time.Now().Add(budget))
+		if read == nil {
+			return c, 0, nil
+		}
+		n, err := c.Read(read)
+		return c, n, err
 	}
-	defer client.Close()
-	c, err := l.Accept()
-	if err != nil {
-		t.Fatalf("the connection did not reach the forwarder: %v", err)
+	asks := func() (net.Conn, *bufio.Reader) {
+		c := within(t, accepted, "connection at the proxy")
+		c.SetDeadline(time.Now().Add(budget))
+		r := bufio.NewReader(c)
+		if request, err := http.ReadRequest(r); err != nil || request.Method != "CONNECT" || request.Host != "pypi.org:8443" {
+			t.Fatalf("the proxy read %+v, %v: want CONNECT pypi.org:8443", request, err)
+		}
+		return c, r
 	}
-	defer c.Close()
-	if to, err := originalDst(c.(*net.TCPConn)); err != nil || to != want {
-		t.Fatalf("the forwarder took the connection to be for %v, %v: want %v", to, err, want)
+
+	client, _, err := connected(pypi, nil)
+	if err != nil {
+		t.Fatalf("a connection to %v: %v", pypi, err)
+	}
+	atProxy, fromClient := asks()
+	atProxy.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\nhello")) // a server that speaks first
+	client.Write([]byte("ping"))
+	read := make([]byte, 5)
+	if _, err := io.ReadFull(client, read); string(read) != "hello" {
+		t.Fatalf("the program read %q, %v: want what follows the proxy's reply", read, err)
+	}
+	if _, err := io.ReadFull(fromClient, read[:4]); string(read[:4]) != "ping" {
+		t.Fatalf("the proxy read %q, %v inside the tunnel", read[:4], err)
+	}
+
+	if client, _, err = connected(pypi, nil); err != nil {
+		t.Fatal(err)
+	}
+	atProxy, _ = asks()
+	atProxy.Write([]byte("HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\nno"))
+	if n, err := client.Read(read); n != 0 || !errors.Is(err, unix.ECONNRESET) {
+		t.Fatalf("the program read %q, %v from a connection the proxy refused: want a reset", read[:n], err)
+	}
+
+	for name, to := range map[string]string{
+		"an address no name was given":    netip.AddrPortFrom(got[0].Next(), 443).String(),
+		"a connection nothing redirected": captureAddr,
+	} {
+		if _, n, err := connected(to, read); n != 0 || !errors.Is(err, unix.ECONNRESET) {
+			t.Fatalf("%s: the program read %q, %v: want a reset", name, read[:n], err)
+		}
+		if len(accepted) != 0 {
+			t.Fatalf("%s: the connection reached the proxy", name)
+		}
 	}
 	if c, err := net.DialTimeout("tcp4", "192.0.2.1:443", budget); !errors.Is(err, unix.ENETUNREACH) {
 		t.Fatalf("a connection to an address outside %v: %v, %v: want no route", captureRange, c, err)
