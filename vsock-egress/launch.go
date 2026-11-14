@@ -146,20 +146,21 @@ func start(sb sandbox, args ...string) (*child, error) {
 }
 
 // inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
-// A thread that cannot come back is never used again: it ends with its goroutine.
+// A thread that cannot come back stays locked, so it is never used again: it ends with its goroutine.
 func inNetns(path string, f func() error) error {
-	runtime.LockOSThread()
-	home, err := os.Open("/proc/thread-self/ns/net")
-	if err != nil {
-		return err
-	}
-	defer home.Close()
 	ns, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("the pod's network namespace is not at %s: %w", path, err)
 	}
 	defer ns.Close()
-	if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
+	runtime.LockOSThread()
+	home, err := os.Open("/proc/thread-self/ns/net")
+	if err == nil {
+		defer home.Close()
+		err = unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET)
+	}
+	if err != nil {
+		runtime.UnlockOSThread()
 		return fmt.Errorf("enter the pod's network namespace at %s: %w", path, err)
 	}
 	err = f()
@@ -173,12 +174,18 @@ func inNetns(path string, f func() error) error {
 type launcher struct {
 	node
 	rate     int
-	workers  map[string]*child // by sandbox id
-	reported map[string]bool   // sandboxes whose fault is already in the log
+	retry    time.Duration        // the least time between two starts of one sandbox's worker
+	workers  map[string]*child    // by sandbox id
+	tried    map[string]time.Time // when each sandbox's worker was last started
+	reported map[string]bool      // sandboxes whose fault is already in the log
+}
+
+func newLauncher() *launcher {
+	return &launcher{retry: 5 * time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]bool{}}
 }
 
 func launch(args []string) error {
-	l := &launcher{workers: map[string]*child{}, reported: map[string]bool{}}
+	l := newLauncher()
 	fs := flag.NewFlagSet("launch", flag.ExitOnError)
 	l.flags(fs)
 	fs.IntVar(&l.rate, "rate", 0, "bytes a second a sandbox's streams may carry, both ways together; 0 for no cap")
@@ -196,8 +203,9 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	wanted := map[string]sandbox{}
+	wanted, present := map[string]sandbox{}, map[string]bool{}
 	for _, r := range records {
+		present[r.ContainerID] = true
 		if r.Capability.Annotations[proxyAnnotation] == "" {
 			continue
 		}
@@ -210,6 +218,11 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		} else if !errors.Is(err, os.ErrNotExist) && !l.reported[r.ContainerID] { // a VM's directory can follow its record
 			l.reported[r.ContainerID] = true
 			log.Printf("%s: no worker: %v", sb.pod, err)
+		}
+	}
+	for id := range l.reported {
+		if !present[id] {
+			delete(l.reported, id)
 		}
 	}
 	return wanted, nil
@@ -227,10 +240,16 @@ func (l *launcher) pass() error {
 			delete(l.workers, id)
 		}
 	}
+	for id := range l.tried {
+		if _, ok := wanted[id]; !ok {
+			delete(l.tried, id)
+		}
+	}
 	for id, sb := range wanted {
-		if l.workers[id] != nil {
+		if l.workers[id] != nil || time.Since(l.tried[id]) < l.retry { // one that cannot start, or dies at once, is not started twice a second
 			continue
 		}
+		l.tried[id] = time.Now()
 		w, err := start(sb, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
 			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
 		if err != nil {

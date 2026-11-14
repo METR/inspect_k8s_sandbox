@@ -25,7 +25,8 @@ func fakeNode(t *testing.T) *launcher {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	os.Chmod(dir, 0o755) // a VM's uid must reach its own directory
-	l := &launcher{node: node{vms: dir + "/vms", cni: dir + "/cni", netns: "/proc/self/ns"}, workers: map[string]*child{}, reported: map[string]bool{}}
+	l := newLauncher()
+	l.node = node{vms: dir + "/vms", cni: dir + "/cni", netns: "/proc/self/ns"}
 	for _, d := range []string{l.vms, l.cni} {
 		if err := os.Mkdir(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -48,7 +49,8 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 		t.Fatal(err)
 	}
 	root := filepath.Join(l.vms, id[:12], "root")
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	os.Mkdir(filepath.Dir(root), 0o755) // root's and open to all, as the runtime has it
+	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
 		t.Fatal(err)
 	}
 	if os.Geteuid() == 0 {
@@ -121,6 +123,20 @@ func status(t *testing.T, pid int, field string) string {
 	return ""
 }
 
+// listening waits until the sandbox's worker has made its socket in the VM's directory.
+func listening(t *testing.T, l *launcher, id string) {
+	t.Helper()
+	socket := filepath.Join(l.vms, id[:12], "root", fmt.Sprintf("vm.vsock_%d", streamPort))
+	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(socket); err == nil {
+			return
+		}
+		if time.Now().After(deadline) || l.workers[id].exited() {
+			t.Fatalf("the worker did not come to listen at %s", socket)
+		}
+	}
+}
+
 func ended(t *testing.T, w *child) {
 	t.Helper()
 	select {
@@ -152,6 +168,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	if first == nil {
 		t.Fatal("no worker for a sandbox that names a proxy")
 	}
+	listening(t, l, id("a"))
 	pid := first.cmd.Process.Pid
 	uids, caps := fmt.Sprintf("%d %[1]d %[1]d %[1]d", vmUID), "0000000000000000"
 	if got := status(t, pid, "Uid"); got != uids {
@@ -178,13 +195,22 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 
 	syscall.Kill(pid, syscall.SIGKILL)
 	ended(t, first)
+	l.retry = time.Hour
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if again := l.workers[id("a")]; again != nil {
+		t.Fatal("a worker that died just after it started was started again at once")
+	}
+	l.retry = 0
 	if err := l.pass(); err != nil {
 		t.Fatal(err)
 	}
 	second := l.workers[id("a")]
-	if second == nil || second == first {
+	if second == nil {
 		t.Fatal("a worker that died was not replaced")
 	}
+	listening(t, l, id("a"))
 
 	os.Remove(record) // the sandbox is deleted
 	if err := l.pass(); err != nil {
