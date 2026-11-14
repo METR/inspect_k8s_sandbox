@@ -38,12 +38,16 @@ type worker struct {
 	failed  atomic.Int64 // streams that did not reach the proxy since the last report
 }
 
+// workerStreams is the most streams a worker joins at once. The forwarder keeps a sandbox to maxStreams; a
+// stream ends on the node a moment after it ends in the guest, so the worker's own bound is twice that.
+const workerStreams = 2 * maxStreams
+
 // newStreams bounds the streams a worker takes in a second. Past it the worker's listener fills, and
 // Firecracker resets the guest's connections: a guest that floods its worker spends its own VM's time.
 const newStreams = 2000
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, maxStreams),
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
 		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -51,7 +55,7 @@ func newWorker(vsock, target string, rate int) *worker {
 // node's log a stream at a time.
 func (w *worker) report() {
 	if refused, failed := w.refused.Swap(0), w.failed.Swap(0); refused+failed > 0 {
-		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy", refused, maxStreams, failed)
+		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy", refused, workerStreams, failed)
 	}
 }
 

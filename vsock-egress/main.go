@@ -18,7 +18,8 @@ const (
 	canaryPort = 3131 // check and canary meet on this vsock port, both ways
 	hostCID    = 2
 	keySize    = 32
-	maxStreams = 64 // a sandbox's streams at once: the next is refused, not queued
+	maxStreams = 64  // a sandbox's streams at once: the forwarder holds the next back until one ends
+	maxWaiting = 448 // connections the forwarder holds back at once: the next is reset
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -158,7 +159,7 @@ func TestConnectionOpensWithTheKeyAndEndsEachWayInTheStream(t *testing.T) {
 	}
 }
 
-func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
+func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 	node, port := loopback(t)
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -192,7 +193,14 @@ func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
 		return c
 	}
 
-	for range maxStreams {
+	first := client()
+	var onNode *os.File
+	select {
+	case onNode = <-dialled:
+	case <-time.After(budget):
+		t.Fatal("the first connection did not reach the node")
+	}
+	for range maxStreams - 1 {
 		client()
 		select {
 		case <-dialled:
@@ -201,15 +209,96 @@ func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
 		}
 	}
 	extra := client()
-	refused := make(chan struct{})
+	reset := make(chan struct{})
 	go func() {
 		extra.Read(make([]byte, 1))
-		close(refused)
+		close(reset)
 	}()
+	first.Close() // one stream ends, both ways: its place is the waiting connection's
+	onNode.Write([]byte{0, 0, 0, 0})
 	select {
 	case <-dialled:
-		t.Fatalf("connection %d reached the node", maxStreams+1)
-	case <-refused:
+	case <-reset:
+		t.Fatalf("connection %d was reset: a client that keeps %d connections busy fails", maxStreams+1, maxStreams)
+	case <-time.After(budget):
+		t.Fatal("the waiting connection never got a place")
+	}
+}
+
+// viaUnix makes f reach w as it does through Firecracker, without one: each of f's vsock connections is a
+// connection to w's socket.
+func viaUnix(t *testing.T, f *forwarder, w *worker) {
+	dial := serve(t, w)
+	f.connect = func(uint32, uint32) (*os.File, error) {
+		c := dial()
+		defer c.Close()
+		raw, err := c.(*net.UnixConn).SyscallConn()
+		if err != nil {
+			return nil, err
+		}
+		fd := -1
+		raw.Control(func(conn uintptr) { fd, err = unix.Dup(int(conn)) })
+		if err != nil {
+			return nil, err
+		}
+		unix.SetNonblock(fd, true) // so that closing it wakes a read, as with a vsock connection
+		return os.NewFile(uintptr(fd), "vsock"), nil
+	}
+}
+
+func TestClientsThatReopenAtTheCapAreAllServed(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				io.Copy(c, c)
+				c.Close()
+			}()
+		}
+	}()
+	f := keyedForwarder(0, 0)
+	viaUnix(t, f, newWorker(firecracker(t, map[uint32]string{keyPort: string(f.key[:])}), echo.Addr().String(), 0))
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go f.serve(l)
+
+	const rounds = 15
+	failed := make(chan error, maxStreams*rounds)
+	var clients sync.WaitGroup
+	for range maxStreams {
+		clients.Add(1)
+		go func() {
+			defer clients.Done()
+			for range rounds { // a request on a new connection, closed, and at once the next
+				c, err := net.Dial("tcp", l.Addr().String())
+				if err == nil {
+					c.SetDeadline(time.Now().Add(budget))
+					got := make([]byte, 4)
+					if _, err = c.Write([]byte("ping")); err == nil {
+						_, err = io.ReadFull(c, got)
+					}
+					c.Close()
+				}
+				if err != nil {
+					failed <- err
+				}
+			}
+		}()
+	}
+	clients.Wait()
+	if len(failed) > 0 {
+		t.Fatalf("%d of %d requests failed, the first: %v", len(failed), maxStreams*rounds, <-failed)
 	}
 }
 

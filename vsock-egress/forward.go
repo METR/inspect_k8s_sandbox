@@ -18,11 +18,13 @@ type forwarder struct {
 	host    uint32        // the node's CID
 	port    uint32        // the node's vsock port for streams
 	slots   chan struct{} // one for each connection it carries
+	queue   chan struct{} // one for each connection it carries or holds back
 	connect func(cid, port uint32) (*os.File, error)
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams), connect: vsockDial}
+	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams),
+		queue: make(chan struct{}, maxStreams+maxWaiting), connect: vsockDial}
 }
 
 func forward(args []string) error {
@@ -104,12 +106,12 @@ func (f *forwarder) serve(l net.Listener) error {
 			continue
 		}
 		select {
-		case f.slots <- struct{}{}:
+		case f.queue <- struct{}{}:
 			go func() {
-				defer func() { <-f.slots }()
+				defer func() { <-f.queue }()
 				f.stream(c.(*net.TCPConn))
 			}()
-		default: // the worker joins no more: the rest would each hold a thread while its vsock connection is made
+		default:
 			c.(*net.TCPConn).SetLinger(0)
 			c.Close()
 		}
@@ -118,6 +120,16 @@ func (f *forwarder) serve(l net.Listener) error {
 
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
 func (f *forwarder) stream(c *net.TCPConn) {
+	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still
+	// ending: the new one waits here for its place. Refusing it broke clients that keep 64 connections busy.
+	select {
+	case f.slots <- struct{}{}:
+		defer func() { <-f.slots }()
+	case <-time.After(handshakeWait):
+		c.SetLinger(0)
+		c.Close()
+		return
+	}
 	up, err := f.dial()
 	if err != nil {
 		log.Print(err)

@@ -53,7 +53,7 @@ func proxy(t *testing.T) (address string, accepted chan net.Conn) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	accepted = make(chan net.Conn, 2*maxStreams)
+	accepted = make(chan net.Conn, 2*workerStreams)
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -302,7 +302,7 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	target, accepted := proxy(t)
 	dial := served(t, key, target, nil)
 
-	for range maxStreams { // a workload process dials and says nothing
+	for range workerStreams { // a workload process dials and says nothing
 		dial()
 	}
 	forwarder := dial()
@@ -321,7 +321,7 @@ func TestStreamPastTheCapIsRefused(t *testing.T) {
 	target, accepted := proxy(t)
 	dial := served(t, key, target, nil)
 
-	open := make([]net.Conn, maxStreams)
+	open := make([]net.Conn, workerStreams)
 	for i := range open {
 		open[i] = dial()
 		open[i].Write(key)
@@ -330,17 +330,17 @@ func TestStreamPastTheCapIsRefused(t *testing.T) {
 		select {
 		case <-accepted:
 		case <-time.After(budget):
-			t.Fatalf("fewer than %d streams reached the proxy", maxStreams)
+			t.Fatalf("fewer than %d streams reached the proxy", workerStreams)
 		}
 	}
 	extra := dial()
 	extra.Write(key)
 	select {
 	case <-accepted:
-		t.Fatalf("stream %d reached the proxy", maxStreams+1)
+		t.Fatalf("stream %d reached the proxy", workerStreams+1)
 	case <-closed(extra):
 	case <-time.After(budget):
-		t.Fatalf("stream %d was neither refused nor joined", maxStreams+1)
+		t.Fatalf("stream %d was neither refused nor joined", workerStreams+1)
 	}
 
 	open[0].Close() // its slot comes back once the worker has seen the close
@@ -380,7 +380,7 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 	io.Copy(io.Discard, up) // the worker has seen the cancel once it closes the proxy's connection
 
 	admitted := 0
-	for range maxStreams {
+	for range workerStreams {
 		c := dial()
 		c.Write(key)
 		select {
@@ -391,8 +391,8 @@ func TestCancelledStreamKeepsItsSlotUntilItHasStopped(t *testing.T) {
 			t.Fatal("a stream was neither refused nor joined")
 		}
 	}
-	if admitted != maxStreams-1 {
-		t.Fatalf("%d streams were let in beside one that had not stopped: want %d", admitted, maxStreams-1)
+	if admitted != workerStreams-1 {
+		t.Fatalf("%d streams were let in beside one that had not stopped: want %d", admitted, workerStreams-1)
 	}
 }
 
