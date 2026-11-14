@@ -197,23 +197,48 @@ func TestAHugeTimeoutIsNoTimeout(t *testing.T) {
 func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	startReaper()
 	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: "t", Timeout: 0.05})
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: a repeat's kill may still be looking for the last one's
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag, Timeout: 0.05})
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 
 	s.dispatch(c, frame{kind: fStart, id: 7, payload: req})
 
+	if status := exitStatus(t, frames); status["timeout"] != true {
+		t.Fatalf("EXIT %v: the client can't tell the timeout from a kill -9", status)
+	}
+}
+
+func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
+	afterFunc = func(time.Duration, func()) *time.Timer {
+		fired := time.NewTimer(0) // a timer that has fired, whose kill found the command gone
+		<-fired.C
+		return fired
+	}
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
+	startReaper()
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "exit 3"}, Env: map[string]string{}, Tag: "e", Timeout: 60})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fStart, id: 8, payload: req})
+
+	if status := exitStatus(t, frames); status["code"] != 3.0 || status["timeout"] != nil {
+		t.Fatalf("EXIT %v, want code 3 and no timeout", status)
+	}
+}
+
+// exitStatus waits for a call's EXIT and returns it under the keys the client reads: a struct would match them in any case.
+func exitStatus(t *testing.T, frames <-chan frame) (status map[string]any) {
+	t.Helper()
 	for {
 		select {
 		case f := <-frames:
-			if f.kind != fExit {
-				continue
+			if f.kind == fExit {
+				json.Unmarshal(f.payload, &status)
+				return status
 			}
-			var status struct{ Timeout bool }
-			if json.Unmarshal(f.payload, &status); !status.Timeout {
-				t.Fatalf("EXIT %s: the client can't tell the timeout from a kill -9", f.payload)
-			}
-			return
 		case <-time.After(30 * time.Second):
 			t.Fatal("no EXIT")
 		}

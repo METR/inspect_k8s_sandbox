@@ -37,7 +37,7 @@ const idleTimeout = 60 * time.Second
 // abandonAfter outlasts the client's reconnect window (5 minutes).
 const abandonAfter = 6 * time.Minute
 
-var afterFunc = time.AfterFunc // tests fire the abandon timers themselves
+var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
 var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
 
@@ -417,12 +417,7 @@ func (cl *call) run(req startRequest) error {
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = time.AfterFunc(time.Duration(req.Timeout*float64(time.Second)), func() {
-			cl.mu.Lock()
-			cl.timedOut = true
-			cl.mu.Unlock()
-			cl.kill()
-		})
+		deadline = afterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
 	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
@@ -453,10 +448,9 @@ func (cl *call) run(req startRequest) error {
 		code := <-exited
 		cl.mu.Lock()
 		cl.pid = 0 // reaped: its id may now be another group's
+		// Not a command that ended by itself as its timer fired: the kill found it gone.
+		cl.timedOut = deadline != nil && !deadline.Stop() && code == 128+int(syscall.SIGKILL)
 		cl.mu.Unlock()
-		if deadline != nil {
-			deadline.Stop()
-		}
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
