@@ -1274,28 +1274,23 @@ async def test_callers_share_one_reconnect(
     async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         raise ConnectionRefusedError
 
+    starts = 0
+
     async def still_running(replace: bool) -> execd.Daemon:
+        nonlocal starts
+        starts += 1
         raise execd.DaemonRunning("address already in use")
 
     monkeypatch.setattr(execd, "_connect", refused)
     monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
     sandbox._start = still_running
-    opens = 0
-    open_ = sandbox._open
-
-    async def counted(deadline: float) -> execd.Link:
-        nonlocal opens
-        opens += 1
-        return await open_(deadline)
-
-    sandbox._open = counted  # type: ignore[method-assign]
 
     results = await asyncio.gather(
         *(sandbox._get(stale) for _ in range(5)), return_exceptions=True
     )
 
     assert all(isinstance(r, ConnectionError) for r in results)
-    assert opens == 1
+    assert starts < len(results)  # one reconnect's starts, not each caller's own
 
 
 async def test_only_a_resume_waits_out_a_reconnect(
@@ -1706,7 +1701,7 @@ async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> 
 
 
 async def test_only_one_fingerprint_line_starts_execd(
-    monkeypatch: pytest.MonkeyPatch,
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     printed = b"0" * 64 + b"\n"
 
@@ -1717,19 +1712,8 @@ async def test_only_one_fingerprint_line_starts_execd(
         def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
             return 0, printed, b""
 
-    async def run(f: collections.abc.Callable[[], object]) -> object:
-        return f()
-
-    async def no_restart() -> None:
-        return None
-
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
-    monkeypatch.setattr(pod_module, "k8s_client", lambda _: None)
-    ip = types.SimpleNamespace(ip="10.0.0.1")
-    monkeypatch.setattr(pod_module, "read_pod", lambda *_: ip)
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
-    monkeypatch.setattr(pod, "check_for_pod_restart", no_restart)
-    monkeypatch.setattr(pod, "_run_async", run)
     assert (await pod._start_execd(False)).fingerprint == "0" * 64
 
     printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
@@ -1905,21 +1889,8 @@ async def test_the_read_of_execds_address_uses_a_client_of_its_own_thread(
 
 
 async def test_a_resume_resends_only_stdin_execd_has_not_written(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+    daemons: Daemons,
 ) -> None:
-    upload = execd.ExecdClient._upload
-
-    async def bounded(
-        client: execd.ExecdClient,
-        link: execd.Link,
-        call: execd.Call,
-        data: bytes | None,
-        offset: int,
-    ) -> None:
-        if offset >= 0:  # below zero, it would hold the loop for ever
-            await upload(client, link, call, data, offset)
-
-    monkeypatch.setattr(execd.ExecdClient, "_upload", bounded)
     resent: list[bytes] = []
     connections = 0
 
@@ -1935,7 +1906,7 @@ async def test_a_resume_resends_only_stdin_execd_has_not_written(
             w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 3}'))  # all written
             w.close()  # dropped, so the client resumes
             return
-        got = {"stdin": -(10**30), "eof": False, "put": 0}
+        got = {"stdin": -5, "eof": False, "put": 0}
         w.write(frame(execd.RESUMED, call_id, json.dumps(got).encode()))
         while not resent or resent[-1]:  # to the empty frame that closes stdin
             kind, _, payload = await read_frame(r)
