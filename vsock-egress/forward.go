@@ -14,14 +14,15 @@ import (
 
 // forwarder is the sandbox's side. It reads nothing of what it carries and names no destination.
 type forwarder struct {
-	key   [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
-	host  uint32        // the node's CID
-	port  uint32        // the node's vsock port for streams
-	slots chan struct{} // one for each connection it carries
+	key     [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
+	host    uint32        // the node's CID
+	port    uint32        // the node's vsock port for streams
+	slots   chan struct{} // one for each connection it carries
+	connect func(cid, port uint32) (*os.File, error)
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams)}
+	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams), connect: vsockDial}
 }
 
 func forward(args []string) error {
@@ -138,7 +139,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 // one that is starting or being replaced.
 func (f *forwarder) dial() (*os.File, error) {
 	for deadline := time.Now().Add(handshakeWait); ; time.Sleep(100 * time.Millisecond) {
-		c, err := vsockDial(f.host, f.port)
+		c, err := f.connect(f.host, f.port)
 		if err == nil || !errors.Is(err, unix.ECONNRESET) || time.Now().After(deadline) {
 			return c, err
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -209,27 +210,24 @@ func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
 
 func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 	node, port := loopback(t)
-	node.f.Close() // no worker listens yet: a connection to the port is reset
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
+	starting := true // the first connection finds no worker listening, as while one is being started
+	f.connect = func(cid, port uint32) (*os.File, error) {
+		if starting {
+			starting = false
+			return nil, fmt.Errorf("vsock connect: %w", unix.ECONNRESET)
+		}
+		return vsockDial(cid, port)
+	}
 	client := proxyPort(t, f)
-	client.Write([]byte("request"))
 	refused := make(chan error, 1)
 	go func() {
 		_, err := client.Read(make([]byte, 1))
 		refused <- err
 	}()
-
-	var late *vsockListener
-	for deadline := time.Now().Add(budget); late == nil; { // the port is free once the kernel has let go of the old listener
-		var err error
-		if late, err = vsockListen(port); err != nil && time.Now().After(deadline) {
-			t.Fatal(err)
-		}
-	}
-	defer late.f.Close()
 	arrived := make(chan error, 1)
 	go func() {
-		c, _, err := late.accept()
+		c, _, err := node.accept()
 		if err == nil {
 			t.Cleanup(func() { c.Close() }) // held open: closing it now would end the client's connection too
 		}
