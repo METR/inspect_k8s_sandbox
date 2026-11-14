@@ -61,7 +61,7 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 		if err != nil {
 			return nil, fmt.Errorf("vsock socket: %w", err)
 		}
-		// Unless told, a guest socket takes 256 KiB at a time and a download stalls at that; the maximum goes first, since it bounds the size.
+		// Unless told, a guest socket takes 256 KiB at a time, which holds a download back; the maximum goes first, since it bounds the size.
 		unix.SetsockoptUint64(fd, unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_MAX_SIZE, vsockBuffer)
 		unix.SetsockoptUint64(fd, unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_SIZE, vsockBuffer)
 		if err = unix.Connect(fd, &unix.SockaddrVM{CID: cid, Port: port}); err == nil {
