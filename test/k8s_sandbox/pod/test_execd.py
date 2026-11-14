@@ -2290,25 +2290,62 @@ async def test_a_read_of_costly_records_takes_a_pass_for_each_slice(
 ) -> None:
     """Regression: 64 KiB of TLS KeyUpdates, one pass, held the loop 45 ms."""
     context, pin = tls
-    size = 4 * execd.RAW_READ
+    count = 3 * execd.RAW_READ // 23  # a byte a record: 23 bytes of TLS each
+    sent = asyncio.Event()
 
     async def sends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        w.write(b"x" * size)
+        for _ in range(count):
+            w.write(b"x")  # a record of its own: bytes that deliver next to nothing
+        await w.drain()
+        sent.set()
         await r.read()
 
     server = await asyncio.start_server(sends, "127.0.0.1", 0, ssl=context)
     monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
+    await asyncio.wait_for(sent.wait(), 30)  # so that it is read in full reads
     looks = itertools.count()
-    clock.cpu = lambda: next(looks) * 0.003  # each look at the clock: 3 ms more spent
+    clock.cpu = lambda: next(looks) * 0.0021  # each look at the clock: 2.1 ms more
+    began = clock.now
+
+    await pipe.readexactly(count)
+
+    await pipe.close()
+    server.close()
+    # After the first pass, one for each 8 KiB: together past a second's 50 ms of TLS.
+    assert clock.now - began > 0.5
+
+
+async def test_a_read_of_records_that_deliver_their_bytes_is_not_sliced(
+    tls: tuple[ssl.SSLContext, str],
+    clock: types.SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: every read was sliced, and a 100 MiB read slept out each second."""
+    context, pin = tls
+    size = 3 * execd.RAW_READ // 2
+    sent = asyncio.Event()
+
+    async def sends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write(b"x" * size)
+        await w.drain()
+        sent.set()
+        await r.read()
+
+    server = await asyncio.start_server(sends, "127.0.0.1", 0, ssl=context)
+    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+    pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
+    await asyncio.wait_for(sent.wait(), 30)  # so that it is read in full reads
+    looks = itertools.count()
+    clock.cpu = lambda: next(looks) * 0.005  # each look at the clock: 5 ms more
     began = clock.now
 
     await pipe.readexactly(size)
 
     await pipe.close()
     server.close()
-    # A pass for each 8 KiB at that cost; unsliced, the few passes fit a second's 50 ms.
-    assert clock.now - began > 0.5
+    # A pass or two; sliced, twelve, whose looks at the clock add up past 50 ms.
+    assert clock.now - began < 0.5
 
 
 async def test_a_stream_is_charged_only_for_tls_s_own_bytes(
