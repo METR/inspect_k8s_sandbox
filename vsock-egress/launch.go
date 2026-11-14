@@ -23,8 +23,7 @@ import (
 // proxyAnnotation names, as host:port, the one place a sandbox's streams are joined to: its sample's egress proxy.
 const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
 
-// A proxy is a Service of the pod's own namespace, by its cluster name, and a port: a Service keeps its
-// address when its pod is replaced, and nothing else reaches a worker's command line.
+// A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
 var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:[0-9]{1,5}$`)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
@@ -40,8 +39,7 @@ func (n *node) flags(fs *flag.FlagSet) {
 	fs.StringVar(&n.netns, "netns", "/run/netns", "where each pod's network namespace is bound")
 }
 
-// record is what libcni keeps for a pod's eth0: the sandbox, its network namespace, and the pod's name and
-// annotations as they were when the sandbox was made. A later change to the pod changes nothing here.
+// record is what libcni keeps for a pod's eth0, as the pod was when its sandbox was made: a later change to the pod changes nothing here.
 type record struct {
 	ContainerID string      `json:"containerId"`
 	IfName      string      `json:"ifName"`
@@ -190,8 +188,7 @@ func reap(args []string) error {
 	return nil
 }
 
-// inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
-// A thread that cannot come back stays locked, so it is never used again: it ends with its goroutine.
+// inNetns runs f on a thread inside the network namespace at path; a thread that cannot come back stays locked, so it ends with its goroutine.
 func inNetns(path string, f func() error) error {
 	ns, err := os.Open(path)
 	if err != nil {

@@ -21,10 +21,7 @@ var (
 	readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4+maxFrame) }}
 )
 
-// join carries one TCP connection over a vsock connection, as frames. Firecracker passes no half-close on,
-// so each direction ends with an empty frame and the vsock connection closes only when both have ended.
-// A stream cut short reaches the TCP peer as a reset, never as a clean end. Both directions have stopped,
-// and let go of their buffers, before join returns.
+// join carries one TCP connection over a vsock connection as frames: Firecracker passes no half-close on, so each direction ends with an empty frame.
 func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 	var running sync.WaitGroup
 	sent, received, gone := make(chan error, 1), make(chan error, 1), make(chan struct{})
@@ -92,8 +89,7 @@ func toFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 	}
 }
 
-// fromFrames copies frames from src to dst until the empty frame, each part of a frame as it arrives.
-// A stream that ends before the empty frame is an error.
+// fromFrames copies frames from src to dst until the empty frame, each part of a frame as it arrives; a stream that ends before it is an error.
 func fromFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 	r := readers.Get().(*bufio.Reader)
 	r.Reset(src)

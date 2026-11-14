@@ -64,8 +64,7 @@ func ready(args []string) error {
 	return err
 }
 
-// loadKey takes the key from file, minting it there first if the file holds none: the worker fetches the
-// key once, so a forwarder that is restarted must come back with the same one.
+// loadKey takes the key from file, minting it there if the file holds none: the worker fetches it once, so a restarted forwarder must come back with the same one.
 func (f *forwarder) loadKey(file string) error {
 	if kept, err := os.ReadFile(file); err == nil && len(kept) == keySize {
 		copy(f.key[:], kept)
@@ -120,8 +119,7 @@ func (f *forwarder) serve(l net.Listener) error {
 
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
 func (f *forwarder) stream(c *net.TCPConn) {
-	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still
-	// ending: the new one waits here for its place. Refusing it broke clients that keep 64 connections busy.
+	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:
 		defer func() { <-f.slots }()
@@ -147,8 +145,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 	join(up, c, nil)
 }
 
-// dial connects to the node's worker. With no worker listening the connection is reset, so this waits out
-// one that is starting or being replaced.
+// dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.
 func (f *forwarder) dial() (*os.File, error) {
 	for deadline := time.Now().Add(handshakeWait); ; time.Sleep(100 * time.Millisecond) {
 		c, err := f.connect(f.host, f.port)

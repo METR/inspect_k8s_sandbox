@@ -1,7 +1,4 @@
-// vsock-egress carries a sandbox's proxy connections out of an AWS Nitro Sandbox that has no network card.
-// In the sandbox, forward serves the proxy port on loopback and sends each connection over the VM's vsock.
-// On the node, launch starts a worker for each such VM, as the VM's own uid inside the pod's network
-// namespace, and the worker joins each connection to the one address the pod's annotation names. Linux only.
+// vsock-egress carries a sandbox's proxy connections out of an AWS Nitro Sandbox with no network card, over the VM's vsock to the one address its pod names. Linux only.
 package main
 
 import (

@@ -54,16 +54,14 @@ func (l *vsockListener) accept() (*os.File, uint32, error) {
 
 const vsockBuffer = 1 << 20 // bytes a dialled socket takes from its peer at a time
 
-// vsockDial connects to a vsock port. The kernel cancels a connect that a signal interrupts, so that one
-// starts again on a new socket.
+// vsockDial connects to a vsock port, on a new socket after a signal interrupts it: the kernel cancels that connect.
 func vsockDial(cid, port uint32) (*os.File, error) {
 	for {
 		fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
 			return nil, fmt.Errorf("vsock socket: %w", err)
 		}
-		// A guest socket takes 256 KiB at a time unless told otherwise, and a download stops at that. The
-		// maximum first, since it bounds the size; a failure leaves the default.
+		// Unless told, a guest socket takes 256 KiB at a time and a download stalls at that; the maximum goes first, since it bounds the size.
 		unix.SetsockoptUint64(fd, unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_MAX_SIZE, vsockBuffer)
 		unix.SetsockoptUint64(fd, unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_SIZE, vsockBuffer)
 		if err = unix.Connect(fd, &unix.SockaddrVM{CID: cid, Port: port}); err == nil {
