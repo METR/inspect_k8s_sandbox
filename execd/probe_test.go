@@ -133,8 +133,8 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 		{"none given", nil, srv.Listener.Addr().String(),
 			http.Header{"User-Agent": {"kube-probe/1.36"}, "Accept": {"*/*"}, "Connection": {"close"}}},
 		// A value is the bytes after the first colon: the kubelet sends on a non-breaking space that ends one.
-		{"its own", []string{"Host:probe.test", "User-Agent:mine", "Accept:", "X-Probe:a ", "x-probe:b:c"}, "probe.test",
-			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a ", "b:c"}, "Connection": {"close"}}},
+		{"its own", []string{"Host:probe.test", "User-Agent:mine", "Accept:", "X-Probe:a\xc2\xa0", "x-probe:b:c"}, "probe.test",
+			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a\xc2\xa0", "b:c"}, "Connection": {"close"}}},
 	} {
 		if err := probe(ask(srv, "/healthz", tc.given...), probeBudget); err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
