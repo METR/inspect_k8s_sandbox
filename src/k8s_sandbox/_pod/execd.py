@@ -67,6 +67,7 @@ HOLD = 2 * ((4 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
+MAX_OWED = 1024  # calls over whose RELEASE no PONG has followed: execd answers at half
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers a second; past any, reading waits: no stand-in holds the loop.
 PACE_FRAMES = 4096
@@ -511,6 +512,8 @@ class ExecdClient:
     def _over(self, link: Link, call_id: int, *kinds: int) -> None:
         """Send a call's last frames, now and until a PONG follows its RELEASE."""
         self._owed[call_id] = kinds
+        if len(self._owed) % (MAX_OWED // 2) == 0:  # the next PING may be 15 s off
+            kinds += (PING,)
         to = link if not link.closed else self._link
         if to is not None and not to.closed:
             to.send_last(call_id, *kinds)
@@ -566,6 +569,8 @@ class ExecdClient:
         }
         start = json.dumps(request).encode()
         link = await self._get()
+        if len(self._owed) >= MAX_OWED:  # a peer that answers no PING is not execd
+            raise ConnectionError("execd has not confirmed the calls already made")
         deadline = None if timeout is None else time.monotonic() + timeout
 
         def left() -> float | None:  # of the command's timeout

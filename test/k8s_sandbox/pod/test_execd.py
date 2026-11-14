@@ -805,6 +805,54 @@ async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
     assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
 
 
+async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: a peer that answered no PING had the client keep every call."""
+    connections: list[asyncio.StreamWriter] = []
+    starts: list[int] = []
+    released: list[int] = []
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        connections.append(w)
+        second = len(connections) == 2
+        with contextlib.suppress(asyncio.IncompleteReadError, OSError):
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.START:
+                    starts.append(call_id)
+                    if len(starts) > 1:  # the first command runs on
+                        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.RESUME:  # its START went into a dropped connection
+                    w.write(frame(execd.ERROR, call_id, b"unknown call"))
+                elif kind == execd.RELEASE and second:
+                    released.append(call_id)
+
+    def call() -> collections.abc.Awaitable[object]:
+        return client.exec(["true"], None, None, {}, None, None)
+
+    client = await tls_daemon(answers_no_ping)
+    held = asyncio.ensure_future(
+        client.exec(["sleep", "600"], None, None, {}, None, None)
+    )
+    await until(lambda: bool(starts))
+    half = execd.MAX_OWED // 2
+    for _ in range(2):  # each half is asked about with a PING
+        await asyncio.wait_for(asyncio.gather(*(call() for _ in range(half))), 30)
+    with pytest.raises(ConnectionError, match="not confirmed"):
+        await call()
+    # One PONG; then the first command's exit, behind which the client has read it.
+    exit_ = frame(execd.EXIT, starts[0], b'{"code": 0}')
+    connections[0].write(frame(execd.PONG, 0) + exit_)
+    await asyncio.wait_for(held, 30)
+    connections[0].close()
+    await asyncio.wait_for(call(), 30)
+    await until(lambda: starts[-1] in released)
+
+    # The PONG answered the first PING: the second half is sent again, the first not.
+    assert set(released) == {*starts[1 + half : 1 + 2 * half], starts[0], starts[-1]}
+
+
 async def test_a_call_left_once_its_connection_is_replaced_is_killed_on_the_new_one(
     tls_daemon: TlsDaemon,
 ) -> None:
