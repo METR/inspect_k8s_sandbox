@@ -574,7 +574,8 @@ class ExecdClient:
         link = await self._get()
         end = time.monotonic() + CONNECT_TIMEOUT
         while len(self._owed) >= MAX_OWED:  # execd's PONGs are on their way
-            link.confirmed.clear()
+            if not link.closed:  # else it is set for good, and the next one is opened
+                link.confirmed.clear()
             try:
                 await asyncio.wait_for(link.confirmed.wait(), end - time.monotonic())
             except asyncio.TimeoutError:  # a peer that answers no PING is not execd
