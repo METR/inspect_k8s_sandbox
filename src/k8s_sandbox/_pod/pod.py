@@ -83,13 +83,6 @@ class Pod:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
         await self.check_for_pod_restart()
         info = self._info
-        api = k8s_client(info.context_name)
-        # Read first, so a started daemon is never lost to a failed read.
-        pod = await self._run_async(
-            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
-        )
-        if pod.ip is None:
-            raise PodError("The pod has no IP address for execd", pod=info.name)
         key = os.urandom(32)
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
@@ -104,6 +97,13 @@ class Pod:
             raise PodError("execd did not start", returncode=code, stderr=stderr)
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
+        api = k8s_client(info.context_name)
+        # Read last: a pod that replaced the one first checked has another address.
+        pod = await self._run_async(
+            lambda: read_pod(api, info.name, info.namespace, API_TIMEOUT)
+        )
+        if pod.ip is None:
+            raise PodError("The pod has no IP address for execd", pod=info.name)
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property

@@ -151,6 +151,7 @@ class Cluster:
     """What Kubernetes shows of pod p: running, its container restarted this often."""
 
     restarts = 0
+    uid, ip = "u", "10.0.0.1"
 
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
         container = {
@@ -159,8 +160,8 @@ class Cluster:
             "state": {"running": {}},
         }
         pod = {
-            "metadata": {"name": "p", "uid": "u"},
-            "status": {"podIP": "10.0.0.1", "containerStatuses": [container]},
+            "metadata": {"name": "p", "uid": self.uid},
+            "status": {"podIP": self.ip, "containerStatuses": [container]},
         }
         return types.SimpleNamespace(data=json.dumps(pod))
 
@@ -1270,24 +1271,39 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
         await pod._start_execd(False)
 
 
-async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
-    cluster: Cluster, monkeypatch: MonkeyPatch
-) -> None:
-    """Regression: a container that restarted as execd started served the sample."""
+def execd_starts(monkeypatch: MonkeyPatch, meanwhile: Callable[[], None]) -> None:
+    """Stand in for the exec that starts execd: meanwhile() runs as it does."""
 
     class Execute:
         def __init__(self, info: object) -> None:
             pass
 
         def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
-            cluster.restarts = 1  # since the check before the start
+            meanwhile()
             return 0, b"0" * 64 + b"\n", b""
 
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
-    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
+
+
+async def test_execd_started_in_a_restarted_container_is_refused_in_raise_mode(
+    cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: a container that restarted as execd started served the sample."""
+    execd_starts(monkeypatch, lambda: setattr(cluster, "restarts", 1))
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
 
     with pytest.raises(error.ContainerRestartedError):
         await pod._start_execd(False)
+
+
+async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
+    cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: in warn mode the client dialed the address of the pod replaced."""
+    execd_starts(monkeypatch, lambda: vars(cluster).update(uid="v", ip="10.0.0.2"))
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
+
+    assert (await pod._start_execd(False)).ip == "10.0.0.2"
 
 
 async def test_a_resume_resends_only_stdin_execd_has_not_written(
