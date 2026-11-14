@@ -778,17 +778,23 @@ var startSearcher = sync.OnceFunc(func() {
 	go func() {
 		runtime.LockOSThread() // the identities it takes are this thread's alone
 		for s := range searches {
-			setfs(s.as.Uid, s.as.Gid)
+			setids(s.as.Uid, s.as.Gid) // its kills are then the user's own: root may lack CAP_KILL
 			killTagged(s.tag)
-			setfs(uint32(os.Geteuid()), uint32(os.Getegid()))
+			setids(uint32(os.Getuid()), uint32(os.Getgid()))
 		}
 	}()
 })
 
-// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks.
-func setfs(uid, gid uint32) {
-	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
-	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
+// setids gives this thread an effective identity; its real and saved ones stay, to come back to.
+func setids(uid, gid uint32) {
+	keep := ^uintptr(0)
+	if uid != 0 { // the group first while still root, and root first on the way back
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
+	syscall.RawSyscall(syscall.SYS_SETRESUID, keep, uintptr(uid), keep)
+	if uid == 0 {
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
 	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
 }
 

@@ -1013,7 +1013,7 @@ func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 
 	// Without CAP_SYS_PTRACE root can't read another user's environment, where the call's tag is.
 	for id, pid := range victims {
-		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) == nil; time.Sleep(10 * time.Millisecond) {
+		for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
 				t.Fatalf("process %d, which call %d's command detached, outlived its kill", pid, id)
 			}
