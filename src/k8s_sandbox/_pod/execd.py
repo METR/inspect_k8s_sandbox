@@ -322,6 +322,7 @@ class Link:
         self.closed = False
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
+        self.bulk = asyncio.Lock()
         self._last_rx = time.monotonic()
         self._tasks = [
             asyncio.create_task(self._read()),
@@ -330,7 +331,9 @@ class Link:
         self._last: set[asyncio.Task[None]] = set()  # held until sent
 
     async def send(self, kind: int, call_id: int, payload: bytes = b"") -> None:
-        async with self._wlock:
+        # Only a START or STDIN waits its turn: any other frame has one ahead at most.
+        turn = self.bulk if kind in (START, STDIN) else contextlib.nullcontext()
+        async with turn, self._wlock:
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
@@ -491,7 +494,8 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
-                await self._replay(link)
+                async with link.bulk:  # no START or STDIN goes between what is owed
+                    await self._replay(link)
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 self._failed = e

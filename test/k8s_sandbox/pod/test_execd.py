@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -809,6 +810,52 @@ async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
     assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12), reason="there a replay is written in one step"
+)
+async def test_a_command_sent_during_a_replay_follows_what_is_owed(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it went out between the frames owed, as each upload would."""
+    got: list[list[int]] = []  # the kinds each connection got
+    drop = False  # the first connection, under the next command sent
+    replaying = asyncio.Event()
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        mine: list[int] = []
+        got.append(mine)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop and len(got) == 1:
+                break
+            mine.append(kind)
+            if len(got) == 2:
+                replaying.set()
+            if kind == execd.START and len(got) == 2:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    left = [call("sleep", "600") for _ in range(64)]
+    await until(lambda: bool(got) and got[0].count(execd.START) == 64)
+    for running in left:
+        running.cancel()
+    await until(lambda: got[0].count(execd.RELEASE) == 64)
+    drop = True
+    reopens = call()
+    await asyncio.wait_for(replaying.wait(), 30)
+    during = call()
+    await asyncio.wait_for(asyncio.gather(reopens, during), 30)
+
+    assert got[1].index(execd.PING) < got[1].index(execd.START)
+
+
 async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
     tls_daemon: TlsDaemon, clock: types.SimpleNamespace
 ) -> None:
@@ -1259,6 +1306,40 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     # Its last frames still go out, once its upload has let go of the connection.
     await until(lambda: got[-1:] == [execd.RELEASE])
     assert (execd.KILL in got) is not exits
+
+
+async def test_a_calls_last_frames_wait_behind_one_start_or_upload_at_most(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: a call's KILL and RELEASE waited behind every START and upload."""
+    got: list[int] = []
+    reads = asyncio.Event()
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            if got.count(execd.START) == 9:  # unread, the tenth's write waits
+                await reads.wait()
+            got.append((await read_frame(r))[0])
+
+    def call(*argv: str, stdin: bytes | None = None) -> asyncio.Future[object]:
+        run = client.exec(list(argv), stdin, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(records)
+    left = call("sleep", "600")
+    uploads = [call("cat", stdin=b"x") for _ in range(8)]
+    # More than the socket buffers hold: the uploads' stdin waits behind this START.
+    uploads.append(call("echo", "x" * (16 << 20)))
+    await until(lambda: got.count(execd.START) == 9)
+    left.cancel()
+    await asyncio.wait({left}, timeout=30)
+    reads.set()
+    await until(lambda: execd.RELEASE in got)
+
+    # The KILL follows the START being written; its RELEASE, one frame more at most.
+    assert (got.index(execd.KILL), got.index(execd.RELEASE)) in [(10, 11), (10, 12)]
+    for running in uploads:
+        running.cancel()
 
 
 async def test_an_empty_user_is_refused_not_run_as_the_containers(
