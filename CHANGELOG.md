@@ -4,23 +4,15 @@
 
 - A pod annotated
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
-  gets a sidecar that serves an HTTP proxy at `127.0.0.1:3128` and carries each
-  connection over the VM's vsock to that Service of the pod's own namespace, for an AWS
-  Nitro Sandbox with no network device. The annotation is rendered as a template, so it
-  can name a Service of the release. The pod's network policy then allows only that
-  name's DNS record and that port on the release's pods. Set the new
-  `egressForwarderImage` value to an image built from `vsock-egress/`. Each node must
-  run `vsock-egress launch` and hold the seccomp profile `profiles/vsock-egress.json`
-  (the runtime's default plus `socket(AF_VSOCK)`). Point the pod's programs at the proxy
-  yourself, with `HTTPS_PROXY` and `HTTP_PROXY`.
-- A pod that names an egress proxy and is also annotated
-  `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that
-  ignore proxy settings: a name the pod looks up gets an address in `198.18.0.0/15`, and
-  a TCP connection to that address reaches the proxy as `CONNECT <name>:<port>`. The
-  service's own names and its `additionalDnsRecords` resolve to `127.0.0.1`. A
-  connection to any other address still has no route, and IPv6 and UDP other than DNS
-  are not carried. The pod gets an init container that runs as root with `NET_ADMIN`,
-  which a namespace at the `baseline` Pod Security Standard refuses.
+  (a template there can name a Service of the release) gets an HTTP proxy at
+  `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
+  Sandbox with no network device. Set `HTTPS_PROXY` and `HTTP_PROXY` yourself, and the
+  new `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
+  seccomp profiles: see `vsock-egress/README.md`.
+- A pod that also carries `inspect-k8s-sandbox/egress-capture: "true"` reaches that proxy
+  from programs that ignore proxy settings: see `vsock-egress/README.md`. Its init
+  container runs as root with `NET_ADMIN`, which a namespace at the `baseline` Pod
+  Security Standard refuses.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

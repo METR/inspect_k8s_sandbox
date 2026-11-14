@@ -47,6 +47,9 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
+// proxyBuffer bounds what the kernel holds each way for a stream whose reader has stopped, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
+const proxyBuffer = 512 << 10
+
 func newWorker(vsock, target string, rate int) *worker {
 	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams),
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams),
@@ -105,10 +108,6 @@ func work(args []string) error {
 	if err != nil {
 		return err
 	}
-	go func() { // the launcher ends a worker by closing its stdin, and so does the launcher's own end
-		io.Copy(io.Discard, os.Stdin)
-		os.Exit(0)
-	}()
 	w := newWorker(*vsock, *target, *rate)
 	go func() {
 		for range time.Tick(time.Minute) {
@@ -188,8 +187,11 @@ func (w *worker) dial() (net.Conn, error) {
 		w.looked.Lock()
 		w.addr = ""
 		w.looked.Unlock()
+		return nil, err
 	}
-	return c, err
+	c.(*net.TCPConn).SetReadBuffer(proxyBuffer)
+	c.(*net.TCPConn).SetWriteBuffer(proxyBuffer)
+	return c, nil
 }
 
 // holds reports whether key is the forwarder's, which a worker fetches once, asking at most once a second: whoever holds the guest's key port later cannot give it another.

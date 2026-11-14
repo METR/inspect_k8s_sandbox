@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -112,7 +111,6 @@ func (n *node) sandbox(r record) (sandbox, error) {
 type child struct {
 	cmd      *exec.Cmd
 	uid, gid uint32
-	stdin    io.Closer
 	done     chan struct{} // closed when the process has ended
 }
 
@@ -134,10 +132,6 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	cmd := exec.Command(self, args...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
 	if netns == "" {
 		err = cmd.Start()
 	} else {
@@ -146,10 +140,9 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 		err = <-started
 	}
 	if err != nil {
-		stdin.Close()
 		return nil, err
 	}
-	c := &child{cmd, uid, gid, stdin, make(chan struct{})}
+	c := &child{cmd, uid, gid, make(chan struct{})}
 	go func() {
 		cmd.Wait()
 		close(c.done)
@@ -157,9 +150,8 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	return c, nil
 }
 
-// end stops a worker and whatever else runs as its uid here: closing its stdin only asks, and the launcher may not signal another uid.
+// end stops a worker and whatever else runs as its uid here, through a reaper: the launcher may not signal another uid.
 func (c *child) end() error {
-	c.stdin.Close()
 	reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
 	if err != nil {
 		return err
@@ -182,7 +174,7 @@ func reap(args []string) error {
 	if err := syscall.Setresuid(reaperUID, uid, reaperUID); err != nil {
 		return err
 	}
-	if err := syscall.Kill(-1, syscall.SIGKILL); err != syscall.ESRCH { // none left is how it mostly ends: a worker goes when its stdin closes
+	if err := syscall.Kill(-1, syscall.SIGKILL); err != syscall.ESRCH { // none left: the worker had ended by itself
 		return err
 	}
 	return nil
