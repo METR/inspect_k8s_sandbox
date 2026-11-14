@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const vmUID = 4242 // a VM's uid in the tests that run as root
@@ -82,6 +85,27 @@ func TestOnlySandboxesThatNameAProxyAddressAreWanted(t *testing.T) {
 	}
 }
 
+// podNetns makes a network namespace for the test's pod, and returns the directory that holds its file "net".
+func podNetns(t *testing.T) string {
+	t.Helper()
+	made, done := make(chan string), make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		runtime.LockOSThread() // never unlocked: the namespace lasts as long as this thread, which ends with the test
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			made <- ""
+			return
+		}
+		made <- fmt.Sprintf("/proc/self/task/%d/ns", unix.Gettid())
+		<-done
+	}()
+	dir := <-made
+	if dir == "" {
+		t.Skip("cannot make a network namespace here: needs CAP_SYS_ADMIN")
+	}
+	return dir
+}
+
 // status reads a field of a process's /proc status, as "Uid:\t4242\t4242\t4242\t4242".
 func status(t *testing.T, pid int, field string) string {
 	t.Helper()
@@ -114,6 +138,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 		}
 	}
 	l := fakeNode(t)
+	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "127.0.0.1:9"}, vmUID)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
@@ -139,6 +164,16 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	}
 	if got := status(t, pid, "Groups"); got != "" {
 		t.Fatalf("the worker kept groups %q", got)
+	}
+	pod, _ := os.Readlink(l.netns + "/net")
+	if got, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", pid)); got != pod {
+		t.Fatalf("the worker is in network namespace %q (%v), not the pod's %s", got, err, pod)
+	}
+	threads, _ := filepath.Glob("/proc/self/task/*/ns/net")
+	for _, thread := range threads {
+		if got, _ := os.Readlink(thread); got == pod && thread != l.netns+"/net" {
+			t.Fatalf("%s stayed in the pod's network namespace", thread)
+		}
 	}
 
 	syscall.Kill(pid, syscall.SIGKILL)

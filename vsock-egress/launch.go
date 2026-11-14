@@ -132,20 +132,7 @@ func start(sb sandbox, args ...string) (*child, error) {
 		return nil, err
 	}
 	started := make(chan error)
-	go func() {
-		runtime.LockOSThread() // never unlocked: the thread ends with this goroutine, in the namespace it entered
-		ns, err := os.Open(sb.netns)
-		if err == nil {
-			err = unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET)
-			ns.Close()
-		}
-		if err != nil {
-			err = fmt.Errorf("enter the pod's network namespace at %s: %w", sb.netns, err)
-		} else {
-			err = cmd.Start() // this thread makes the child, so the child is in its namespace
-		}
-		started <- err
-	}()
+	go func() { started <- inNetns(sb.netns, cmd.Start) }() // the thread that makes the child gives it its namespace
 	if err := <-started; err != nil {
 		stdin.Close()
 		return nil, err
@@ -156,6 +143,30 @@ func start(sb sandbox, args ...string) (*child, error) {
 		close(c.done)
 	}()
 	return c, nil
+}
+
+// inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
+// A thread that cannot come back is never used again: it ends with its goroutine.
+func inNetns(path string, f func() error) error {
+	runtime.LockOSThread()
+	home, err := os.Open("/proc/thread-self/ns/net")
+	if err != nil {
+		return err
+	}
+	defer home.Close()
+	ns, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("the pod's network namespace is not at %s: %w", path, err)
+	}
+	defer ns.Close()
+	if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
+		return fmt.Errorf("enter the pod's network namespace at %s: %w", path, err)
+	}
+	err = f()
+	if unix.Setns(int(home.Fd()), unix.CLONE_NEWNET) == nil {
+		runtime.UnlockOSThread()
+	}
+	return err
 }
 
 // launcher keeps one worker for each sandbox on this node whose pod names an egress proxy.
