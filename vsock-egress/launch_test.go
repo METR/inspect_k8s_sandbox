@@ -118,6 +118,9 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 }
 
 func TestLaunchNeedsAPIDNamespaceOfItsOwn(t *testing.T) {
+	if os.Getpid() == 1 {
+		t.Skip("this binary is the first process of a PID namespace")
+	}
 	err := launch([]string{"-cni", filepath.Join(t.TempDir(), "none")})
 	if err == nil || !strings.Contains(err.Error(), "PID namespace") {
 		t.Fatalf("got %v: among the node's processes, ending a worker would end its VM", err)
@@ -183,13 +186,25 @@ func ended(t *testing.T, w *child) {
 	}
 }
 
-func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
+// alone skips a test that ends workers unless root runs it, and then refuses unless this binary is the first process of a PID namespace: a reaper signals every process of its uid there.
+func alone(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	if os.Getpid() != 1 {
+		t.Fatal("as root, run this test binary under unshare -pf --mount-proc: its reapers would kill the machine's processes of the tests' uids")
+	}
 	self, _ := os.Executable()
 	for d := filepath.Dir(self); d != "/"; d = filepath.Dir(d) {
-		if st, err := os.Stat(d); os.Geteuid() != 0 || err != nil || st.Mode().Perm()&0o005 != 0o005 {
-			t.Skip("needs root, and this test binary where another uid can run it: go test -c -o DIR/x.test with DIR open to all")
+		if st, err := os.Stat(d); err != nil || st.Mode().Perm()&0o005 != 0o005 {
+			t.Fatalf("no other uid can run this test binary from %s: go test -c -o DIR/x.test with DIR open to all", d)
 		}
 	}
+}
+
+func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
+	alone(t)
 	l := fakeNode(t)
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
@@ -264,12 +279,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 
 // A worker the guest has taken over can signal every process of its own uid, the VM's.
 func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
-	self, _ := os.Executable()
-	for d := filepath.Dir(self); d != "/"; d = filepath.Dir(d) {
-		if st, err := os.Stat(d); os.Geteuid() != 0 || err != nil || st.Mode().Perm()&0o005 != 0o005 {
-			t.Skip("needs root, and this test binary where another uid can run it: go test -c -o DIR/x.test with DIR open to all")
-		}
-	}
+	alone(t)
 	for name, signal := range map[string]syscall.Signal{"kills": syscall.SIGKILL, "stops": syscall.SIGSTOP} {
 		t.Run(name, func(t *testing.T) {
 			const uid = vmUID + 2 // no other test's processes run as it
@@ -319,9 +329,7 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 }
 
 func TestEndSaysWhenItsReaperFailed(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("needs root: the reaper starts as root")
-	}
+	alone(t)
 	c := &child{uid: reaperUID} // a uid the reaper refuses
 	if err := c.end(); err == nil {
 		t.Fatal("end said nothing of a reaper that killed no process")

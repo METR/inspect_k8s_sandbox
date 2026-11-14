@@ -18,7 +18,7 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: vsock-egress/go.sum
-      - run: sudo modprobe vsock_loopback || true  # without it the forwarder's tests skip
+      - run: sudo modprobe vsock_loopback # without it the forwarder's tests would skip
       - run: go vet ./... && go test ./...
-      # As root, from a directory any uid can reach: the launcher's test starts a worker as another uid.
-      - run: mkdir -m 755 /tmp/ve && go test -c -o /tmp/ve/vsock-egress.test . && sudo /tmp/ve/vsock-egress.test
+      # The tests that need root, from a directory any uid can reach and alone in a PID namespace: their reapers kill every process of a uid there.
+      - run: mkdir -m 755 /tmp/ve && go test -c -o /tmp/ve/vsock-egress.test . && sudo unshare -pf --mount-proc /tmp/ve/vsock-egress.test -test.run 'TestOnlySandboxesThatNameAProxyAreWanted|TestWorkerRunsAsItsVMsUid|TestWorkerThatSignalsItsOwnUid|TestEndSaysWhenItsReaperFailed'
