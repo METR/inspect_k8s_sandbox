@@ -357,6 +357,21 @@ func recordedConn(t *testing.T) (*conn, <-chan frame) {
 	return &conn{nc: a, dead: make(chan struct{})}, frames
 }
 
+func TestAVariableNameShWouldDropFailsTheCall(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{"a-b": "1"}, Tag: "n"})
+
+	s.dispatch(c, frame{kind: fStart, id: 10, payload: req})
+
+	// dash would start the command without the variable, in silence.
+	status := exitStatus(t, frames)
+	if why, _ := status["error"].(string); status["code"] != 126.0 || !strings.Contains(why, "a-b") {
+		t.Fatalf("EXIT %v, want the name refused", status)
+	}
+}
+
 func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)

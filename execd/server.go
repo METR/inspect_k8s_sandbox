@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -36,6 +37,8 @@ const idleTimeout = 60 * time.Second
 
 // abandonAfter outlasts the client's reconnect window (5 minutes).
 const abandonAfter = 6 * time.Minute
+
+var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name sh keeps
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
@@ -349,6 +352,11 @@ func (s *server) resume(c *conn, f frame) {
 func (cl *call) run(req startRequest) error {
 	if strings.HasPrefix(req.Argv[0], "-") { // bash and busybox would read it as an option of their exec
 		return &os.PathError{Op: "exec", Path: req.Argv[0], Err: syscall.ENOENT}
+	}
+	for name := range req.Env { // sh starts the command, and dash passes on no other name
+		if !shName.MatchString(name) {
+			return fmt.Errorf("bad variable name %s", name)
+		}
 	}
 	req.Env["HAWK_NEXT_EXEC"] = req.Tag
 	argv := append([]string{"/bin/sh", "-c", `exec "$@"`, "/bin/sh"}, req.Argv...)
