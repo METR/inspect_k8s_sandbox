@@ -24,6 +24,26 @@ import (
 	"unsafe"
 )
 
+// fromAnotherUser says whether a Unix socket's peer runs as a user other than execd's, who could hold every unauthenticated slot.
+func fromAnotherUser(nc net.Conn) bool {
+	if secured, ok := nc.(interface{ NetConn() net.Conn }); ok {
+		nc = secured.NetConn()
+	}
+	local, ok := nc.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	uid := -1
+	if raw, err := local.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			if peer, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED); err == nil {
+				uid = int(peer.Uid)
+			}
+		})
+	}
+	return uid != os.Geteuid()
+}
+
 // server owns every process; a call outlives its connection, so a client can resume it.
 type server struct {
 	keyHash []byte
@@ -128,7 +148,7 @@ func (s *server) serve(l net.Listener) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+		if fromThisPod(nc) || fromAnotherUser(nc) { // the client dials from another pod, or through an exec as execd's user
 			nc.Close()
 			continue
 		}

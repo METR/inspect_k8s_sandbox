@@ -1,4 +1,4 @@
-"""Commands and file transfer over TLS to execd in the sandbox, never exec stdin."""
+"""Commands and file transfer over TLS to execd in the sandbox."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shlex
+import socket
 import ssl
 import struct
 import time
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 ANNOTATION = "inspect-k8s-sandbox/execd"
 EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
 EXECD_PORT = 14601  # below every runtime's ephemeral ports: gVisor's start at 16000
+EXECD_SOCKET = "inspect-k8s-sandbox-execd"  # abstract: where a pod has no network card
 
 AUTH, START, STDIN, KILL, RESUME, RELEASE, PING, ACK = 1, 2, 3, 4, 5, 6, 7, 8
 OK, STDOUT, STDERR, EXIT, PONG, ERROR, RESUMED, STDIN_ACK = (
@@ -96,6 +98,8 @@ class Daemon:
     ip: str
     fingerprint: str
     key: bytes = field(repr=False)
+    # Opens an exec joined to the daemon's socket, for a pod with no network card.
+    stdio: Callable[[], Awaitable[ByteStream]] | None = None
 
 
 class Dropped(Exception):
@@ -112,7 +116,8 @@ class DaemonRunning(Exception):
 
 def _port_held() -> RuntimeError:
     return RuntimeError(
-        f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
+        f"execd's TCP port {EXECD_PORT} or socket in the sandbox is held by a process "
+        "other than execd"
     )
 
 
@@ -217,6 +222,45 @@ class _Pipe:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
+_relays: set[asyncio.Task[None]] = set()  # held until their connections end
+
+
+async def _through(
+    stdio: ByteStream,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """A socket whose far end is an exec's stdio, for _Pipe to read and write as TCP."""
+    near, far = socket.socketpair()
+    far.setblocking(False)
+    loop = asyncio.get_running_loop()
+    reader, writer = await asyncio.open_connection(sock=near)
+
+    async def out() -> None:
+        while data := await loop.sock_recv(far, RAW_READ):
+            await stdio.send(data)
+
+    async def back() -> None:
+        while True:
+            await loop.sock_sendall(far, await stdio.receive(RAW_READ))
+
+    async def relay() -> None:
+        # _Pipe's closing too: out() may be waiting on an exec that takes no more.
+        ends = (out(), back(), writer.wait_closed())
+        ways = [asyncio.create_task(end) for end in ends]
+        try:
+            await asyncio.wait(ways, return_when=asyncio.FIRST_COMPLETED)
+        finally:  # any of them ending ends all: _Pipe reads end-of-file, the exec ends
+            for way in ways:
+                way.cancel()
+            await asyncio.gather(*ways, return_exceptions=True)
+            far.close()
+            await stdio.aclose()
+
+    task = asyncio.create_task(relay())
+    _relays.add(task)
+    task.add_done_callback(_relays.discard)
+    return reader, writer
+
+
 async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     # The certificate is self-signed: it is trusted by its fingerprint, below.
@@ -226,8 +270,11 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     # One group: a stand-in can't pick a 150 ms one. Python 3.10 can't set X25519.
     context.set_ecdh_curve("prime256v1")
 
+    # Before the timeout: its exec waits its turn among the pod's operations.
+    stdio = None if daemon.stdio is None else await _through(await daemon.stdio())
+
     async def handshake() -> _Pipe:
-        reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        reader, writer = stdio or await asyncio.open_connection(daemon.ip, EXECD_PORT)
         pipe = _Pipe(reader, writer, context, pace)
         try:
             await pipe.handshake()

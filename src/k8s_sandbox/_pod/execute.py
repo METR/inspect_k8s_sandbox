@@ -149,14 +149,14 @@ class ExecuteOperation(PodOperation):
         return result
 
     def open_stdio(
-        self, cmd: list[str], user: str | None
+        self, cmd: list[str], user: str | None, stderr: bool = True
     ) -> tuple[ExitStack, WSClient]:
         """Start `cmd` as `user`, switched to as exec() does, joined to a websocket."""
         stack = ExitStack()
         # No resize keepalive: its events can stall the stdin (see _send_keepalive).
         ws_client = stack.enter_context(
             self._interactive_shell(
-                _shell_command(user, command=cmd), send_keepalive=False
+                _shell_command(user, command=cmd), send_keepalive=False, stderr=stderr
             )
         )
         return stack, ws_client
@@ -206,13 +206,13 @@ class ExecuteOperation(PodOperation):
 
     @contextmanager
     def _interactive_shell(
-        self, command: list[str], send_keepalive: bool = True
+        self, command: list[str], send_keepalive: bool = True, stderr: bool = True
     ) -> Generator[WSClient, None, None]:
         # ExecutableNotFoundError here: no /bin/sh, or no runuser a probe had found.
         yield from self.create_websocket_client_for_exec(
             send_keepalive,
             command=command,
-            stderr=True,
+            stderr=stderr,
             stdin=True,
             stdout=True,
             # Leave stdout and stderr as binary. Has no effect on stdin.

@@ -16,8 +16,10 @@ import subprocess
 import threading
 import time
 import types
+import urllib.parse
 
 import anyio
+import anyio.abc
 import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
@@ -2486,6 +2488,108 @@ async def test_only_the_pinned_certificate_is_trusted(
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
     await pipe.close()
     server.close()
+
+
+async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+    closed = asyncio.Event()
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"ran"))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        w.write(execd.HEADER.pack(execd.STDOUT, call_id, execd.MAX_FRAME + 1))
+        if not await r.read():  # no frame of execd's: the client ends the connection
+            closed.set()
+
+    server = await asyncio.start_server(exits, "127.0.0.1", 0, ssl=context)
+
+    async def start(replace: bool) -> execd.Daemon:
+        address = server.sockets[0].getsockname()  # as `execd connect` joins a stdio
+        return execd.Daemon("", pin, b"key", lambda: anyio.connect_tcp(*address))
+
+    call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert result.stdout == "ran"
+    await asyncio.wait_for(closed.wait(), 30)
+    server.close()
+
+
+async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> None:
+    sending, closed = asyncio.Event(), asyncio.Event()
+
+    class Stalled(anyio.abc.ByteStream):
+        """An exec whose guest has stopped reading its stdin."""
+
+        async def send(self, item: bytes) -> None:
+            sending.set()
+            await asyncio.Event().wait()
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            closed.set()
+
+    _, writer = await execd._through(Stalled())
+    writer.write(b"more than the exec takes")
+    await asyncio.wait_for(sending.wait(), 30)  # only bounds a hang
+    writer.transport.abort()  # as the client closes a connection
+
+    await asyncio.wait_for(closed.wait(), 30)
+
+
+@pytest.fixture
+async def refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> collections.abc.AsyncIterator[list[bytes]]:
+    """The requests of the real Kubernetes client to an API server that refuses each."""
+    requests: list[bytes] = []
+
+    async def refuse(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        requests.append(await r.readuntil(b"\r\n\r\n"))
+        w.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+        w.close()
+
+    server = await asyncio.start_server(refuse, "127.0.0.1", 0)
+    host = "http://127.0.0.1:%d" % server.sockets[0].getsockname()[1]
+    api = kubernetes.client.CoreV1Api(
+        kubernetes.client.ApiClient(kubernetes.client.Configuration(host=host))
+    )
+    monkeypatch.setattr(op, "k8s_client", lambda _: api)
+    yield requests
+    server.close()
+
+
+async def test_an_exec_the_api_refuses_reads_as_a_refused_connection(
+    refused: list[bytes],
+) -> None:
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise", "stdio")
+
+    with pytest.raises(ConnectionError):  # which the client's reconnect waits out
+        await asyncio.wait_for(pod._execd_stdio(), 30)
+
+
+async def test_the_exec_that_reaches_execd_asks_for_no_stderr(
+    refused: list[bytes],
+) -> None:
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise", "stdio")
+
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(pod._execd_stdio(), 30)
+
+    # Nothing would pace that channel, were a guest to flood it.
+    target = urllib.parse.urlsplit(refused[0].split()[1].decode())
+    assert urllib.parse.parse_qs(target.query)["stderr"][0].lower() == "false"
 
 
 async def test_the_client_offers_one_key_exchange_group(

@@ -21,6 +21,7 @@
   `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
   against the container's limit: about 6 MB idle, and up to about 30 MB more for each
   command printing at once.
+- Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
   sidecar.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
