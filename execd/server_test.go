@@ -353,18 +353,39 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 }
 
 func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
-	afterFunc = func(time.Duration, func()) *time.Timer {
-		fired := time.NewTimer(0) // a timer that has fired, whose kill found the command gone
+	var fire func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer {
+		fire = f
+		fired := time.NewTimer(0) // a timer that has fired: it can no longer be stopped
 		<-fired.C
 		return fired
 	}
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "exit 3"}, Env: map[string]string{}, Tag: "e", Timeout: 60})
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit 3"}, Env: map[string]string{}, Stdin: true, Tag: "e", Timeout: 60})
 	c, frames := recordedConn(t)
 	s.authenticated(c)
-
 	s.dispatch(c, frame{kind: fStart, id: 8, payload: req})
+	cl := s.get(8)
+	cl.mu.Lock()
+	pid := cl.pid
+	cl.mu.Unlock()
+	reaper.mu.Lock() // the command ends, and execd has yet to note it
+	noted := sync.OnceFunc(reaper.mu.Unlock)
+	t.Cleanup(noted)
+	s.dispatch(c, frame{kind: fStdin, id: 8, payload: []byte("\n")})
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") Z ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+
+	fire() // the timer's callback runs now: its kill finds the command gone
+	noted()
 
 	if status := exitStatus(t, frames); status["code"] != 3.0 || status["timeout"] != nil {
 		t.Fatalf("EXIT %v, want code 3 and no timeout", status)
