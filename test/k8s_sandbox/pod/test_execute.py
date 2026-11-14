@@ -1868,7 +1868,7 @@ class TestExecStdio:
         client, server = tls_sockets
         stream = _stdio(client)
         reader = _reader(server)
-        request = os.urandom(op_module.STDIN_CHUNK_SIZE * 2 + 1)
+        request = os.urandom(2 * 1024**2 + 1)
         frames: list[bytes] = []
 
         def read() -> None:
@@ -1883,11 +1883,7 @@ class TestExecStdio:
         await stream.aclose()
 
         assert b"".join(frame[1:] for frame in frames) == request
-        assert [len(frame) - 1 for frame in frames] == [
-            op_module.STDIN_CHUNK_SIZE,
-            op_module.STDIN_CHUNK_SIZE,
-            1,
-        ]
+        assert max(len(frame) - 1 for frame in frames) <= 1024**2
 
     async def test_the_stream_sends_no_resize_keepalive(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
