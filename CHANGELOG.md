@@ -30,8 +30,9 @@
   device. As an `exec` probe there, `/execd/execd probe --timeout=1s tcp PORT` or
   `/execd/execd probe --timeout=1s --path=PATH --header=NAME:VALUE http|https PORT`
   makes the kubelet's check of that port from inside the container, at `127.0.0.1`.
-  The timeout is a duration such as `1s` or `500ms`, not a number of seconds, and each
-  header has a `--header` of its own. A response whose body breaks off fails the probe,
+  The timeout is a duration such as `1s` or `500ms`, not a number of seconds; each
+  header has a `--header` of its own; and in PATH and VALUE a `%` is written `%25`, as
+  any other byte may be written `%XX`. A response whose body breaks off fails the probe,
   where the kubelet discards the result.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.

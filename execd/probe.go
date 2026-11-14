@@ -19,15 +19,21 @@ import (
 func probeCommand(args []string) {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
 	timeout := fs.Duration("timeout", time.Second, "the longest the probe may take, over 0")
-	path := fs.String("path", "/", "the path an http or https probe asks for")
+	// Percent-encoded, a task's string passes whole through YAML, the kubelet's $(VAR) and an argument.
+	path := "/"
+	fs.Func("path", "the path an http or https probe asks for, any byte of it as %XX", func(p string) (err error) {
+		path, err = url.PathUnescape(p)
+		return err
+	})
 	var headers []string
-	fs.Func("header", "a NAME:VALUE header of an http or https probe, once for each", func(h string) error {
+	fs.Func("header", "a NAME:VALUE header of an http or https probe, any byte of it as %XX; once for each", func(h string) error {
+		h, err := url.PathUnescape(h)
 		headers = append(headers, h)
-		return nil
+		return err
 	})
 	fs.Parse(args)
 	if fs.NArg() != 2 || *timeout <= 0 {
-		fail("usage: execd probe [--timeout=DURATION] [--path=PATH] [--header=NAME:VALUE]... tcp|http|https PORT, the DURATION over 0")
+		fail("usage: execd probe [--timeout=DURATION] [--path=PATH] [--header=NAME:VALUE]... tcp|http|https PORT, the DURATION over 0 and a % in PATH or VALUE as %25")
 	}
 	failed := func(err error) {
 		fmt.Fprintln(os.Stderr, "execd:", err)
@@ -35,7 +41,7 @@ func probeCommand(args []string) {
 	}
 	// The process ends itself: a server can hold Go's HTTP/2 client past a timeout of its own.
 	time.AfterFunc(*timeout, func() { failed(errors.New("timed out")) })
-	if err := probe(fs.Arg(0), fs.Arg(1), *path, headers); err != nil {
+	if err := probe(fs.Arg(0), fs.Arg(1), path, headers); err != nil {
 		failed(err)
 	}
 	os.Exit(0)

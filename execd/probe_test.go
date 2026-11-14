@@ -51,6 +51,19 @@ func ask(srv *httptest.Server, flags ...string) []string {
 	return append(append([]string{"--timeout=" + probeBudget.String()}, flags...), u.Scheme, u.Port())
 }
 
+// escaped is s as Hawk's runner writes a path or a header's value for the probe: all of it as %XX but letters, digits and "-._~/".
+func escaped(s string) string {
+	var b strings.Builder
+	for _, c := range []byte(s) {
+		if strings.IndexByte("-._~/", c) >= 0 || '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
 func TestTheProbeCommandExitsZeroWhileAPortListensAndOneOnceItIsClosed(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -111,7 +124,7 @@ func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
 		"/a b":                "/a%20b",
 		"/health#part":        "/health",
 	} {
-		if code, said := probeExit(t, ask(srv, "--path="+path)...); code != 0 {
+		if code, said := probeExit(t, ask(srv, "--path="+escaped(path))...); code != 0 {
 			t.Errorf("the path %q: the probe exited %d saying %q", path, code, said)
 			continue
 		}
@@ -121,7 +134,7 @@ func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
 		}
 	}
 	// The kubelet's has no host left to ask of this one.
-	if code, _ := probeExit(t, ask(srv, "--path=other:8080/health")...); code != 1 {
+	if code, _ := probeExit(t, ask(srv, "--path="+escaped("other:8080/health"))...); code != 1 {
 		t.Errorf("the path %q made the probe exit %d, want 1 with nothing asked", "other:8080/health", code)
 	}
 }
@@ -153,9 +166,9 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 	}{
 		{"none given", nil, srv.Listener.Addr().String(),
 			http.Header{"User-Agent": {"kube-probe/1.36"}, "Accept": {"*/*"}, "Connection": {"close"}}},
-		// A value is the bytes after the first colon: the kubelet sends on a non-breaking space that ends one.
-		{"its own", []string{"--header=Host:probe.test", "--header=User-Agent:mine", "--header=Accept:", "--header=X-Probe:a\xc2\xa0", "--header=x-probe:b:c"}, "probe.test",
-			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a\xc2\xa0", "b:c"}, "Connection": {"close"}}},
+		// A value is the bytes after the first colon, as themselves or as %XX: the kubelet sends on a non-breaking space that ends one.
+		{"its own", []string{"--header=Host:probe.test", "--header=User-Agent:mine", "--header=Accept:", "--header=X-Probe:a%C2%A0", "--header=x-probe:b:" + escaped("c:d")}, "probe.test",
+			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a\xc2\xa0", "b:c:d"}, "Connection": {"close"}}},
 	} {
 		if code, said := probeExit(t, ask(srv, tc.given...)...); code != 0 {
 			t.Fatalf("%s: the probe exited %d saying %q", tc.name, code, said)
@@ -168,7 +181,7 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 		}
 	}
 	// A line break ends no value: Go's client refuses to send one, for the kubelet as here.
-	if code, _ := probeExit(t, ask(srv, "--header=X-Probe:a\r\n")...); code != 1 {
+	if code, _ := probeExit(t, ask(srv, "--header=X-Probe:a%0D%0A")...); code != 1 {
 		t.Errorf("a header value ending in a line break made the probe exit %d, want 1 with nothing sent", code)
 	}
 }
