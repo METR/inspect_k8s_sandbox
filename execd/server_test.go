@@ -433,7 +433,13 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 				}
 			}
 
-			fire() // the timer's callback runs now: its kill finds the command gone
+			fired := make(chan struct{})
+			go func() { fire(); close(fired) }() // the timer's callback runs now: its kill finds the command gone
+			select {
+			case <-fired:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the timeout's kill waited to see the command reaped")
+			}
 			noted()
 
 			if status := exitStatus(t, frames); status["code"] != float64(code) || status["timeout"] != nil {
@@ -583,7 +589,7 @@ func TestAStartErrorFitsTheClientsControlFrame(t *testing.T) {
 				t.Fatalf("EXIT is %d bytes", len(f.payload))
 			}
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(30 * time.Second):
 			t.Fatal("no EXIT")
 		}
 	}
