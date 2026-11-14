@@ -150,7 +150,9 @@ class _Pipe:
                 await self._charge(began, used=held - self._in.pending)
                 await self._flush()
                 self._in.write(await self._raw())
+        await self._charge(began, used=held - self._in.pending)
         await self._flush()
+        self._rest = self._in.read()  # what came with the handshake is read as the rest
 
     async def write(self, data: bytes) -> None:
         self.tls.write(data)
