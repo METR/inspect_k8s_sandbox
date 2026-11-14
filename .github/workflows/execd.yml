@@ -17,9 +17,9 @@ jobs:
           cache: false  # no go.sum to key it on
       - run: go vet ./... && go test ./...
         working-directory: execd
-      # As root with a sandbox's few capabilities less KILL, which a task may drop: only root runs a command as another user.
+      # As root with a sandbox's few capabilities less KILL and DAC_OVERRIDE, which a task may drop: only root runs a command as another user.
       - run: >-
-          docker run --rm --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER
+          docker run --rm --cap-drop ALL --cap-add CHOWN --cap-add FOWNER
           --cap-add SETGID --cap-add SETUID --security-opt no-new-privileges -v "$PWD:/src:ro" -w /src
           public.ecr.aws/docker/library/golang:1.26-alpine@sha256:30b1e546a9c7fa3b747c2bdba3a0c7bdf3a02ebb4c5b8405d2f948d7e8aac4ec
           go test ./...

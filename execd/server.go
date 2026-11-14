@@ -394,7 +394,7 @@ func (cl *call) run(req startRequest) error {
 			return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
 		}
 	}
-	if req.Cwd != "" { // a directory this user can enter: else it is the cd that fails, not the command
+	if req.Cwd != "" && as == nil { // one execd's user can enter, else the cd fails, not the command; another user's cd is its launcher's
 		if err := syscall.Access(req.Cwd+"/.", 0); err != nil {
 			return fmt.Errorf("cd: %s: %w", req.Cwd, err)
 		}

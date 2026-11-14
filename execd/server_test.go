@@ -996,6 +996,27 @@ func TestACommandForAnotherUserEntersItsDirectoryAsThem(t *testing.T) {
 	}
 }
 
+func TestACommandForAnotherUserEntersADirectoryOnlyTheyCan(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	open := t.TempDir()
+	home := filepath.Join(open, "home") // a 700 home: root without CAP_DAC_OVERRIDE can't enter it
+	os.Mkdir(home, 0o700)
+	os.Chown(home, 65534, 65534)
+	t.Cleanup(func() { os.Chown(home, 0, 0) }) // root's again, to be removed
+	os.Chmod(open, 0o755)
+	os.Chmod(filepath.Dir(open), 0o755)
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Cwd: home, User: "65534", Tag: "h"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 27, payload: req})
+
+	if code := exitCode(t, s.get(27)); code != 0 {
+		t.Fatalf("exit %d: execd looked for the directory as itself, not as the command's user", code)
+	}
+}
+
 func TestAKillReachesWhatAnotherUsersCommandDetached(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
