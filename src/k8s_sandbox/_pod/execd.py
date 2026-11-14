@@ -30,7 +30,11 @@ from k8s_sandbox._pod.error import (
     ExecResultUnknownError,
     PodError,
 )
-from k8s_sandbox._pod.execute import _STDERR_TAIL_BYTES, EXEC_USER_URL
+from k8s_sandbox._pod.execute import (
+    _STDERR_TAIL_BYTES,
+    EXEC_USER_URL,
+    _land_pending_cancel,
+)
 from k8s_sandbox._pod.op import SYSTEM_PATH, raise_for_known_read_write_errors
 from k8s_sandbox._pod.read import read_command
 
@@ -867,6 +871,7 @@ class ExecdStream(ByteStream):
     async def receive(self, max_bytes: int = 65536) -> bytes:
         if max_bytes < 1:
             raise ValueError("max_bytes must be at least 1")
+        await anyio.lowlevel.checkpoint()  # held output would be given out with no wait
         if self._closed:
             raise anyio.ClosedResourceError
         self._drop_if_restarted()
@@ -915,6 +920,7 @@ class ExecdStream(ByteStream):
         if self._closed:
             raise anyio.ClosedResourceError
         async with self._send_lock:
+            await _land_pending_cancel()  # also one that came as it waited for the lock
             self._drop_if_restarted()
             try:
                 for i in range(0, len(item), CHUNK):

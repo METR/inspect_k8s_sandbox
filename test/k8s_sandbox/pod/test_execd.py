@@ -350,6 +350,41 @@ async def test_a_stream_acks_only_what_its_reader_takes(daemons: Daemons) -> Non
     assert start["stream"]  # so execd ends it with its connection
 
 
+async def test_a_stream_lets_a_cancellation_land_and_others_run(
+    daemons: Daemons,
+) -> None:
+    """Regression: with output held, receive() gave way to nothing; send() wrote."""
+    stdin = bytearray()
+
+    async def writes(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.STDOUT, call_id, b"ABC"))
+            elif kind == execd.STDIN:
+                stdin.extend(payload)
+
+    await daemons.serve(writes)
+    stream = await daemons.client().open_stream(["cat"], None)
+    assert await stream.receive(1) == b"A"  # the rest is held
+    others_ran: list[bool] = []
+    asyncio.get_running_loop().call_soon(others_ran.append, True)
+
+    assert (await stream.receive(1), others_ran) == (b"B", [True])
+    got = None
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        got = await stream.receive(1)
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        await stream.send(b"x")
+    await stream.send(b"y")
+
+    await until(lambda: bool(stdin))
+    assert (got, bytes(stdin)) == (None, b"y")
+    await stream.aclose()
+
+
 async def test_send_waiting_for_room_fails_when_the_connection_closes(
     daemons: Daemons,
 ) -> None:
