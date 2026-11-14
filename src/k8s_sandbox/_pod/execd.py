@@ -780,11 +780,12 @@ class ExecdClient:
         stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
         code = await self._file_op(["/bin/sh", "-c", script], data, None, stderr)
         if code != 0:
-            raise_for_known_read_write_errors(str(stderr))
+            said = str(stderr)  # once: 10 MiB of it holds the event loop 100 ms
+            raise_for_known_read_write_errors(said)
             raise PodError(
                 "Unrecognised error writing file to pod.",
                 returncode=code,
-                stderr=str(stderr),
+                stderr=said,
             )
 
     async def read_file(self, src: Path, dst: IO[bytes]) -> None:
@@ -792,11 +793,12 @@ class ExecdClient:
         stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
         code = await self._file_op(read_command(src), None, dst, stderr)
         if code != 0:
-            raise_for_known_read_write_errors(str(stderr))
+            said = str(stderr)  # once: 10 MiB of it holds the event loop 100 ms
+            raise_for_known_read_write_errors(said)
             raise PodError(
                 "Unrecognised error reading file from pod.",
                 returncode=code,
-                stderr=str(stderr),
+                stderr=said,
             )
         dst.flush()
 
