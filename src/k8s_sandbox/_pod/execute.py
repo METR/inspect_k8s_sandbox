@@ -79,13 +79,9 @@ def _shell_command(
     inherits from the container instead.
 
     `switch` is whether a probe of the container (ExecuteOperation.probe_switch)
-    found that it needs `runuser` for this user, and that `runuser` works. Otherwise
-    the shell checks for itself, which costs two more process starts per exec. It does
-    even where the probe found the container already running as the user: a pod
-    replaced under the same name since might not, and a plain shell would then run the
-    command as someone else, where `runuser` can only switch or fail. `sh -c` takes its
-    script from argv, so stdin reaches the command it execs unread, and the caller's
-    protocol is unchanged.
+    found that it needs `runuser` for this user, and that `runuser` works; otherwise
+    the shell checks for itself. `sh -c` takes its script from argv, so stdin reaches
+    the command it execs unread, and the caller's protocol is unchanged.
     """
     if user is None:
         return list(command)
@@ -155,11 +151,7 @@ class ExecuteOperation(PodOperation):
     def open_stdio(
         self, cmd: list[str], user: str | None
     ) -> tuple[ExitStack, WSClient]:
-        """Start `cmd` as `user`, switched to as exec() does, joined to the websocket.
-
-        Returns the websocket and the stack that closes it. The command is the exec's
-        argv (through `sh -c` to switch users), so stdin reaches it unread.
-        """
+        """Start `cmd` as `user`, switched to as exec() does, joined to a websocket."""
         stack = ExitStack()
         # No resize keepalive: its events can stall the stdin (see _send_keepalive).
         ws_client = stack.enter_context(
@@ -170,17 +162,7 @@ class ExecuteOperation(PodOperation):
         return stack, ws_client
 
     def probe_switch(self, user: str) -> bool:
-        """Whether exec(user=...) can start `runuser` directly to run as `user`.
-
-        True if the container isn't running as `user` and `runuser` can switch to them.
-        Otherwise (it already runs as them, `runuser` is missing, the user doesn't
-        exist, or the container may not switch users) the shell's own check handles
-        each exec, as before. Starting `runuser` directly only once it is known to work
-        matters: one that fails at once ends the exec before its script arrives, and
-        the server then resets the connection, losing the error. The answer is the exit
-        status the exec's status channel reports, so nothing the container prints can
-        change it.
-        """
+        """Whether exec(user=...) can start `runuser` directly to run as `user`."""
         quoted = shlex.quote(user)
         probe = (
             f"if {_runs_as(user)}; then exit 0; fi; "
@@ -461,14 +443,7 @@ class ExecuteOperation(PodOperation):
 
 
 def _update(ws_client: WSClient, timeout: float | None) -> None:
-    """ws_client.update(timeout), or a frame TLS has already decrypted if there is one.
-
-    Before kubernetes 37, update() reads one frame but polls only the raw socket, which
-    can't see a decrypted one: a frame that arrived in the same TLS record as the last
-    would wait unseen for more data, forever while a background process holds the exec
-    open. Take just the one, so that the caller checks its output limit and deadline
-    after each frame.
-    """
+    """ws_client.update(timeout), or a frame TLS has already decrypted, if any."""
     sock = ws_client.sock.sock
     if not (isinstance(sock, ssl.SSLSocket) and sock.pending()):
         ws_client.update(timeout=timeout)
@@ -482,14 +457,7 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
 
 
 class PodStdio(ByteStream):
-    """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio()).
-
-    receive() and send() read and write the websocket's socket, made non-blocking,
-    in the task that calls them: no thread has to win the GIL from a busy event loop
-    to pass a reply on. Nothing is read while no one receives, so a slow reader stops
-    the command through TCP. The websocket closes at the exec's status, or once the
-    stream is closed.
-    """
+    """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio())."""
 
     def __init__(
         self,
@@ -551,11 +519,7 @@ class PodStdio(ByteStream):
         return data
 
     def _drop_if_restarted(self) -> None:
-        """End the stream if a restart was found since it opened, as if it was lost.
-
-        Its command may run in the replacement, so not even replies already read are
-        given out.
-        """
+        """End the stream if a restart was found since it opened, as if it was lost."""
         if self._closed or self._restarted is None:
             return
         if (error := self._restarted()) is not None:
@@ -563,12 +527,7 @@ class PodStdio(ByteStream):
             raise anyio.BrokenResourceError(repr(error)) from error
 
     async def _turn(self) -> None:
-        """Count a call or a frame read, and let other tasks run every so many.
-
-        So that frames or calls that keep coming (a flood of stdout or stderr, or many
-        small reads) do not hold the event loop. What was read stays read, so a cancel
-        here loses nothing.
-        """
+        """Count a call or a frame read, and let other tasks run every so many."""
         self._unyielded += 1
         if self._unyielded >= _STEPS_PER_TURN:
             self._unyielded = 0
@@ -677,12 +636,7 @@ def _is_255(status: bytes) -> bool:
 
 
 async def _land_pending_cancel() -> None:
-    """Let a cancellation already due in this task land before the stream acts.
-
-    A cancel scope's, or a bare Task.cancel() requested while the task ran, which
-    anyio's checkpoint_if_cancelled() misses. Otherwise none lands while the stream
-    reads or writes without waiting.
-    """
+    """Let a cancellation already due in this task land before the stream acts."""
     if anyio.get_current_task().has_pending_cancellation():
         await anyio.lowlevel.checkpoint()
 
@@ -692,21 +646,12 @@ _TLS_ERROR_CLEARER = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
 
 def _clear_tls_errors() -> None:
-    """Clear OpenSSL's error queue for this thread: on an event loop, everyone's.
-
-    CPython raises a TLS read or write's system error (EPIPE, say) as OSError without
-    clearing the queue, and OpenSSL then reports any later TLS call on the thread that
-    would wait as that error, ending the loop's other TLS connections.
-    """
+    """Clear OpenSSL's error queue for this thread: on an event loop, everyone's."""
     _TLS_ERROR_CLEARER.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO(), server_side=True)
 
 
 class _MarkedStream:
-    """One of the command's output streams, up to the shell's end marker.
-
-    A frame can end partway through the marker, so the bytes at the end of each frame
-    that could be its start are held back until the next frame settles it.
-    """
+    """One of the command's output streams, up to the shell's end marker."""
 
     def __init__(self, marker: str) -> None:
         self.buffer = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)

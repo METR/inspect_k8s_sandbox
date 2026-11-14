@@ -47,7 +47,7 @@ func main() {
 	run(*port, *keyHash, *replace)
 }
 
-// become takes a user's identity (uid, gid, groups), enters cwd as them and execs argv, failing as a shell would.
+// become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
 func become(cwd string, ids, argv []string) {
 	var n []int
 	for _, id := range append([]string{ids[0], ids[1]}, strings.Fields(ids[2])...) {

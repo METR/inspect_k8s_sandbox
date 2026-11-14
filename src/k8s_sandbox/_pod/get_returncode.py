@@ -54,13 +54,7 @@ def returncode_from_status(channel_value: Any) -> int:
 def raise_if_stopped_before_lost(
     ws_client: WSClient, lost: BaseException, pod: str
 ) -> None:
-    """
-    Raise ContainerStoppedError if the exec reported 255 before its connection was lost.
-
-    255 is Kata's status for a command whose VM stopped, for a command (``head``,
-    ``mkdir``) that never exits 255 itself. Otherwise LOST, the error that lost the
-    connection, stands: the caller raises it.
-    """
+    """Raise ContainerStoppedError if the exec's status was 255 before it was lost."""
     if ERROR_CHANNEL not in ws_client._channels:
         return
     if ws_client.is_open():

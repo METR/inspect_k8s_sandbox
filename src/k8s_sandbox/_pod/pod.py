@@ -196,14 +196,10 @@ class Pod:
         To support the required functionality, the supplied command is executed in a
         shell (/bin/sh).
 
-        The exit code comes from the exec's status channel, which reports /bin/sh's own
-        exit status. To allow this method to return when the supplied command has
-        completed, even if backgrounded processes which inherit stdout or stderr are
-        still running, the shell writes a marker to both stdout and stderr once the
-        command exits. The marker holds a random value made up for this exec, so the
-        command's output cannot imitate it, and the command's exit code. If the
-        websocket connection is still open shortly after both markers arrive, we close
-        it and use the marker's exit code.
+        To allow this method to return when the supplied command has completed, even if
+        backgrounded processes which inherit stdout or stderr are still running, the
+        shell writes a marker holding the command's exit code to stdout and stderr once
+        the command exits, and we then close the websocket connection.
 
         Args:
           cmd (list[str]): The command and arguments to execute.
@@ -223,7 +219,7 @@ class Pod:
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd. On a pod with execd, cmd and
-            every process it started get SIGKILL instead.
+            its background processes get SIGKILL instead.
         """
         if (execd := self._execd) is not None:
             return await self._over_execd(
@@ -267,18 +263,7 @@ class Pod:
     async def exec_stdio(
         self, cmd: list[str], user: str | None
     ) -> PodStdio | ExecdStream:
-        """Start a command as exec() would, and join a stream to its stdin and stdout.
-
-        Closing the stream ends the command's stdin and stdout. Until then the stream
-        holds the exec's connection, so callers must close it.
-
-        In "raise" mode a restart found already, or one Kubernetes shows, raises here
-        as for exec(), rather than starting the command in the replacement. A stream
-        that ends with 255 after the command wrote stdout, Kata's status for a command
-        whose VM stopped, keeps a restart for every later operation: so the command must
-        not exit 255 itself once it has written. A stream open when a restart is found
-        drops, as one whose connection was lost.
-        """
+        """Start a command as exec() does, and join a stream to its stdin and stdout."""
         if self._execd is not None:
             await self._check_before_execd()
             return await self._execd.open_stream(cmd, user, lambda: self._restart_error)
@@ -354,13 +339,7 @@ class Pod:
         await self._after_failure_check(lambda: reader.read_file(src, dst))
 
     async def _after_failure_check(self, callable: Callable[[], None]) -> None:
-        """Run a file operation, and in "raise" mode check for a restart if it fails.
-
-        Also when ``INSPECT_POD_RESTART_CHECK=false``: the replacement of a restarted
-        container has none of the files the sample wrote, and the provider's retry of a
-        lost connection must not reach it unchecked. "warn" mode leaves the failure, and
-        any retry, as they were.
-        """
+        """Run a file operation, and in "raise" mode check for a restart if it fails."""
         try:
             await self._run_async(callable)
         except (PodReplacedError, ContainerRestartedError):
@@ -373,15 +352,7 @@ class Pod:
     async def _run_async(
         self, callable: Callable[[], T], discard: Callable[[T], object] | None = None
     ) -> T:
-        """Run a synchronous function asynchronously.
-
-        Once a check in "raise" mode has detected a restart, raise it instead: before
-        running the function, and after, if it was detected meanwhile, whether the
-        function returned or failed. In "raise" mode a container that stopped under
-        the function counts as restarted. DISCARD closes a result the caller won't
-        get, such as an open connection: one a restart was found in, or one that came
-        once the caller stopped waiting.
-        """
+        """Run a synchronous function asynchronously."""
 
         def run() -> T:
             self._raise_restart()

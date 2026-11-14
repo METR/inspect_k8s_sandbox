@@ -38,8 +38,7 @@ class ContainerStatus:
     last_terminated_reason: str | None
     """Why its last instance stopped: the one stopped now, else the previous one."""
     running: bool
-    """False while the container is stopped (``state.terminated``) or waiting to
-    start (``state.waiting``)."""
+    """False while the container is stopped or waiting to start."""
 
 
 @dataclass(frozen=True)
@@ -84,11 +83,7 @@ def read_pod(
     namespace: str,
     request_timeout: int | None = None,
 ) -> PodSnapshot:
-    """Read a single pod, bypassing the kubernetes client's model deserialization.
-
-    `request_timeout` is in seconds; without one a stalled socket holds the thread
-    reading it.
-    """
+    """Read a single pod, bypassing the kubernetes client's model deserialization."""
     # _preload_content is passed through to the generated client's **kwargs at
     # runtime but is absent from the typed stubs, hence the call-arg ignore.
     response = cast(

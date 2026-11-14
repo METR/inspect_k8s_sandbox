@@ -89,10 +89,7 @@ class PodOpExecutor:
         of the number of ongoing operations. Other than the user display, the
         use of the semaphore is redundant.
 
-        A cancelled caller cannot stop the operation's thread. If the caller stops
-        waiting and the operation still returns a result, `discard` is called with it
-        on a new thread, so that a result holding an open connection is closed rather
-        than left to the garbage collector.
+        `discard` gets a result that comes once the caller has stopped waiting.
 
         This method is async-safe but not thread-safe.
         """

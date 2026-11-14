@@ -46,7 +46,7 @@ var workdir, _ = os.Getwd() // where execd started, and so does a command given 
 
 var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
 
-var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes: late once its grace is over
+var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -54,9 +54,9 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu, which output holds through a write to a stalled connection
+	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu, held through writes
 	pid int
-	// where the reaper sends its command's exit status: registered until then, so the id is still the command's
+	// where the reaper sends its command's exit status
 	status chan int
 	as     *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
@@ -141,7 +141,7 @@ func (s *server) serve(l net.Listener) {
 	}
 }
 
-// fromThisPod says whether a connection comes from the pod itself: from loopback or any of its addresses.
+// fromThisPod says whether a connection comes from the pod itself.
 func fromThisPod(nc net.Conn) bool {
 	remote, ok := nc.RemoteAddr().(*net.TCPAddr)
 	if !ok || remote.IP.IsLoopback() {
@@ -319,7 +319,7 @@ func (s *server) start(c *conn, f frame) {
 		}
 		msg := err.Error()
 		cl.output(1, []byte("execd: "+msg+"\n"))
-		// Out of band too, so the command's own stderr can't fake it; capped, so even escaped to JSON it fits the client's 4 KiB control frame.
+		// Out of band too, so the command's stderr can't fake it; capped to fit the client's 4 KiB control frame.
 		cl.finish(code, msg[:min(len(msg), 512)])
 	}
 }
@@ -855,7 +855,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper reaps every child, orphans included, under mu: an id is freed and its status sent in one step, and run() registers a new one in another.
+// The reaper reaps every child, orphans included, under mu, so an id is never reused before its status is sent.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int
