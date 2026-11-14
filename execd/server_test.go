@@ -1305,7 +1305,8 @@ func TestStdinACommandHasReadIsLetGoWhileItRuns(t *testing.T) {
 	chunk := make([]byte, 1<<20)
 	sent := weak.Make(&chunk[0])
 	s.dispatch(c, frame{kind: fStdin, id: 36, payload: chunk})
-	for nextFrame(t, frames).kind != fStdinAck { // written to the command
+	if f := nextFrame(t, frames); f.kind != fStdinAck { // written to the command
+		t.Fatalf("frame %d came before the stdin ack", f.kind)
 	}
 
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
