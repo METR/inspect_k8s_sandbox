@@ -607,6 +607,48 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     assert (result.returncode, starts) == (7, 1)
 
 
+async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
+    daemons: Daemons,
+) -> None:
+    """Regression: cancelled during a reconnect, it ran on until execd abandoned it."""
+    auths = 0
+    answer = asyncio.Event()
+    started: list[int] = []
+    got: list[tuple[int, int]] = []
+
+    async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal auths
+        await read_frame(r)  # AUTH
+        auths += 1
+        if auths == 1:
+            w.write(frame(execd.OK, 0))
+            started.append((await read_frame(r))[1])  # START
+            w.close()  # the connection drops under the command
+            return
+        await answer.wait()  # the client is still reconnecting
+        w.write(frame(execd.OK, 0))
+        for _ in range(2):
+            kind, call_id, _ = await read_frame(r)
+            got.append((kind, call_id))
+        await r.read()
+
+    server = await asyncio.start_server(connection, "127.0.0.1", 0)
+    daemon = execd.Daemon("127.0.0.1", "cert", b"key")
+    daemons.ports[daemon] = server.sockets[0].getsockname()[1]
+    daemons.unstarted.append(daemon)
+    run = daemons.client().exec(["sleep", "600"], None, None, {}, None, None)
+    call = asyncio.ensure_future(run)
+    await until(lambda: auths == 2)
+
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    answer.set()
+
+    await until(lambda: len(got) == 2)
+    assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:

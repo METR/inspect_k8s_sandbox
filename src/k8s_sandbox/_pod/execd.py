@@ -428,6 +428,7 @@ class ExecdClient:
         self._opened = float("-inf")
         self._backoff = 0.0
         self._failed: BaseException | None = None  # why the open under way last failed
+        self._unkilled: list[tuple[Daemon, int]] = []  # calls left while cut off
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -451,6 +452,10 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
+                for left_on, call_id in self._unkilled:
+                    if left_on is daemon:
+                        await link.send_last(call_id, KILL, RELEASE)
+                self._unkilled.clear()
                 return link
             except (Dropped, OSError, asyncio.TimeoutError) as e:
                 self._failed = e
@@ -634,6 +639,8 @@ class ExecdClient:
                 if not finished and not link.closed:
                     # Abandoned by the caller (an output limit, a cancel): stop it.
                     await link.send_last(call.id, KILL, RELEASE)
+                elif not finished:  # cut off: stopped once its daemon is reached again
+                    self._unkilled.append((call.daemon, call.id))
             finally:
                 link.calls.pop(call.id, None)
 
