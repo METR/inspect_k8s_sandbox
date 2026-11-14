@@ -386,13 +386,14 @@ class ExecuteOperation(PodOperation):
         # and turned a supported configuration into a fatal error, so warn and
         # let the failed ExecResult through. Only an unknown user still raises,
         # because no fallback makes a name that isn't there work.
+        end = stderr[-_STDERR_TAIL_BYTES:]  # a command can fill stderr to its limit
         if "runuser: may not be used by non-root users" in stderr.casefold():
             logger.warning(
                 "exec(user=%r) failed: the container is not running as root, so "
                 "runuser cannot switch users. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # Anchored on the `runuser: ` prefix like the arms above it: `newgrp`,
@@ -406,7 +407,7 @@ class ExecuteOperation(PodOperation):
                 "been dropped. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # dash and busybox say "not found", bash "No such file or directory".
@@ -418,7 +419,7 @@ class ExecuteOperation(PodOperation):
                 "at /sbin/runuser, which this container lacks. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
 
