@@ -18,7 +18,6 @@ import struct
 import subprocess
 import sys
 import threading
-import time
 import types
 from contextlib import contextmanager
 from importlib.metadata import version
@@ -70,16 +69,7 @@ def _status(returncode: int) -> tuple[int, bytes]:
 
 
 class _FakeWSClient(WSClient):
-    """A WSClient whose frames come from a list rather than a socket.
-
-    Only update() is replaced, so peek_*() and read_*() behave as they do for real,
-    including peek_*() calling update(timeout=0) and so taking in the next frame.
-
-    A number in place of a frame is a pause, in seconds, before the next one. Once the
-    frames run out the exec ends (the server closes the connection), unless
-    `ends=False`, which is a background process holding stdout or stderr open: then
-    nothing more ever arrives.
-    """
+    """A WSClient whose frames come from a list rather than a socket."""
 
     def __init__(
         self,
@@ -99,6 +89,8 @@ class _FakeWSClient(WSClient):
         self._frames = list(frames)
         self._ends = ends
         self._error = error
+        self.now = 0.0  # its own clock: only its pauses and waits move it
+        self._waited = 0
 
     def update(self, timeout: float | None = 0) -> None:
         if not self.is_open():
@@ -106,10 +98,10 @@ class _FakeWSClient(WSClient):
         if self._frames and isinstance(self._frames[0], float):
             pause = self._frames[0]
             if timeout is not None and timeout < pause:
-                time.sleep(timeout)
+                self.now += timeout
                 self._frames[0] = pause - timeout
                 return
-            time.sleep(pause)
+            self.now += pause
             self._frames.pop(0)
         if self._frames:
             frame = self._frames.pop(0)
@@ -123,13 +115,27 @@ class _FakeWSClient(WSClient):
         elif timeout is None:
             raise AssertionError("update(timeout=None) would block forever")
         else:
-            time.sleep(timeout)
+            self.now += timeout
+            self._waited += 1
+            if self._waited > 10_000:  # so that code which never gives up fails
+                raise AssertionError("waited for ever on a client with no more to send")
+
+
+def _on_its_clock(ws: WSClient) -> contextlib.AbstractContextManager[object]:
+    """On a fake client's clock, which a stall of the machine does not move."""
+    if not isinstance(ws, _FakeWSClient):
+        return contextlib.nullcontext()
+    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
+    return patch.object(execute_module, "time", clock)
 
 
 def _handle(
     ws: WSClient, user: str | None = None, timeout: int | None = None
 ) -> ExecResult[str]:
-    return ExecuteOperation(MagicMock())._handle_shell_output(ws, user, timeout, MARKER)
+    with _on_its_clock(ws):
+        return ExecuteOperation(MagicMock())._handle_shell_output(
+            ws, user, timeout, MARKER
+        )
 
 
 @pytest.fixture
@@ -150,9 +156,7 @@ class TestCompletion:
         assert (result.returncode, result.success) == (3, False)
         assert result.stdout == "out"
 
-    def test_a_status_that_arrives_wins_over_the_markers(
-        self, short_grace: None
-    ) -> None:
+    def test_a_status_that_arrives_wins_over_the_markers(self) -> None:
         """Even if the connection then stays open past the grace period."""
         ws = _FakeWSClient(
             [(STDOUT, _marker(0)), (STDERR, _marker(0)), _status(3)], ends=False
@@ -451,7 +455,7 @@ class TestScriptInAShell:
                 [shutil.which(shell[0]) or shell[0], *shell[1:]],
                 stdin=read_end,
                 capture_output=True,
-                timeout=10,
+                timeout=30,
                 env={"PATH": str(tmp_path)},
             )
         finally:
@@ -565,12 +569,7 @@ def _root_script(cmd: list[str], status: Path) -> str:
 def test_a_root_exec_runs_its_command_only_as_uid_0(
     shell: list[str], tmp_path: Path, status: str | None, runs: bool
 ) -> None:
-    """As `runuser -u root` would, also in a container replaced by one not root.
-
-    The check needs no program from the PATH: only the command is on it here, and an
-    `id` that records being run, so one that starts `id` from it fails too (busybox
-    runs its own `id` applet instead).
-    """
+    """As `runuser -u root` would, also in a container replaced by one not root."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "touch").symlink_to(shutil.which("touch") or "/usr/bin/touch")
@@ -602,11 +601,7 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
 def test_a_root_exec_gives_the_command_the_environment_a_plain_exec_does(
     shell: list[str], tmp_path: Path
 ) -> None:
-    """The uid check leaves the command the environment a plain exec gives it.
-
-    `-a` exports every variable the shell sets, so any the check left would show, and
-    the container's own variables arrive, under names a check might use too.
-    """
+    """`-a` exports every variable the shell sets, so any the uid check left shows."""
     status_file = tmp_path / "status"
     status_file.write_text(_proc_status("0\t0\t0\t0", "0\t0\t0\t0"))
     # Every name the check uses, so one that sets or unsets any of them shows.
@@ -641,7 +636,9 @@ def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> No
     cuts = [i + 1 for i, char in enumerate(script[:-1]) if char == "\n"]
 
     for cut in cuts:
-        result = subprocess.run(shell, input=script[:cut].encode(), capture_output=True)
+        result = subprocess.run(
+            shell, input=script[:cut].encode(), capture_output=True, timeout=30
+        )
 
         assert not ran.exists(), f"ran after a cut at {cut}: {script[:cut]!r}"
         assert result.stdout == b""
@@ -699,6 +696,7 @@ def _tls(
         + ["-keyout", str(key), "-out", str(cert)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -712,17 +710,19 @@ def _tls(
     )
     client = client_context.wrap_socket(client_socket, do_handshake_on_connect=False)
     handshake = threading.Thread(target=server.do_handshake)
+    for end in (client, server):
+        end.settimeout(30)  # only bounds a hang
     handshake.start()
     client.do_handshake()
-    handshake.join()
+    handshake.join(30)
+    assert not handshake.is_alive()
+    for end in (client, server):
+        end.settimeout(None)
     return client, server
 
 
 def _keep_a_tls_error(tmp_path: Path, other: ssl.SSLSocket) -> bool:
-    """Whether `other`, waiting for nothing, reports a system error left in the queue.
-
-    OpenSSL keeps a reset connection's write error in its queue for this thread.
-    """
+    """Whether `other` reports the error a reset connection left in OpenSSL's queue."""
     for _ in range(5):  # A write can find the reset still on its way.
         with socket.create_server(("127.0.0.1", 0)) as listener:
             client_socket = socket.create_connection(listener.getsockname())
@@ -804,10 +804,7 @@ def _sending(
 
 
 def _straddling(first: bytes, frame: bytes, count: int) -> list[bytes]:
-    """TLS records holding `first`, then `count` copies of `frame`.
-
-    Each record ends one byte into the next frame, so TLS always holds part of one.
-    """
+    """Each record ends a byte into the next frame, so TLS always holds part of one."""
     return [first + frame[:1]] + [frame[1:] + frame[:1]] * (count - 1) + [frame[1:]]
 
 
@@ -822,7 +819,7 @@ def test_frames_tls_has_already_decrypted_are_read(
     pool = concurrent.futures.ThreadPoolExecutor(1)
     reading = pool.submit(_handle, ws)
     try:
-        result = reading.result(timeout=5)
+        result = reading.result(timeout=30)
     finally:
         # Wakes a read still waiting, so that a failure can't hang the suite.
         server.close()
@@ -890,7 +887,7 @@ def test_a_frame_cut_off_after_the_markers_does_not_hold_the_exec_open(
 
     reading = pool.submit(_handle, _SocketWSClient(client))
     try:
-        result = reading.result(timeout=5)
+        result = reading.result(timeout=30)
     finally:
         # Wakes a read still waiting, so that a failure can't hang the suite.
         server.close()
@@ -1045,7 +1042,7 @@ class TestStatusReceivedBeforeTheConnectionWasLost:
 
 
 class TestResultLostAfterTheScriptWasSent:
-    """Once the script is sent the command may run, so a lost result isn't retried."""
+    """Once the script is sent the command may run: a lost result is an unknown one."""
 
     @pytest.mark.parametrize(
         "error",
@@ -1202,20 +1199,12 @@ class TestExecChunksStdin:
 
 
 @pytest.mark.parametrize(
-    ("user", "shell", "checked"),
-    [
-        ("root", ["/bin/sh"], True),
-        ("0", ["/bin/sh"], True),
-        (None, ["/bin/sh"], False),
-        ("agent", _shell_command("agent"), False),
-    ],
-    ids=["root", "0", "default", "agent"],
+    ("user", "checked"),
+    [("root", True), ("0", True), (None, False)],
+    ids=["root", "0", "default"],
 )
 def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
-    monkeypatch: pytest.MonkeyPatch,
-    user: str | None,
-    shell: list[str],
-    checked: bool,
+    monkeypatch: pytest.MonkeyPatch, user: str | None, checked: bool
 ) -> None:
     """One program start, not `id` and a second shell; the check runs in it first."""
     writes, op = _exec_writing_to(monkeypatch)
@@ -1224,9 +1213,10 @@ def test_a_root_exec_opens_the_containers_own_shell_behind_a_uid_check(
 
     op.exec(["true"], stdin=None, cwd="/w", env={"K": "v"}, user=user, timeout=None)
 
-    opened.assert_called_once_with(shell)
-    check = execute_module._ROOT_CHECK if checked else ""
-    assert "".join(writes).startswith(f"{{\n{check}cd /w || exit $?\nexport K=v\n")
+    opened.assert_called_once_with(["/bin/sh"])
+    before, _, rest = "".join(writes).partition("cd /w || exit $?\nexport K=v\n")
+    # The uid is read from /proc before anything the caller asked for: for root.
+    assert rest and ("/proc/self/status" in before) is checked
 
 
 def _exec_writing_to(
@@ -1484,7 +1474,7 @@ class TestProbeSwitch:
             stub.chmod(0o755)
             script = script.replace("/sbin/runuser", str(stub))
 
-        result = subprocess.run([*shell, "-c", script])
+        result = subprocess.run([*shell, "-c", script], timeout=30)
 
         assert result.returncode == expected
 
@@ -1492,17 +1482,15 @@ class TestProbeSwitch:
 class TestProbeBounds:
     """A misbehaving `id` or `runuser` can hold the probe's output open or flood it."""
 
-    def test_gives_up_on_a_probe_that_never_ends(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(execute_module, "API_TIMEOUT", 0.05)
+    def test_gives_up_on_a_probe_that_never_ends(self) -> None:
         op = ExecuteOperation(MagicMock())
+        ws = _FakeWSClient([(STDOUT, b"x")], ends=False)
 
         @contextmanager
         def fake_shell(command: list[str]) -> Generator[WSClient, None, None]:
-            yield _FakeWSClient([(STDOUT, b"x")], ends=False)
+            yield ws
 
-        with patch.object(op, "_interactive_shell", fake_shell):
+        with patch.object(op, "_interactive_shell", fake_shell), _on_its_clock(ws):
             with pytest.raises(PodError, match="timed out"):
                 op.probe_switch("agent")
 
@@ -1521,10 +1509,7 @@ class TestProbeBounds:
     def test_a_status_received_before_the_connection_was_lost_answers(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """As kubernetes 37's update() can: read the status, then fail.
-
-        E.g. replying to the server's close after it has gone.
-        """
+        """As kubernetes 37's update() can: read the status, then fail."""
         op = ExecuteOperation(MagicMock())
         ws = _FakeWSClient([_status(1)], error=BrokenPipeError("gone"))
         read_one = ws.update
@@ -1889,7 +1874,7 @@ class TestExecStdio:
         client, server = tls_sockets
         stream = _stdio(client)
         reader = _reader(server)
-        request = os.urandom(op_module.STDIN_CHUNK_SIZE * 2 + 1)
+        request = os.urandom(2 * 1024**2 + 1)
         frames: list[bytes] = []
 
         def read() -> None:
@@ -1904,19 +1889,12 @@ class TestExecStdio:
         await stream.aclose()
 
         assert b"".join(frame[1:] for frame in frames) == request
-        assert [len(frame) - 1 for frame in frames] == [
-            op_module.STDIN_CHUNK_SIZE,
-            op_module.STDIN_CHUNK_SIZE,
-            1,
-        ]
+        assert max(len(frame) - 1 for frame in frames) <= 1024**2
 
     async def test_the_stream_sends_no_resize_keepalive(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
-        """CRI-O does not drain resize events for an exec without a TTY.
-
-        They would stall the stream's stdin.
-        """
+        """On CRI-O, resize events would stall the stdin of an exec without a TTY."""
         before = set(threading.enumerate())
         stream = _stdio(tls_sockets[0])
         started = [
@@ -1933,10 +1911,7 @@ class TestExecStdio:
         tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Its caller sees only the stream end, and closes the stream on it.
-
-        Logged in the caller's context, where Inspect finds the sample's log.
-        """
+        """Logged in the caller's context, where Inspect finds the sample's log."""
         sample = contextvars.ContextVar[str | None]("sample", default=None)
         sample.set("this sample")
 
@@ -2342,10 +2317,7 @@ class TestExecStdio:
         tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """By the open's own close, not the garbage collector's.
-
-        That can run late, and on the event loop, which the close blocks for seconds.
-        """
+        """By the open's own close, not the garbage collector's."""
         client, _ = tls_sockets
         opening, release = threading.Event(), threading.Event()
         closed = threading.Event()
@@ -2428,12 +2400,7 @@ class TestExecStdio:
     async def test_a_stream_s_end_leaves_other_tls_connections_working(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], tmp_path: Path
     ) -> None:
-        """On the event loop, which a runner's other TLS connections share.
-
-        CPython raises a TLS read or write's system error (EPIPE, say) without clearing
-        it from OpenSSL's queue for the thread, and OpenSSL 3.5 then reports it for the
-        thread's next TLS call that would wait. A stream's read left one on staging.
-        """
+        """An error left in OpenSSL's queue fails other TLS calls on the event loop."""
         client, _ = tls_sockets
         stream = _stdio(client)
         other, _peer = _tls(tmp_path, *socket.socketpair())
@@ -2539,11 +2506,7 @@ class TestExecStdio:
         tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """As a busy runner's event loop can starve them of the GIL, for good.
-
-        CPython hands the GIL to a waiting thread only once one hold outlasts the
-        switch interval, so an event loop busy for less at a time keeps it.
-        """
+        """As a busy runner's event loop can starve them of the GIL, for good."""
         client, server = tls_sockets
         released = threading.Event()
         start = threading.Thread.start

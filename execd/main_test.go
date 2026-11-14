@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -17,22 +18,32 @@ import (
 func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
 	defer cancel()
-	first := exec.CommandContext(ctx, os.Args[0], "listen", "--key-sha256", strings.Repeat("00", 32)) // on any free port
+	first := exec.CommandContext(ctx, os.Args[0], "listen", "--key-sha256", strings.Repeat("00", 32)) // any port
 	// The daemon it leaves running.
 	t.Cleanup(stopOthers)
 
-	first.WaitDelay = time.Second // or a daemon that kept its stdout would hold Output() past the budget
-	out, _ := first.Output()      // its exit status may go to another test's reaper
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Stdout = w
+	if err := first.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	r.SetReadDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	out, err := io.ReadAll(r)                           // ends once the exec and its daemon have both let go
+	first.Wait()                                        // its exit status may go to another test's reaper
 
-	if ctx.Err() != nil {
-		t.Fatal("the first exec never returned")
+	if err != nil {
+		t.Fatalf("the first exec's stdout stayed open: %v", err)
 	}
 	if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out) {
 		t.Fatalf("the first exec printed %q, want its daemon's fingerprint", out)
 	}
 }
 
-// firstProcess runs execd as a pod's first process that reaps nothing would, then prints the children it is left with.
+// firstProcess runs execd as a pod's first process that reaps nothing would.
 func firstProcess(argv []string) {
 	prctl(prSetChildSubreaper, 1)
 	start := exec.Command(os.Args[0], argv...)

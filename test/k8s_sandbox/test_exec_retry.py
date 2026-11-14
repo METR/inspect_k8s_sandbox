@@ -10,7 +10,7 @@ from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
 from k8s_sandbox import _helm, _sandbox_environment
-from k8s_sandbox._pod import op, pod
+from k8s_sandbox._pod import execd, op, pod
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
     ExecdResultUnknownError,
@@ -413,7 +413,7 @@ class TestExecStdioRetry:
 
     async def test_transient_error_is_retried(self) -> None:
         sandbox, mock_pod = _make_sandbox()
-        stream = MagicMock()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
         mock_pod.exec_stdio.side_effect = [
             ApiException(status=503, reason="Unavailable"),
             stream,
@@ -427,7 +427,7 @@ class TestExecStdioRetry:
     async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
         """Nothing checks the pod again while the stream lasts."""
         sandbox, mock_pod = _make_sandbox()
-        stream = AsyncMock()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
         mock_pod.exec_stdio.return_value = stream
         mock_pod.check_for_pod_restart.side_effect = PodReplacedError(
             pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
@@ -441,7 +441,7 @@ class TestExecStdioRetry:
 
     async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
         sandbox, mock_pod = _make_sandbox()
-        stream = AsyncMock()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
         mock_pod.exec_stdio.return_value = stream
         mock_pod.check_for_pod_restart.side_effect = anyio.Event().wait
 
@@ -455,7 +455,7 @@ class TestExecStdioRetry:
 
     async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
         sandbox, mock_pod = _make_sandbox()
-        stream = MagicMock()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
         mock_pod.exec_stdio.return_value = stream
         mock_pod.check_for_pod_restart.side_effect = [
             ApiException(status=503, reason="Unavailable"),

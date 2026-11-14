@@ -48,6 +48,8 @@ spec:
       {{- end }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
+      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
+      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -66,6 +68,14 @@ spec:
       dnsConfig:
         nameservers:
           - 127.0.0.1
+      {{- end }}
+      {{- if and $noCard (include "shouldCreateDnsRecord" $service) }}
+      {{- /* No sidecar answers there, so the service's own names lead to the pod itself. */}}
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+            - {{ $name | quote }}
+            - {{ printf "%s-%s" (include "agentEnv.fullname" $) $name | quote }}
       {{- end }}
 
       {{- $egressProxy := get $podAnnotations "inspect-k8s-sandbox/egress-proxy" }}
@@ -211,6 +221,7 @@ spec:
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
+      {{- if not $noCard }}
       - name: coredns
         image: {{ quote $.Values.corednsImage }}
         command:
@@ -246,6 +257,7 @@ spec:
           - name: coredns-config
             mountPath: /etc/coredns
             readOnly: true
+      {{- end }}
       {{- with $.Values.extraContainers }}
         {{- toYaml . | nindent 6 }}
       {{- end }}
@@ -258,9 +270,11 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
+      {{- if not $noCard }}
         - name: coredns-config
           configMap:
             name: {{ template "agentEnv.fullname" $ -}}-coredns-configmap
+      {{- end }}
       {{- if not $.Values.corednsUpstream }}
         - name: resolv-conf
           configMap:

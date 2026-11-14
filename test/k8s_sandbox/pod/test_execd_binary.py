@@ -12,6 +12,10 @@ import subprocess
 import sys
 import uuid
 
+import anyio
+import anyio.abc
+import anyio.streams.stapled
+import anyio.streams.tls
 import pytest
 
 from k8s_sandbox._pod import execd
@@ -33,9 +37,14 @@ for host in sys.argv[2:]:
 """
 
 
-def docker(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+def docker(
+    *args: str, stdin: str | None = None, timeout: float = 30
+) -> subprocess.CompletedProcess[str]:
     command = ["docker", *args]
-    return subprocess.run(command, input=stdin, capture_output=True, text=True)
+    # The timeout only bounds a hang: a build pulls images, and takes longer.
+    return subprocess.run(
+        command, input=stdin, capture_output=True, text=True, timeout=timeout
+    )
 
 
 @dataclasses.dataclass
@@ -63,11 +72,11 @@ def sandbox() -> collections.abc.Iterator[Sandbox]:
     if shutil.which("docker") is None or sys.platform != "linux":
         pytest.skip("needs Docker on Linux, where a container's address is routed")
     name = f"execd-test-{uuid.uuid4().hex[:8]}"
-    built = docker("build", "-q", "-t", f"{name}:execd", str(EXECD))
+    built = docker("build", "-q", "-t", f"{name}:execd", str(EXECD), timeout=600)
     assert built.returncode == 0, built.stderr
     dockerfile = f"FROM {name}:execd AS execd\nFROM {IMAGE}\n"
     dockerfile += f"COPY --from=execd /execd {execd.EXECD_PATH}\n"
-    built = docker("build", "-q", "-t", name, "-", stdin=dockerfile)
+    built = docker("build", "-q", "-t", name, "-", stdin=dockerfile, timeout=600)
     assert built.returncode == 0, built.stderr
     try:
         started = docker("run", "-d", "--name", name, name, "sleep", "3600")
@@ -119,20 +128,67 @@ async def relay(
     server.close()
 
 
+class Execs:
+    """`docker exec`s joined to execd's socket, as the execs to a pod with no card."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.open: list[anyio.abc.Process] = []
+
+    async def connect(self, *user: str) -> anyio.abc.ByteStream:
+        bridge = [execd.EXECD_PATH, "connect", execd.EXECD_SOCKET]
+        argv = ["docker", "exec", "-i", *user, self.name, *bridge]
+        self.open.append(await anyio.open_process(argv, stderr=subprocess.DEVNULL))
+        stdin, stdout = self.open[-1].stdin, self.open[-1].stdout
+        assert stdin is not None and stdout is not None
+        return anyio.streams.stapled.StapledByteStream(stdin, stdout)
+
+    def drop(self) -> None:
+        for process in self.open:
+            if process.returncode is None:
+                process.kill()
+
+
+@pytest.fixture
+async def execs(sandbox: Sandbox) -> collections.abc.AsyncIterator[Execs]:
+    carrier = Execs(sandbox.name)
+    yield carrier
+    carrier.drop()
+    for process in carrier.open:
+        await process.aclose()
+
+
+async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, bytes]:
+    """`docker exec` starts execd, as an exec into a pod does: its fingerprint, key."""
+    key = os.urandom(32)
+    listen = [execd.EXECD_PATH, "listen", *at]
+    listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+    listen += ["--replace"] if replace else []
+    started = await asyncio.to_thread(docker, "exec", sandbox.name, *listen)
+    if "address already in use" in started.stderr:
+        raise execd.DaemonRunning(started.stderr)
+    assert started.returncode == 0, started.stderr
+    return started.stdout.strip(), key
+
+
 @pytest.fixture
 def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
-    """The real client; `docker exec` starts execd, as an exec into a pod does."""
+    """The real client, reaching execd at its port."""
 
     async def start(replace: bool) -> execd.Daemon:
-        key = os.urandom(32)
-        listen = [execd.EXECD_PATH, "listen", "--port", str(PORT)]
-        listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
-        listen += ["--replace"] if replace else []
-        started = await asyncio.to_thread(docker, "exec", sandbox.name, *listen)
-        if "address already in use" in started.stderr:
-            raise execd.DaemonRunning(started.stderr)
-        assert started.returncode == 0, started.stderr
-        return execd.Daemon("127.0.0.1", started.stdout.strip(), key)
+        at = await start_execd(sandbox, replace, "--port", str(PORT))
+        return execd.Daemon("127.0.0.1", *at)
+
+    return execd.ExecdClient(start)
+
+
+@pytest.fixture
+def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
+    """The real client, reaching execd through an exec's stdio."""
+
+    async def start(replace: bool) -> execd.Daemon:
+        at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
+        return execd.Daemon("", *at, execs.connect)
 
     return execd.ExecdClient(start)
 
@@ -152,6 +208,24 @@ async def test_a_command_whose_connection_drops_is_resumed_and_runs_once(
 
     # All of its output, once: what came before the drop and what came after.
     assert (result.returncode, result.stdout) == (0, "before\nafter\n")
+    assert sandbox.sh(f"cat {runs}").stdout == "run\n"
+
+
+async def test_a_command_whose_exec_ends_is_resumed_through_another_and_runs_once(
+    sandbox: Sandbox, execs: Execs, stdio_client: execd.ExecdClient
+) -> None:
+    runs = f"/tmp/{uuid.uuid4().hex}"
+    script = 'echo run >> "$0"; until [ -e "$0.go" ]; do sleep 0.05; done; echo ran'
+    call = asyncio.ensure_future(
+        stdio_client.exec(["sh", "-c", script, runs], None, None, {}, None, None)
+    )
+    await sandbox.until(f"test -e {runs}")
+
+    execs.drop()
+    sandbox.sh(f"touch {runs}.go")
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert (result.returncode, result.stdout) == (0, "ran\n")
     assert sandbox.sh(f"cat {runs}").stdout == "run\n"
 
 
@@ -181,6 +255,25 @@ async def test_a_connection_from_the_sandbox_itself_is_closed(
     assert probe.stdout.split() == ["127.0.0.1", "closed", sandbox.ip, "closed"]
 
 
+async def test_another_users_process_is_refused_at_execds_socket(
+    execs: Execs, stdio_client: execd.ExecdClient
+) -> None:
+    call = stdio_client.exec(["true"], None, None, {}, None, None)  # execd runs
+    await asyncio.wait_for(call, 30)  # only bounds a hang
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
+    theirs = await execs.connect("-u", "65534")
+
+    # Closed, before the handshake or in it, where its own user is served.
+    closed = (anyio.EndOfStream, anyio.BrokenResourceError)
+    with anyio.fail_after(30), pytest.raises(closed):  # the budgets only bound a hang
+        await anyio.streams.tls.TLSStream.wrap(
+            theirs, server_side=False, ssl_context=context, standard_compatible=False
+        )
+    with anyio.fail_after(30):
+        assert await execs.open[-1].wait() == 0  # the bridge itself ran, and connected
+
+
 async def test_a_timed_out_command_is_killed(
     sandbox: Sandbox, client: execd.ExecdClient
 ) -> None:
@@ -190,7 +283,7 @@ async def test_a_timed_out_command_is_killed(
     with pytest.raises(TimeoutError):
         await client.exec(argv, None, None, {}, None, 1)
 
-    await sandbox.until(f"! kill -0 $(cat {pid})")
+    await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
 async def test_a_streams_command_is_killed_when_its_connection_drops(
@@ -202,4 +295,4 @@ async def test_a_streams_command_is_killed_when_its_connection_drops(
 
     relay.drop()
 
-    await sandbox.until(f"! kill -0 $(cat {pid})")
+    await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")

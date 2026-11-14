@@ -60,7 +60,8 @@ class ReadFileOperation(PodOperation):
         # response in memory.
         try:
             while ws_client.is_open():
-                # `timeout=None`: `update` blocks until there is data to read.
+                # `timeout=None` means `update` will block indefinitely until there is
+                # data to read.
                 ws_client.update(timeout=None)
                 if ws_client.peek_stdout():
                     dst.write(ws_client.read_stdout())
@@ -71,7 +72,7 @@ class ReadFileOperation(PodOperation):
             raise_if_stopped_before_lost(ws_client, e, self._pod.name)
             raise
         returncode = get_returncode(ws_client)
-        # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
+        # `head` never exits 255: Kata gives it when the VM stopped.
         if returncode == 255:
             raise ContainerStoppedError(
                 "The container stopped while reading the file.",

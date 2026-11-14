@@ -24,6 +24,26 @@ import (
 	"unsafe"
 )
 
+// fromAnotherUser says whether a Unix socket's peer runs as a user other than execd's, who could hold every unauthenticated slot.
+func fromAnotherUser(nc net.Conn) bool {
+	if secured, ok := nc.(interface{ NetConn() net.Conn }); ok {
+		nc = secured.NetConn()
+	}
+	local, ok := nc.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	uid := -1
+	if raw, err := local.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			if peer, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED); err == nil {
+				uid = int(peer.Uid)
+			}
+		})
+	}
+	return uid != os.Geteuid()
+}
+
 // server owns every process; a call outlives its connection, so a client can resume it.
 type server struct {
 	keyHash []byte
@@ -42,11 +62,16 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
-var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
+var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-var afterRead = func() {} // tests hold a reader here, with output it has taken and not counted
+// Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
+var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
 
-var afterDrainCheck = func(late bool) {} // tests hold an exit here, each time it has checked its pipes
+func hook(h *atomic.Pointer[func(late bool)], late bool) {
+	if f := h.Load(); f != nil {
+		(*f)(late)
+	}
+}
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -54,7 +79,7 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu, held through writes
+	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu
 	pid int
 	// where the reaper sends its command's exit status
 	status chan int
@@ -67,11 +92,11 @@ type call struct {
 	detached int  // times its connection dropped
 	stdinEOF bool // the client closed stdin
 	mu       sync.Mutex
-	out      [2]bytes.Buffer // stdout, stderr: what the process wrote and the client has not acked
-	base     [2]int          // the stream offset of out[i][0]
-	sent     [2]int          // the offset up to which the current subscriber has been sent output
-	flushed  time.Time       // when output was last sent
-	deferred bool            // a flush waits for its millisecond
+	out      [2]fifo   // stdout, stderr: what the process wrote and the client has not acked
+	base     [2]int    // the stream offset of out[i][0]
+	sent     [2]int    // the offset up to which the current subscriber has been sent output
+	flushed  time.Time // when output was last sent
+	deferred bool      // a flush waits for its millisecond
 	room     *sync.Cond
 	gone     bool // released: drop any further output
 	exited   bool
@@ -128,7 +153,7 @@ func (s *server) serve(l net.Listener) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+		if fromThisPod(nc) || fromAnotherUser(nc) { // the client dials from another pod, or through an exec as execd's user
 			nc.Close()
 			continue
 		}
@@ -257,7 +282,7 @@ func (s *server) detach(c *conn) {
 				if orphaned {
 					cl.kill() // before its output is let go: a command that ended on that would leave what it started
 					cl.mu.Lock()
-					cl.gone, cl.out, cl.stdinQ = true, [2]bytes.Buffer{}, nil
+					cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil
 					cl.room.Broadcast()
 					cl.mu.Unlock()
 				}
@@ -274,7 +299,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out = true, [2]bytes.Buffer{}
+		cl.gone, cl.out = true, [2]fifo{}
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -298,7 +323,7 @@ func (s *server) start(c *conn, f frame) {
 	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
-	if s.current != nil && s.current != c { // replaced since dispatch looked: its client may have run this call again by now
+	if s.current != nil && s.current != c { // its client may have run this call again since dispatch looked
 		s.mu.Unlock()
 		return
 	}
@@ -334,7 +359,7 @@ func (s *server) resume(c *conn, f frame) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	s.mu.Lock()
-	replaced := s.current != nil && s.current != c // since dispatch looked: the call is the new connection's to resume
+	replaced := s.current != nil && s.current != c // the call is the new connection's to resume
 	s.mu.Unlock()
 	if replaced {
 		return
@@ -371,7 +396,7 @@ func (cl *call) run(req startRequest) error {
 			return err
 		}
 		if cred != nil {
-			// execd itself becomes the user, then the shell: a child Go switched would be theirs to stop before it execs, with execd waiting on it.
+			// A child Go switched to the user would be theirs to stop before it execs, with execd waiting on it.
 			argv = append([]string{"/proc/self/exe", "as", dir, fmt.Sprint(cred.Uid), fmt.Sprint(cred.Gid), strings.Trim(fmt.Sprint(cred.Groups), "[]")}, argv...)
 			as, dir = cred, ""
 			// As runuser sets them, unless the caller did.
@@ -384,28 +409,43 @@ func (cl *call) run(req startRequest) error {
 	}
 	// By its path, as Kubernetes exec does: a command may have replaced the directory.
 	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
-		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+		// A user who cannot enter it by its path stays in it, while that path is still this directory.
+		if here, _ := syscall.Getwd(); !errors.Is(err, syscall.EACCES) || here != workdir {
+			return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+		}
 	}
-	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
-		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
+	if req.Cwd != "" && as == nil { // one execd's user can enter, else the cd fails, not the command; another user's cd is its launcher's
+		if err := syscall.Access(req.Cwd+"/.", 0); err != nil {
+			return fmt.Errorf("cd: %s: %w", req.Cwd, err)
+		}
 	}
 	stdinR, stdinW, err := stdinPipe(req.Stdin)
 	if err != nil {
 		return err
 	}
-	outR, outW, _ := os.Pipe()
-	errR, errW, _ := os.Pipe()
+	outR, outW, noOut := os.Pipe()
+	errR, errW, noErr := os.Pipe()
+	var envR, envW *os.File
+	var noEnv error
+	if as != nil {
+		envR, envW, noEnv = os.Pipe()
+	}
+	if err := errors.Join(noOut, noErr, noEnv); err != nil { // out of descriptors: it would run with a stream missing
+		for _, f := range []*os.File{stdinR, stdinW, outR, outW, errR, errW, envR, envW} {
+			f.Close()
+		}
+		return err
+	}
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
-	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it (GODEBUG)
-		envR, envW, _ := os.Pipe()
+	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it
 		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
 		for i, kv := range env {
 			raw[i] = []byte(kv)
 		}
 		go func() { json.NewEncoder(envW).Encode(raw); envW.Close() }()
 		defer envR.Close()
-		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // the launcher's: each thread it starts takes a PID of the pod's
+		env, files = []string{"GOMAXPROCS=1"}, append(files, envR) // each launcher thread takes a PID of the pod's
 	}
 	// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
 	p, err := os.StartProcess(argv[0], argv, &os.ProcAttr{
@@ -428,7 +468,7 @@ func (cl *call) run(req startRequest) error {
 	cl.pid, cl.as, cl.status = p.Pid, as, exited // before Release, which sets it to -1
 	killed := cl.killed
 	cl.kmu.Unlock()
-	if killed { // while it started: nothing is reaped under this lock, so the id is its own, though it may have ended
+	if killed { // while it started: nothing is reaped under this lock, so the id is its own
 		syscall.Kill(-p.Pid, syscall.SIGKILL)
 	}
 	reaper.mu.Unlock()
@@ -455,7 +495,7 @@ func (cl *call) run(req startRequest) error {
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
-					afterRead()
+					hook(&afterRead, false)
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
@@ -504,12 +544,12 @@ func (cl *call) run(req startRequest) error {
 			if delivered && late {
 				outR.SetReadDeadline(time.Now())
 				errR.SetReadDeadline(time.Now())
-				afterDrainCheck(true)
+				hook(&afterDrainCheck, true)
 				<-done
 				cl.finish(code, "")
 				return
 			}
-			afterDrainCheck(late)
+			hook(&afterDrainCheck, late)
 		}
 	}()
 	return nil
@@ -580,6 +620,43 @@ func (cl *call) feedStdin(w *os.File) {
 // Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
 const maxUnacked, streamUnacked = 4 << 20, 1 << 20
 
+// fifo is a stream's unacked output, kept in a ring: an ack frees its front without a copy.
+type fifo struct {
+	buf     []byte
+	head, n int // where its first byte is in buf, and how many it holds
+}
+
+func (f *fifo) Len() int { return f.n }
+
+// Write adds data; most is all the fifo will be asked to hold, and it doubles no further.
+func (f *fifo) Write(data []byte, most int) {
+	if need := f.n + len(data); need > len(f.buf) {
+		grown := make([]byte, max(need, min(2*len(f.buf), most)))
+		k := copy(grown, f.buf[f.head:min(f.head+f.n, len(f.buf))])
+		copy(grown[k:], f.buf[:f.n-k])
+		f.buf, f.head = grown, 0
+	}
+	tail := (f.head + f.n) % len(f.buf)
+	copy(f.buf, data[copy(f.buf[tail:], data):])
+	f.n += len(data)
+}
+
+// Next drops the first n bytes.
+func (f *fifo) Next(n int) {
+	if n > 0 {
+		f.head, f.n = (f.head+n)%len(f.buf), f.n-n
+	}
+}
+
+// span is the n bytes from offset off: a copy where they pass the ring's end.
+func (f *fifo) span(off, n int) []byte {
+	start := (f.head + off) % len(f.buf)
+	if start+n <= len(f.buf) {
+		return f.buf[start : start+n]
+	}
+	return append(append(make([]byte, 0, n), f.buf[start:]...), f.buf[:start+n-len(f.buf)]...)
+}
+
 func (cl *call) output(stream int, data []byte) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -593,11 +670,11 @@ func (cl *call) output(stream int, data []byte) {
 	if cl.gone {
 		return
 	}
-	cl.out[stream].Write(data)
+	cl.out[stream].Write(data, limit+len(data))
 	cl.flushSoon()
 }
 
-// When the next call may send output, since start: calls take turns, so together they keep within the client's frame pace.
+// When the next call may send output: calls take turns, to keep within the client's frame pace.
 var slot atomic.Int64
 
 var epoch = time.Now() // turns are measured from here, on the monotonic clock
@@ -673,19 +750,19 @@ func (cl *call) ackLocked(req resumeRequest) {
 // kill stops the call's process group, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
-// stop is kill; a timeout's notes that it found the command running, so only then does the exit say "timed out".
+// stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
 func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
-	var ended [128]byte // a siginfo_t: waitid sets its first field while the child has exited and is not yet reaped
+	var ended [128]byte // a siginfo_t: waitid sets its first field for a child exited and not yet reaped
 	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
 	if pid <= 0 || ended[0] != 0 {
 		return
 	}
-	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is the command's own
+	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own
 	running := reaper.waiting[pid] == status
 	if running {
 		cl.kmu.Lock()
@@ -714,22 +791,28 @@ type search struct {
 
 var searches = make(chan search)
 
-// startSearcher starts, once, the thread that searches as other users: at execd's start, as a pod out of PIDs can start none.
+// startSearcher starts the searching thread at execd's start: a pod out of PIDs can start none.
 var startSearcher = sync.OnceFunc(func() {
 	go func() {
 		runtime.LockOSThread() // the identities it takes are this thread's alone
 		for s := range searches {
-			setfs(s.as.Uid, s.as.Gid)
+			setids(s.as.Uid, s.as.Gid) // its kills are then the user's own: root may lack CAP_KILL
 			killTagged(s.tag)
-			setfs(uint32(os.Geteuid()), uint32(os.Getegid()))
+			setids(uint32(os.Getuid()), uint32(os.Getgid()))
 		}
 	}()
 })
 
-// setfs gives this thread a filesystem identity, which is what opening /proc/PID/environ checks.
-func setfs(uid, gid uint32) {
-	syscall.RawSyscall(syscall.SYS_SETFSGID, uintptr(gid), 0, 0)
-	syscall.RawSyscall(syscall.SYS_SETFSUID, uintptr(uid), 0, 0)
+// setids gives this thread an effective identity; its real and saved ones stay, to come back to.
+func setids(uid, gid uint32) {
+	keep := ^uintptr(0)
+	if uid != 0 { // the group first while still root, and root first on the way back
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
+	syscall.RawSyscall(syscall.SYS_SETRESUID, keep, uintptr(uid), keep)
+	if uid == 0 {
+		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
+	}
 	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
 }
 
@@ -753,7 +836,7 @@ func (cl *call) flush() (frames int) {
 		end := cl.base[i] + cl.out[i].Len()
 		for cl.sent[i] < end {
 			next := min(end, cl.sent[i]+1<<20)
-			cl.sub.send(kind, cl.id, cl.out[i].Bytes()[cl.sent[i]-cl.base[i]:next-cl.base[i]])
+			cl.sub.send(kind, cl.id, cl.out[i].span(cl.sent[i]-cl.base[i], next-cl.sent[i]))
 			cl.sent[i] = next
 			frames++
 		}
@@ -783,7 +866,7 @@ func childEnv(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	if _, given := extra["PATH"]; !given {
-		if _, inherited := os.LookupEnv("PATH"); !inherited { // or the shell's own applies, and bash's ends in the working directory
+		if _, inherited := os.LookupEnv("PATH"); !inherited { // else bash's own ends in the working directory
 			env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 		}
 	}
@@ -855,7 +938,7 @@ func killTagged(tag string) {
 	}
 }
 
-// The reaper reaps every child, orphans included, under mu, so an id is never reused before its status is sent.
+// The reaper reaps every child under mu, so an id is never reused before its status is sent.
 type reaperState struct {
 	mu      sync.Mutex
 	waiting map[int]chan int

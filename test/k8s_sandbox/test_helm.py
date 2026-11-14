@@ -427,10 +427,7 @@ async def test_helm_install_extra_values_escaped() -> None:
 async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
     tmp_path: Path, name: str
 ) -> None:
-    """Helm's --set syntax in either ends up in its value, not as values of its own.
-
-    Nor does Helm read a name as a list, number or boolean.
-    """
+    """Helm's --set syntax in either ends up in its value, not as values of its own."""
     chart = tmp_path / "chart"
     (chart / "templates").mkdir(parents=True)
     (chart / "Chart.yaml").write_text("apiVersion: v2\nname: values\nversion: 0.1.0\n")
@@ -454,6 +451,7 @@ async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
         capture_output=True,
         text=True,
         check=True,
+        timeout=30,
     )
     values = json.loads(yaml.safe_load(rendered.stdout)["data"]["values"])
     assert values == {

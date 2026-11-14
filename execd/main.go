@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -29,11 +30,15 @@ func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
+	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket
+		connect(os.Args[2])
+	}
 	if len(os.Args) < 2 || os.Args[1] != "listen" && os.Args[1] != "serve" {
-		fail("usage: execd listen --port N --key-sha256 HEX")
+		fail("usage: execd listen (--port N | --socket NAME) --key-sha256 HEX")
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	port := fs.Int("port", 0, "TCP port")
+	socket := fs.String("socket", "", "abstract Unix socket")
 	keyHash := fs.String("key-sha256", "", "hex SHA-256 of the session key")
 	replace := fs.Bool("replace", false, "stop any execd already listening")
 	fs.Parse(os.Args[2:])
@@ -44,7 +49,22 @@ func main() {
 		start()
 		return
 	}
-	run(*port, *keyHash, *replace)
+	network, address := "tcp", fmt.Sprintf(":%d", *port)
+	if *socket != "" {
+		network, address = "unix", "@"+*socket
+	}
+	run(network, address, *keyHash, *replace)
+}
+
+// connect joins an exec's stdin and stdout to the daemon on the abstract socket name, until either ends.
+func connect(name string) {
+	c, err := net.Dial("unix", "@"+name)
+	if err != nil {
+		fail(err.Error())
+	}
+	go func() { io.Copy(c, os.Stdin); os.Exit(0) }()
+	io.Copy(os.Stdout, c)
+	os.Exit(0)
 }
 
 // become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
@@ -129,7 +149,7 @@ func start() {
 	fmt.Println(fingerprint)
 }
 
-func run(port int, keyHash string, replace bool) {
+func run(network, address, keyHash string, replace bool) {
 	status := os.NewFile(3, "status")
 	report := func(msg string) {
 		status.WriteString(msg + "\n")
@@ -147,10 +167,10 @@ func run(port int, keyHash string, replace bool) {
 		os.Exit(2)
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
-	l, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
+	l, err := tls.Listen(network, address, config)
 	for i := 0; replace && err != nil && i < 20 && errors.Is(err, syscall.EADDRINUSE); i++ {
-		time.Sleep(100 * time.Millisecond) // the daemon --replace stopped may still hold the port
-		l, err = tls.Listen("tcp", fmt.Sprintf(":%d", port), config)
+		time.Sleep(100 * time.Millisecond) // the daemon --replace stopped may still hold the address
+		l, err = tls.Listen(network, address, config)
 	}
 	if err != nil {
 		report(err.Error())
@@ -167,7 +187,7 @@ func stopOthers() {
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
+		if err != nil {
 			continue
 		}
 		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
