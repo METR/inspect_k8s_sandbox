@@ -231,7 +231,7 @@ async def _through(
         while data := await loop.sock_recv(far, RAW_READ):
             await stdio.send(data)
 
-    pace = Pace()  # a message costs a pass here before _Pipe counts a byte of it
+    pace = Pace()  # a backstop: a message costs a pass here before _Pipe counts it
 
     async def back() -> None:
         while True:

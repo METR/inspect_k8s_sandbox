@@ -2816,7 +2816,7 @@ async def test_what_a_guest_writes_to_its_exec_is_paced(
     monkeypatch.setattr(execd, "PACE_FRAMES", 50)
 
     class Floods(anyio.abc.ByteStream):
-        """An exec whose guest writes a byte at a time, as fast as it is read."""
+        """An exec that delivers a guest's bytes faster than the cap."""
 
         left = 150
 
