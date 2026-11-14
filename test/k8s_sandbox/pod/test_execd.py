@@ -490,6 +490,7 @@ async def test_stdin_in_flight_stays_within_the_window(
             written = received
             if kind == execd.STDIN:
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                await r.read()  # open till the client is done: Python 3.13 closes TLS
                 return
             put = json.dumps({"stdin": written}).encode()
             w.write(frame(execd.STDIN_ACK, call_id, put))
@@ -1084,7 +1085,6 @@ RESTARTED = error.ContainerRestartedError(
 @pytest.mark.parametrize(
     ("failure", "raised"),
     [
-        (execd.NotStarted("execd did not start"), error.ExecdResultUnknownError),
         pytest.param(
             kubernetes.client.exceptions.ApiException(status=404),
             error.ExecdResultUnknownError,
@@ -1122,7 +1122,8 @@ async def test_a_failed_restart_after_start_is_not_retryable(
     "failure",
     [
         kubernetes.client.exceptions.ApiException(status=503),
-        error.PodError("/execd/execd timed out"),  # the start's exec got no answer
+        # As at the pod's PID limit: the start fails, and the daemon runs on.
+        error.PodError("execd did not start"),
     ],
 )
 async def test_a_start_that_fails_while_reconnecting_does_not_lose_the_command(

@@ -28,7 +28,6 @@ from k8s_sandbox._pod.execd import (
     DaemonRunning,
     ExecdClient,
     ExecdStream,
-    NotStarted,
 )
 from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
 from k8s_sandbox._pod.executor import PodOpExecutor
@@ -100,7 +99,7 @@ class Pod:
             raise DaemonRunning(stderr.decode(errors="replace"))
         # Exactly the fingerprint execd prints: anything else, cut output too, fails.
         if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
-            raise NotStarted("execd did not start", returncode=code, stderr=stderr)
+            raise PodError("execd did not start", returncode=code, stderr=stderr)
         self._execd_lost = True  # until it is returned: a failure below loses its key
         if not replace:  # the daemon reached before died, perhaps with its container
             self._execd_restarted = time.monotonic()
@@ -113,7 +112,7 @@ class Pod:
             )
         )
         if pod.ip is None:
-            raise NotStarted("The pod has no IP address for execd", pod=info.name)
+            raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
         return Daemon(pod.ip, stdout.decode().strip(), key)

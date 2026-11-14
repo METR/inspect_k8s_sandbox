@@ -110,10 +110,6 @@ class DaemonRunning(Exception):
     """A start found the port taken: the daemon already started still runs."""
 
 
-class NotStarted(PodError):
-    """A start ran and failed: no daemon runs, so no call can be resumed."""
-
-
 def _port_held() -> RuntimeError:
     return RuntimeError(
         f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
@@ -497,9 +493,8 @@ class ExecdClient:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
                 except Exception as failed:
-                    # A deleted pod, or a start that ran and failed: nothing to resume.
+                    # Only a deleted pod: a start can fail and its daemon run on.
                     gone = isinstance(failed, ApiException) and failed.status == 404
-                    gone = gone or isinstance(failed, NotStarted)
                     if self._link is None or gone or isinstance(failed, K8sError):
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
