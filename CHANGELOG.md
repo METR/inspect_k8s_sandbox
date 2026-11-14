@@ -10,18 +10,22 @@
   `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
   a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
   its environment holds `HAWK_NEXT_EXEC`, a `cwd` that does not exist ends it with
-  status 1, and with no `stdin` it reads end-of-file. A timed-out `exec()` whose command
-  is still running gets SIGKILL at once, and so do its background processes, except one
-  that has left its process group and cleared its environment; those of a command that
-  has ended are left running. A command that ends execd, by killing every process or
-  taking the pod's last PID, makes each running `exec()` raise `ExecResultUnknownError`,
-  and commands still running lose their timeout. Make execd mode 111; where a container
-  runs on gVisor as a user other than root it must be readable too (555). A process
-  running as execd's user with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in
-  for it while it starts. execd's memory counts against the container's limit: about 7
-  MB idle, 9 to 16 MB for each stream (stdout, stderr) of a command that prints faster
-  than the client reads, and up to about 9 MB of the stdin a command leaves unread, most
-  of it kept for minutes after the command ends.
+  status 1, and with no `stdin` it reads end-of-file. If the container's working
+  directory is reached through a symbolic link, a command given no `cwd` keeps running
+  where the link pointed when execd started, also after the link is re-pointed. A
+  timed-out `exec()` whose command is still running gets SIGKILL at once, and so do its
+  background processes, except one that has left its process group and cleared its
+  environment, or on gVisor has left its process group under a command run as another
+  user; those of a command that has ended are left running. A command that ends execd,
+  by killing every process or taking the pod's last PID, makes each running `exec()`
+  raise `ExecResultUnknownError`, and commands still running lose their timeout. Make
+  execd mode 111; where a container runs on gVisor as a user other than root it must be
+  readable too (555). A process running as execd's user with `CAP_DAC_OVERRIDE` or
+  `CAP_DAC_READ_SEARCH` can stand in for it while it starts. execd's memory counts
+  against the container's limit: about 7 MB idle, 9 to 16 MB for each stream (stdout,
+  stderr) of a command that prints faster than the client reads, and up to about 10 MB
+  for each command that leaves its stdin unread, most of it kept for minutes after the
+  command ends.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
