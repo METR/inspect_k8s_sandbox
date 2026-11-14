@@ -367,6 +367,34 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 	}
 }
 
+func TestNoReaperStartsOnceAPassIsOutOfTime(t *testing.T) {
+	alone(t)
+	l := fakeNode(t)
+	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+4)
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	w := l.workers[id("a")]
+	if w == nil {
+		t.Fatal("no worker for a sandbox that names a proxy")
+	}
+	listening(t, l, id("a"))
+
+	os.Remove(record) // the sandbox is deleted
+	l.reap = 0        // as when the reapers before this worker's used all of the pass's time
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if w.reaper != nil || l.workers[id("a")] != w {
+		t.Fatal("a reaper started past the pass's deadline: reapers that run together end each other")
+	}
+	l.reap = budget
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	ended(t, w)
+}
+
 // A reaper can fail, and a process of its uid outside this namespace can stop it: the launcher goes on, resumes or replaces the reaper, and gives the uid to no other sandbox meanwhile.
 func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 	alone(t)

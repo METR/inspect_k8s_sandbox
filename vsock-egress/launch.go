@@ -155,6 +155,9 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 // end stops a worker and whatever else runs as its uid here, through a reaper: the launcher may not signal another uid.
 func (c *child) end(wait time.Duration) error {
 	if c.reaper == nil {
+		if wait <= 0 { // reapers share a real uid, so two that run together end each other: none starts once a pass is out of time
+			return errors.New("no reaper yet: the pass was out of time")
+		}
 		reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
 		if err != nil {
 			return err
