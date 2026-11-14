@@ -8,7 +8,7 @@ import ssl
 import subprocess
 import time
 import types
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
 
 import anyio
@@ -24,6 +24,7 @@ from k8s_sandbox._pod.pod import Pod
 from k8s_sandbox._pod.snapshot import _parse_pod
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
+TlsDaemon = Callable[[Handler], Awaitable[execd.ExecdClient]]
 
 
 async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
@@ -183,7 +184,9 @@ def cluster(monkeypatch: MonkeyPatch) -> Cluster:
     ],
 )
 async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
-    daemons: Daemons, cluster: Cluster, operation: Callable[[Pod], Awaitable[object]]
+    tls_daemon: TlsDaemon,
+    cluster: Cluster,
+    operation: Callable[[pod_module.Pod], Awaitable[object]],
 ) -> None:
     """Regression: a cached connection kept serving a restarted container's sample."""
     starts = 0
@@ -201,9 +204,8 @@ async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
                 # Exit 1: exec() returns it, a file operation raises.
                 w.write(frame(execd.EXIT, call_id, b'{"code": 1}'))
 
-    await daemons.serve(exits_once_found)
-    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
-    pod._execd = daemons.client()
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod._execd = await tls_daemon(exits_once_found)
     running = asyncio.ensure_future(operation(pod))
     await until(lambda: starts == 1)
     cluster.restarts = 1
@@ -221,7 +223,7 @@ async def test_a_restart_found_in_raise_mode_fails_operations_over_execd(
 
 
 async def test_a_restart_found_in_raise_mode_ends_streams_over_execd(
-    daemons: Daemons, cluster: Cluster
+    tls_daemon: TlsDaemon, cluster: Cluster
 ) -> None:
     """Regression: a restarted container's stream stayed open, and another opened."""
     starts = 0
@@ -238,9 +240,8 @@ async def test_a_restart_found_in_raise_mode_ends_streams_over_execd(
                 await found.wait()
                 w.write(frame(execd.STDOUT, call_id, b"late"))
 
-    await daemons.serve(writes_once_found)
-    pod = Pod("p", "ns", None, "default", "u", 0, "raise")
-    pod._execd = daemons.client()
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod._execd = await tls_daemon(writes_once_found)
     stream = await pod.exec_stdio(["cat"], None)
     waiting = asyncio.ensure_future(stream.receive())
     await until(lambda: starts == 1)
@@ -469,10 +470,11 @@ async def test_a_command_whose_connection_closed_after_it_was_sent_is_not_retrya
             await read_frame(r)  # START: the command may have run
         w.close()  # the reopened connection is gone before the RESUME is written
 
+    # Plain: over TLS the client writes its RESUME before it sees the close.
     await daemons.serve(drops)
 
     # A ConnectionError would be retried, running the command again.
-    with pytest.raises(ExecdResultUnknownError):
+    with pytest.raises(error.ExecdResultUnknownError):
         await daemons.client().exec(["touch", "/once"], None, None, {}, None, 10)
 
 
@@ -585,28 +587,18 @@ async def test_a_timed_out_call_is_released_with_no_exit(
 
 
 async def test_a_command_execd_killed_at_its_timeout_raises(
-    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+    tls_daemon: TlsDaemon,
 ) -> None:
-    context, pin = tls
-
     async def times_out(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        await read_frame(r)  # AUTH
-        w.write(frame(execd.OK, 0))
         _, call_id, _ = await read_frame(r)  # START
         w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
         await r.read()
 
-    server = await asyncio.start_server(times_out, "127.0.0.1", 0, ssl=context)
-    monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
-
-    async def start(replace: bool) -> execd.Daemon:
-        return execd.Daemon("127.0.0.1", pin, b"key")
-
+    sandbox = await tls_daemon(times_out)
     with pytest.raises(TimeoutError, match="Command timed out after 60s"):
         await asyncio.wait_for(
-            execd.ExecdClient(start).exec(["sleep", "99"], None, None, {}, None, 60), 30
+            sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
-    server.close()
 
 
 async def test_a_failed_restart_after_start_is_not_retryable(
@@ -1713,6 +1705,34 @@ def tls(tmp_path: Path) -> tuple[ssl.SSLContext, str]:
     context.load_cert_chain(cert, key)
     der = ssl.PEM_cert_to_DER_cert(cert.read_text())
     return context, hashlib.sha256(der).hexdigest()
+
+
+@pytest.fixture
+async def tls_daemon(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: MonkeyPatch
+) -> AsyncGenerator[TlsDaemon, None]:
+    """Serves a stand-in for execd over TLS; gives the client that pins it."""
+    context, pin = tls
+    servers: list[asyncio.Server] = []
+
+    async def serve(handler: Handler) -> execd.ExecdClient:
+        async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+            await read_frame(r)  # AUTH
+            w.write(frame(execd.OK, 0))
+            await handler(r, w)
+
+        server = await asyncio.start_server(connection, "127.0.0.1", 0, ssl=context)
+        servers.append(server)
+        monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+
+        async def start(replace: bool) -> execd.Daemon:
+            return execd.Daemon("127.0.0.1", pin, b"key")
+
+        return execd.ExecdClient(start)
+
+    yield serve
+    for server in servers:
+        server.close()
 
 
 async def test_only_the_pinned_certificate_is_trusted(
