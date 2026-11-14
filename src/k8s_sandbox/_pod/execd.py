@@ -497,12 +497,13 @@ class ExecdClient:
         return [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
 
     async def _kill_left(self, link: Link) -> None:
-        """KILL and RELEASE again, on each new connection, the calls lately left."""
-        self._unkilled = self._left()
+        """KILL and RELEASE again, on each new connection, the calls left."""
         with contextlib.suppress(OSError):  # dropped again: the next one sends them
             for _, call_id in self._unkilled:  # a daemon ignores ids not its own
                 await link.send(KILL, call_id)
                 await link.send(RELEASE, call_id)
+            # An older one has now had the RELEASE that frees execd's record of it.
+            self._unkilled = self._left()
 
     async def _get(self, stale: Link | None = None) -> Link:
         link = self._link

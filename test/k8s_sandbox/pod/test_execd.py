@@ -780,26 +780,24 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
 
 
-async def test_a_call_left_longer_ago_than_execd_keeps_it_is_killed_no_more(
+async def test_a_call_left_is_killed_and_released_once_more_after_execd_lets_it_go(
     daemons: Daemons, clock: types.SimpleNamespace
 ) -> None:
+    """Regressions: sent for ever; then dropped unsent, so execd kept its record."""
     left: list[int] = []
-    connections: list[asyncio.StreamWriter] = []
-    later: list[int] = []
+    got: list[list[int]] = []
 
     async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        connections.append(w)
-        nth = len(connections)
+        mine: list[int] = []
+        got.append(mine)
         while True:
             kind, call_id, _ = await read_frame(r)
-            if nth == 1 and kind == execd.START:
-                left.append(call_id)
-            elif nth > 1:
-                later.append(kind)
-                if kind == execd.RESUME:  # of the next command, if it left on the first
-                    w.write(frame(execd.ERROR, call_id, b"unknown call"))
-                elif kind == execd.START:
-                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            if not left:
+                left.append(call_id)  # the START of the command to be left
+            elif call_id == left[0]:
+                mine.append(kind)
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
     await daemons.serve(records)
     client = daemons.client()
@@ -809,12 +807,16 @@ async def test_a_call_left_longer_ago_than_execd_keeps_it_is_killed_no_more(
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
         await call
-    clock.now += execd.ABANDONED_AFTER  # execd has ended it by itself
-    connections[0].close()
 
+    for later in (350, 20, 0):  # execd lets it go at 360 s: before, after, again
+        clock.now += later
+        await asyncio.wait_for(client._get(stale=client._link), 30)
+    # In order behind anything the last connection was sent for the call left.
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
-    assert later and execd.KILL not in later
+    again = [execd.KILL, execd.RELEASE]
+    await until(lambda: got[1:3] == [again, again])
+    assert got[3] == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])
