@@ -2591,25 +2591,32 @@ async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
     assert "the container is not running as root" in caplog.text
 
 
-async def test_a_user_execd_cannot_become_is_logged_with_only_the_end_of_stderr(
-    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    "why", ["cannot run as 0: execd is not root", "unknown user 0"]
+)
+async def test_a_user_execd_cannot_run_as_is_told_with_only_the_end_of_stderr(
+    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture, why: str
 ) -> None:
     """Regression: a stand-in for execd had 10 MiB logged by each call."""
 
     async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
         w.write(frame(execd.STDERR, call_id, b"x" * execd.CHUNK + b"the end\n"))
-        status = b'{"code": 126, "error": "cannot run as 0: execd is not root"}'
+        status = json.dumps({"code": 126, "error": why}).encode()
         w.write(frame(execd.EXIT, call_id, status))
         await r.read()
 
     client = await tls_daemon(floods)
 
     with caplog.at_level("WARNING"):
-        call = client.exec(["true"], None, None, {}, "root", None)
-        await asyncio.wait_for(call, 30)
+        try:
+            call = client.exec(["true"], None, None, {}, "root", None)
+            await asyncio.wait_for(call, 30)
+            told = caplog.text
+        except RuntimeError as unknown_user:
+            told = str(unknown_user)
 
-    assert "the end" in caplog.text and len(caplog.text) < 8192
+    assert "the end" in told and len(told) < 8192
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(

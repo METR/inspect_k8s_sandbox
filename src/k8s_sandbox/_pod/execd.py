@@ -67,7 +67,7 @@ HOLD = 2 * ((4 << 20) + CHUNK)  # untaken output; past it, the peer isn't execd
 MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
-MAX_OWED = 1024  # calls over whose RELEASE no PONG has followed: execd answers at half
+MAX_OWED = 1024  # calls over whose RELEASE no PONG has followed: a PING asks at half
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers a second; past any, reading waits: no stand-in holds the loop.
 PACE_FRAMES = 4096
@@ -778,7 +778,8 @@ class ExecdClient:
         if error.startswith("unknown user"):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does not appear to "
-                f"exist in the container. Docs: {EXEC_USER_URL}\n{result.stderr}"
+                f"exist in the container. Docs: {EXEC_USER_URL}\n"
+                f"{result.stderr[-_STDERR_TAIL_BYTES:]}"
             )
         if error.startswith("cannot run as"):
             logger.warning(

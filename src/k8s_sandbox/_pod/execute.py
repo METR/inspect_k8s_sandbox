@@ -373,10 +373,11 @@ class ExecuteOperation(PodOperation):
         return result
 
     def _check_for_runuser_error(self, stderr: str, user: str) -> None:
+        end = stderr[-_STDERR_TAIL_BYTES:]  # a command can fill stderr to its limit
         if re.search(r"runuser: user \S+ does not exist", stderr, re.IGNORECASE):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does "
-                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{stderr}"
+                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{end}"
             )
         # The three arms below describe an environment that cannot perform the
         # switch, not a caller asking for something that does not exist. Callers
@@ -386,7 +387,6 @@ class ExecuteOperation(PodOperation):
         # and turned a supported configuration into a fatal error, so warn and
         # let the failed ExecResult through. Only an unknown user still raises,
         # because no fallback makes a name that isn't there work.
-        end = stderr[-_STDERR_TAIL_BYTES:]  # a command can fill stderr to its limit
         if "runuser: may not be used by non-root users" in stderr.casefold():
             logger.warning(
                 "exec(user=%r) failed: the container is not running as root, so "
