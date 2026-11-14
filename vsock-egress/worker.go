@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,11 +32,27 @@ type worker struct {
 	looked sync.Mutex
 	addr   string // the target's address, once looked up
 	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
+
+	accepts *pacer       // new streams a second
+	refused atomic.Int64 // streams turned away since the last report: without the key, or past the cap
+	failed  atomic.Int64 // streams that did not reach the proxy since the last report
 }
+
+// newStreams bounds the streams a worker takes in a second. Past it the worker's listener fills, and
+// Firecracker resets the guest's connections: a guest that floods its worker spends its own VM's time.
+const newStreams = 2000
 
 func newWorker(vsock, target string, rate int) *worker {
 	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, maxStreams),
-		lookup: net.DefaultResolver.LookupNetIP}
+		lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
+}
+
+// report writes what went wrong since the last report as one line: a guest must not be able to fill the
+// node's log a stream at a time.
+func (w *worker) report() {
+	if refused, failed := w.refused.Swap(0), w.failed.Swap(0); refused+failed > 0 {
+		log.Printf("refused %d streams (no key, or more than %d open); %d did not reach the proxy", refused, maxStreams, failed)
+	}
 }
 
 func work(args []string) error {
@@ -59,11 +76,18 @@ func work(args []string) error {
 		io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
 	}()
-	return newWorker(*vsock, *target, *rate).serve(l)
+	w := newWorker(*vsock, *target, *rate)
+	go func() {
+		for range time.Tick(time.Minute) {
+			w.report()
+		}
+	}()
+	return w.serve(l)
 }
 
 func (w *worker) serve(l net.Listener) error {
 	for {
+		w.accepts.wait(1)
 		c, err := l.Accept()
 		if err != nil {
 			return err
@@ -75,7 +99,7 @@ func (w *worker) serve(l net.Listener) error {
 				w.stream(c)
 			}()
 		default:
-			log.Printf("refused a stream: %d are open", maxStreams)
+			w.refused.Add(1)
 			c.Close()
 		}
 	}
@@ -87,13 +111,15 @@ func (w *worker) stream(c net.Conn) {
 	key := make([]byte, keySize)
 	c.SetReadDeadline(time.Now().Add(handshakeWait))
 	if _, err := io.ReadFull(c, key); err != nil || !w.holds(key) {
-		log.Print("refused a stream that did not open with the sandbox's key")
+		w.refused.Add(1)
 		return
 	}
 	c.SetReadDeadline(time.Time{})
 	t, err := w.dial()
 	if err != nil {
-		log.Print(err)
+		if w.failed.Add(1) == 1 { // the first of each report says why
+			log.Print(err)
+		}
 		return
 	}
 	join(c, t.(*net.TCPConn), w.pace)

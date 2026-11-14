@@ -2,14 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -135,6 +138,83 @@ func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
 		}
 	case <-time.After(budget):
 		t.Fatal("a stream that opened with the key did not reach the proxy")
+	}
+}
+
+// logged collects what the test's workers write to the log.
+type logged struct {
+	sync.Mutex
+	bytes.Buffer
+}
+
+func (l *logged) Write(p []byte) (int, error) {
+	l.Lock()
+	defer l.Unlock()
+	return l.Buffer.Write(p)
+}
+
+func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
+	var out logged
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	target, _ := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	dial := serve(t, w)
+
+	const refused = 50
+	for range refused {
+		c := dial()
+		c.Write(newKey())
+		select {
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream without the key was not closed")
+		}
+	}
+	out.Lock()
+	lines := out.String()
+	out.Unlock()
+	if lines != "" {
+		t.Fatalf("refused streams wrote to the log as they came: %q", lines)
+	}
+	w.report()
+	out.Lock()
+	defer out.Unlock()
+	if want := fmt.Sprintf("refused %d streams", refused); !strings.Contains(out.String(), want) {
+		t.Fatalf("the report is %q, want %q in it", out.String(), want)
+	}
+}
+
+func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
+	var mu sync.Mutex
+	clock, slept := time.Unix(0, 0), time.Duration(0)
+	const rate, streams = 10, 100
+	target, _ := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	w.accepts = &pacer{rate: rate, now: func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}, sleep: func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		clock, slept = clock.Add(d), slept+d
+	}}
+	dial := serve(t, w)
+
+	for range streams {
+		c := dial()
+		c.Write(newKey())
+		select {
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream without the key was not closed")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if least := (streams/rate - 1) * time.Second; slept < least {
+		t.Fatalf("taking %d streams at %d a second waited %v: want at least %v", streams, rate, slept, least)
 	}
 }
 

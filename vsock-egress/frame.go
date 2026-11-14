@@ -132,9 +132,9 @@ func fromFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 // paceSlack is how far ahead of its rate a pacer lets bytes run before it sleeps: short messages never wait.
 const paceSlack = 10 * time.Millisecond
 
-// pacer holds the bytes that pass it to a rate. A nil pacer holds nothing back.
+// pacer holds what passes it, bytes or new streams, to a rate. A nil pacer holds nothing back.
 type pacer struct {
-	rate  float64 // bytes a second
+	rate  float64 // a second
 	now   func() time.Time
 	sleep func(time.Duration)
 
