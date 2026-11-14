@@ -1863,6 +1863,17 @@ async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
     assert (await pod._start_execd(False)).ip == "10.0.0.1"
 
 
+async def test_a_start_that_finds_execds_port_taken_says_a_daemon_runs(
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
+    await pod._start_execd(False)
+
+    with pytest.raises(execd.DaemonRunning):  # so its client keeps the one it has
+        await pod._start_execd(False)
+
+
 async def test_the_read_of_execds_address_uses_a_client_of_its_own_thread(
     cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1998,6 +2009,23 @@ async def test_a_file_write_stops_at_the_output_limit(
 
     with pytest.raises(inspect_ai.util.OutputLimitExceededError):
         await daemons.client().write_file(b"data", pathlib.Path("/tmp/f"))
+
+
+async def test_a_command_stops_at_the_output_limit(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
+
+    async def chatters(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"x" * 2048))  # past the limit, then done
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    await daemons.serve(chatters)
+
+    with pytest.raises(inspect_ai.util.OutputLimitExceededError):
+        await daemons.client().exec(["yes"], None, None, {}, None, 30)
 
 
 @pytest.mark.parametrize(
@@ -2239,6 +2267,31 @@ async def test_a_stream_refuses_input_once_its_command_exits(daemons: Daemons) -
 
     with pytest.raises(anyio.BrokenResourceError):
         await stream.send(b"lost")
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "end"),
+    [
+        (execd.EXIT, b'{"code": 0}', anyio.EndOfStream),
+        (execd.ERROR, b"unknown user", anyio.BrokenResourceError),
+    ],
+    ids=["exit", "error"],
+)
+async def test_a_stream_ends_cleanly_only_when_its_command_exits(
+    daemons: Daemons, kind: int, payload: bytes, end: type[Exception]
+) -> None:
+    async def ends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"last words"))
+        w.write(frame(kind, call_id, payload))
+        await r.read()
+
+    await daemons.serve(ends)
+    stream = await daemons.client().open_stream(["cat"], None)
+
+    assert await asyncio.wait_for(stream.receive(), 30) == b"last words"
+    with pytest.raises(end):
+        await asyncio.wait_for(stream.receive(), 30)
 
 
 async def test_unasked_unknown_call_errors_start_nothing_again(

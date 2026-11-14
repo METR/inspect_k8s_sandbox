@@ -1093,6 +1093,20 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	}
 }
 
+func TestAnExitDoesNotWaitForWhatTheCommandLeftHoldingItsOutput(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged("holder") })
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "sleep 600 & echo x"}, Env: map[string]string{}, Tag: "holder"})
+
+	s.dispatch(c, frame{kind: fStart, id: 40, payload: req})
+
+	if status := exitStatus(t, frames); status["code"] != 0.0 { // no EXIT: it waited for the sleeper
+		t.Fatalf("the exit was %v", status)
+	}
+}
+
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
