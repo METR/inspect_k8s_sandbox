@@ -12,7 +12,7 @@ import shlex
 import ssl
 import struct
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, cast
@@ -81,6 +81,7 @@ STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays smal
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
 RECONNECT_FOR = 300.0
+ABANDONED_AFTER = 360.0  # execd ends a call no client has resumed by then
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
@@ -341,12 +342,8 @@ class Link:
                 for kind in kinds:
                     await self.send(kind, call_id)
 
-        await self.last(send())
-
-    async def last(self, sends: Coroutine[Any, Any, None]) -> None:
-        """Run a call's last sends to their end, even if the caller is cancelled."""
         # A task of its own: anyio cancels a cancelled caller again at each await.
-        task = asyncio.create_task(sends)
+        task = asyncio.create_task(send())
         self._last.add(task)
         task.add_done_callback(self._last.discard)
         await asyncio.shield(task)
@@ -452,7 +449,7 @@ class ExecdClient:
         self._opened = float("-inf")
         self._backoff = 0.0
         self._failed: BaseException | None = None  # why the open under way last failed
-        self._unkilled: list[tuple[Daemon, int]] = []  # calls left, KILL not yet sent
+        self._unkilled: list[tuple[float, Daemon, int]] = []  # when, and which call
 
     async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
@@ -497,16 +494,16 @@ class ExecdClient:
                     self._failed = failed  # the daemon may run on: its calls can resume
 
     async def _kill_left(self, link: Link) -> None:
-        """KILL and RELEASE the calls their callers left; each stays until sent."""
+        """KILL and RELEASE, on a new connection, the calls their callers left."""
         while self._unkilled:
-            daemon, call_id = self._unkilled[0]
-            if daemon is link.daemon:
+            left = self._unkilled[0]
+            if left[1] is link.daemon:
                 try:
-                    await link.send(KILL, call_id)
-                    await link.send(RELEASE, call_id)
+                    await link.send(KILL, left[2])
+                    await link.send(RELEASE, left[2])
                 except OSError:
                     return  # dropped again: the next connection sends it
-            if self._unkilled[:1] == [(daemon, call_id)]:
+            if self._unkilled[:1] == [left]:
                 del self._unkilled[0]
 
     async def _get(self, stale: Link | None = None) -> Link:
@@ -675,11 +672,13 @@ class ExecdClient:
                 sender.cancel()
             try:
                 if not finished:
-                    # Abandoned by the caller (an output limit, a cancel): stop it.
-                    self._unkilled.append((call.daemon, call.id))
-                    now = link if not link.closed else self._link
-                    if now is not None and not now.closed:  # else at the next open
-                        await now.last(self._kill_left(now))
+                    # Abandoned by the caller: stop it, and at the next open again.
+                    now = time.monotonic()
+                    kept = [u for u in self._unkilled if now - u[0] < ABANDONED_AFTER]
+                    self._unkilled = [*kept, (now, call.daemon, call.id)]
+                    to = link if not link.closed else self._link
+                    if to is not None and not to.closed and to.daemon is call.daemon:
+                        await to.send_last(call.id, KILL, RELEASE)
             finally:
                 link.calls.pop(call.id, None)
 

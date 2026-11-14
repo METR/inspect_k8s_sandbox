@@ -661,6 +661,45 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
+async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_the_next(
+    daemons: Daemons,
+) -> None:
+    """Regression: cancelled over a connection dead unnoticed, the command ran on."""
+    left: list[int] = []
+    first: list[asyncio.StreamWriter] = []
+    got: list[tuple[int, int]] = []
+
+    async def swallows_the_first(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        if not first:  # as a network that drops everything: nothing it is sent arrives
+            first.append(w)
+            left.append((await read_frame(r))[1])  # START
+            await r.read()
+            return
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            got.append((kind, call_id))
+            if kind == execd.RESUME:  # of the next command, if it left on the first
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(swallows_the_first)
+    client = daemons.client()
+    run = client.exec(["sleep", "600"], None, None, {}, None, None)
+    call = asyncio.ensure_future(run)
+    await until(lambda: bool(left))
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    first[0].close()  # only now does the client learn the connection is gone
+
+    await client.exec(["true"], None, None, {}, None, None)
+
+    assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
+
+
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
