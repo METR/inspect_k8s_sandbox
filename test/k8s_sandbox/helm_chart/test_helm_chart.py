@@ -982,6 +982,12 @@ def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> Non
         ("networks.backend.driver=bridge", "networks"),
         ("services.default.networks[0]=backend", "services.default.networks"),
         ("services.default.networkIsolated=true", "services.default.networkIsolated"),
+        # With no policy, only a Service's name bounds what the pod's node dials.
+        (
+            "egressForwarderImage=vsock-egress:1,services.default.podAnnotations."
+            "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local:3128",
+            "the egress proxy services.default names",
+        ),
     ],
 )
 def test_network_policy_disabled_refuses_unenforceable_restrictions(
