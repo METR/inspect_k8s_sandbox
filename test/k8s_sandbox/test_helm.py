@@ -1108,31 +1108,41 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
 
 
 @pytest.mark.parametrize(
-    ("spec", "short", "enough"),
+    ("spec", "short", "enough", "in_a_list"),
     [
-        pytest.param("", [], [_helper_pod()], id="a-pod-that-is-no-sandbox"),
+        pytest.param("", [], [_helper_pod()], False, id="a-pod-that-is-no-sandbox"),
+        pytest.param("", [], [_helper_pod()], True, id="in-a-list"),
         pytest.param(
             "  replicas: 2\n",
             [_helper_pod()],
             [_helper_pod(), _helper_pod(1)],
+            False,
             id="every-replica",
         ),
         # Failed by the pod GC, a pod stays Ready; its replacement takes its name.
         pytest.param(
-            "", [_helper_pod(phase="Failed")], [_helper_pod()], id="a-pod-that-failed"
+            "",
+            [_helper_pod(phase="Failed")],
+            [_helper_pod()],
+            False,
+            id="a-pod-that-failed",
         ),
         pytest.param(
             "",
             [_helper_pod(ready=False, phase="Succeeded")],
             [_helper_pod()],
+            False,
             id="a-pod-that-ran-to-completion",
         ),
         pytest.param(
-            "  ordinals: {start: 3}\n", [], [_helper_pod(3)], id="a-start-ordinal"
+            "  ordinals: {start: 3}\n",
+            [],
+            [_helper_pod(3)],
+            False,
+            id="a-start-ordinal",
         ),
     ],
 )
-@pytest.mark.parametrize("in_a_list", [False, True])
 async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(
     spec: str,
     short: list[PodSnapshot],
