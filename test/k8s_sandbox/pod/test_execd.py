@@ -591,6 +591,7 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     """Regression: a START cut as it was written failed a call execd could resume."""
     starts = connections = 0
     first: list[asyncio.StreamWriter] = []
+    resumes: list[bool] = []
     released = asyncio.Event()
 
     async def resets_the_first(
@@ -602,11 +603,13 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
             first.append(w)
             _, call_id, _ = await read_frame(r)  # the command that opens the connection
             w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
-            await read_frame(r)  # its RELEASE: else that is the write the reset meets
+            kind, _, _ = await read_frame(r)
+            assert kind == execd.RELEASE  # else it is the write the reset meets
             released.set()
             await r.read()
             return
-        _, call_id, _ = await read_frame(r)  # RESUME
+        kind, call_id, _ = await read_frame(r)
+        resumes.append(kind == execd.RESUME)
         w.write(frame(execd.ERROR, call_id, b"unknown call"))
         kind, call_id, _ = await read_frame(r)
         starts += kind == execd.START
@@ -628,7 +631,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     call = client.exec(["touch", "/once"], None, None, {}, None, None)
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
 
-    assert (result.returncode, starts) == (7, 1)
+    # Asked for first, then sent again once: execd had never read it.
+    assert (result.returncode, resumes, starts) == (7, [True], 1)
 
 
 @pytest.mark.parametrize(
@@ -806,7 +810,7 @@ async def test_a_call_left_is_killed_and_released_once_more_after_execd_lets_it_
     await until(lambda: bool(left))
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await call
+        await asyncio.wait_for(call, 30)
 
     for later in (350, 20, 0):  # execd lets it go at 360 s: before, after, again
         clock.now += later
