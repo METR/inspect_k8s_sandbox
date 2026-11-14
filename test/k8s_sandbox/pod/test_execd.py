@@ -812,7 +812,7 @@ async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
 async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
     tls_daemon: TlsDaemon, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: a peer that answered no PING had the client keep every call."""
+    """Regressions: no PONG, and every call was kept; then a busy execd was refused."""
     connections: list[asyncio.StreamWriter] = []
     starts: list[int] = []
     killed: list[int] = []
@@ -872,7 +872,8 @@ async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
 
     # The PONG answered the first PING: the second half is sent again, the first not.
     others = {starts[0], starts[1], starts[-2], starts[-1]}
-    assert waited and set(released) == {*starts[2 + half : 2 + 2 * half], *others}
+    assert waited
+    assert set(released) == {*starts[2 + half : 2 + 2 * half], *others}
 
 
 async def test_a_call_left_once_its_connection_is_replaced_is_killed_on_the_new_one(
@@ -2592,10 +2593,11 @@ async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
 
 
 @pytest.mark.parametrize(
-    "why", ["cannot run as 0: execd is not root", "unknown user 0"]
+    ("why", "raises"),
+    [("cannot run as 0: execd is not root", False), ("unknown user 0", True)],
 )
 async def test_a_user_execd_cannot_run_as_is_told_with_only_the_end_of_stderr(
-    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture, why: str
+    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture, why: str, raises: bool
 ) -> None:
     """Regression: a stand-in for execd had 10 MiB logged by each call."""
 
@@ -2607,14 +2609,16 @@ async def test_a_user_execd_cannot_run_as_is_told_with_only_the_end_of_stderr(
         await r.read()
 
     client = await tls_daemon(floods)
+    call = client.exec(["true"], None, None, {}, "root", None)
 
     with caplog.at_level("WARNING"):
-        try:
-            call = client.exec(["true"], None, None, {}, "root", None)
+        if raises:
+            with pytest.raises(RuntimeError) as unknown_user:
+                await asyncio.wait_for(call, 30)
+            told = str(unknown_user.value)
+        else:
             await asyncio.wait_for(call, 30)
             told = caplog.text
-        except RuntimeError as unknown_user:
-            told = str(unknown_user)
 
     assert "the end" in told and len(told) < 8192
 

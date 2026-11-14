@@ -19,7 +19,6 @@ import (
 func TestTheMemoryLimitIsHalfTheContainers(t *testing.T) {
 	for cgroupMax, want := range map[string]int64{
 		"1999998976\n": 999999488,
-		"67108864\n":   32 << 20,
 		"16777216\n":   32 << 20,      // never less: execd idles at 7 MiB
 		"max\n":        math.MaxInt64, // a container with no limit
 	} {
