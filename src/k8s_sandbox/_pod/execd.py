@@ -535,6 +535,7 @@ class ExecdClient:
                         offsets = {"stdout": call.got[0], "stderr": call.got[1]}
                         call.resuming = True  # before the RESUMED can arrive
                         await link.send(RESUME, call.id, json.dumps(offsets).encode())
+                        log_warn("execd connection lost: resuming", pod=call.daemon.ip)
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item
