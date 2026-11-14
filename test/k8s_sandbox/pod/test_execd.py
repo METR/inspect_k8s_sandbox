@@ -894,6 +894,50 @@ async def test_a_commands_timeout_bounds_its_start_behind_a_blocked_write(
     assert link is not None and not link.closed
 
 
+@pytest.mark.parametrize("exits", [True, False], ids=["exit", "output and no exit"])
+async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
+    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, exits: bool
+) -> None:
+    """Regression: its RELEASE or its ack waited 45 s behind its stdin's write."""
+    got: list[int] = []
+
+    class Stuck(Plain):
+        async def write(self, data: bytes) -> None:
+            if data[0] == execd.STDIN:  # the pod stopped reading: the upload waits
+                await asyncio.Event().wait()
+            await super().write(data)
+
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
+        return Stuck(r, w)
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        if exits:
+            w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+        else:  # output enough to be acked
+            w.write(frame(execd.STDOUT, call_id, b"x" * execd.ACK_EVERY))
+        while True:
+            kind, _, _ = await read_frame(r)
+            got.append(kind)
+            if kind == execd.KILL:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
+
+    monkeypatch.setattr(execd, "_connect", connect)
+    await daemons.serve(answers)
+    call = daemons.client().exec(["cat"], b"x", None, {}, None, None if exits else 1)
+
+    if exits:
+        result = await asyncio.wait_for(call, 30)  # only bounds a hang
+        assert result.returncode == 7
+    else:
+        with pytest.raises(TimeoutError, match="Command timed out"):
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+    # Its last frames still go out, once its upload has let go of the connection.
+    await until(lambda: got[-1:] == [execd.RELEASE])
+    assert (execd.KILL in got) is not exits
+
+
 async def test_a_timed_out_call_frees_what_execd_holds(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:

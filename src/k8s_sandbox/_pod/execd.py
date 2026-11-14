@@ -577,6 +577,7 @@ class ExecdClient:
                     try:
                         item = await _next(call.queue, left())
                     except asyncio.TimeoutError:
+                        sender.cancel()  # its write could hold the lock the KILL needs
                         try:
                             await asyncio.wait_for(
                                 self._kill(link, call), KILL_WAIT + 1
@@ -611,15 +612,10 @@ class ExecdClient:
                     kind, payload = item
                     if kind in (STDOUT, STDERR):
                         yield kind, payload
-                        await _taken(link, call, kind, len(payload))
+                        await _taken(link, call, kind, len(payload), left())
                     elif kind == EXIT:
                         finished = True  # no KILL: it would end what it left running
-                        try:
-                            with contextlib.suppress(OSError):
-                                await link.send(RELEASE, call.id)
-                        except BaseException:  # cut off: it may not have gone out
-                            link.send_last(call.id, RELEASE)
-                            raise
+                        link.send_last(call.id, RELEASE)
                         status = json.loads(payload)
                         code, why = status.get("code"), status.get("error", "")
                         if (
@@ -897,14 +893,18 @@ async def _window(link: Link, call: Call, sent: int) -> None:
         await call.stdin_room.wait()
 
 
-async def _taken(link: Link, call: Call, kind: int, n: int) -> None:
+async def _taken(
+    link: Link, call: Call, kind: int, n: int, within: float | None = None
+) -> None:
     """Count output the caller took, and acknowledge it, so execd sends more."""
     call.taken[kind - STDOUT] += n
     if sum(call.taken) - call.acked >= call.ack_every:
         call.acked = sum(call.taken)
         offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
-        with contextlib.suppress(OSError):
-            await link.send(ACK, call.id, json.dumps(offsets).encode())
+        # Out of time, the ack is left unsent: the call's own timeout ends it.
+        with contextlib.suppress(OSError, asyncio.TimeoutError):
+            ack = link.send(ACK, call.id, json.dumps(offsets).encode())
+            await asyncio.wait_for(ack, within)
 
 
 class ExecdStream(ByteStream):
