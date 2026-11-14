@@ -171,11 +171,12 @@ func TestRefusedStreamsAreCountedNotLoggedOneByOne(t *testing.T) {
 			t.Fatal("a stream without the key was not closed")
 		}
 	}
+	// Other tests' workers may still be writing to the log: only lines about refusals count.
 	out.Lock()
-	lines := out.String()
+	lines := strings.Count(out.String(), "refused")
 	out.Unlock()
-	if lines != "" {
-		t.Fatalf("refused streams wrote to the log as they came: %q", lines)
+	if lines != 0 {
+		t.Fatalf("%d lines about refused streams were written as they came", lines)
 	}
 	w.report()
 	out.Lock()

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -170,8 +171,12 @@ func TestForwarderCarriesNoMoreConnectionsThanAWorkerJoins(t *testing.T) {
 	go func() {
 		for {
 			c, _, err := node.accept()
-			if err != nil {
+			if errors.Is(err, os.ErrClosed) {
 				return
+			}
+			if err != nil {
+				t.Logf("accept: %v", err)
+				continue
 			}
 			t.Cleanup(func() { c.Close() })
 			dialled <- c

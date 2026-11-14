@@ -29,7 +29,7 @@ func vsockListen(port uint32) (*vsockListener, error) {
 func (l *vsockListener) accept() (*os.File, uint32, error) {
 	raw, err := l.f.SyscallConn()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, os.ErrClosed
 	}
 	var fd int
 	var peer unix.Sockaddr
@@ -37,8 +37,8 @@ func (l *vsockListener) accept() (*os.File, uint32, error) {
 	if err := raw.Read(func(listener uintptr) bool {
 		fd, peer, errno = unix.Accept4(int(listener), unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
 		return errno != unix.EAGAIN
-	}); err != nil {
-		return nil, 0, err
+	}); err != nil { // the listener was closed while this waited
+		return nil, 0, os.ErrClosed
 	}
 	if errno != nil {
 		return nil, 0, fmt.Errorf("vsock accept: %w", errno)
