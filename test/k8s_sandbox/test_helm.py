@@ -1051,7 +1051,8 @@ async def _wait(
     monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 0)
     # A short deadline of its own: the wait treats an exhausted script as a failed
     # poll and would otherwise spin for the whole INSPECT_HELM_TIMEOUT.
-    await release._wait_until_ready(time.monotonic() + 2)
+    # Bounded too: before Python 3.12 an exhausted script's StopIteration hangs it.
+    await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 2), 10)
     if isinstance(polls, list):
         assert mock.call_count == len(polls), (
             f"expected the wait to read the pods {len(polls)} times, not "
@@ -1118,12 +1119,15 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
             [_helper_pod(), _helper_pod(1)],
             id="every-replica",
         ),
-        # Its replacement takes the same name.
+        # Failed by the pod GC, a pod stays Ready; its replacement takes its name.
+        pytest.param(
+            "", [_helper_pod(phase="Failed")], [_helper_pod()], id="a-pod-that-failed"
+        ),
         pytest.param(
             "",
-            [_helper_pod(ready=False, phase="Failed")],
+            [_helper_pod(ready=False, phase="Succeeded")],
             [_helper_pod()],
-            id="a-pod-that-failed",
+            id="a-pod-that-ran-to-completion",
         ),
         pytest.param(
             "  ordinals: {start: 3}\n", [], [_helper_pod(3)], id="a-start-ordinal"

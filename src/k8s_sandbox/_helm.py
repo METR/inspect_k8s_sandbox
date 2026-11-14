@@ -467,7 +467,7 @@ class Release:
             not self._missing_services(pods)
             and all(map(_pod_ready, live))
             # A pod its controller has yet to create is in no list to be judged.
-            and self._expected_pods <= {pod.name for pod in pods if pod.ready}
+            and self._expected_pods <= {pod.name for pod in live if pod.ready}
         )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
