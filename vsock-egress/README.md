@@ -14,15 +14,16 @@ namespace at the `baseline` Pod Security Standard refuses.
 Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
-  the default profile of Amazon Linux's containerd 2.3 for a container with no capability, less the three `io_uring`
-  calls it allows and upstream's does not, plus `socket(AF_VSOCK)`, for the pod's forwarder.
-- `profiles/<architecture>/vsock-egress-launcher.json`, beside it: the same default plus `setns` into a network
-  namespace, for the launcher.
+  containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)`, for the pod's
+  forwarder.
+- `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
+  process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
   `SETGID` and no other, under the launcher's profile, with the node's `/var/lib/nitro-sandbox/firecracker` and
   `/run/netns` mounted with `HostToContainer` propagation and `/var/lib/cni/results` read-only. Every sandbox's worker
-  runs in that container's cgroup, where a sandbox that stops reading 64 downloads holds 80 MiB: give it a CPU request,
-  and a memory limit for as many sandboxes as the node can hold.
+  runs in that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
+  downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
+  as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
 
 `gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
 which names the assumption about AWS's runtime that broke.

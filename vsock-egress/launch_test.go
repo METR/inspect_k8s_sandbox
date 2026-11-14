@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -117,6 +118,39 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 	}
 }
 
+// A profile made again from the node's default would bring these back: io_uring, and the calls by which a worker could slow its own reaper.
+func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
+	everywhere := []string{"io_uring_setup", "io_uring_enter", "io_uring_register"}
+	launchers := []string{"sched_setattr", "sched_setscheduler", "sched_setparam", "sched_setaffinity", "setpriority", "ioprio_set"}
+	files, _ := filepath.Glob("profiles/*/*.json")
+	if len(files) != 4 {
+		t.Fatalf("found %d profiles, want two for each of two architectures: %v", len(files), files)
+	}
+	for _, file := range files {
+		var profile struct {
+			Syscalls []struct {
+				Names  []string `json:"names"`
+				Action string   `json:"action"`
+			} `json:"syscalls"`
+		}
+		b, err := os.ReadFile(file)
+		if err != nil || json.Unmarshal(b, &profile) != nil || len(profile.Syscalls) == 0 {
+			t.Fatalf("%s is no seccomp profile: %v", file, err)
+		}
+		refused := everywhere
+		if strings.HasSuffix(file, "-launcher.json") {
+			refused = append(refused, launchers...)
+		}
+		for _, rule := range profile.Syscalls {
+			for _, name := range rule.Names {
+				if rule.Action == "SCMP_ACT_ALLOW" && slices.Contains(refused, name) {
+					t.Errorf("%s allows %s", file, name)
+				}
+			}
+		}
+	}
+}
+
 func TestLaunchNeedsAPIDNamespaceOfItsOwn(t *testing.T) {
 	if os.Getpid() == 1 {
 		t.Skip("this binary is the first process of a PID namespace")
@@ -155,7 +189,7 @@ func status(t *testing.T, pid int, field string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		if strings.HasPrefix(line, field+":") {
 			return strings.Join(strings.Fields(line)[1:], " ")
 		}
@@ -206,6 +240,7 @@ func alone(t *testing.T) {
 func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	alone(t)
 	l := fakeNode(t)
+	l.reap = budget
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
 	addSandbox(t, l, id("b"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+1)
@@ -284,6 +319,7 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			const uid = vmUID + 2 // no other test's processes run as it
 			l := fakeNode(t)
+			l.reap = budget
 			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
 			t.Setenv(hostileWorker, strconv.Itoa(int(signal)))
 			t.Cleanup(func() { // whatever a failed run left as that uid
@@ -324,19 +360,51 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 				t.Fatal("the launcher's pass did not return: no sandbox on the node gets or loses a worker now")
 			}
 			ended(t, w)
+			if len(l.workers) != 0 { // a reaper the worker reached may still have ended it, and then been stopped or killed itself
+				t.Fatal("the worker's reaper did not end cleanly: the launcher still holds the worker")
+			}
 		})
 	}
 }
 
-// A reaper can fail, and a process of its uid outside this namespace can stop it: neither holds up the launcher, nor lets its worker go on.
+func TestNoReaperStartsOnceAPassIsOutOfTime(t *testing.T) {
+	alone(t)
+	l := fakeNode(t)
+	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+4)
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	w := l.workers[id("a")]
+	if w == nil {
+		t.Fatal("no worker for a sandbox that names a proxy")
+	}
+	listening(t, l, id("a"))
+
+	os.Remove(record) // the sandbox is deleted
+	l.reap = 0        // as when the reapers before this worker's used all of the pass's time
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if w.reaper != nil || l.workers[id("a")] != w {
+		t.Fatal("a reaper started past the pass's deadline: reapers that run together end each other")
+	}
+	l.reap = budget
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	ended(t, w)
+}
+
+// A reaper can fail, and a process of its uid outside this namespace can stop it: the launcher goes on, resumes or replaces the reaper, and gives the uid to no other sandbox meanwhile.
 func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 	alone(t)
 	for _, how := range []string{"stops", "fails"} {
 		t.Run("a reaper that "+how, func(t *testing.T) {
 			const uid = vmUID + 3 // no other test's processes run as it
+			proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}
 			l := fakeNode(t)
-			l.reap = time.Millisecond
-			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
+			l.reap, l.retry = time.Millisecond, 0
+			record := addSandbox(t, l, id("a"), "eth0", proxied, uid)
 			if err := l.pass(); err != nil {
 				t.Fatal(err)
 			}
@@ -357,19 +425,28 @@ func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 				t.Fatal("the launcher let go of a worker that nothing had ended")
 			}
 
+			addSandbox(t, l, id("b"), "eth0", proxied, uid) // the VM's uid goes to a new sandbox while the old worker runs
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			if l.workers[id("a")] != nil && l.workers[id("b")] != nil {
+				t.Fatal("a new sandbox got a worker as a uid whose last worker has not been ended")
+			}
 			t.Setenv(brokenReaper, "")
-			for deadline := time.Now().Add(budget); len(l.workers) > 0; time.Sleep(time.Millisecond) {
-				if w.reaper != nil {
-					syscall.Kill(w.reaper.cmd.Process.Pid, syscall.SIGCONT) // whoever stopped it lets it go on
-				}
+			for deadline := time.Now().Add(budget); l.workers[id("a")] != nil || l.workers[id("b")] == nil; time.Sleep(time.Millisecond) {
 				if err := l.pass(); err != nil {
 					t.Fatal(err)
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("no later pass ended the worker")
+					t.Fatalf("no later pass ended the old worker and started the new sandbox's: the launcher holds %d", len(l.workers))
 				}
 			}
 			ended(t, w)
+			next := l.workers[id("b")]
+			t.Cleanup(func() { next.end(budget) })
+			if next.exited() {
+				t.Fatal("the old worker's reaper ended the new sandbox's worker")
+			}
 		})
 	}
 }

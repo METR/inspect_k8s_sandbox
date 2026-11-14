@@ -2120,7 +2120,7 @@ class TestExecStdio:
 
         with anyio.fail_after(30):
             first = received = await stream.receive()
-            while True:
+            while len(received) < 3 * turn:
                 more = await stream.receive()
                 if others_ran.is_set():
                     break

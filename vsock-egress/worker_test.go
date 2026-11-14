@@ -215,6 +215,9 @@ func TestNewStreamsAreTakenAtABoundedRate(t *testing.T) {
 	const streams = 2 * newStreams
 	target, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	if w.accepts == nil {
+		t.Fatal("a worker has no pacer for new streams")
+	}
 	w.accepts.now = func() time.Time {
 		mu.Lock()
 		defer mu.Unlock()
@@ -344,26 +347,20 @@ func TestStreamsDoNotWaitForEachOthersLookup(t *testing.T) {
 	target, accepted := proxy(t)
 	_, port, _ := net.SplitHostPort(target)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
-	asked, answer := make(chan struct{}, 3), make(chan struct{})
-	var answered sync.Once
-	t.Cleanup(func() { answered.Do(func() { close(answer) }) })
+	var lookups atomic.Int32
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
 	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
-		asked <- struct{}{}
-		<-answer // the cluster's DNS is slow
+		if lookups.Add(1) == 1 {
+			<-hang // the cluster's DNS has no answer for one stream
+		}
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	}
 	dial := serve(t, w)
 
-	for range cap(asked) {
-		dial().Write(key)
-	}
-	for range cap(asked) {
-		within(t, asked, "lookup for a stream while another's had no answer")
-	}
-	answered.Do(func() { close(answer) })
-	for range cap(asked) {
-		within(t, accepted, "stream at the proxy once its lookup was answered")
-	}
+	dial().Write(key)
+	dial().Write(key)
+	within(t, accepted, "stream at the proxy while another stream's lookup hangs")
 }
 
 func TestProxyNamedByHostIsLookedUp(t *testing.T) {
@@ -422,7 +419,7 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
 	dial := serve(t, w)
 
-	for range workerStreams { // a workload process dials and says nothing
+	for range workerStreams - 1 { // a guest process dials and says nothing
 		dial()
 	}
 	forwarder := dial()
@@ -437,6 +434,49 @@ func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
 	if held := len(w.slots); held != 1 {
 		t.Fatalf("%d connections hold a stream's place: want the forwarder's alone", held)
 	}
+}
+
+func TestConnectionPastThoseThatHaveShownNoKeyIsClosed(t *testing.T) {
+	target, _ := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(newKey())}), target, 0)
+	w.keyWait = time.Hour // no silent connection gives its place up while the test runs
+	dial := serve(t, w)
+
+	for range workerStreams {
+		dial()
+	}
+	if _, err := dial().Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection %d that showed no key ended with %v: want it closed at once", workerStreams+1, err)
+	}
+}
+
+// The kernel takes twice what is asked, up to its own maximum. On loopback it never grows a buffer, so reading the option back is all a test can hold of the cap.
+func TestProxySocketIsCappedEachWay(t *testing.T) {
+	most := func(sysctl string) int {
+		b, err := os.ReadFile("/proc/sys/net/core/" + sysctl)
+		n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || n <= 0 {
+			t.Skipf("cannot read the kernel's %s: %v", sysctl, err)
+		}
+		return min(n, proxyBuffer)
+	}
+	target, _ := proxy(t)
+	c, err := newWorker("", target, 0).dial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	raw, err := c.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.Control(func(fd uintptr) {
+		for option, want := range map[int]int{syscall.SO_RCVBUF: 2 * most("rmem_max"), syscall.SO_SNDBUF: 2 * most("wmem_max")} {
+			if got, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); got != want || err != nil {
+				t.Errorf("socket option %d is %d bytes (%v): want %d, the kernel's count of the cap", option, got, err, want)
+			}
+		}
+	})
 }
 
 func TestStreamPastTheCapIsRefused(t *testing.T) {

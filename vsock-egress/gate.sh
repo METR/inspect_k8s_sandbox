@@ -74,13 +74,13 @@ k -n "$NS" get pod "$SANDBOX" -o jsonpath='{range .spec.initContainers[*]}{.name
 k -n "$LNS" get pod "$(launcher)" -o jsonpath='{.spec.containers[0].securityContext}' | grep -q '"localhostProfile":"profiles/vsock-egress-launcher.json"' \
   && pass "the launcher runs under profiles/vsock-egress-launcher.json" || fail "the launcher is not under profiles/vsock-egress-launcher.json"
 
-# A pod on that node, beside the runtime: it lists the VM directories and the node's processes, and can change neither.
+# A pod on that node, beside the runtime: it lists the VM directories and the node's processes as uid 65533, which is no reaper's and can signal none of them.
 cat <<EOF | k -n "$NS" apply -f - > /dev/null
 {"apiVersion":"v1","kind":"Pod","metadata":{"name":"$REL-peek","labels":$LABELS},
  "spec":{"nodeName":"$node","hostPID":true,"restartPolicy":"Never","terminationGracePeriodSeconds":1,"automountServiceAccountToken":false,
   "tolerations":[{"operator":"Exists"}],
   "containers":[{"name":"peek","image":"public.ecr.aws/docker/library/busybox:1.38-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6","command":["sleep","3600"],
-   "securityContext":{"runAsUser":0,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
+   "securityContext":{"runAsUser":65533,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
    "volumeMounts":[{"name":"vms","mountPath":"/vms","readOnly":true}]}],
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
@@ -116,14 +116,14 @@ case "$answer" in closed*|reset*) pass "32 zero bytes for a key, then a request:
 code=$(in_sandbox curl -sS -o /dev/null -m 60 -w '%{http_code}' "$LISTED" 2>&1)
 [ "$code" = 200 ] && pass "the forwarder's own streams still pass: $code" || fail "after the refusal GET $LISTED -> $code"
 
-say "5. the service's own container may not open a vsock socket"
+say "5. the service's own container is refused socket(AF_VSOCK)"
 opened=$(in_sandbox python3 -c 'import socket
 try:
     socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM); print("opened")
 except PermissionError:
     print("refused")' 2>&1 | tail -1)
-[ "$opened" = refused ] && pass "socket(AF_VSOCK) is refused there: seccomp is applied in the guest" \
-  || fail "socket(AF_VSOCK) in the service's container: $opened. Only the key now keeps a workload from the node's port"
+[ "$opened" = refused ] && pass "the call is refused there: the default seccomp profile is applied in the guest" \
+  || fail "socket(AF_VSOCK) in the service's container: $opened. The default seccomp profile is not applied in the guest"
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!

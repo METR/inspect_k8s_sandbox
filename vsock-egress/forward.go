@@ -20,6 +20,7 @@ type forwarder struct {
 	port    uint32        // the node's vsock port for streams
 	slots   chan struct{} // one for each connection it carries
 	queue   chan struct{} // one for each connection it carries or holds back
+	wait    time.Duration // how long a connection is held back for a place
 	connect func(cid, port uint32) (*os.File, error)
 
 	names *names // with capture: the address each name the sandbox looked up was given
@@ -27,7 +28,7 @@ type forwarder struct {
 
 func newForwarder(host, port uint32) *forwarder {
 	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams),
-		queue: make(chan struct{}, maxStreams+maxWaiting), connect: vsockDial}
+		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
 func forward(args []string) error {
@@ -155,7 +156,7 @@ func (f *forwarder) stream(c *net.TCPConn, target string) {
 	select {
 	case f.slots <- struct{}{}:
 		defer func() { <-f.slots }()
-	case <-time.After(handshakeWait):
+	case <-time.After(f.wait):
 		c.SetLinger(0)
 		c.Close()
 		return
