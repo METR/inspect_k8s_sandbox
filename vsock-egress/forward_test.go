@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -360,5 +361,78 @@ func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 		}
 	case err := <-refused:
 		t.Fatalf("the client's connection ended (%v) before the worker was up", err)
+	}
+}
+
+func TestUploadsFramesEndWhereThePeersBufferEnds(t *testing.T) {
+	node, port := loopback(t)
+	// The node's end takes peerBuffer bytes as Firecracker does, and no more until the test has read them.
+	listener, _ := node.f.SyscallConn()
+	var err error
+	listener.Control(func(fd uintptr) {
+		err = unix.SetsockoptUint64(int(fd), unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_SIZE, peerBuffer)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := proxyPort(t, keyedForwarder(unix.VMADDR_CID_LOCAL, port))
+	sent := make([]byte, 16*maxFrame)
+	rand.Read(sent)
+	go func() {
+		client.Write(sent)
+		client.CloseWrite()
+	}()
+	up, _, err := node.accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+
+	// frames reads the stream so far: what its frames carry, how many of them cross the end of a full buffer, and whether the last has come.
+	frames := func(stream []byte) (carried []byte, crossed int, ended bool) {
+		for at := keySize; at+4 <= len(stream); {
+			length := int(binary.BigEndian.Uint32(stream[at:]))
+			if length == 0 {
+				return carried, crossed, true
+			}
+			if at+4+length > len(stream) {
+				break
+			}
+			carried = append(carried, stream[at+4:at+4+length]...)
+			if at/peerBuffer != (at+4+length-1)/peerBuffer {
+				crossed++
+			}
+			at += 4 + length
+		}
+		return carried, crossed, false
+	}
+	var stream []byte
+	end, _ := up.SyscallConn()
+	queued := make([]byte, peerBuffer)
+	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+		var n int
+		end.Control(func(fd uintptr) { n, _, _ = unix.Recvfrom(int(fd), queued, unix.MSG_PEEK|unix.MSG_DONTWAIT) })
+		n = max(n, 0)
+		_, _, ended := frames(append(stream[:len(stream):len(stream)], queued[:n]...))
+		if n < peerBuffer && !ended {
+			if time.Now().After(deadline) {
+				t.Fatalf("the forwarder has neither filled the peer's buffer nor ended the upload: %d bytes wait", n)
+			}
+			continue
+		}
+		// Firecracker tells the guest of room once its buffer is all but full, not before: a full buffer is read at once.
+		end.Control(func(fd uintptr) { unix.Read(int(fd), queued[:n]) })
+		stream = append(stream, queued[:n]...)
+		if deadline = time.Now().Add(budget); ended {
+			break
+		}
+	}
+	carried, crossed, _ := frames(stream)
+	if !bytes.Equal(carried, sent) {
+		t.Fatalf("the frames carry %d bytes: want the %d sent, unchanged", len(carried), len(sent))
+	}
+	// One frame finds where the buffer ends; a read that leaves it under five bytes of room costs one more.
+	if crossed > 2 {
+		t.Fatalf("%d frames cross the end of the peer's buffer: each is sent in two packets with a wait between", crossed)
 	}
 }

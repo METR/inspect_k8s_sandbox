@@ -67,8 +67,13 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 func toFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 	buf := chunks.Get().(*[4 + maxFrame]byte)
 	defer chunks.Put(buf)
+	fit, _ := dst.(*fitted)
 	for {
-		n, err := src.Read(buf[4:])
+		most := maxFrame
+		if fit != nil {
+			most = fit.payload()
+		}
+		n, err := src.Read(buf[4 : 4+most])
 		if n > 0 {
 			pace.wait(n)
 			binary.BigEndian.PutUint32(buf[:], uint32(n))

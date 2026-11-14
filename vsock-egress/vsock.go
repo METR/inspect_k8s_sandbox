@@ -74,3 +74,57 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 		}
 	}
 }
+
+// peerBuffer is what Firecracker holds of a connection's bytes from the guest (its CONN_TX_BUF_SIZE, src/vmm/src/devices/virtio/vsock/csm/mod.rs): the guest's kernel sends no more until it has passed them on.
+const peerBuffer = 64 << 10
+
+// fitted is a dialled vsock connection whose frames end where the peer's buffer ends: a full frame that starts part-way through the buffer goes in two packets with a wait between, and so does every full frame after it.
+type fitted struct {
+	*os.File
+	room int // bytes the peer's buffer takes before it is full, known once a write has found it full
+}
+
+// payload is the most the next frame carries: what fills the peer's buffer, when that is known.
+func (f *fitted) payload() int {
+	if f.room > 4 {
+		return min(maxFrame, f.room-4)
+	}
+	return maxFrame
+}
+
+func (f *fitted) Write(p []byte) (int, error) {
+	raw, err := f.File.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	done, full := 0, -1 // full: where in p the peer's buffer was last found full
+	var failed error
+	if err := raw.Write(func(fd uintptr) bool {
+		for done < len(p) {
+			n, err := unix.Write(int(fd), p[done:])
+			switch err {
+			case nil:
+				done += n
+			case unix.EINTR:
+			case unix.EAGAIN:
+				full = done
+				return false
+			default:
+				failed = err
+				return true
+			}
+		}
+		return true
+	}); err != nil {
+		return done, err
+	}
+	if failed != nil {
+		return done, failed
+	}
+	if full >= 0 {
+		f.room = peerBuffer - (len(p) - full) // the rest of p went into an emptied buffer
+	} else {
+		f.room = max(f.room-len(p), 0)
+	}
+	return done, nil
+}
