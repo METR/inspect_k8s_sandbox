@@ -33,11 +33,13 @@ for host in sys.argv[2:]:
 """
 
 
-def docker(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+def docker(
+    *args: str, stdin: str | None = None, timeout: float = 30
+) -> subprocess.CompletedProcess[str]:
     command = ["docker", *args]
-    # The timeout only bounds a hang.
+    # The timeout only bounds a hang: a build pulls images, and takes longer.
     return subprocess.run(
-        command, input=stdin, capture_output=True, text=True, timeout=600
+        command, input=stdin, capture_output=True, text=True, timeout=timeout
     )
 
 
@@ -66,11 +68,11 @@ def sandbox() -> collections.abc.Iterator[Sandbox]:
     if shutil.which("docker") is None or sys.platform != "linux":
         pytest.skip("needs Docker on Linux, where a container's address is routed")
     name = f"execd-test-{uuid.uuid4().hex[:8]}"
-    built = docker("build", "-q", "-t", f"{name}:execd", str(EXECD))
+    built = docker("build", "-q", "-t", f"{name}:execd", str(EXECD), timeout=600)
     assert built.returncode == 0, built.stderr
     dockerfile = f"FROM {name}:execd AS execd\nFROM {IMAGE}\n"
     dockerfile += f"COPY --from=execd /execd {execd.EXECD_PATH}\n"
-    built = docker("build", "-q", "-t", name, "-", stdin=dockerfile)
+    built = docker("build", "-q", "-t", name, "-", stdin=dockerfile, timeout=600)
     assert built.returncode == 0, built.stderr
     try:
         started = docker("run", "-d", "--name", name, name, "sleep", "3600")

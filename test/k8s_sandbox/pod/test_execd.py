@@ -1752,10 +1752,13 @@ async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> No
 
     async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
-            got.append((await read_frame(r))[0])
+            kind, call_id, _ = await read_frame(r)
+            if call_id:  # the stream's own: a PING has no call
+                got.append(kind)
 
     await daemons.serve(records)
-    stream = await daemons.client().open_stream(["cat"], None)
+    opening = daemons.client().open_stream(["cat"], None)
+    stream = await asyncio.wait_for(opening, 30)  # only bounds a hang
 
     async with stream._link._wlock:  # another call's write
         with anyio.CancelScope() as scope:
@@ -1763,7 +1766,7 @@ async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> No
             await stream.aclose()
     await until(lambda: execd.RELEASE in got)
 
-    assert got[-2:] == [execd.KILL, execd.RELEASE]
+    assert got == [execd.START, execd.KILL, execd.RELEASE]  # and no EOF before
 
 
 async def test_stray_frames_end_the_connection(daemons: Daemons) -> None:
