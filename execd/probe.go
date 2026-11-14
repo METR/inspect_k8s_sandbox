@@ -18,45 +18,57 @@ import (
 // probeCommand is a pod's exec probe where the kubelet's own can't reach: it exits 0 on a pass and 1 on a failure.
 func probeCommand(args []string) {
 	fs := flag.NewFlagSet("probe", flag.ExitOnError)
-	timeout := fs.Duration("timeout", time.Second, "the longest the probe may take")
+	timeout := fs.Duration("timeout", time.Second, "the longest the probe may take, over 0")
+	path := fs.String("path", "/", "the path an http or https probe asks for")
+	var headers []string
+	fs.Func("header", "a NAME:VALUE header of an http or https probe, once for each", func(h string) error {
+		headers = append(headers, h)
+		return nil
+	})
 	fs.Parse(args)
-	if err := probe(fs.Args(), *timeout); err != nil {
+	if fs.NArg() != 2 || *timeout <= 0 {
+		fail("usage: execd probe [--timeout=DURATION] [--path=PATH] [--header=NAME:VALUE]... tcp|http|https PORT, the DURATION over 0")
+	}
+	failed := func(err error) {
 		fmt.Fprintln(os.Stderr, "execd:", err)
 		os.Exit(1)
+	}
+	// The process ends itself: a server can hold Go's HTTP/2 client past a timeout of its own.
+	time.AfterFunc(*timeout, func() { failed(errors.New("timed out")) })
+	if err := probe(fs.Arg(0), fs.Arg(1), *path, headers); err != nil {
+		failed(err)
 	}
 	os.Exit(0)
 }
 
 // probe checks a port of 127.0.0.1 once, as the kubelet's tcpSocket or httpGet probe checks a pod's (pkg/probe in kubernetes).
-func probe(args []string, timeout time.Duration) error {
-	switch {
-	case len(args) == 2 && args[0] == "tcp":
-	case len(args) > 2 && (args[0] == "http" || args[0] == "https"):
-	default:
-		return errors.New("usage: execd probe [--timeout DURATION] (tcp PORT | http|https PORT PATH [NAME:VALUE...])")
-	}
-	port, err := strconv.Atoi(args[1])
+func probe(scheme, port, path string, headers []string) error {
+	n, err := strconv.Atoi(port)
 	if err != nil {
 		return err
 	}
-	host := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	if args[0] == "tcp" {
-		c, err := net.DialTimeout("tcp", host, timeout)
+	host := net.JoinHostPort("127.0.0.1", strconv.Itoa(n))
+	switch scheme {
+	case "tcp":
+		c, err := net.Dial("tcp", host)
 		if err != nil {
 			return err
 		}
 		return c.Close()
+	case "http", "https":
+	default:
+		return fmt.Errorf("unsupported scheme %q", scheme)
 	}
-	u, err := url.Parse(args[2])
+	u, err := url.Parse(path)
 	if err != nil { // the kubelet passes on a path it can't parse
-		u = &url.URL{Path: args[2]}
+		u = &url.URL{Path: path}
 	}
-	u.Scheme, u.Host = args[0], host
+	u.Scheme, u.Host = scheme, host
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return err
 	}
-	for _, h := range args[3:] {
+	for _, h := range headers {
 		name, value, _ := strings.Cut(h, ":")
 		req.Header.Add(name, value)
 	}
@@ -70,7 +82,6 @@ func probe(args []string, timeout time.Duration) error {
 	}
 	req.Host = req.Header.Get("Host")
 	client := &http.Client{
-		Timeout: timeout,
 		Transport: &http.Transport{
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 			ForceAttemptHTTP2:  true,

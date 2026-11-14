@@ -20,8 +20,8 @@ import (
 const probeBudget = 30 * time.Second
 
 // probeExit runs the probe command and returns its exit status, which the tests' reaper collects, and what it said.
-func probeExit(t *testing.T, check ...string) (int, string) {
-	cmd := exec.Command(os.Args[0], append([]string{"probe", "--timeout", probeBudget.String()}, check...)...)
+func probeExit(t *testing.T, args ...string) (int, string) {
+	cmd := exec.Command(os.Args[0], append([]string{"probe"}, args...)...)
 	var said strings.Builder
 	cmd.Stderr = &said
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is watched
@@ -34,15 +34,21 @@ func probeExit(t *testing.T, check ...string) (int, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := <-exited // its own timeout bounds this
-	cmd.Wait()       // for what it said; the reaper has its status
-	return code, said.String()
+	select {
+	case code := <-exited:
+		cmd.Wait() // for what it said; the reaper has its status
+		return code, said.String()
+	case <-time.After(2 * probeBudget):
+		cmd.Process.Kill()
+		t.Fatalf("the probe %q was still running long after its timeout", args)
+		return 0, ""
+	}
 }
 
-// ask is a probe's arguments for a path of a test server, which listens on 127.0.0.1.
-func ask(srv *httptest.Server, path string, headers ...string) []string {
+// ask is a probe's arguments for a test server, which listens on 127.0.0.1: the budget, then flags, then its scheme and port.
+func ask(srv *httptest.Server, flags ...string) []string {
 	u, _ := url.Parse(srv.URL)
-	return append([]string{u.Scheme, u.Port(), path}, headers...)
+	return append(append([]string{"--timeout=" + probeBudget.String()}, flags...), u.Scheme, u.Port())
 }
 
 func TestTheProbeCommandExitsZeroWhileAPortListensAndOneOnceItIsClosed(t *testing.T) {
@@ -51,25 +57,40 @@ func TestTheProbeCommandExitsZeroWhileAPortListensAndOneOnceItIsClosed(t *testin
 		t.Fatal(err)
 	}
 	defer l.Close()
-	port := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+	budget, port := "--timeout="+probeBudget.String(), strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
 
-	if code, said := probeExit(t, "tcp", port); code != 0 {
+	if code, said := probeExit(t, budget, "tcp", port); code != 0 {
 		t.Fatalf("the probe of a listening port exited %d saying %q, want 0", code, said)
 	}
+	if code, said := probeExit(t, "--timeout=0s", "tcp", port); code != 2 {
+		t.Fatalf("the probe given no time at all exited %d saying %q, want the usage and 2", code, said)
+	}
 	l.Close()
-	if code, said := probeExit(t, "tcp", port); code != 1 || !strings.Contains(said, "connection refused") {
+	if code, said := probeExit(t, budget, "tcp", port); code != 1 || !strings.Contains(said, "connection refused") {
 		t.Fatalf("the probe of a closed port exited %d saying %q, want 1 and the refusal", code, said)
 	}
 }
 
+func TestAProbeEndsAtItsTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // answers nothing until the probe hangs up
+	}))
+	defer srv.Close()
+	defer srv.CloseClientConnections() // lets the handler go if the probe never hung up
+
+	if code, said := probeExit(t, ask(srv, "--timeout=50ms")...); code != 1 || !strings.Contains(said, "timed out") {
+		t.Fatalf("a probe that got no answer exited %d saying %q, want 1 once its 50ms were up", code, said)
+	}
+}
+
 func TestAnHTTPProbePassesOnlyOnAStatusFrom200To399(t *testing.T) {
-	for status, pass := range map[int]bool{200: true, 399: true, 400: false, 503: false} {
+	for status, pass := range map[int]bool{200: true, 399: true, 400: false} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
-		err := probe(ask(srv, "/"), probeBudget)
+		code, said := probeExit(t, ask(srv)...)
 		srv.Close()
 
-		if (err == nil) != pass {
-			t.Errorf("a %d answer gave %v", status, err)
+		if (code == 0) != pass {
+			t.Errorf("a %d answer made the probe exit %d saying %q", status, code, said)
 		}
 	}
 }
@@ -90,8 +111,8 @@ func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
 		"/a b":                "/a%20b",
 		"/health#part":        "/health",
 	} {
-		if err := probe(ask(srv, path), probeBudget); err != nil {
-			t.Errorf("the path %q: %v", path, err)
+		if code, said := probeExit(t, ask(srv, "--path="+path)...); code != 0 {
+			t.Errorf("the path %q: the probe exited %d saying %q", path, code, said)
 			continue
 		}
 
@@ -100,8 +121,8 @@ func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
 		}
 	}
 	// The kubelet's has no host left to ask of this one.
-	if err := probe(ask(srv, "other:8080/health"), probeBudget); err == nil {
-		t.Errorf("the path %q was asked for as %q", "other:8080/health", (<-seen).RequestURI)
+	if code, _ := probeExit(t, ask(srv, "--path=other:8080/health")...); code != 1 {
+		t.Errorf("the path %q made the probe exit %d, want 1 with nothing asked", "other:8080/health", code)
 	}
 }
 
@@ -115,7 +136,7 @@ func TestAProbesSchemeCannotNameAnotherHost(t *testing.T) {
 	l.Close() // the port the probe names has nothing on it
 
 	scheme := other.URL + "/#"
-	if err := probe([]string{scheme, strconv.Itoa(l.Addr().(*net.TCPAddr).Port), "/"}, probeBudget); err == nil {
+	if code, _ := probeExit(t, "--timeout="+probeBudget.String(), scheme, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)); code == 0 {
 		t.Fatalf("a probe with the scheme %q passed: it asked the server that names", scheme)
 	}
 }
@@ -133,11 +154,11 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 		{"none given", nil, srv.Listener.Addr().String(),
 			http.Header{"User-Agent": {"kube-probe/1.36"}, "Accept": {"*/*"}, "Connection": {"close"}}},
 		// A value is the bytes after the first colon: the kubelet sends on a non-breaking space that ends one.
-		{"its own", []string{"Host:probe.test", "User-Agent:mine", "Accept:", "X-Probe:a\xc2\xa0", "x-probe:b:c"}, "probe.test",
+		{"its own", []string{"--header=Host:probe.test", "--header=User-Agent:mine", "--header=Accept:", "--header=X-Probe:a\xc2\xa0", "--header=x-probe:b:c"}, "probe.test",
 			http.Header{"User-Agent": {"mine"}, "X-Probe": {"a\xc2\xa0", "b:c"}, "Connection": {"close"}}},
 	} {
-		if err := probe(ask(srv, "/healthz", tc.given...), probeBudget); err != nil {
-			t.Fatalf("%s: %v", tc.name, err)
+		if code, said := probeExit(t, ask(srv, tc.given...)...); code != 0 {
+			t.Fatalf("%s: the probe exited %d saying %q", tc.name, code, said)
 		}
 		got := <-seen
 
@@ -147,8 +168,8 @@ func TestAnHTTPProbeSendsTheKubeletsHeadersUnlessItIsGivenItsOwn(t *testing.T) {
 		}
 	}
 	// A line break ends no value: Go's client refuses to send one, for the kubelet as here.
-	if err := probe(ask(srv, "/healthz", "X-Probe:a\r\n"), probeBudget); err == nil {
-		t.Errorf("a header value ending in a line break was sent as %q", (<-seen).Header["X-Probe"])
+	if code, _ := probeExit(t, ask(srv, "--header=X-Probe:a\r\n")...); code != 1 {
+		t.Errorf("a header value ending in a line break made the probe exit %d, want 1 with nothing sent", code)
 	}
 }
 
@@ -159,8 +180,8 @@ func TestAnHTTPSProbeChecksNoCertificateAndOffersHTTP2(t *testing.T) {
 	srv.StartTLS() // with a certificate no one vouches for
 	defer srv.Close()
 
-	if err := probe(ask(srv, "/"), probeBudget); err != nil {
-		t.Fatal(err)
+	if code, said := probeExit(t, ask(srv)...); code != 0 {
+		t.Fatalf("the probe exited %d saying %q", code, said)
 	}
 	if got := <-seen; got.ProtoMajor != 2 {
 		t.Fatalf("the server was asked over %s, want HTTP/2 as the kubelet's probe uses when offered", got.Proto)
@@ -185,14 +206,14 @@ func TestAnHTTPProbeFollowsARedirectOnlyToItsOwnHost(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := probe(ask(srv, "/here"), probeBudget); err == nil || !strings.Contains(err.Error(), "503") {
-		t.Errorf("a redirect to a failing page of the same host gave %v, want that page's 503", err)
+	if code, said := probeExit(t, ask(srv, "--path=/here")...); code != 1 || !strings.Contains(said, "503") {
+		t.Errorf("a redirect to a failing page of the same host made the probe exit %d saying %q, want 1 and that page's 503", code, said)
 	}
-	if err := probe(ask(srv, "/elsewhere"), probeBudget); err != nil {
-		t.Errorf("a redirect to another host gave %v, want a pass without following it", err)
+	if code, said := probeExit(t, ask(srv, "--path=/elsewhere")...); code != 0 {
+		t.Errorf("a redirect to another host made the probe exit %d saying %q, want a pass without following it", code, said)
 	}
-	if err := probe(ask(srv, "/loop"), probeBudget); err == nil || loops.Load() != 10 {
-		t.Errorf("a redirect to itself gave %v after %d requests, want a failure after 10", err, loops.Load())
+	if code, said := probeExit(t, ask(srv, "--path=/loop")...); code != 1 || loops.Load() != 10 {
+		t.Errorf("a redirect to itself made the probe exit %d saying %q after %d requests, want 1 after 10", code, said, loops.Load())
 	}
 }
 
@@ -206,8 +227,8 @@ func TestAnHTTPProbePassesWithoutReadingABodyToItsEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := probe(ask(srv, "/"), probeBudget); err != nil {
-		t.Fatalf("a body with no end gave %v, want a pass", err)
+	if code, said := probeExit(t, ask(srv)...); code != 0 {
+		t.Fatalf("a body with no end made the probe exit %d saying %q, want a pass", code, said)
 	}
 }
 
@@ -218,27 +239,7 @@ func TestAnHTTPProbeFailsWhenTheBodyBreaksOff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := probe(ask(srv, "/"), probeBudget); err == nil {
-		t.Fatal("a 200 whose body broke off passed")
-	}
-}
-
-func TestAnHTTPProbeGivesUpAtItsTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done() // answers nothing until the probe hangs up
-	}))
-	defer srv.Close()
-	defer srv.CloseClientConnections() // lets the handler go if the probe never hung up
-	done := make(chan error, 1)
-
-	go func() { done <- probe(ask(srv, "/"), 50*time.Millisecond) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("a probe that got no answer passed")
-		}
-	case <-time.After(probeBudget):
-		t.Fatal("the probe was still waiting long after its timeout")
+	if code, said := probeExit(t, ask(srv)...); code != 1 {
+		t.Fatalf("a 200 whose body broke off made the probe exit %d saying %q, want 1", code, said)
 	}
 }
