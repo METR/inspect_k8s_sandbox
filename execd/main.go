@@ -167,7 +167,7 @@ func stopOthers() {
 	entries, _ := os.ReadDir("/proc")
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
+		if err != nil {
 			continue
 		}
 		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
