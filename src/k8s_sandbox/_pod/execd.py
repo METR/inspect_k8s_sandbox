@@ -549,7 +549,6 @@ class ExecdClient:
                         except BaseException:  # cut off: it may not have gone out
                             await link.send_last(call.id, RELEASE)
                             raise
-                        # {"code": n[, "error": why][, "timeout": true]}
                         yield EXIT, json.loads(payload)
                         return
                     elif kind == RESUMED:  # send the stdin it didn't get
