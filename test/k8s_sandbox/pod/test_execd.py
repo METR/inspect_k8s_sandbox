@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -809,6 +810,52 @@ async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
     assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12), reason="there a replay's writes do not give way"
+)
+async def test_a_command_sent_during_a_replay_follows_what_is_owed(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it went out between the frames owed, as each upload would."""
+    got: list[list[int]] = []  # the kinds each connection got
+    drop = False  # the first connection, under the next command sent
+    replaying = asyncio.Event()
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        mine: list[int] = []
+        got.append(mine)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop and len(got) == 1:
+                break
+            mine.append(kind)
+            if len(got) == 2:
+                replaying.set()
+            if kind == execd.START and len(got) == 2:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    left = [call("sleep", "600") for _ in range(64)]
+    await until(lambda: bool(got) and got[0].count(execd.START) == 64)
+    for running in left:
+        running.cancel()
+    await until(lambda: got[0].count(execd.RELEASE) == 64)
+    drop = True
+    reopens = call()
+    await asyncio.wait_for(replaying.wait(), 30)
+    during = call()
+    await asyncio.wait_for(asyncio.gather(reopens, during), 30)
+
+    assert got[1].index(execd.PING) < got[1].index(execd.START)
+
+
 async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
     tls_daemon: TlsDaemon, clock: types.SimpleNamespace
 ) -> None:
@@ -1259,6 +1306,40 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     # Its last frames still go out, once its upload has let go of the connection.
     await until(lambda: got[-1:] == [execd.RELEASE])
     assert (execd.KILL in got) is not exits
+
+
+async def test_a_calls_last_frames_wait_behind_one_queued_command_at_most(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: a call's KILL and RELEASE waited behind each command queued first."""
+    got: list[tuple[int, int]] = []
+    reads = asyncio.Event()
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        got.append((await read_frame(r))[:2])  # the START of the command to be left
+        await reads.wait()  # unread, the next START backs up: its write waits
+        while True:
+            got.append((await read_frame(r))[:2])
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(records)
+    left = call("sleep", "600")
+    await until(lambda: bool(got))
+    # One holds the connection, with more than the socket buffers take; eight queue.
+    queued = [call("echo", "x" * (16 << 20))] + [call() for _ in range(8)]
+    left.cancel()
+    await asyncio.wait({left}, timeout=30)
+    reads.set()
+    await until(lambda: (execd.RELEASE, got[0][1]) in got)
+
+    kinds = [kind for kind, _ in got]
+    # Its own START, the one being written, and one more at most.
+    assert kinds[: kinds.index(execd.RELEASE)].count(execd.START) <= 3
+    for command in queued:
+        command.cancel()
 
 
 async def test_an_empty_user_is_refused_not_run_as_the_containers(
