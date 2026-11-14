@@ -400,12 +400,22 @@ func (cl *call) run(req startRequest) error {
 	if err != nil {
 		return err
 	}
-	outR, outW, _ := os.Pipe()
-	errR, errW, _ := os.Pipe()
+	outR, outW, noOut := os.Pipe()
+	errR, errW, noErr := os.Pipe()
+	var envR, envW *os.File
+	var noEnv error
+	if as != nil {
+		envR, envW, noEnv = os.Pipe()
+	}
+	if err := errors.Join(noOut, noErr, noEnv); err != nil { // out of descriptors: it would run with a stream missing
+		for _, f := range []*os.File{stdinR, stdinW, outR, outW, errR, errW, envR, envW} {
+			f.Close()
+		}
+		return err
+	}
 	reaper.mu.Lock() // so the reaper cannot collect the exit before it is registered
 	env, files := childEnv(req.Env), []*os.File{stdinR, outW, errW}
 	if as != nil { // its environment goes by a pipe: in the launcher's own, the Go runtime would read it
-		envR, envW, _ := os.Pipe()
 		raw := make([][]byte, len(env)) // as bytes: JSON would rewrite text that isn't UTF-8
 		for i, kv := range env {
 			raw[i] = []byte(kv)
