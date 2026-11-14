@@ -32,7 +32,7 @@ func main() {
 	commands := map[string]func([]string) error{
 		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
 		"launch": launch, "check": check, // on the node
-		"work": work, "probe": probe, // started by launch and check, as a VM's uid
+		"work": work, "probe": probe, "reap": reap, // started by launch and check, as a VM's uid
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
 		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check (on the node)")

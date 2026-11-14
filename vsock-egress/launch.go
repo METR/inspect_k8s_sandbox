@@ -105,12 +105,12 @@ func (n *node) sandbox(r record) (sandbox, error) {
 	return sb, nil
 }
 
-// child is a process started as a VM's uid inside its pod's network namespace. Closing its stdin ends it:
-// the launcher holds no capability to signal another uid's process.
+// child is a process started as a VM's uid.
 type child struct {
-	cmd   *exec.Cmd
-	stdin io.Closer
-	done  chan struct{} // closed when the process has ended
+	cmd      *exec.Cmd
+	uid, gid uint32
+	stdin    io.Closer
+	done     chan struct{} // closed when the process has ended
 }
 
 func (c *child) exited() bool {
@@ -122,30 +122,53 @@ func (c *child) exited() bool {
 	}
 }
 
-func start(sb sandbox, args ...string) (*child, error) {
+// start runs this program as uid and gid, inside the network namespace at netns if one is named.
+func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
 	cmd := exec.Command(self, args...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: sb.uid, Gid: sb.gid}}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
-	started := make(chan error)
-	go func() { started <- inNetns(sb.netns, cmd.Start) }() // the thread that makes the child gives it its namespace
-	if err := <-started; err != nil {
+	if netns == "" {
+		err = cmd.Start()
+	} else {
+		started := make(chan error)
+		go func() { started <- inNetns(netns, cmd.Start) }() // the thread that makes the child gives it its namespace
+		err = <-started
+	}
+	if err != nil {
 		stdin.Close()
 		return nil, err
 	}
-	c := &child{cmd, stdin, make(chan struct{})}
+	c := &child{cmd, uid, gid, stdin, make(chan struct{})}
 	go func() {
 		cmd.Wait()
 		close(c.done)
 	}()
 	return c, nil
+}
+
+// end stops a worker and whatever else runs as its uid here. Closing its stdin only asks; the launcher may
+// not signal another uid's process, so a child of that uid kills them all. Each live VM has a uid of its
+// own, and its Firecracker is outside this PID namespace.
+func (c *child) end() {
+	c.stdin.Close()
+	if reaper, err := start(c.uid, c.gid, "", "reap"); err != nil {
+		log.Printf("uid %d: its processes are not ended: %v", c.uid, err)
+	} else {
+		<-reaper.done
+	}
+}
+
+// reap is what end runs as the VM's uid.
+func reap([]string) error {
+	return syscall.Kill(-1, syscall.SIGKILL)
 }
 
 // inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
@@ -193,6 +216,9 @@ func launch(args []string) error {
 	l.flags(fs)
 	fs.IntVar(&l.rate, "rate", 0, "bytes a second a sandbox's streams may carry, both ways together; 0 for no cap")
 	fs.Parse(args)
+	if os.Getpid() != 1 { // or ending a worker would reach every process of its uid on the node: the VM's Firecracker
+		return errors.New("launch must be the first process of a PID namespace of its own")
+	}
 	for ; ; time.Sleep(500 * time.Millisecond) {
 		if err := l.pass(); err != nil {
 			return err
@@ -206,7 +232,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	wanted, present := map[string]sandbox{}, map[string]bool{}
+	wanted, present, vms := map[string]sandbox{}, map[string]bool{}, map[uint32]int{}
+	for _, r := range records {
+		if sb, err := l.sandbox(r); err == nil {
+			vms[sb.uid]++
+		}
+	}
 	for _, r := range records {
 		present[r.ContainerID] = true
 		if r.Capability.Annotations[proxyAnnotation] == "" {
@@ -215,6 +246,9 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		sb, err := l.sandbox(r)
 		if err == nil && !proxyTarget.MatchString(sb.target) {
 			err = fmt.Errorf("its annotation %s is %q, not host:port", proxyAnnotation, sb.target)
+		}
+		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
+			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
 		}
 		if err == nil {
 			wanted[r.ContainerID] = sb
@@ -239,7 +273,7 @@ func (l *launcher) pass() error {
 	}
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
-			w.stdin.Close()
+			w.end()
 			delete(l.workers, id)
 		}
 	}
@@ -253,7 +287,7 @@ func (l *launcher) pass() error {
 			continue
 		}
 		l.tried[id] = time.Now()
-		w, err := start(sb, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
+		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
 			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
 			log.Printf("%s: %v", sb.pod, err)

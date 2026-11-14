@@ -39,7 +39,7 @@ func check(args []string) error {
 		if err != nil {
 			return err
 		}
-		p, err := start(sb, "probe", "-vsock", filepath.Join(sb.root, "vm.vsock"), "-wait", wait.String())
+		p, err := start(sb.uid, sb.gid, sb.netns, "probe", "-vsock", filepath.Join(sb.root, "vm.vsock"), "-wait", wait.String())
 		if err != nil {
 			return err
 		}

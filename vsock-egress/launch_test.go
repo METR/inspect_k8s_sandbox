@@ -64,27 +64,60 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 func id(c string) string { return strings.Repeat(c, 64) }
 
 func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
+	proxied := map[string]string{proxyAnnotation: "10.0.0.9:3128"}
+	for name, tc := range map[string]struct {
+		ifName      string
+		annotations map[string]string
+		uid         int // of the VM's directory, where the test can choose it: as root
+		wanted      bool
+	}{
+		"a proxy by address":              {"eth0", proxied, vmUID, true},
+		"a proxy by name":                 {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}, vmUID, true},
+		"no proxy":                        {"eth0", map[string]string{"other": "annotation"}, vmUID, false},
+		"more than host:port":             {"eth0", map[string]string{proxyAnnotation: "http://10.0.0.9:3128 -rate=1"}, vmUID, false},
+		"the loopback interface's record": {"lo", proxied, vmUID, false},
+		"a VM directory that is root's":   {"eth0", proxied, 0, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.uid == 0 && os.Geteuid() != 0 {
+				t.Skip("only root can make a directory root's")
+			}
+			l := fakeNode(t)
+			addSandbox(t, l, id("a"), tc.ifName, tc.annotations, tc.uid)
+			wanted, err := l.wanted()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sb, ok := wanted[id("a")]
+			if ok != tc.wanted || len(wanted) > 1 {
+				t.Fatalf("wanted %v, want the sandbox: %v", wanted, tc.wanted)
+			}
+			want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net",
+				target: tc.annotations[proxyAnnotation], uid: sb.uid, gid: sb.gid}
+			if ok && (sb != want || os.Geteuid() == 0 && sb.uid != vmUID) {
+				t.Fatalf("got %+v, want %+v", sb, want)
+			}
+		})
+	}
+}
+
+func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 	l := fakeNode(t)
 	addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID)
-	addSandbox(t, l, id("a"), "lo", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID)
-	addSandbox(t, l, id("b"), "eth0", map[string]string{"other": "annotation"}, vmUID)
-	addSandbox(t, l, id("c"), "eth0", map[string]string{proxyAnnotation: "http://10.0.0.9:3128 -rate=1"}, vmUID)
-	addSandbox(t, l, id("e"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}, vmUID)
-	if os.Geteuid() == 0 {
-		addSandbox(t, l, id("d"), "eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, 0)
-	}
+	addSandbox(t, l, id("b"), "eth0", nil, vmUID) // names no proxy, and runs as the same uid
 	wanted, err := l.wanted()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sb, ok := wanted[id("a")]
-	if _, named := wanted[id("e")]; len(wanted) != 2 || !ok || !named {
-		t.Fatalf("wanted %v: want only the sandboxes whose pod names a host:port and whose VM has a uid of its own", wanted)
+	if len(wanted) != 0 {
+		t.Fatalf("wanted %v: a worker as that uid could open the other VM's socket", wanted)
 	}
-	want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net", target: "10.0.0.9:3128"}
-	want.uid, want.gid = sb.uid, sb.gid
-	if sb != want || os.Geteuid() == 0 && sb.uid != vmUID {
-		t.Fatalf("got %+v, want %+v", sb, want)
+}
+
+func TestLaunchNeedsAPIDNamespaceOfItsOwn(t *testing.T) {
+	err := launch([]string{"-cni", filepath.Join(t.TempDir(), "none")})
+	if err == nil || !strings.Contains(err.Error(), "PID namespace") {
+		t.Fatalf("got %v: among the node's processes, ending a worker would end its VM", err)
 	}
 }
 
@@ -159,7 +192,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "127.0.0.1:9"}, vmUID)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
-			w.stdin.Close()
+			w.end()
 		}
 	})
 	if err := l.pass(); err != nil {
@@ -212,6 +245,18 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 		t.Fatal("a worker that died was not replaced")
 	}
 	listening(t, l, id("a"))
+
+	// The next worker does not end when its stdin closes: it is ended all the same.
+	t.Setenv(deafWorker, "1")
+	syscall.Kill(second.cmd.Process.Pid, syscall.SIGKILL)
+	ended(t, second)
+	if err := l.pass(); err != nil {
+		t.Fatal(err)
+	}
+	second = l.workers[id("a")]
+	if second == nil {
+		t.Fatal("a worker that died was not replaced")
+	}
 
 	os.Remove(record) // the sandbox is deleted
 	if err := l.pass(); err != nil {

@@ -333,8 +333,14 @@ type zeros struct{}
 
 func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 
+// deafWorker, in the environment, makes this binary a worker that ignores its stdin closing.
+const deafWorker = "VSOCK_EGRESS_TEST_DEAF_WORKER"
+
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && os.Args[1] == "work" { // the launcher's test starts this binary as a worker
+	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+		for os.Args[1] == "work" && os.Getenv(deafWorker) != "" {
+			time.Sleep(time.Hour)
+		}
 		main()
 		return
 	}
