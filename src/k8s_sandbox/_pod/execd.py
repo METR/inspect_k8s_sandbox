@@ -400,7 +400,7 @@ class Link:
         if not self.ready.done():
             self.ready.set_exception(Dropped("connection closed before auth"))
         for c in self.calls.values():
-            c.queue.put_nowait(Dropped())
+            c.queue.put_nowait(Dropped(self))
             c.stdin_room.set()  # a sender waiting for room sees the close
         current = asyncio.current_task()
         for t in self._tasks:
@@ -536,6 +536,8 @@ class ExecdClient:
                         yield EXIT, None
                         return
                     if isinstance(item, Dropped):
+                        if item.args != (link,):  # a connection the call has left since
+                            continue
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
@@ -546,9 +548,12 @@ class ExecdClient:
                                 pod=link.daemon.ip,
                             )
                         link.calls[call.id] = call
-                        offsets = {"stdout": call.got[0], "stderr": call.got[1]}
+                        at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
                         call.resuming = True  # before the RESUMED can arrive
-                        await link.send(RESUME, call.id, json.dumps(offsets).encode())
+                        try:
+                            await link.send(RESUME, call.id, at.encode())
+                        except OSError:  # dropped again before it left: once more
+                            call.queue.put_nowait(Dropped(link))
                         log_warn("execd connection lost: resuming", pod=call.daemon.ip)
                         continue
                     assert isinstance(item, tuple)
@@ -591,7 +596,11 @@ class ExecdClient:
                     ):
                         # The same daemon never got the START: nothing ran, so start it.
                         call.resuming = False
-                        await link.send(START, call.id, start)
+                        try:
+                            await link.send(START, call.id, start)
+                        except OSError:  # dropped again: the next resume asks once more
+                            call.queue.put_nowait(Dropped(link))
+                            continue
                         sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                     elif kind == ERROR:
                         raise ExecdResultUnknownError(

@@ -486,25 +486,35 @@ async def test_a_command_whose_connection_closed_before_it_was_sent_is_retryable
         await call
 
 
-async def test_a_command_whose_connection_closed_after_it_was_sent_is_not_retryable(
+async def test_a_command_whose_connection_closed_after_it_was_sent_is_resumed(
     daemons: Daemons,
 ) -> None:
-    connections = 0
+    """Regression: a second drop, before the RESUME was written, lost the command."""
+    starts = connections = 0
 
-    async def drops(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal connections
+    async def drops_twice(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts, connections
         connections += 1
-        if connections == 1:
-            await read_frame(r)  # START: the command may have run
-        w.close()  # the reopened connection is gone before the RESUME is written
+        if connections == 2:  # the reopened connection is gone before the RESUME
+            w.close()
+            return
+        kind, call_id, _ = await read_frame(r)
+        starts += kind == execd.START
+        if connections == 1:  # the command may have run
+            w.close()
+            return
+        w.write(frame(execd.RESUMED, call_id, b'{"stdin": 0, "eof": true, "put": 0}'))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+        await r.read()
 
     # Plain: over TLS the client writes its RESUME before it sees the close.
-    await daemons.serve(drops)
+    await daemons.serve(drops_twice)
 
-    # A ConnectionError would be retried, running the command again.
-    with pytest.raises(error.ExecdResultUnknownError):
-        call = daemons.client().exec(["touch", "/once"], None, None, {}, None, None)
-        await asyncio.wait_for(call, 30)  # only bounds a hang
+    call = daemons.client().exec(["touch", "/once"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    # Sent once: a ConnectionError would be retried, running the command again.
+    assert (result.returncode, starts) == (7, 1)
 
 
 async def test_a_peer_that_stops_reading_cannot_hang_a_timed_out_command(
