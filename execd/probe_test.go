@@ -38,7 +38,7 @@ func probeExit(t *testing.T, args ...string) (int, string) {
 	case code := <-exited:
 		cmd.Wait() // for what it said; the reaper has its status
 		return code, said.String()
-	case <-time.After(2 * probeBudget):
+	case <-time.After(probeBudget):
 		cmd.Process.Kill()
 		t.Fatalf("the probe %q was still running long after its timeout", args)
 		return 0, ""
@@ -81,7 +81,6 @@ func TestAProbeEndsAtItsTimeout(t *testing.T) {
 		<-r.Context().Done() // answers nothing until the probe hangs up
 	}))
 	defer srv.Close()
-	defer srv.CloseClientConnections() // lets the handler go if the probe never hung up
 
 	if code, said := probeExit(t, ask(srv, "--timeout=50ms")...); code != 1 || !strings.Contains(said, "no answer within 50ms") {
 		t.Fatalf("a probe that got no answer exited %d saying %q, want 1 once its 50ms were up", code, said)
@@ -104,8 +103,7 @@ func TestAnHTTPProbeAsksForWhatTheKubeletWouldOfAPath(t *testing.T) {
 	var last atomic.Pointer[http.Request]
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { last.Store(r) }))
 	defer srv.Close()
-	// The paths //other/health, /health% and /health?a=b&c, percent-encoded as Hawk's runner writes them, and what
-	// a server got of each from the kubelet's own formatURL and request (kubernetes 1.36, pkg/probe/http/request.go).
+	// Hawk's encoding of //other/health, /health% and /health?a=b&c, and what kubelet 1.36 asks for.
 	for path, asked := range map[string]string{
 		"--path=//other/health":      "/health",
 		"--path=/health%25":          "/health%25",
