@@ -1,5 +1,7 @@
+import contextlib
 import json
 import logging
+import socket
 import threading
 from abc import ABC
 from dataclasses import dataclass
@@ -24,8 +26,23 @@ class _ConnectsInTime(websocket.WebSocket):
     """kubernetes' websocket, whose connect and upgrade it gives no timeout at all."""
 
     def connect(self, url: str, **options: Any) -> None:
-        super().connect(url, **{"timeout": API_TIMEOUT, **options})
+        over = threading.Event()
+        threading.Thread(target=self._cut, args=(over,), daemon=True).start()
+        try:
+            super().connect(url, **{"timeout": API_TIMEOUT, **options})
+        finally:
+            over.set()
         self.settimeout(None)  # as kubernetes leaves it: each read sets its own
+
+    def _cut(self, over: threading.Event) -> None:
+        """Shut the socket of a connect still going after API_TIMEOUT."""
+        if over.wait(API_TIMEOUT):
+            return
+        # A read's timeout is for each byte of the answer, which a server can drip.
+        while not over.wait(0.05):  # the socket is None until TCP and TLS are up
+            if (sock := self.sock) is not None:
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)  # wakes a read: close need not
 
 
 ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
