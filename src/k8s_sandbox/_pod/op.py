@@ -31,12 +31,7 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
 STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
-# The helpers operations run besides the caller's command (`id` for exec(user=...),
-# `base64` and `timeout` for exec(), `head` and `mkdir` for read_file() and
-# write_file()) run as the container's user, so they are looked up only in these system
-# directories, not through the image's PATH: busybox images have them only in /bin,
-# and Debian 10 and Alpine have some only in /usr/bin. The caller's command keeps the
-# container's PATH.
+# Helpers run as the container's user: found here, never through the image's PATH.
 SYSTEM_PATH = "/usr/bin:/bin"
 
 logger = logging.getLogger(__name__)
@@ -113,9 +108,7 @@ class PodOperation(ABC):
         finally:
             stop_keepalive.set()
             ws_client.close()
-            # Once the server has closed the connection, websocket-client's close()
-            # returns without closing the socket, which then waits for the garbage
-            # collector.
+            # close() leaves the socket open once the server has closed the connection.
             if ws_client.sock:
                 ws_client.sock.shutdown()
 
@@ -196,9 +189,7 @@ def check_for_pod_restart(pod: PodInfo) -> None:
             last_reason=status.last_terminated_reason or "unknown",
         )
     if not status.running and pod.restarted_container_behavior == "raise":
-        # The container stopped, and the kubelet is starting another, which an
-        # operation can reach before its restart count is published (seconds later
-        # when the restart replaces a Kata VM). "warn" reports it when the count moves.
+        # Stopped: an operation could reach its replacement before the count moves.
         raise ContainerRestartedError(
             pod_name=pod.name,
             container_name=status.name,

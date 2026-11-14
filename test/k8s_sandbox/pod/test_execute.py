@@ -636,8 +636,7 @@ def test_a_script_cut_short_runs_nothing(shell: list[str], tmp_path: Path) -> No
     script = ExecuteOperation(MagicMock())._build_shell_script(
         ["touch", str(ran)], None, str(tmp_path), {"K": "V"}, None, MARKER
     )
-    # Cut after each line but the last, as a dropped connection might: the shell then
-    # reads end of input.
+    # Cut after each line but the last, as a dropped connection might cut it.
     cuts = [i + 1 for i, char in enumerate(script[:-1]) if char == "\n"]
 
     for cut in cuts:
@@ -1184,7 +1183,7 @@ class TestExecChunksStdin:
         sentinel = ExecResult(success=True, returncode=0, stdout="", stderr="")
         monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: sentinel)
 
-        # The assembled script (input + pipeline) is several hundred bytes,
+        # The assembled script (base64 input + pipeline) is several hundred bytes,
         # well above the 16-byte chunk size, so it splits into many frames.
         result = op.exec(
             ["cat"], stdin=b"x" * 100, cwd=None, env={}, user=None, timeout=None
@@ -2307,8 +2306,7 @@ class TestExecStdio:
             async with anyio.create_task_group() as tasks:
                 for request in requests:
                     tasks.start_soon(stream.send, request)
-                # Nothing is read until both sends are under way: the first stops
-                # partway, and the second either waits its turn or writes too.
+                # Read nothing until both sends are under way and the first has stopped.
                 await anyio.wait_all_tasks_blocked()
                 reading.start()
         reading.join(30)

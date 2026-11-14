@@ -40,9 +40,7 @@ from k8s_sandbox._pod.op import (
 )
 
 COMPLETED_SENTINEL = "completed-sentinel-value"
-# How long to wait, once both end markers have arrived, for the exec to end by itself
-# and report the shell's exit status (which takes milliseconds). It only runs out when
-# a background process still holds the command's stdout or stderr open.
+# After both end markers, how long the exec has to report the shell's exit status.
 STREAM_END_GRACE_SECONDS = 0.1
 EXEC_USER_URL = "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
 # The last line of every exec script, which closes its { } group: see exec().
@@ -51,29 +49,17 @@ _CLOSE_GROUP = "}\n"
 _STDERR_TAIL_BYTES = 4096
 # How often an exec_stdio stream retries TLS that must write to read, or read to write.
 _TLS_RETRY_SECONDS = 0.01
-# The most receive() calls and frames read an exec_stdio stream takes, while they keep
-# coming, before it lets other tasks run: a few per reply, so a large one rarely waits
-# for a busy event loop.
+# The receive() calls and frames an exec_stdio stream takes before others get a turn.
 _STEPS_PER_TURN = 32
-# The users that mean uid 0, whatever the image's passwd says. exec() runs a command as
-# one of them in the container's own shell, behind _ROOT_CHECK: one program start where
-# `_shell_command`'s check and second shell cost three.
+# The users that mean uid 0 whatever passwd says: their exec runs behind _ROOT_CHECK.
 ROOT_USERS = ("root", "0")
-# The first line of a root exec's script, inside its { } group. Unless the shell is
-# uid 0 it ends the exec before the command runs, with the message and status
-# `runuser -u root` gives in a container that is not root, so the refusal is handled
-# as one. Shell builtins only: the effective uid comes from /proc, not from `id`. A
-# shell that cannot read it is refused the same way, after its own error saying why;
-# container runtimes mount /proc. The subshell keeps its variables from the command;
-# a fork costs a fraction of a millisecond even where a program start costs 20 ms.
+# A root exec's uid check, in builtins alone; it refuses as `runuser -u root` does.
 _ROOT_CHECK = (
     '(u=; while read -r k r e x; do [ "$k" = Uid: ] && u=$e && break; done'
     ' </proc/self/status; [ "$u" = 0 ]) ||'
     ' { echo "runuser: may not be used by non-root users" >&2; exit 1; }\n'
 )
-# The user switch runs `runuser` as the container's user, before switching, so it is
-# not found through the image's PATH either (see SYSTEM_PATH): it is at this path
-# wherever util-linux provides it (Debian, Ubuntu, RHEL and its rebuilds, Alpine).
+# Not found through the image's PATH (see SYSTEM_PATH): util-linux puts it here.
 _RUNUSER = "/sbin/runuser"
 
 logger = logging.getLogger(__name__)
@@ -144,8 +130,7 @@ class ExecuteOperation(PodOperation):
         timeout: int | None,
         switch: bool = False,
     ) -> ExecResult[str]:
-        # The shell ends the command's output with this marker. It holds a random value
-        # made up for this exec, so nothing the command prints can be taken for it.
+        # Random per exec, so nothing the command prints can be taken for the marker.
         marker = f"<{COMPLETED_SENTINEL}-{secrets.token_hex(16)}-"
         root = user in ROOT_USERS
         shell_script = self._build_shell_script(
@@ -154,12 +139,9 @@ class ExecuteOperation(PodOperation):
         shell = ["/bin/sh"] if root else _shell_command(user, switch)
         with self._interactive_shell(shell) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
-            # argument (-c) to better support potentially long commands. Nothing runs
-            # until the group's closing `}` arrives, so a failure before then may be
-            # retried. A shell that got the `}` runs the group even without the
-            # newline after it, and over plain ws:// part of a frame cut off by a lost
-            # connection can still arrive: once that line is being sent, it may run.
+            # argument (-c) to better support potentially long commands.
             self._write_stdin_chunked(ws_client, shell_script[: -len(_CLOSE_GROUP)])
+            # Nothing runs before the `}`: only a failure from here on may have run it.
             try:
                 ws_client.write_stdin(_CLOSE_GROUP)
             except (OSError, websocket.WebSocketException) as e:
@@ -179,11 +161,7 @@ class ExecuteOperation(PodOperation):
         argv (through `sh -c` to switch users), so stdin reaches it unread.
         """
         stack = ExitStack()
-        # No resize keepalive: resize events for an exec without a TTY stall its stdin
-        # where they go unread (CRI-O, and any runtime over v5.channel.k8s.io: see
-        # _send_keepalive). TCP keepalives keep the connection alive; a stream idle past
-        # the runtime's stream idle timeout (4 h by default) closes, and Inspect opens
-        # another.
+        # No resize keepalive: its events can stall the stdin (see _send_keepalive).
         ws_client = stack.enter_context(
             self._interactive_shell(
                 _shell_command(user, command=cmd), send_keepalive=False
@@ -248,10 +226,7 @@ class ExecuteOperation(PodOperation):
     def _interactive_shell(
         self, command: list[str], send_keepalive: bool = True
     ) -> Generator[WSClient, None, None]:
-        # ExecutableNotFoundError from here only means /bin/sh, or runuser once a
-        # probe has found it, is missing. A missing `runuser` is otherwise exec'd by
-        # the shell rather than by the API server, so it surfaces as a 127 on stderr
-        # and is handled by _check_for_runuser_error instead.
+        # ExecutableNotFoundError here: no /bin/sh, or no runuser a probe had found.
         yield from self.create_websocket_client_for_exec(
             send_keepalive,
             command=command,
@@ -273,8 +248,7 @@ class ExecuteOperation(PodOperation):
         root: bool = False,
     ) -> str:
         def generate() -> Generator[str, None, None]:
-            # A group is read in full before any of it runs, so the command cannot
-            # read the rest of the script, marker included, from the shell's stdin.
+            # A group is read whole before it runs: the command can't read the marker.
             yield "{\n"
             if root:
                 yield _ROOT_CHECK
@@ -282,22 +256,17 @@ class ExecuteOperation(PodOperation):
                 yield f"cd {shlex.quote(cwd)} || exit $?\n"
             for key, value in env.items():
                 yield f"export {shlex.quote(key)}={shlex.quote(value)}\n"
-            # Run the command in a subshell, so that one which exits or execs this
-            # shell doesn't end it before it writes the markers.
+            # In a subshell, so `exit` or `exec` in the command can't skip the markers.
             pipe = "" if stdin is None else self._pipe_user_input(stdin)
             yield f"({pipe}{self._prefix_timeout(timeout)}{shlex.join(command)})\n"
             # Store the returncode so that the `printf` below doesn't overwrite it.
             yield "returncode=$?\n"
             # `printf` is a builtin in dash, bash and busybox, but not every shell.
             yield f"PATH={SYSTEM_PATH}\n"
-            # End both streams with the marker and the returncode. The exec's status
-            # channel reports the returncode when the shell exits; the markers are for
-            # when a background process keeps stdout or stderr, and so the exec, open.
+            # The markers end each stream when a background process keeps the exec open.
             yield f"printf '{marker}%d>' \"$returncode\"\n"
             yield f"printf '{marker}%d>' \"$returncode\" >&2\n"
-            # Exit the shell. This won't actually close the websocket connection until
-            # stdout and stderr (which have been inherited by the user command) are
-            # closed.
+            # Exit the shell: the websocket closes only once stdout and stderr do.
             yield 'exit "$returncode"\n'
             yield _CLOSE_GROUP
 
@@ -312,9 +281,7 @@ class ExecuteOperation(PodOperation):
         ).decode("ascii")
         # Pipe user input. Simply writing it to the shell's stdin after a command e.g.
         # `cat` results in `cat` blocking indefinitely as there is no way to close the
-        # stdin stream in v4.channel.k8s.io. `base64` is found in the system
-        # directories, in a subshell of its own (which a pipeline's part runs in
-        # anyway), so the command keeps the PATH.
+        # stdin stream in v4.channel.k8s.io.
         return f"echo '{stdin_b64}' | (PATH={SYSTEM_PATH}; exec base64 -d) | "
 
     def _prefix_timeout(self, timeout: int | None) -> str:
@@ -323,10 +290,9 @@ class ExecuteOperation(PodOperation):
         # Enforce timeout using `timeout` on the Pod. Simpler than alternative of
         # enforcing this on the client side (requires terminating the remote process).
         # `-k 5s` sends SIGKILL after grace period in case user command doesn't respect
-        # SIGTERM. `timeout` runs from the path that a substitution finds in the system
-        # directories, so the PATH it sets does not reach the command. With no
-        # `timeout` there, the error names /usr/bin/timeout.
+        # SIGTERM.
         find = f"PATH={SYSTEM_PATH}; command -v timeout || echo /usr/bin/timeout"
+        # In a substitution, so PATH stays its own; the echo names what was missing.
         return f'"$({find})" -k 5s {timeout}s '
 
     def _handle_shell_output(
@@ -343,16 +309,11 @@ class ExecuteOperation(PodOperation):
                     break
                 lost = None
                 try:
-                    # Until both markers are in, `wait` is None and this blocks until
-                    # there is data to read.
+                    # `wait` is None until both markers are in: this blocks for data.
                     _update(ws_client, wait)
                 except (OSError, websocket.WebSocketException) as e:
                     lost = e
-                # Take what was read straight from the client's buffers, also by an
-                # update() that then failed (from kubernetes 37 it reads every frame
-                # waiting). The peek_*() calls read another frame first, and one for
-                # the stream already read would wait unseen through the next blocking
-                # update().
+                # Not peek_*(): it reads another frame first, which may wait unseen.
                 stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
                 stdout.append(ws_client._channels.pop(STDOUT_CHANNEL, b""))
                 self._verify_output_limit(stdout.buffer, stderr.buffer)
@@ -371,8 +332,7 @@ class ExecuteOperation(PodOperation):
                         ) from lost
                     break
             if deadline is None or ERROR_CHANNEL in ws_client._channels:
-                # The exec reported the shell's exit status, or ended before the
-                # markers (e.g. `cd` failed, so the command never ran).
+                # The exec gave a status, or ended before its markers (a failed `cd`).
                 if ws_client.is_open():
                     ws_client.close()
                 stdout.flush()
@@ -387,15 +347,13 @@ class ExecuteOperation(PodOperation):
                             pod=self._pod.name,
                         ) from e
                     returncode = self._marked_returncode(stdout, stderr)
-                # The shell can only exit 0 once it has written both markers, so a
-                # missing one means the end of the output was lost on the way.
+                # The shell exits 0 only after both markers: one missing is lost output.
                 if returncode == 0 and None in (stdout.returncode, stderr.returncode):
                     raise ExecResultUnknownError(
                         "The exec ended without the end of the command's output",
                         pod=self._pod.name,
                     )
-                # 255 unless both say so is Kata's status for a command whose VM
-                # stopped under its shell.
+                # 255 unless both markers say so is Kata's status for a VM that stopped.
                 if returncode == 255 and (stdout.returncode, stderr.returncode) != (
                     255,
                     255,
@@ -406,9 +364,7 @@ class ExecuteOperation(PodOperation):
                         returncode=returncode,
                     )
             else:
-                # Both markers are in but no exit status: a background process is
-                # holding stdout or stderr open, or the connection was lost after the
-                # command exited.
+                # No status after both markers: output held open, or a lost connection.
                 returncode = self._marked_returncode(stdout, stderr)
             return (
                 ExecResult(
@@ -428,9 +384,7 @@ class ExecuteOperation(PodOperation):
         # PermissionError for exit code 126 and stderr containing "permission denied".
         if result.returncode == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
-        # Without our sentinel, the wrapper or a root exec's uid check may have failed
-        # before the command ran, so parse runuser errors. With it, any runuser
-        # stderr came from the user-supplied command.
+        # Only without the marker can a runuser error on stderr be the user switch's.
         if result.returncode != 0 and user is not None and not saw_completed_sentinel:
             self._check_for_runuser_error(result.stderr, user)
         return result
@@ -472,8 +426,7 @@ class ExecuteOperation(PodOperation):
                 stderr,
             )
             return
-        # dash and busybox say "not found" for a missing /sbin/runuser, bash "No such
-        # file or directory".
+        # dash and busybox say "not found", bash "No such file or directory".
         if re.search(
             r"runuser: (?:not found|no such file or directory)", stderr, re.IGNORECASE
         ):
@@ -489,8 +442,7 @@ class ExecuteOperation(PodOperation):
     def _marked_returncode(
         self, stdout: "_MarkedStream", stderr: "_MarkedStream"
     ) -> int:
-        # The markers disagree only if something besides the shell wrote one: code the
-        # command runs can read its own stdout back through /proc and so learn it.
+        # They differ only if the command forged one, having read its own stdout back.
         if stdout.returncode is None or stdout.returncode != stderr.returncode:
             raise ExecResultUnknownError(
                 "The command's end markers disagree, so its exit code is unknown",
@@ -548,11 +500,7 @@ class PodStdio(ByteStream):
     ) -> None:
         self._stack = stack
         self._ws = ws_client
-        # Called if the exec's status is 255 once the command has written stdout: Kata's
-        # status for a command whose VM stopped, for a command that never exits 255
-        # itself after its first output. Inspect's tools bridge writes its ready line
-        # first, then exits only with 0 (its stdin closed) or 1 (an uncaught exception,
-        # under PyInstaller 4.3 or later); PyInstaller's own 255 precedes any output.
+        # Called on a status of 255 after stdout: Kata's for a command whose VM stopped.
         self._stopped = stopped
         # The restart found since the stream opened, if any.
         self._restarted = restarted
@@ -637,8 +585,7 @@ class PodStdio(ByteStream):
         elif frame.opcode in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
             message = payload
         else:
-            # A ping goes unanswered: the API server sends none, and a pong could
-            # land inside a frame a send() has begun.
+            # No pong for a ping: it could land inside a frame a send() has begun.
             return
         self._message = b"" if frame.fin else message
         if not frame.fin or len(message) < 2:
@@ -683,8 +630,7 @@ class PodStdio(ByteStream):
             except (ssl.SSLWantWriteError, BlockingIOError):
                 await self._wait(anyio.wait_writable)
             except ssl.SSLWantReadError:
-                # TLS 1.3 never reads to write (1.2 could, to renegotiate), and the
-                # read and write directions may not both wait on the socket at once.
+                # Not wait_readable(): a receive() may be waiting on the socket already.
                 await anyio.sleep(_TLS_RETRY_SECONDS)
 
     async def _wait(self, wait: Callable[[int], Awaitable[None]]) -> None:
@@ -713,8 +659,7 @@ class PodStdio(ByteStream):
         self._ws.sock.shutdown()  # Closes the socket: the close then awaits no answer.
         self._stack.close()
         if not (self._wrote or self._closed):
-            # It failed to start (a missing user, runuser or executable): the caller
-            # only sees the stream end.
+            # It failed to start, and the caller only sees the stream end: say why.
             log_warn(
                 "An exec_stdio command ended before writing to stdout.",
                 status=self._status,
@@ -783,8 +728,7 @@ class _MarkedStream:
             self.returncode = int(match[1])
             self._pending = b""
         else:
-            # Hold back only a tail that could still become the marker, which starts at
-            # its only `<`.
+            # Hold back only a tail that could become the marker, from its one `<`.
             start = data.rfind(b"<", max(0, len(data) - self._hold))
             if start == -1 or not self._could_become_marker(data[start:]):
                 start = len(data)

@@ -63,8 +63,7 @@ def test_no_change_does_not_raise():
         )
         # Should not raise
         check_for_pod_restart(_pod_info())
-    # A stalled read gives up rather than hold its thread. The kubernetes client
-    # ignores a timeout that is not an int.
+    # A stalled read must give up; the kubernetes client ignores a non-int timeout.
     read = mock_client.return_value.read_namespaced_pod.call_args
     assert read.kwargs["_request_timeout"] == API_TIMEOUT
     assert isinstance(API_TIMEOUT, int)
@@ -145,8 +144,7 @@ def test_container_restarted_raises_typed():
 def test_container_not_running_raises_before_its_restart_count_moves(
     state: dict, last_state: dict, restart_count: int, reason: str
 ):
-    # Between a Kata VM's death and its new containers starting, the pod shows the
-    # container stopped at the old restart count.
+    # After a Kata VM dies, the pod shows the container stopped at its old count.
     pod = _raw_pod_response(
         {
             "metadata": {"uid": "uid-1", "name": "agent-env-abc-default-0"},
@@ -202,8 +200,7 @@ def test_warn_mode_refreshes_uid_after_replacement():
             uid="uid-NEW", container_name="default", restart_count=2
         )
         assert isinstance(pod._check_for_pod_restart_sync(), PodReplacedError)
-        # Cached identity is refreshed so a subsequent call against the new pod
-        # does NOT report it again.
+        # The cached identity is refreshed, so the new pod is not reported again.
         assert pod.info.uid == "uid-NEW"
         assert pod.info.initial_restart_count == 2
         assert pod._check_for_pod_restart_sync() is None
@@ -359,9 +356,7 @@ def test_env_var_default_keeps_file_op_check(monkeypatch):
 def test_raise_mode_fails_every_later_operation_with_the_check_off(
     monkeypatch, uid: str, restart_count: int, error_type: type[Exception]
 ):
-    # A solver that caught the restart error must not carry on in the new container,
-    # through a file operation either, when INSPECT_POD_RESTART_CHECK=false skips
-    # their pod reads.
+    # With the check off, file operations too must not carry on in the new container.
     monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
     with _inline_executor():
         with patch("k8s_sandbox._pod.op.k8s_client") as mock_client:
@@ -393,8 +388,7 @@ def _healthy_pod_response() -> MagicMock:
 
 
 def test_raise_mode_keeps_a_container_that_stopped_under_a_command(monkeypatch):
-    # Kata's 255 before the command's end, while Kubernetes still shows the container
-    # running: later operations must not reach the container that replaces it.
+    # Kata's 255, the container still shown running: later operations must fail.
     monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
     with (
         _inline_executor(),
@@ -440,8 +434,7 @@ def test_warn_mode_reports_a_container_that_stopped_under_a_command():
 
 
 def test_raise_mode_drops_a_result_got_while_a_restart_was_found():
-    # Another operation found the restart while this one ran: its result may come from
-    # the new container.
+    # A restart found while this one ran: its result may be the new container's.
     pod = _make_pod()
     restart = ContainerRestartedError(
         pod_name="p", container_name="default", restart_count=1, last_reason="Error"
@@ -768,8 +761,7 @@ def test_warn_mode_raises_the_restart_a_user_probe_was_warned_of_when_it_stops()
 def test_raise_mode_checks_a_failed_file_operation_also_after_a_connection_error(
     monkeypatch, error: Exception
 ):
-    # With the check off, the provider would retry a connection error into the
-    # restarted container.
+    # Unchecked, the provider would retry a connection error into the new container.
     monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
     with (
         _inline_executor(),

@@ -63,8 +63,7 @@ MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
-# What a pod delivers per second: past any, reading waits, so a stand-in can't hold
-# the runner's loop. execd sends output in reads of up to 256 KiB.
+# What a pod delivers a second; past any, reading waits: no stand-in holds the loop.
 PACE_FRAMES = 4096
 PACE_BYTES = 128 << 20
 PACE_TLS = 0.05  # CPU seconds in TLS: tiny records and messages cost more than bytes

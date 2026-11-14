@@ -150,8 +150,7 @@ async def test_a_result_in_as_its_caller_stops_waiting_is_discarded_off_the_loop
     with anyio.fail_after(30):
         while not started.is_set():
             await asyncio.sleep(0)
-    # The event loop is held from here until the cancel, so the result comes in where
-    # the caller cannot see it: the pool's one thread takes the next only after.
+    # No await until the cancel: the result is in, by the pool's one thread, but unseen.
     release.set()
     executor._executor.submit(lambda: None).result(timeout=30)
     task.cancel()

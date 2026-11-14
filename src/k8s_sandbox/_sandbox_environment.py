@@ -78,7 +78,6 @@ _TRANSIENT_TYPES = (
 # but are listed defensively: if _TRANSIENT_TYPES ever gains a parent class they
 # inherit from, these entries prevent accidental retries of permanent failures.
 # PermissionError and TimeoutError are OSError subclasses and MUST be excluded.
-# A retry would reach a replaced container, or re-run what execd couldn't resume.
 _PERMANENT_TYPES = (
     ExecutableNotFoundError,
     RuntimeError,
@@ -86,8 +85,8 @@ _PERMANENT_TYPES = (
     TimeoutError,
     FileNotFoundError,
     IsADirectoryError,
-    ContainerStoppedError,
-    ExecdResultUnknownError,
+    ContainerStoppedError,  # a retry would reach the container that replaced it
+    ExecdResultUnknownError,  # a retry would re-run what execd couldn't resume
 )
 
 
@@ -320,16 +319,12 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         if user is None:
             user = self._config.default_user
         with self._log_op("K8s open exec stdio in Pod", (), cmd=cmd):
-            # A retry may start the command again: the earlier one's stdin ends with
-            # its connection.
+            # A retry may start a second: the first's stdin ends with its connection.
             async for attempt in _retry():
                 with attempt:
                     stream = await self._pod.exec_stdio(cmd, user)
             try:
-                # After the open, so that a pod replaced or restarted while it opened
-                # is found too: the stream itself reads no pod, it only ends once
-                # another operation finds a restart. Retried alone, so that the command
-                # is not started again.
+                # After the open, so a restart during it is found; retried by itself.
                 async for attempt in _retry():
                     with attempt:
                         await self._pod.check_for_pod_restart()

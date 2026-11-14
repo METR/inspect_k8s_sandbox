@@ -22,11 +22,7 @@ from k8s_sandbox._pod.op import (
 
 def read_command(src: Path) -> list[str]:
     """The command that prints a file, read_file() on either transport."""
-    # Limit number of bytes read (-c) to 1 byte over the limit (to detect if the
-    # file is too large). A shell finds `head` in the system directories: started
-    # directly, it would be found through the image's PATH. It execs `head`, so
-    # the errors and exit status are head's own. str() because kubernetes>=37
-    # validates each element as a string and rejects the call before sending it.
+    # A shell, so that `head` comes from SYSTEM_PATH; exec'd, so the errors are head's.
     return [
         "/bin/sh",
         "-c",
@@ -64,8 +60,7 @@ class ReadFileOperation(PodOperation):
         # response in memory.
         try:
             while ws_client.is_open():
-                # `timeout=None` means `update` will block indefinitely until there is
-                # data to read.
+                # `timeout=None`: `update` blocks until there is data to read.
                 ws_client.update(timeout=None)
                 if ws_client.peek_stdout():
                     dst.write(ws_client.read_stdout())

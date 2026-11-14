@@ -70,8 +70,7 @@ class Pod:
             initial_restart_count,
             restarted_container_behavior,
         )
-        # Whether exec() can start runuser directly to run as a user, per pod,
-        # container start and user (see exec()).
+        # Whether exec() can start runuser directly, per pod, container start and user.
         self._switch: dict[tuple[str, int, str], bool] = {}
         # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
@@ -223,8 +222,7 @@ class Pod:
         warned_restart = await self.check_for_pod_restart()
         info = self._info
         executor = ExecuteOperation(info)
-        # Probing once per container spares later execs that switch user two process
-        # starts each.
+        # One probe per container saves later execs as that user two process starts.
         key = (info.uid, info.initial_restart_count, user or "")
         try:
             if user and user not in ROOT_USERS and key not in self._switch:
@@ -233,13 +231,11 @@ class Pod:
                         lambda: executor.probe_switch(user)
                     )
                 except (PodError, PodReplacedError, ContainerRestartedError):
-                    # A probe that timed out: the shell's own check would wait on the
-                    # same container, unbounded. Or a container that stopped under it.
+                    # The shell's own check would wait on the same container, unbounded.
                     raise
                 except Exception:
                     logger.debug("Probing exec(user=%r) failed", user, exc_info=True)
-            # A probe answers for the container it ran in: if this one was replaced or
-            # restarted meanwhile, let its shell check for itself this time.
+            # A probe answers only for the container it ran in, which may be gone now.
             switch = (
                 self._switch.get(key, False) if user and self._info == info else False
             )
@@ -247,8 +243,7 @@ class Pod:
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
             )
         except ExecResultUnknownError:
-            # A container restarted or replaced under the command explains the lost
-            # result better.
+            # A restart or replacement under the command explains a lost result better.
             if warned_restart is not None:
                 raise warned_restart
             await self._diagnose_restart_after_failure()
@@ -401,9 +396,7 @@ class Pod:
                 raise
             return result
 
-        # Not queued behind other operations if it was found already, but suspended
-        # first, as queueing would have: a caller retrying in a loop must not hold the
-        # event loop.
+        # Suspended first, as queueing would: a retrying caller must not hold the loop.
         if self._restart_error is not None:
             await asyncio.sleep(0)
             self._raise_restart()
@@ -462,6 +455,5 @@ class Pod:
 
     def _raise_restart(self) -> None:
         if (error := self._restart_error) is not None:
-            # A copy: one exception raised again collects each raise's frames, and
-            # concurrent raises would share them.
+            # A copy: raised again, one exception would collect every raise's frames.
             raise type(error)(**vars(error))

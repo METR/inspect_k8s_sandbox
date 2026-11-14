@@ -309,8 +309,7 @@ func (s *server) start(c *conn, f frame) {
 		}
 		msg := err.Error()
 		cl.output(1, []byte("execd: "+msg+"\n"))
-		// Out of band too, so the command's own stderr can't fake it; capped, so even
-		// escaped to JSON it fits the client's 4 KiB control frame.
+		// Out of band too, so the command's own stderr can't fake it; capped, so even escaped to JSON it fits the client's 4 KiB control frame.
 		cl.finish(code, msg[:min(len(msg), 512)])
 	}
 }

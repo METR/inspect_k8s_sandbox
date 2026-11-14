@@ -358,8 +358,7 @@ class Release:
                 # Returns the rendered manifest, which is where the pod count for the
                 # readiness wait comes from.
                 "--output=json",
-                # Annotations have no strict length limit. Escaped as a string, so
-                # the name is the annotation's value and sets nothing else.
+                # An annotation, as a label is too short; escaped, it sets nothing else.
                 "--set-string=annotations.inspectTaskName="
                 + _helm_escape(self.task_name),
                 # Include a label to identify releases created by Inspect.
