@@ -21,6 +21,7 @@ import anyio
 from anyio.abc import ByteStream
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
+from kubernetes.client.exceptions import ApiException
 
 from k8s_sandbox._error import K8sError
 from k8s_sandbox._logger import log_trace, log_warn
@@ -491,7 +492,13 @@ class ExecdClient:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
                 except Exception as failed:
-                    if self._link is None or isinstance(failed, K8sError):
+                    # A deleted pod, or a start that ran and failed: nothing to resume.
+                    gone = isinstance(failed, ApiException) and failed.status == 404
+                    gone = gone or (
+                        isinstance(failed, PodError)
+                        and not isinstance(failed, ExecResultUnknownError)
+                    )
+                    if self._link is None or gone or isinstance(failed, K8sError):
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
 

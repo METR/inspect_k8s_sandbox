@@ -908,11 +908,20 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
         )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        error.PodError("execd did not start"),
+        kubernetes.client.exceptions.ApiException(status=404),  # the pod is deleted
+    ],
+)
 async def test_a_failed_restart_after_start_is_not_retryable(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+    daemons: Daemons, failure: Exception
 ) -> None:
+    """Regression: a start that could never succeed was tried again for 5 minutes."""
+
     async def start_fails(replace: bool) -> execd.Daemon:
-        raise error.PodError("execd did not start")
+        raise failure
 
     async def dies_after_start(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -924,7 +933,6 @@ async def test_a_failed_restart_after_start_is_not_retryable(
 
     server = await daemons.serve(dies_after_start)
     sandbox = daemons.client()
-    monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
 
     # PodError is retried too, which would run the command again.
     with pytest.raises(error.ExecdResultUnknownError):
