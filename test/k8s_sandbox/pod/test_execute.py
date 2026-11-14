@@ -1180,9 +1180,8 @@ class TestExecChunksStdin:
 
         op = ExecuteOperation(MagicMock())
         monkeypatch.setattr(op, "_interactive_shell", fake_interactive_shell)
-        monkeypatch.setattr(
-            execute_module.secrets, "token_hex", lambda n: MARKER.split("-")[-2]
-        )
+        token = types.SimpleNamespace(token_hex=lambda n: MARKER.split("-")[-2])
+        monkeypatch.setattr(execute_module, "secrets", token)
         sentinel = ExecResult(success=True, returncode=0, stdout="", stderr="")
         monkeypatch.setattr(op, "_handle_shell_output", lambda *a, **k: sentinel)
 
