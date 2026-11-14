@@ -78,9 +78,9 @@ RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 SLICE = RAW_READ // 3 + 1  # to TLS at once: 8 KiB slowed bulk reads, 64 held the loop
 PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
-# shortcut: AWS's guest agent reorders exec messages in flight, drop with its fix
+# shortcut for aws/containers-roadmap#2913: drop the gap and the cap with its fix
 MESSAGE_GAP = 0.001
-MESSAGE_SIZE = 64 << 10  # one a gap; at 256 KiB they were still reordered
+MESSAGE_SIZE = 64 << 10
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone

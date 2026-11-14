@@ -2837,7 +2837,7 @@ async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
 async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     clock: types.SimpleNamespace,
 ) -> None:
-    """Regression: a message a write, which AWS's guest agent reordered in flight."""
+    """Regression: a message a write, of any size: AWS's guest agent reordered them."""
     sent: list[bytes] = []
     at: list[float] = []
 
@@ -2866,6 +2866,7 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     await until(lambda: len(sent) == 2)
     upload = bytes(range(256)) * 600  # 150 KiB: more than a message may carry
     stdio.write(upload)
+    await asyncio.wait_for(stdio.drain(), 30)  # room again once most of it has gone
     await until(lambda: sum(map(len, sent[2:])) == len(upload))
     stdio.abort()
 
