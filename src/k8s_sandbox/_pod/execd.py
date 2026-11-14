@@ -80,6 +80,7 @@ PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to th
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
 # shortcut: AWS's guest agent reorders exec messages in flight, drop with its fix
 MESSAGE_GAP = 0.001
+MESSAGE_SIZE = 64 << 10  # one a gap: 50 MiB/s of writes; 256 KiB was reordered
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -252,15 +253,17 @@ class _Stdio:
             raise ConnectionResetError("the exec that reaches execd ended")
 
     async def _send(self) -> None:
-        """A message at a time: what is written meanwhile goes in the next, together."""
+        """A message at a time: what is written meanwhile goes in the next ones."""
         try:
             while True:
                 await self._written.wait()
                 self._written.clear()
-                data, self._out = bytes(self._out), bytearray()
-                self._taken.set()
-                await self._stdio.send(data)
-                await asyncio.sleep(MESSAGE_GAP)
+                while self._out:
+                    data = bytes(self._out[:MESSAGE_SIZE])
+                    del self._out[:MESSAGE_SIZE]
+                    self._taken.set()
+                    await self._stdio.send(data)
+                    await asyncio.sleep(MESSAGE_GAP)
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             self.abort()  # the reader sees the end, as of a port reset under a write
 

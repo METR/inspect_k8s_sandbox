@@ -2862,10 +2862,13 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     stdio.write(b"while it ")
     stdio.write(b"is on its way")
     await until(lambda: len(sent) == 2)
+    stdio.write(b"x" * (2 * execd.MESSAGE_SIZE + 1))
+    await until(lambda: len(sent) == 5)
     stdio.abort()
 
     assert sent[1] == b"while it is on its way"
-    assert clock.now >= execd.MESSAGE_GAP  # the second waited out the first's gap
+    assert [len(message) for message in sent[2:]] == [*[execd.MESSAGE_SIZE] * 2, 1]
+    assert clock.now >= 4 * execd.MESSAGE_GAP  # each waited out the last one's gap
 
 
 async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
