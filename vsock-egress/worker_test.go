@@ -296,6 +296,25 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 	}
 }
 
+func TestConnectionsThatSendNoKeyTakeNoStreamsPlace(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	dial := served(t, key, target, nil)
+
+	for range maxStreams { // a workload process dials and says nothing
+		dial()
+	}
+	forwarder := dial()
+	forwarder.Write(key)
+	select {
+	case <-accepted:
+	case <-closed(forwarder):
+		t.Fatal("the forwarder's stream was refused while silent connections were open")
+	case <-time.After(budget):
+		t.Fatal("the forwarder's stream reached nothing")
+	}
+}
+
 func TestStreamPastTheCapIsRefused(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)

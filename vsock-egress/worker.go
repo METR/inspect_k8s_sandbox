@@ -92,16 +92,7 @@ func (w *worker) serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
-		select {
-		case w.slots <- struct{}{}:
-			go func() {
-				defer func() { <-w.slots }()
-				w.stream(c)
-			}()
-		default:
-			w.refused.Add(1)
-			c.Close()
-		}
+		go w.stream(c)
 	}
 }
 
@@ -111,6 +102,13 @@ func (w *worker) stream(c net.Conn) {
 	key := make([]byte, keySize)
 	c.SetReadDeadline(time.Now().Add(handshakeWait))
 	if _, err := io.ReadFull(c, key); err != nil || !w.holds(key) {
+		w.refused.Add(1)
+		return
+	}
+	select { // only now: a connection that sends no key holds no stream's place
+	case w.slots <- struct{}{}:
+		defer func() { <-w.slots }()
+	default:
 		w.refused.Add(1)
 		return
 	}
