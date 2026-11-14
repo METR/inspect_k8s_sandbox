@@ -67,11 +67,11 @@ type call struct {
 	detached int  // times its connection dropped
 	stdinEOF bool // the client closed stdin
 	mu       sync.Mutex
-	out      [2]bytes.Buffer // stdout, stderr: what the process wrote and the client has not acked
-	base     [2]int          // the stream offset of out[i][0]
-	sent     [2]int          // the offset up to which the current subscriber has been sent output
-	flushed  time.Time       // when output was last sent
-	deferred bool            // a flush waits for its millisecond
+	out      [2]fifo   // stdout, stderr: what the process wrote and the client has not acked
+	base     [2]int    // the stream offset of out[i][0]
+	sent     [2]int    // the offset up to which the current subscriber has been sent output
+	flushed  time.Time // when output was last sent
+	deferred bool      // a flush waits for its millisecond
 	room     *sync.Cond
 	gone     bool // released: drop any further output
 	exited   bool
@@ -257,7 +257,7 @@ func (s *server) detach(c *conn) {
 				if orphaned {
 					cl.kill() // before its output is let go: a command that ended on that would leave what it started
 					cl.mu.Lock()
-					cl.gone, cl.out, cl.stdinQ = true, [2]bytes.Buffer{}, nil
+					cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil
 					cl.room.Broadcast()
 					cl.mu.Unlock()
 				}
@@ -274,7 +274,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out = true, [2]bytes.Buffer{}
+		cl.gone, cl.out = true, [2]fifo{}
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -580,6 +580,43 @@ func (cl *call) feedStdin(w *os.File) {
 // Unacked output per stdout or stderr before reading waits; a stream's reader takes it as needed.
 const maxUnacked, streamUnacked = 4 << 20, 1 << 20
 
+// fifo is a stream's unacked output, kept in a ring: an ack frees its front without a copy, and it takes no more memory than it holds.
+type fifo struct {
+	buf     []byte
+	head, n int // where its first byte is in buf, and how many it holds
+}
+
+func (f *fifo) Len() int { return f.n }
+
+// Write adds data; most is all the fifo will be asked to hold, and it doubles no further.
+func (f *fifo) Write(data []byte, most int) {
+	if need := f.n + len(data); need > len(f.buf) {
+		grown := make([]byte, max(need, min(2*len(f.buf), most)))
+		k := copy(grown, f.buf[f.head:min(f.head+f.n, len(f.buf))])
+		copy(grown[k:], f.buf[:f.n-k])
+		f.buf, f.head = grown, 0
+	}
+	tail := (f.head + f.n) % len(f.buf)
+	copy(f.buf, data[copy(f.buf[tail:], data):])
+	f.n += len(data)
+}
+
+// Next drops the first n bytes.
+func (f *fifo) Next(n int) {
+	if n > 0 {
+		f.head, f.n = (f.head+n)%len(f.buf), f.n-n
+	}
+}
+
+// span is the n bytes from offset off: a copy where they pass the ring's end.
+func (f *fifo) span(off, n int) []byte {
+	start := (f.head + off) % len(f.buf)
+	if start+n <= len(f.buf) {
+		return f.buf[start : start+n]
+	}
+	return append(append(make([]byte, 0, n), f.buf[start:]...), f.buf[:start+n-len(f.buf)]...)
+}
+
 func (cl *call) output(stream int, data []byte) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -593,7 +630,7 @@ func (cl *call) output(stream int, data []byte) {
 	if cl.gone {
 		return
 	}
-	cl.out[stream].Write(data)
+	cl.out[stream].Write(data, limit+len(data))
 	cl.flushSoon()
 }
 
@@ -753,7 +790,7 @@ func (cl *call) flush() (frames int) {
 		end := cl.base[i] + cl.out[i].Len()
 		for cl.sent[i] < end {
 			next := min(end, cl.sent[i]+1<<20)
-			cl.sub.send(kind, cl.id, cl.out[i].Bytes()[cl.sent[i]-cl.base[i]:next-cl.base[i]])
+			cl.sub.send(kind, cl.id, cl.out[i].span(cl.sent[i]-cl.base[i], next-cl.sent[i]))
 			cl.sent[i] = next
 			frames++
 		}
