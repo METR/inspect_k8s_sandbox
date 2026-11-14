@@ -181,19 +181,23 @@ func TestACommandGivenNoCwdRunsWhereItsUserCannotEnterTheDirectoryByPath(t *test
 	if os.Getuid() == 0 {
 		t.Skip("root enters any directory")
 	}
-	tests, closed := workdir, t.TempDir()
-	t.Cleanup(func() { os.Chmod(closed, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
-	workdir = filepath.Join(closed, "work")
-	os.Mkdir(workdir, 0o755)
-	os.Chdir(workdir)
-	os.Chmod(closed, 0) // its path can no longer be followed: a 700 /root for uid 1000
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
+	for _, shut := range []string{"", "work"} { // its parent, or itself: a 700 /root for uid 1000, in /root/work or /root
+		t.Run("shut="+shut, func(t *testing.T) {
+			tests, closed := workdir, t.TempDir()
+			t.Cleanup(func() { os.Chmod(filepath.Join(closed, shut), 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
+			workdir = filepath.Join(closed, "work")
+			os.Mkdir(workdir, 0o755)
+			os.Chdir(workdir)
+			os.Chmod(filepath.Join(closed, shut), 0)
+			s, _ := newServer(strings.Repeat("00", 32))
+			req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "p"})
 
-	s.start(testConn(t), frame{kind: fStart, id: 42, payload: req})
+			s.start(testConn(t), frame{kind: fStart, id: 42, payload: req})
 
-	if code := exitCode(t, s.get(42)); code != 0 {
-		t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+			if code := exitCode(t, s.get(42)); code != 0 {
+				t.Fatalf("exit %d: over Kubernetes exec the command runs, in the directory its container started in", code)
+			}
+		})
 	}
 }
 
@@ -201,24 +205,29 @@ func TestACommandGivenNoCwdFailsOnceItsDirectoryIsReplacedByOneItCannotEnter(t *
 	if os.Getuid() == 0 {
 		t.Skip("root enters any directory")
 	}
-	tests, parent := workdir, t.TempDir()
-	t.Cleanup(func() { workdir = tests; os.Chdir(tests) }) // back where the tests run
-	workdir = filepath.Join(parent, "work")
-	os.Mkdir(workdir, 0o755)
-	os.Chdir(workdir)
-	os.Rename(workdir, filepath.Join(parent, "old")) // as a command might, to have the next ones run there
-	os.Mkdir(workdir, 0)
-	s, _ := newServer(strings.Repeat("00", 32))
-	made := filepath.Join(t.TempDir(), "made")
-	req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}, Env: map[string]string{}, Tag: "r"})
+	for _, shut := range []string{"work", ""} { // the one put in its place, or the parent of both
+		t.Run("shut="+shut, func(t *testing.T) {
+			tests, parent := workdir, t.TempDir()
+			t.Cleanup(func() { os.Chmod(parent, 0o755); workdir = tests; os.Chdir(tests) }) // back where the tests run
+			workdir = filepath.Join(parent, "work")
+			os.Mkdir(workdir, 0o755)
+			os.Chdir(workdir)
+			os.Rename(workdir, filepath.Join(parent, "old")) // as a command might, to have the next ones run there
+			os.Mkdir(workdir, 0o755)
+			os.Chmod(filepath.Join(parent, shut), 0)
+			s, _ := newServer(strings.Repeat("00", 32))
+			made := filepath.Join(t.TempDir(), "made")
+			req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}, Env: map[string]string{}, Tag: "r"})
 
-	s.start(testConn(t), frame{kind: fStart, id: 45, payload: req})
+			s.start(testConn(t), frame{kind: fStart, id: 45, payload: req})
 
-	if code := exitCode(t, s.get(45)); code != 1 {
-		t.Fatalf("exit %d, want 1: the directory at its path is not the one it would run in", code)
-	}
-	if _, err := os.Stat(made); err == nil {
-		t.Fatal("the command ran, in the directory that was moved away")
+			if code := exitCode(t, s.get(45)); code != 1 {
+				t.Fatalf("exit %d, want 1: the directory at its path is not the one it would run in", code)
+			}
+			if _, err := os.Stat(made); err == nil {
+				t.Fatal("the command ran, in the directory that was moved away")
+			}
+		})
 	}
 }
 

@@ -42,7 +42,7 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
-var workdir, _ = os.Getwd() // where execd started, and so does a command given no cwd
+var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
 var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
@@ -389,10 +389,8 @@ func (cl *call) run(req startRequest) error {
 	}
 	// By its path, as Kubernetes exec does: a command may have replaced the directory.
 	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
-		here, _ := os.Stat(".")
-		there, unseen := os.Stat(workdir)
 		// A user who cannot enter it by its path stays in it, while that path is still this directory.
-		if !errors.Is(err, syscall.EACCES) || (unseen == nil && !os.SameFile(here, there)) {
+		if here, _ := syscall.Getwd(); !errors.Is(err, syscall.EACCES) || here != workdir {
 			return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
 		}
 	}
