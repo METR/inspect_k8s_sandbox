@@ -240,6 +240,7 @@ func alone(t *testing.T) {
 func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	alone(t)
 	l := fakeNode(t)
+	l.reap = budget
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
 	addSandbox(t, l, id("b"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+1)
@@ -318,6 +319,7 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			const uid = vmUID + 2 // no other test's processes run as it
 			l := fakeNode(t)
+			l.reap = budget
 			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
 			t.Setenv(hostileWorker, strconv.Itoa(int(signal)))
 			t.Cleanup(func() { // whatever a failed run left as that uid
@@ -365,15 +367,16 @@ func TestWorkerThatSignalsItsOwnUidStillEndsWithItsSandbox(t *testing.T) {
 	}
 }
 
-// A reaper can fail, and a process of its uid outside this namespace can stop it: neither holds up the launcher, nor lets its worker go on.
+// A reaper can fail, and a process of its uid outside this namespace can stop it: the launcher goes on, resumes or replaces the reaper, and gives the uid to no other sandbox meanwhile.
 func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 	alone(t)
 	for _, how := range []string{"stops", "fails"} {
 		t.Run("a reaper that "+how, func(t *testing.T) {
 			const uid = vmUID + 3 // no other test's processes run as it
+			proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}
 			l := fakeNode(t)
-			l.reap = time.Millisecond
-			record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, uid)
+			l.reap, l.retry = time.Millisecond, 0
+			record := addSandbox(t, l, id("a"), "eth0", proxied, uid)
 			if err := l.pass(); err != nil {
 				t.Fatal(err)
 			}
@@ -394,19 +397,28 @@ func TestWorkerWhoseReaperDidNotEndItIsEndedOnALaterPass(t *testing.T) {
 				t.Fatal("the launcher let go of a worker that nothing had ended")
 			}
 
+			addSandbox(t, l, id("b"), "eth0", proxied, uid) // the VM's uid goes to a new sandbox while the old worker runs
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			if l.workers[id("a")] != nil && l.workers[id("b")] != nil {
+				t.Fatal("a new sandbox got a worker as a uid whose last worker has not been ended")
+			}
 			t.Setenv(brokenReaper, "")
-			for deadline := time.Now().Add(budget); len(l.workers) > 0; time.Sleep(time.Millisecond) {
-				if w.reaper != nil {
-					syscall.Kill(w.reaper.cmd.Process.Pid, syscall.SIGCONT) // whoever stopped it lets it go on
-				}
+			for deadline := time.Now().Add(budget); l.workers[id("a")] != nil || l.workers[id("b")] == nil; time.Sleep(time.Millisecond) {
 				if err := l.pass(); err != nil {
 					t.Fatal(err)
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("no later pass ended the worker")
+					t.Fatalf("no later pass ended the old worker and started the new sandbox's: the launcher holds %d", len(l.workers))
 				}
 			}
 			ended(t, w)
+			next := l.workers[id("b")]
+			t.Cleanup(func() { next.end(budget) })
+			if next.exited() {
+				t.Fatal("the old worker's reaper ended the new sandbox's worker")
+			}
 		})
 	}
 }

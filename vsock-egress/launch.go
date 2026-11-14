@@ -160,10 +160,12 @@ func (c *child) end(wait time.Duration) error {
 			return err
 		}
 		c.reaper = reaper
-		select { // a process of the reaper's uid outside this namespace can stop it: the launcher goes on, and looks again on its next pass
-		case <-reaper.done:
-		case <-time.After(wait):
-		}
+	} else {
+		c.reaper.cmd.Process.Signal(syscall.SIGCONT) // a process of the reaper's uid outside this namespace can stop it, and the launcher's session may resume it
+	}
+	select { // the launcher goes on, and looks again on its next pass
+	case <-c.reaper.done:
+	case <-time.After(wait):
 	}
 	if !c.reaper.exited() {
 		return fmt.Errorf("its reaper, process %d, has not ended", c.reaper.cmd.Process.Pid)
@@ -222,7 +224,7 @@ type launcher struct {
 	node
 	rate     int
 	retry    time.Duration        // the least time between two starts of one sandbox's worker
-	reap     time.Duration        // how long a pass waits for a worker's reaper
+	reap     time.Duration        // how long a pass waits for its workers' reapers
 	workers  map[string]*child    // by sandbox id
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]bool      // sandboxes whose fault is already in the log
@@ -293,9 +295,10 @@ func (l *launcher) pass() error {
 	if err != nil {
 		return err
 	}
+	deadline := time.Now().Add(l.reap)
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
-			if err := w.end(l.reap); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
+			if err := w.end(time.Until(deadline)); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
 				if !w.unended {
 					w.unended = true
 					log.Printf("uid %d: its processes are not ended yet: %v", w.uid, err)
@@ -310,8 +313,12 @@ func (l *launcher) pass() error {
 			delete(l.tried, id)
 		}
 	}
+	held := map[uint32]bool{}
+	for _, w := range l.workers {
+		held[w.uid] = true
+	}
 	for id, sb := range wanted {
-		if l.workers[id] != nil || time.Since(l.tried[id]) < l.retry { // one that cannot start, or dies at once, is not started twice a second
+		if l.workers[id] != nil || held[sb.uid] || time.Since(l.tried[id]) < l.retry { // one that cannot start, or dies at once, is not started twice a second
 			continue
 		}
 		l.tried[id] = time.Now()
