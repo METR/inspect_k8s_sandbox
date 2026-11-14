@@ -26,6 +26,10 @@
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
   sidecar. A service with a DNS record finds itself there under its own name through
   `/etc/hosts`, at `127.0.0.1`; its `additionalDnsRecords` do not resolve.
+- The kubelet's `httpGet` and `tcpSocket` probes cannot reach a pod with no network
+  device. As an `exec` probe there, `/execd/execd probe [--timeout DURATION] URL
+  [NAME:VALUE...]` makes the same check from inside the container: a `tcp://HOST:PORT`
+  connection, or an `http://` or `https://` GET with those headers.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

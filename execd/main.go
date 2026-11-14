@@ -33,6 +33,9 @@ func main() {
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket
 		connect(os.Args[2])
 	}
+	if len(os.Args) > 1 && os.Args[1] == "probe" { // a pod's exec probe
+		probeCommand(os.Args[2:])
+	}
 	if len(os.Args) < 2 || os.Args[1] != "listen" && os.Args[1] != "serve" {
 		fail("usage: execd listen (--port N | --socket NAME) --key-sha256 HEX")
 	}

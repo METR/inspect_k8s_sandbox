@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 		firstProcess(os.Args[2:])
 		return
 	}
-	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve") {
+	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "probe") {
 		main()
 		return
 	}
