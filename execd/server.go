@@ -54,7 +54,7 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as and killed: a kill must not wait for mu, which output holds through a write to a stalled connection
+	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu, which output holds through a write to a stalled connection
 	pid int
 	// where the reaper sends its command's exit status: registered until then, so the id is still the command's
 	status chan int
@@ -82,6 +82,8 @@ type call struct {
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
 	timedOut  bool // its timeout killed it: its exit says so, as the code alone can't
+	// its timeout found it running and signalled it
+	timeoutKilled bool
 }
 
 type conn struct {
@@ -380,7 +382,10 @@ func (cl *call) run(req startRequest) error {
 			}
 		}
 	}
-	os.Chdir(workdir) // by its path, as Kubernetes exec does: a command may have replaced the directory
+	// By its path, as Kubernetes exec does: a command may have replaced the directory.
+	if err := os.Chdir(workdir); err != nil && !strings.HasPrefix(req.Cwd, "/") {
+		return fmt.Errorf("cd: %s: %w", workdir, errors.Unwrap(err))
+	}
 	if _, err := os.Stat(req.Cwd); req.Cwd != "" && err != nil {
 		return fmt.Errorf("cd: %s: %w", req.Cwd, errors.Unwrap(err))
 	}
@@ -419,23 +424,21 @@ func (cl *call) run(req startRequest) error {
 		return err
 	}
 	exited := reaper.watch(p.Pid)
-	reaper.mu.Unlock()
 	cl.kmu.Lock()
 	cl.pid, cl.as, cl.status = p.Pid, as, exited // before Release, which sets it to -1
 	killed := cl.killed
 	cl.kmu.Unlock()
-	if killed { // while it started: that holds even if it has ended since, for what it left running too
-		reaper.mu.Lock()
-		if ch, taken := reaper.waiting[p.Pid]; !taken || ch == exited { // not another command's id by now
-			syscall.Kill(-p.Pid, syscall.SIGKILL)
-		}
-		reaper.mu.Unlock()
+	if killed { // while it started: nothing is reaped under this lock, so the id is its own, though it may have ended
+		syscall.Kill(-p.Pid, syscall.SIGKILL)
+	}
+	reaper.mu.Unlock()
+	if killed { // that holds for what it left running too
 		cl.end(as)
 	}
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = afterFunc(time.Duration(req.Timeout*float64(time.Second)), cl.kill)
+		deadline = afterFunc(time.Duration(req.Timeout*float64(time.Second)), func() { cl.stop(true) })
 	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
@@ -467,12 +470,15 @@ func (cl *call) run(req startRequest) error {
 		if stdinW != nil {
 			stdinW.Close() // or its writer waits for ever on what the command left holding its stdin
 		}
+		if deadline != nil {
+			deadline.Stop()
+		}
 		cl.kmu.Lock()
 		cl.pid = 0 // reaped: its id may now be another group's
+		byTimeout := cl.timeoutKilled
 		cl.kmu.Unlock()
 		cl.mu.Lock()
-		// Not a command that ended by itself as its timer fired: the kill found it gone.
-		cl.timedOut = deadline != nil && !deadline.Stop() && code == 128+int(syscall.SIGKILL)
+		cl.timedOut = byTimeout && code == 128+int(syscall.SIGKILL)
 		cl.mu.Unlock()
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
@@ -665,7 +671,10 @@ func (cl *call) ackLocked(req resumeRequest) {
 }
 
 // kill stops the call's process group, and every process still carrying its tag.
-func (cl *call) kill() {
+func (cl *call) kill() { cl.stop(false) }
+
+// stop is kill; a timeout's notes that it found the command running, so only then does the exit say "timed out".
+func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
@@ -679,6 +688,9 @@ func (cl *call) kill() {
 	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is the command's own
 	running := reaper.waiting[pid] == status
 	if running {
+		cl.kmu.Lock()
+		cl.timeoutKilled = cl.timeoutKilled || timeout
+		cl.kmu.Unlock()
 		syscall.Kill(-pid, syscall.SIGKILL)
 	}
 	reaper.mu.Unlock()

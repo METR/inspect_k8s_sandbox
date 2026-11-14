@@ -150,6 +150,28 @@ func TestAReleasedCallIsForgotten(t *testing.T) {
 	}
 }
 
+func TestACommandGivenNoCwdFailsOnceThatDirectoryIsGone(t *testing.T) {
+	tests := workdir
+	t.Cleanup(func() { workdir = tests; os.Chdir(tests) }) // back where the tests run
+	workdir = filepath.Join(t.TempDir(), "work")
+	os.Mkdir(workdir, 0o755)
+	os.Chdir(workdir) // as execd starts in it
+	s, _ := newServer(strings.Repeat("00", 32))
+	os.RemoveAll(workdir) // as a command's rm -rf of it, with a file put in its place
+	os.WriteFile(workdir, nil, 0o644)
+	made := filepath.Join(t.TempDir(), "made")
+	req, _ := json.Marshal(startRequest{Argv: []string{"touch", made}, Env: map[string]string{}, Tag: "g"})
+
+	s.start(testConn(t), frame{kind: fStart, id: 40, payload: req})
+
+	if code := exitCode(t, s.get(40)); code != 1 {
+		t.Fatalf("exit %d, want 1: the command's directory is gone", code)
+	}
+	if _, err := os.Stat(made); err == nil {
+		t.Fatal("the command ran, in the directory that was removed")
+	}
+}
+
 func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	t.Cleanup(func() { killTagged("stream") })
@@ -341,42 +363,46 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 }
 
 func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
-	var fire func()
-	afterFunc = func(_ time.Duration, f func()) *time.Timer {
-		fire = f
-		fired := time.NewTimer(0) // a timer that has fired: it can no longer be stopped
-		<-fired.C
-		return fired
-	}
-	t.Cleanup(func() { afterFunc = time.AfterFunc })
-	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit 3"}, Env: map[string]string{}, Stdin: true, Tag: "e", Timeout: 60})
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	s.dispatch(c, frame{kind: fStart, id: 8, payload: req})
-	cl := s.get(8)
-	cl.kmu.Lock()
-	pid := cl.pid
-	cl.kmu.Unlock()
-	reaper.mu.Lock() // the command ends, and execd has yet to note it
-	noted := sync.OnceFunc(reaper.mu.Unlock)
-	t.Cleanup(noted)
-	s.dispatch(c, frame{kind: fStdin, id: 8, payload: []byte("\n")})
-	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-		if strings.Contains(string(stat), ") Z ") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the command never ended")
-		}
-	}
+	for _, code := range []int{3, 137} { // 137: a kill's exit code, from a command nothing killed
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			var fire func()
+			afterFunc = func(_ time.Duration, f func()) *time.Timer {
+				fire = f
+				fired := time.NewTimer(0) // a timer that has fired: it can no longer be stopped
+				<-fired.C
+				return fired
+			}
+			t.Cleanup(func() { afterFunc = time.AfterFunc })
+			s, _ := newServer(strings.Repeat("00", 32))
+			req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit " + strconv.Itoa(code)}, Env: map[string]string{}, Stdin: true, Tag: "e", Timeout: 60})
+			c, frames := recordedConn(t)
+			s.authenticated(c)
+			s.dispatch(c, frame{kind: fStart, id: 8, payload: req})
+			cl := s.get(8)
+			cl.kmu.Lock()
+			pid := cl.pid
+			cl.kmu.Unlock()
+			reaper.mu.Lock() // the command ends, and execd has yet to note it
+			noted := sync.OnceFunc(reaper.mu.Unlock)
+			t.Cleanup(noted)
+			s.dispatch(c, frame{kind: fStdin, id: 8, payload: []byte("\n")})
+			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+				stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+				if strings.Contains(string(stat), ") Z ") {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the command never ended")
+				}
+			}
 
-	fire() // the timer's callback runs now: its kill finds the command gone
-	noted()
+			fire() // the timer's callback runs now: its kill finds the command gone
+			noted()
 
-	if status := exitStatus(t, frames); status["code"] != 3.0 || status["timeout"] != nil {
-		t.Fatalf("EXIT %v, want code 3 and no timeout", status)
+			if status := exitStatus(t, frames); status["code"] != float64(code) || status["timeout"] != nil {
+				t.Fatalf("EXIT %v, want code %d and no timeout", status, code)
+			}
+		})
 	}
 }
 
@@ -954,17 +980,21 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
 	cl.kill()     // from another connection, while this one's START is still at work
-	cl.kmu.Lock() // and stays at work: the command has ended before the START can note its id
+	cl.kmu.Lock() // and stays at work: the command has ended before the START notes its id
 	noted := sync.OnceFunc(cl.kmu.Unlock)
 	t.Cleanup(noted)
 	started := make(chan error, 1)
 	go func() { started <- cl.run(req) }()
 	var leader, grouped, detached int
-	for deadline := time.Now().Add(30 * time.Second); detached == 0 || syscall.Kill(leader, 0) == nil; time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		if b, _ := os.ReadFile(pids); len(strings.Fields(string(b))) == 3 {
 			leader, _ = strconv.Atoi(strings.Fields(string(b))[0])
 			grouped, _ = strconv.Atoi(strings.Fields(string(b))[1])
 			detached, _ = strconv.Atoi(strings.Fields(string(b))[2])
+		}
+		// Ended and not reaped: the START holds the reaper's lock until it has noted the id.
+		if stat, _ := os.ReadFile("/proc/" + strconv.Itoa(leader) + "/stat"); detached != 0 && strings.Contains(string(stat), ") Z ") {
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the command never ended")
