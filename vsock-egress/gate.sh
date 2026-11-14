@@ -80,7 +80,7 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
  "spec":{"nodeName":"$node","hostPID":true,"restartPolicy":"Never","terminationGracePeriodSeconds":1,"automountServiceAccountToken":false,
   "tolerations":[{"operator":"Exists"}],
   "containers":[{"name":"peek","image":"public.ecr.aws/docker/library/busybox:1.38-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6","command":["sleep","3600"],
-   "securityContext":{"runAsUser":0,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
+   "securityContext":{"runAsUser":65534,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
    "volumeMounts":[{"name":"vms","mountPath":"/vms","readOnly":true}]}],
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
