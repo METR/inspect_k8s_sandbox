@@ -847,12 +847,27 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
     ]
 
 
-def test_egress_capture_annotation_needs_an_egress_proxy(chart_dir: Path) -> None:
+@pytest.mark.parametrize(
+    "others",
+    [
+        pytest.param(
+            r"services.default.podAnnotations.sandbox\.amazonaws\.com/network-isolated=true,",
+            id="no proxy",
+        ),
+        # Its container that holds NET_ADMIN is for a pod with no network card alone.
+        pytest.param(f"services.default.podAnnotations.{_EGRESS_PROXY},", id="a card"),
+    ],
+)
+def test_egress_capture_annotation_needs_an_egress_proxy_and_no_network_card(
+    chart_dir: Path, others: str
+) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(
-            chart_dir, set_string=f"services.default.podAnnotations.{_EGRESS_CAPTURE}"
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1",
+            set_string=f"{others}services.default.podAnnotations.{_EGRESS_CAPTURE}",
         )
-    assert "inspect-k8s-sandbox/egress-proxy" in exc_info.value.stderr
+    assert "inspect-k8s-sandbox/egress-capture needs" in exc_info.value.stderr
 
 
 @pytest.mark.parametrize(

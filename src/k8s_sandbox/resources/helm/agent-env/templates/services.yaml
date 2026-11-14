@@ -57,8 +57,8 @@ spec:
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
       {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
       {{- $egressCapture := eq (get $podAnnotations "inspect-k8s-sandbox/egress-capture") "true" }}
-      {{- if and $egressCapture (not $egressProxy) }}
-      {{- fail "the annotation inspect-k8s-sandbox/egress-capture needs inspect-k8s-sandbox/egress-proxy" }}
+      {{- if and $egressCapture (not (and $egressProxy $noCard)) }}
+      {{- fail "the annotation inspect-k8s-sandbox/egress-capture needs inspect-k8s-sandbox/egress-proxy, on a pod annotated sandbox.amazonaws.com/network-isolated" }}
       {{- end }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
