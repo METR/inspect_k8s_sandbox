@@ -591,6 +591,7 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
     """Regression: a START cut as it was written failed a call execd could resume."""
     starts = connections = 0
     first: list[asyncio.StreamWriter] = []
+    released = asyncio.Event()
 
     async def resets_the_first(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
@@ -601,6 +602,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
             first.append(w)
             _, call_id, _ = await read_frame(r)  # the command that opens the connection
             w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            await read_frame(r)  # its RELEASE: else that is the write the reset meets
+            released.set()
             await r.read()
             return
         _, call_id, _ = await read_frame(r)  # RESUME
@@ -612,7 +615,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
 
     await daemons.serve(resets_the_first)
     client = daemons.client()
-    await client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    await asyncio.wait_for(released.wait(), 30)
     reset = struct.pack("ii", 1, 0)  # close with a reset, not an end of stream
     first[0].get_extra_info("socket").setsockopt(
         socket.SOL_SOCKET, socket.SO_LINGER, reset
