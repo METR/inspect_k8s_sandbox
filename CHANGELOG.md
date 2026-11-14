@@ -22,11 +22,11 @@
   running lose their timeout. Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   with `CAP_DAC_OVERRIDE` or `CAP_DAC_READ_SEARCH` can stand in for it while it starts.
-  execd's memory counts against the container's limit: about 7 MB idle; while commands
-  print faster than the client reads, up to about 32 MB, or about 5 MB for each of their
-  streams (stdout, stderr) if that is more; and up to about 10 MB for each command that
-  leaves its stdin unread. It keeps up to about 32 MB for minutes after the commands
-  end.
+  execd's memory counts against the container's limit: about 7 MB idle, and more with
+  output the client has not yet read (about 5 MB for each stream of a command, stdout
+  and stderr) and with stdin a command has not read (up to about 10 MB for each
+  command). It collects its garbage once it holds half the container's memory limit, or
+  32 MB if that is more or the limit cannot be read, and may go on holding that much.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

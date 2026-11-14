@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +15,22 @@ import (
 	"testing"
 	"time"
 )
+
+func TestTheMemoryLimitIsHalfTheContainers(t *testing.T) {
+	for cgroupMax, want := range map[string]int64{
+		"1999998976\n": 999999488,
+		"67108864\n":   32 << 20,
+		"16777216\n":   32 << 20,      // never less: execd idles at 7 MiB
+		"max\n":        math.MaxInt64, // a container with no limit
+	} {
+		if got := memoryLimit([]byte(cgroupMax), nil); got != want {
+			t.Errorf("memory.max %q: limit %d, want %d", cgroupMax, got, want)
+		}
+	}
+	if got := memoryLimit(nil, os.ErrNotExist); got != 32<<20 { // cgroup v1
+		t.Errorf("no memory.max: limit %d, want 32 MiB", got)
+	}
+}
 
 func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang

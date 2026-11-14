@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"os"
 	"runtime/debug"
@@ -46,6 +47,19 @@ func main() {
 		return
 	}
 	run(*port, *keyHash, *replace)
+}
+
+// memoryLimit is half the container's memory limit, or 32 MiB if that is more or the limit can't be read; none where the container has none.
+func memoryLimit(cgroupMax []byte, err error) int64 {
+	limit := strings.TrimSpace(string(cgroupMax))
+	if limit == "max" {
+		return math.MaxInt64
+	}
+	n, bad := strconv.ParseInt(limit, 10, 64)
+	if err != nil || bad != nil {
+		return 32 << 20
+	}
+	return max(n/2, 32<<20)
 }
 
 // become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
@@ -137,7 +151,7 @@ func run(port int, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
-	debug.SetMemoryLimit(32 << 20) // past it garbage is collected at once: it counts against the sandbox's memory
+	debug.SetMemoryLimit(memoryLimit(os.ReadFile("/sys/fs/cgroup/memory.max"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())
