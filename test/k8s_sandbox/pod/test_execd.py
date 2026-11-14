@@ -2864,7 +2864,7 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     stdio.write(b"while it ")
     stdio.write(b"is on its way")
     await until(lambda: len(sent) == 2)
-    upload = bytes(range(256)) * 600  # 150 KiB: more than a message may carry
+    upload = bytes(range(251)) * 612  # 150 KiB, and no two messages of it alike
     stdio.write(upload)
     await asyncio.wait_for(stdio.drain(), 30)  # room again once most of it has gone
     await until(lambda: sum(map(len, sent[2:])) == len(upload))
@@ -2937,16 +2937,14 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
     server.close()
 
 
-async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(execd, "CONNECT_TIMEOUT", 0.05)
-    closed, left = asyncio.Event(), asyncio.Event()
+async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec() -> None:
+    writing, closed, left = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
     class Stalled(anyio.abc.ByteStream):
         """An exec whose guest has stopped reading its stdin."""
 
         async def send(self, item: bytes) -> None:
+            writing.set()
             try:
                 await asyncio.Event().wait()
             finally:
@@ -2965,8 +2963,11 @@ async def test_a_connection_closed_under_a_stalled_exec_closes_the_exec(
     async def stdio() -> Stalled:
         return Stalled()
 
-    with pytest.raises(asyncio.TimeoutError):  # the handshake's first bytes never go
-        await execd._connect(execd.Daemon("", "0" * 64, b"key", stdio), execd.Pace())
+    connecting = asyncio.ensure_future(
+        execd._connect(execd.Daemon("", "0" * 64, b"key", stdio), execd.Pace())
+    )
+    await asyncio.wait_for(writing.wait(), 30)  # the handshake's first bytes never go
+    connecting.cancel()
 
     # The exec is closed, and nothing is left writing to it.
     await asyncio.wait_for(asyncio.gather(closed.wait(), left.wait()), 30)
