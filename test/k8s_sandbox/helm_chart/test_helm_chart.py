@@ -613,7 +613,8 @@ def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
-        set_str="services.default.dnsRecord=true",
+        # Records the sidecar answers and the API server refuses as a pod's aliases.
+        set_str=r"services.default.additionalDnsRecords={Site.test,my_db,site.test.}",
         set_string=r"annotations.sandbox\.amazonaws\.com/network-isolated=true",
     )
 
