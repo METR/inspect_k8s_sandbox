@@ -429,18 +429,17 @@ func TestATimeoutKillsACommandWhoseOutputWaitsOnAStalledConnection(t *testing.T)
 	t.Cleanup(func() { ours.Close(); theirs.Close() })
 	c := &conn{nc: ours, dead: make(chan struct{})}
 	s.authenticated(c)
-	alive := filepath.Join(t.TempDir(), "alive")
-	// It prints, so execd's write of that waits, holding the call; then it keeps putting a file back.
-	script := `echo x; while :; do : >"$0"; sleep 0.01; done`
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, alive}, Env: map[string]string{}, Tag: "stalled", Timeout: 0.2})
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	// It prints, so execd's write of that waits, holding the call.
+	script := `echo $$ >"$0"; echo x; exec sleep 600`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script, pidFile}, Env: map[string]string{}, Tag: "stalled", Timeout: 0.2})
 
 	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
 
-	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(100 * time.Millisecond) {
-		os.Remove(alive)
-		time.Sleep(100 * time.Millisecond)
-		if _, err := os.Stat(alive); err != nil && time.Until(deadline) < 29*time.Second {
-			return // past its timeout, and nothing puts the file back
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		written, _ := os.ReadFile(pidFile)
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(written))); err == nil && syscall.Kill(pid, 0) != nil {
+			return // killed and reaped
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the command outlived its timeout: its kill waited for the write of its output")

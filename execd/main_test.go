@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -21,11 +22,21 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	// The daemon it leaves running.
 	t.Cleanup(stopOthers)
 
-	first.WaitDelay = time.Second // or a daemon that kept its stdout would hold Output() past the budget
-	out, _ := first.Output()      // its exit status may go to another test's reaper
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Stdout = w
+	if err := first.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	r.SetReadDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	out, err := io.ReadAll(r)                           // ends once the exec and the daemon it left have both let go of it
+	first.Wait()                                        // its exit status may go to another test's reaper
 
-	if ctx.Err() != nil {
-		t.Fatal("the first exec never returned")
+	if err != nil {
+		t.Fatalf("the first exec's stdout stayed open: %v", err)
 	}
 	if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out) {
 		t.Fatalf("the first exec printed %q, want its daemon's fingerprint", out)

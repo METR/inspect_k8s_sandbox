@@ -35,7 +35,10 @@ for host in sys.argv[2:]:
 
 def docker(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     command = ["docker", *args]
-    return subprocess.run(command, input=stdin, capture_output=True, text=True)
+    # The timeout only bounds a hang.
+    return subprocess.run(
+        command, input=stdin, capture_output=True, text=True, timeout=600
+    )
 
 
 @dataclasses.dataclass
@@ -190,7 +193,7 @@ async def test_a_timed_out_command_is_killed(
     with pytest.raises(TimeoutError):
         await client.exec(argv, None, None, {}, None, 1)
 
-    await sandbox.until(f"! kill -0 $(cat {pid})")
+    await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
 async def test_a_streams_command_is_killed_when_its_connection_drops(
@@ -202,4 +205,4 @@ async def test_a_streams_command_is_killed_when_its_connection_drops(
 
     relay.drop()
 
-    await sandbox.until(f"! kill -0 $(cat {pid})")
+    await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")

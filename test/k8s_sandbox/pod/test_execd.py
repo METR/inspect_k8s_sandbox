@@ -780,14 +780,23 @@ async def test_a_stdin_ack_read_before_its_send_returns_is_counted(
     """Regression: such an ack was dropped, and an upload past 8 MiB never finished."""
     got = 0
 
-    class Late(Plain):
+    class AckedFirst(Plain):  # a send returns once the client has handled its ack
+        reads = sent = 0
+
+        async def readexactly(self, n: int) -> bytes:
+            self.reads += 1
+            return await super().readexactly(n)
+
         async def write(self, data: bytes) -> None:
             await super().write(data)
-            await asyncio.sleep(0.03)  # the ack is read before the sender runs again
+            if data[0] == execd.STDIN and len(data) > execd.HEADER.size:
+                self.sent += 1
+                # OK and each ack take two reads: the next begins when it is handled.
+                await until(lambda: self.reads > 2 * (self.sent + 1))
 
     async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
         r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
-        return Late(r, w)
+        return AckedFirst(r, w)
 
     async def acks_at_once(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         nonlocal got
@@ -1316,42 +1325,22 @@ async def test_many_small_frames_arrive_without_dropping_the_connection(
     assert sandbox._link is not None and not sandbox._link.closed
 
 
-async def test_callers_share_one_reconnect(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        while True:
-            kind, call_id, _ = await read_frame(r)
-            if kind == execd.START:
-                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+async def test_callers_share_one_reconnect(daemons: Daemons) -> None:
+    connections = 0
 
-    await daemons.serve(answers)
+    async def idle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        await r.read()
+
+    await daemons.serve(idle)
     sandbox = daemons.client()
-    await sandbox.exec(["true"], None, None, {}, None, 30)
-    stale = sandbox._link
-    assert stale is not None
+    stale = await sandbox._get()
     await stale.close()
 
-    async def refused(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
-        raise ConnectionRefusedError
+    links = await asyncio.gather(*(sandbox._get(stale) for _ in range(5)))
 
-    starts = 0
-
-    async def still_running(replace: bool) -> execd.Daemon:
-        nonlocal starts
-        starts += 1
-        raise execd.DaemonRunning("address already in use")
-
-    monkeypatch.setattr(execd, "_connect", refused)
-    monkeypatch.setattr(execd, "RECONNECT_FOR", 0.5)
-    sandbox._start = still_running
-
-    results = await asyncio.gather(
-        *(sandbox._get(stale) for _ in range(5)), return_exceptions=True
-    )
-
-    assert all(isinstance(r, ConnectionError) for r in results)
-    assert starts < len(results)  # one reconnect's starts, not each caller's own
+    assert (len(set(links)), connections) == (1, 2)
 
 
 async def test_only_a_resume_waits_out_a_reconnect(
@@ -1764,12 +1753,12 @@ async def test_a_daemon_that_drops_each_connection_is_reconnected_with_backoff(
 
     await daemons.serve(drops)
 
-    with pytest.raises(TimeoutError):  # the budget only bounds a hang
+    with pytest.raises(TimeoutError, match="Command timed out"):
         call = daemons.client().exec(["true"], None, None, {}, None, 1)
-        await asyncio.wait_for(call, 30)
+        await asyncio.wait_for(call, 30)  # only bounds a hang
 
     # Paced: a handful before the waits between them pass the second.
-    assert connections <= 10
+    assert 1 < connections <= 10
 
 
 async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> None:
