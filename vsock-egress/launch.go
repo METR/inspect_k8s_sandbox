@@ -103,6 +103,9 @@ func (n *node) sandbox(r record) (sandbox, error) {
 	if owner.Uid == 0 {
 		return sb, fmt.Errorf("%s is root's: expected a uid of the VM's own", sb.root)
 	}
+	if owner.Uid == reaperUID {
+		return sb, fmt.Errorf("%s is uid %d's, which a worker may not have: its reaper runs as that uid", sb.root, reaperUID)
+	}
 	sb.uid, sb.gid = owner.Uid, owner.Gid
 	return sb, nil
 }
@@ -156,21 +159,35 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	return c, nil
 }
 
-// end stops a worker and whatever else runs as its uid here. Closing its stdin only asks; the launcher may
-// not signal another uid's process, so a child of that uid kills them all. Each live VM has a uid of its
-// own, and its Firecracker is outside this PID namespace.
-func (c *child) end() {
+// end stops a worker and whatever else runs as its uid here: closing its stdin only asks, and the launcher may not signal another uid.
+func (c *child) end() error {
 	c.stdin.Close()
-	if reaper, err := start(c.uid, c.gid, "", "reap"); err != nil {
-		log.Printf("uid %d: its processes are not ended: %v", c.uid, err)
-	} else {
-		<-reaper.done
+	reaper, err := start(0, 0, "", "reap", strconv.Itoa(int(c.uid)))
+	if err != nil {
+		return err
 	}
+	<-reaper.done
+	if !reaper.cmd.ProcessState.Success() {
+		return fmt.Errorf("its reaper ended with %v", reaper.cmd.ProcessState)
+	}
+	return nil
 }
 
-// reap is what end runs as the VM's uid.
-func reap([]string) error {
-	return syscall.Kill(-1, syscall.SIGKILL)
+const reaperUID = 65534 // the reaper's real and saved uid, which no VM may have
+
+// reap kills every process of one VM's uid here. Only its effective uid is the VM's, so no such process can signal it first.
+func reap(args []string) error {
+	uid, err := strconv.Atoi(strings.Join(args, " "))
+	if err != nil || uid <= 0 || uid == reaperUID {
+		return fmt.Errorf("%q is no VM's uid", args)
+	}
+	if err := syscall.Setresuid(reaperUID, uid, reaperUID); err != nil {
+		return err
+	}
+	if err := syscall.Kill(-1, syscall.SIGKILL); err != syscall.ESRCH { // none left is how it mostly ends: a worker goes when its stdin closes
+		return err
+	}
+	return nil
 }
 
 // inNetns runs f on a thread that has entered the network namespace at path, and brings the thread back.
@@ -275,7 +292,9 @@ func (l *launcher) pass() error {
 	}
 	for id, w := range l.workers {
 		if _, ok := wanted[id]; !ok || w.exited() {
-			w.end()
+			if err := w.end(); err != nil {
+				log.Printf("uid %d: its processes are not ended: %v", w.uid, err)
+			}
 			delete(l.workers, id)
 		}
 	}

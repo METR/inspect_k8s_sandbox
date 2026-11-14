@@ -12,8 +12,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -436,8 +438,17 @@ func (zeros) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 // deafWorker, in the environment, makes this binary a worker that ignores its stdin closing.
 const deafWorker = "VSOCK_EGRESS_TEST_DEAF_WORKER"
 
+// hostileWorker, in the environment, names a signal: this binary as a worker then sends it to all of its uid, again and again.
+const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+		if signal, err := strconv.Atoi(os.Getenv(hostileWorker)); err == nil && os.Args[1] == "work" {
+			os.WriteFile(filepath.Join(filepath.Dir(os.Args[5]), "signalling"), nil, 0o600) // beside the socket -vsock names
+			for {
+				syscall.Kill(-1, syscall.Signal(signal))
+			}
+		}
 		for os.Args[1] == "work" && os.Getenv(deafWorker) != "" {
 			time.Sleep(time.Hour)
 		}
