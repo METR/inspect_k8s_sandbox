@@ -14,6 +14,7 @@ from pathlib import Path
 import anyio
 import pytest
 from inspect_ai.util import OutputLimitExceededError
+from kubernetes.client.exceptions import ApiException
 from pytest import MonkeyPatch
 
 from k8s_sandbox._helm import Release, ValuesSource
@@ -153,8 +154,12 @@ class Cluster:
 
     restarts = 0
     uid, ip = "u", "10.0.0.1"
+    unavailable = False  # its next read fails
 
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
+        if self.unavailable:
+            self.unavailable = False
+            raise ApiException(status=503)
         container = {
             "name": "default",
             "restartCount": self.restarts,
@@ -1266,12 +1271,17 @@ async def test_only_one_fingerprint_line_starts_execd(monkeypatch: MonkeyPatch) 
 
 def execd_starts(monkeypatch: MonkeyPatch, meanwhile: Callable[[], None]) -> None:
     """Stand in for the exec that starts execd: meanwhile() runs as it does."""
+    running = False
 
     class Execute:
         def __init__(self, info: object) -> None:
             pass
 
         def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
+            nonlocal running
+            if running and "--replace" not in cmd:  # as execd finds its port taken
+                return 2, b"", b"listen tcp :24601: bind: address already in use\n"
+            running = True
             meanwhile()
             return 0, b"0" * 64 + b"\n", b""
 
@@ -1297,6 +1307,21 @@ async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
 
     assert (await pod._start_execd(False)).ip == "10.0.0.2"
+
+
+async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
+    cluster: Cluster, monkeypatch: MonkeyPatch
+) -> None:
+    """Regression: in warn mode its key was lost, and its port stayed taken."""
+    fails = iter([True])
+    execd_starts(
+        monkeypatch, lambda: setattr(cluster, "unavailable", next(fails, False))
+    )
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
+    with pytest.raises(ApiException):
+        await pod._start_execd(False)
+
+    assert (await pod._start_execd(False)).ip == "10.0.0.1"
 
 
 async def test_a_resume_resends_only_stdin_execd_has_not_written(

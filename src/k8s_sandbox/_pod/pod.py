@@ -78,6 +78,7 @@ class Pod:
         self._restart_lock = threading.Lock()
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
         self._execd = ExecdClient(self._start_execd) if execd else None
+        self._execd_lost = False  # a daemon started whose key a failure then lost
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -86,7 +87,7 @@ class Pod:
         key = os.urandom(32)
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
-        cmd += ["--replace"] if replace else []
+        cmd += ["--replace"] if replace or self._execd_lost else []
         code, stdout, stderr = await self._run_async(
             lambda: ExecuteOperation(info).run_argv(cmd)
         )
@@ -95,6 +96,7 @@ class Pod:
         # Exactly the fingerprint execd prints: anything else, cut output too, fails.
         if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
             raise PodError("execd did not start", returncode=code, stderr=stderr)
+        self._execd_lost = True  # until it is returned: a failure below loses its key
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
         api = k8s_client(info.context_name)
@@ -104,6 +106,7 @@ class Pod:
         )
         if pod.ip is None:
             raise PodError("The pod has no IP address for execd", pod=info.name)
+        self._execd_lost = False
         return Daemon(pod.ip, stdout.decode().strip(), key)
 
     @property
