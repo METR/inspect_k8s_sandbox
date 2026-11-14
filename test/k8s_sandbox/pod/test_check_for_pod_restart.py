@@ -912,11 +912,7 @@ def test_exec_stdio_keeps_a_restart_when_its_stream_says_the_container_stopped(
 
 @contextlib.contextmanager
 def _opening_stdio(after_queued=None):
-    """Pod.exec_stdio on a healthy pod, with its operations run inline.
-
-    Yields the mock ExecuteOperation. AFTER_QUEUED(n, before) runs before and after
-    the nth operation.
-    """
+    """Pod.exec_stdio on a healthy pod, with its operations run inline."""
     calls = 0
 
     async def queue(callable, discard=None):

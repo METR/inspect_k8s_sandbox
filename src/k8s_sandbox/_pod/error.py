@@ -22,11 +22,7 @@ class GetReturncodeError(Exception):
 
 
 class ExecResultUnknownError(PodError, GetReturncodeError):
-    """An exec's command was sent to the pod, but its result could not be read.
-
-    The command may have run, and may still be running. It is sent again unless its
-    container stopped or the pod runs execd.
-    """
+    """An exec's command was sent to the pod, but its result could not be read."""
 
 
 class ExecdResultUnknownError(ExecResultUnknownError):
@@ -34,12 +30,7 @@ class ExecdResultUnknownError(ExecResultUnknownError):
 
 
 class ContainerStoppedError(ExecResultUnknownError):
-    """An operation's container stopped under it.
-
-    The operation ended with the exit status 255 that Kata gives a command whose VM
-    stopped, before its command did. With ``restarted_container_behavior="raise"`` the
-    operation raises a ``ContainerRestartedError`` instead, from this.
-    """
+    """An operation's container stopped under it."""
 
 
 class ExecutableNotFoundError(Exception):
