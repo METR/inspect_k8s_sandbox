@@ -16,7 +16,10 @@
 {{- /* A pod that names an egress proxy takes the last policy of this file in place of sandbox-egress. */}}
 {{- $egressProxies := dict }}
 {{- range $svcName, $svc := .Values.services }}
-{{- with include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $_ := set $egressProxies $svcName . }}{{ end }}
+{{- with include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}
+{{- if $svc.networkIsolated }}{{ fail (printf "services.%s.networkIsolated denies the pod all egress, so it could not reach the egress proxy it names: unset one of the two" $svcName) }}{{ end }}
+{{- $_ := set $egressProxies $svcName . }}
+{{- end }}
 {{- end -}}
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy

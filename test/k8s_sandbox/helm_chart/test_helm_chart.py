@@ -819,6 +819,20 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
 
 
+def test_an_isolated_service_cannot_name_an_egress_proxy(
+    chart_dir: pathlib.Path,
+) -> None:
+    # Its deny of all egress would stand beside the policy that lets it reach the proxy.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1,"
+            "services.default.networkIsolated=true",
+            set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
+        )
+    assert "services.default.networkIsolated" in exc_info.value.stderr
+
+
 @pytest.mark.parametrize(
     ("annotations", "named_by"),
     [
