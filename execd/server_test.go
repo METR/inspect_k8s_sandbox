@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -32,6 +35,71 @@ func testConn(t *testing.T) *conn {
 	go io.Copy(io.Discard, b) //nolint:errcheck // drains what the server sends
 	t.Cleanup(func() { a.Close(); b.Close() })
 	return &conn{nc: a, dead: make(chan struct{})}
+}
+
+func TestOnlyTheKeysHolderIsServed(t *testing.T) {
+	key, long := []byte("the session key"), bytes.Repeat([]byte("k"), maxKey+1)
+	for _, tc := range []struct {
+		name      string
+		key, sent []byte
+		served    bool
+	}{
+		{"the key", key, key, true},
+		{"another key", key, []byte("another key"), false},
+		{"a key past the bound on what is read before AUTH", long, long, false},
+	} {
+		sum := sha256.Sum256(tc.key)
+		s, _ := newServer(hex.EncodeToString(sum[:]))
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() })
+		s.preauth <- struct{}{} // as serve() takes a slot for it
+		go s.handle(&conn{nc: a, dead: make(chan struct{})})
+		go b.Write(encodeFrame(fAuth, 0, tc.sent)) //nolint:errcheck // a refused peer's write fails
+		b.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+		f, err := readFrameMax(b, maxPayload)
+
+		if served := err == nil && f.kind == fOK; served != tc.served {
+			t.Errorf("%s: served %v, want %v", tc.name, served, tc.served)
+		}
+	}
+}
+
+func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
+	key := []byte("the session key")
+	sum := sha256.Sum256(key)
+	s, _ := newServer(hex.EncodeToString(sum[:]))
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.serve(l) // left listening: serve has no end
+	nc, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nc.Close() })
+	nc.Write(encodeFrame(fAuth, 0, key))
+	nc.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	if f, err := readFrameMax(nc, maxPayload); err == nil {
+		t.Fatalf("a connection from loopback, with the key, got frame %d: the sandbox could dial its own execd", f.kind)
+	}
+}
+
+func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	t.Cleanup(func() { killTagged("stream") })
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "kill -STOP $$"}, Env: map[string]string{}, Stdin: true, Tag: "stream", Stream: true}) // it never ends by itself
+	c := testConn(t)
+	s.start(c, frame{kind: fStart, id: 36, payload: req})
+	cl := s.get(36)
+
+	s.detach(c)
+
+	if code := exitCode(t, cl); code != 137 || s.get(36) != nil {
+		t.Fatalf("exit %d, still held %v: nothing resumes a stream, so its command would run on unseen", code, s.get(36) != nil)
+	}
 }
 
 func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
