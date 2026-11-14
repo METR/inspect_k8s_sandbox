@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 ANNOTATION = "inspect-k8s-sandbox/execd"
 EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
-EXECD_PORT = 24601
+EXECD_PORT = 14601  # below every runtime's ephemeral ports: gVisor's start at 16000
 
 AUTH, START, STDIN, KILL, RESUME, RELEASE, PING, ACK = 1, 2, 3, 4, 5, 6, 7, 8
 OK, STDOUT, STDERR, EXIT, PONG, ERROR, RESUMED, STDIN_ACK = (

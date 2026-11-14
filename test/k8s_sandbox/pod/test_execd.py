@@ -1546,7 +1546,7 @@ def execd_starts(
         def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
             nonlocal running
             if running and "--replace" not in cmd:  # as execd finds its port taken
-                return 2, b"", b"listen tcp :24601: bind: address already in use\n"
+                return 2, b"", b"listen tcp :14601: bind: address already in use\n"
             running = True
             meanwhile()
             return 0, b"0" * 64 + b"\n", b""

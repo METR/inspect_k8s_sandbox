@@ -66,5 +66,5 @@ additionalResources:
             - world
           toPorts:
             - ports:
-                - port: "24601"
+                - port: "14601"
                   protocol: TCP
