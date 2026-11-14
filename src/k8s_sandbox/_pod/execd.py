@@ -380,7 +380,8 @@ class Link:
                     and c is not None
                     and c.stdin_put < put <= c.stdin_sent
                 ):
-                    await self.pace.take(n)
+                    # A call's first ack is not counted, as its streams' first frames.
+                    await self.pace.take(n, frames=int(c.stdin_put > 0))
                     c.stdin_put = put
                     c.stdin_room.set()
                 elif c is not None and (
@@ -388,7 +389,9 @@ class Link:
                     or (kind in (STDOUT, STDERR) and n)
                     or (kind == RESUMED and c.resuming)
                 ):
-                    await self.pace.take(n)
+                    # Counted: a stream's frames after its first; calls bound the rest.
+                    more = kind in (STDOUT, STDERR) and c.got[kind - STDOUT] > 0
+                    await self.pace.take(n, frames=int(more))
                     # Checked before counting it, so a resume asks for it again.
                     if c.queue.qsize() >= MAX_QUEUED:  # tiny or control frames, too
                         return

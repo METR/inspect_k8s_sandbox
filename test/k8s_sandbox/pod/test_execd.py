@@ -1723,6 +1723,33 @@ async def test_what_a_pod_delivers_is_paced(
     assert clock.now == 2.0
 
 
+async def test_calls_that_each_print_and_exit_are_not_paced_as_a_flood(
+    daemons: Daemons, clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: 32 callers on a pod reached the frame cap, and its calls stalled."""
+    monkeypatch.setattr(execd, "PACE_FRAMES", 50)
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind == execd.STDIN and payload:
+                w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": 1}'))
+            elif kind == execd.STDIN:  # stdin's end: the command prints and exits
+                w.write(frame(execd.STDOUT, call_id, b"out\n"))
+                w.write(frame(execd.STDERR, call_id, b"err\n"))
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    await daemons.serve(answers)
+    client = daemons.client()
+    calls = [client.exec(["sh"], b"x", None, {}, None, None) for _ in range(60)]
+
+    results = await asyncio.wait_for(asyncio.gather(*calls), 30)
+
+    # Four frames a call, several times the cap, and no read waited for the next second.
+    assert clock.now == 0.0
+    assert {(r.stdout, r.stderr) for r in results} == {("out\n", "err\n")}
+
+
 async def test_the_stray_count_spans_reconnects(
     daemons: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
