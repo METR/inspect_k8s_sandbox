@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -114,6 +115,39 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 	}
 	if len(wanted) != 0 {
 		t.Fatalf("wanted %v: a worker as that uid could open the other VM's socket", wanted)
+	}
+}
+
+// A profile made again from the node's default would bring these back: io_uring, and the calls by which a worker could slow its own reaper.
+func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
+	everywhere := []string{"io_uring_setup", "io_uring_enter", "io_uring_register"}
+	launchers := []string{"sched_setattr", "sched_setscheduler", "sched_setparam", "sched_setaffinity", "setpriority", "ioprio_set"}
+	files, _ := filepath.Glob("profiles/*/*.json")
+	if len(files) != 4 {
+		t.Fatalf("found %d profiles, want two for each of two architectures: %v", len(files), files)
+	}
+	for _, file := range files {
+		var profile struct {
+			Syscalls []struct {
+				Names  []string `json:"names"`
+				Action string   `json:"action"`
+			} `json:"syscalls"`
+		}
+		b, err := os.ReadFile(file)
+		if err != nil || json.Unmarshal(b, &profile) != nil || len(profile.Syscalls) == 0 {
+			t.Fatalf("%s is no seccomp profile: %v", file, err)
+		}
+		refused := everywhere
+		if strings.HasSuffix(file, "-launcher.json") {
+			refused = append(refused, launchers...)
+		}
+		for _, rule := range profile.Syscalls {
+			for _, name := range rule.Names {
+				if rule.Action == "SCMP_ACT_ALLOW" && slices.Contains(refused, name) {
+					t.Errorf("%s allows %s", file, name)
+				}
+			}
+		}
 	}
 }
 
