@@ -134,7 +134,7 @@ spec:
         {{- /* Once, before any program of the service. */}}
         - name: egress-capture
           image: {{ $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", "redirect", "-forwarder", "65532"]
+          command: ["/vsock-egress", "redirect", "-forwarder", "65532"{{ range $.Values.egressCaptureRanges }}, {{ printf "-range=%s" . | quote }}{{ end }}]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

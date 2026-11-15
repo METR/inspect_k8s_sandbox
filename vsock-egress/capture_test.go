@@ -273,7 +273,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		t.Fatalf("bring lo up: %v", err)
 	}
 	for run := range 2 { // an init container that is started again
-		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid())}); err != nil {
+		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid()), "-range", "10.78.0.0/16:8443", "-range", "10.77.0.0/24:5432"}); err != nil {
 			t.Fatalf("run %d: %v", run+1, err)
 		}
 	}
@@ -341,12 +341,12 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		n, err := c.Read(read)
 		return c, n, err
 	}
-	asks := func() (net.Conn, *bufio.Reader) {
+	asks := func(target string) (net.Conn, *bufio.Reader) {
 		c := within(t, accepted, "connection at the proxy")
 		c.SetDeadline(time.Now().Add(budget))
 		r := bufio.NewReader(c)
-		if request, err := http.ReadRequest(r); err != nil || request.Method != "CONNECT" || request.Host != "pypi.org:8443" {
-			t.Fatalf("the proxy read %+v, %v: want CONNECT pypi.org:8443", request, err)
+		if request, err := http.ReadRequest(r); err != nil || request.Method != "CONNECT" || request.Host != target {
+			t.Fatalf("the proxy read %+v, %v: want CONNECT %s", request, err, target)
 		}
 		return c, r
 	}
@@ -355,7 +355,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a connection to %v: %v", pypi, err)
 	}
-	atProxy, fromClient := asks()
+	atProxy, fromClient := asks("pypi.org:8443")
 	atProxy.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\nhello")) // a server that speaks first
 	client.Write([]byte("ping"))
 	read := make([]byte, 5)
@@ -369,7 +369,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	if client, _, err = connected(pypi, nil); err != nil {
 		t.Fatal(err)
 	}
-	atProxy, _ = asks()
+	atProxy, _ = asks("pypi.org:8443")
 	atProxy.Write([]byte("HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\nno"))
 	if n, err := client.Read(read); n != 0 || !errors.Is(err, unix.ECONNRESET) {
 		t.Fatalf("the program read %q, %v from a connection the proxy refused: want a reset", read[:n], err)
@@ -388,5 +388,42 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	}
 	if c, err := net.DialTimeout("tcp4", "192.0.2.1:443", budget); !errors.Is(err, unix.ENETUNREACH) {
 		t.Fatalf("a connection to an address outside %v: %v, %v: want no route", captureRange, c, err)
+	}
+
+	// A granted range's port reaches the proxy by address, from every address of the network.
+	for _, to := range []string{"10.77.0.10:5432", "10.77.0.255:5432", "10.78.3.4:8443"} {
+		if _, _, err := connected(to, nil); err != nil {
+			t.Fatalf("a connection to %v, in a granted range: %v", to, err)
+		}
+		asks(to)
+	}
+	// The range is the machine's own, so the pod itself would answer on its other ports.
+	own, err := net.Listen("tcp4", "0.0.0.0:22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.Close()
+	if c, err := net.DialTimeout("tcp4", "10.77.0.10:22", budget); !errors.Is(err, unix.EHOSTUNREACH) {
+		t.Fatalf("a connection to another port of a granted range: %v, %v: want it refused at once", c, err)
+	}
+	datagram, err := net.Dial("udp4", "10.77.0.10:5432")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer datagram.Close()
+	if _, err := datagram.Write([]byte("x")); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("a datagram to a granted range's port: %v: want it refused", err)
+	}
+	if len(accepted) != 0 {
+		t.Fatal("what a grant does not name reached the proxy")
+	}
+}
+
+func TestGrantRefuses(t *testing.T) {
+	// 0.0.0.0/1 as a local route took a connection to 127.0.0.1.
+	for _, s := range []string{"0.0.0.0/1:443", "127.0.0.1/32:80", "198.19.0.0/16:443", "fd00::/64:443", "10.77.0.9/24:443", "10.77.0.0/24", "10.77.0.0/24:0", "10.77.0.0/24:65536"} {
+		if r, err := grant(s); err == nil {
+			t.Errorf("%s is the grant %v: want it refused", s, r)
+		}
 	}
 }

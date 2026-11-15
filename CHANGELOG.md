@@ -15,7 +15,8 @@
 - A pod that also carries `inspect-k8s-sandbox/egress-capture: "true"` reaches that proxy
   from programs that ignore proxy settings: see `vsock-egress/README.md`. Its init
   container runs as root with `NET_ADMIN`, which a namespace at the `baseline` Pod
-  Security Standard refuses.
+  Security Standard refuses. The new `egressCaptureRanges` value names IPv4 ranges, each
+  with one TCP port, that such a pod also reaches through its proxy, by address.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

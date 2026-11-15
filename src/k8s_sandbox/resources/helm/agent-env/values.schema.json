@@ -75,6 +75,12 @@
     "egressForwarderImage": {
       "type": "string"
     },
+    "egressCaptureRanges": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "corednsImage": {
       "type": "string"
     },
