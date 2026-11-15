@@ -30,6 +30,9 @@
   ends.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
+- **BREAKING CHANGE**: A key the chart does not render is now rejected with a schema
+  error: in a service's `env` item, any key but `name` and `value`, such as `valueFrom`;
+  in an init container, a key such as `envFrom` or `restartPolicy`. Remove it.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
   entrypoint. The default entrypoint requires `sh` and `sleep`. Services explicitly
   configured to run `tail -f /dev/null` still accumulate zombies; they must use the

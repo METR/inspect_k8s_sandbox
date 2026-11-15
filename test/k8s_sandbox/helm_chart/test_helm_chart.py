@@ -1,4 +1,5 @@
 import ipaddress
+import pathlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -424,12 +425,46 @@ def test_init_containers_with_all_fields(
     assert agent_env_var is not None
     assert "agent-env-my-release" in agent_env_var["value"]
     assert {"name": "GREETING", "value": "hello"} in init_container["env"]
+    assert {"name": "RETRIES", "value": "3"} in init_container["env"]
 
     # Test volumeMounts, onto a volume the service declares
     assert init_container["volumeMounts"] == [
         {"name": "shared", "mountPath": "/shared"}
     ]
     assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
+
+
+_VALUE_FROM = "{name: TOKEN, valueFrom: {secretKeyRef: {name: token, key: value}}}"
+
+
+@pytest.mark.parametrize(
+    ("default", "key"),
+    [
+        (f"env: [{_VALUE_FROM}]", "valueFrom"),
+        (
+            f"initContainers: [{{name: init, image: busybox, env: [{_VALUE_FROM}]}}]",
+            "valueFrom",
+        ),
+        (
+            "initContainers: [{name: init, image: busybox,"
+            " envFrom: [{secretRef: {name: token}}]}]",
+            "envFrom",
+        ),
+    ],
+    ids=["service env", "init container env", "init container"],
+)
+def test_a_key_the_chart_does_not_render_is_refused(
+    chart_dir: pathlib.Path, tmp_path: pathlib.Path, default: str, key: str
+) -> None:
+    """Regression: it passed the schema, and the pod was made without it."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"services: {{default: {{{default}}}}}")
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, values)
+
+    assert "values don't meet the specifications of the schema" in exc_info.value.stderr
+    assert key in exc_info.value.stderr
 
 
 def test_resource_requests_and_limits(
@@ -1071,9 +1106,7 @@ def _run_helm_template(
         cmd += ["--set-string", set_string]
 
     # stderr is captured so that tests asserting rejection can check why helm failed.
-    result = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
     return list(yaml.safe_load_all(result.stdout))
 
 

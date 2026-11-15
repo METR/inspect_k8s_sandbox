@@ -215,7 +215,11 @@
               "type": "object"
             },
             "env": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "properties": {"name": {}, "value": {}},
+                "additionalProperties": false
+              }
             },
             "resources": {
               "type": "object"
@@ -259,12 +263,19 @@
                   "args": { "type": "array", "items": { "type": "string" } },
                   "imagePullPolicy": {"type": "string"},
                   "workingDir": {"type": "string"},
-                  "env": {"type": "array"},
+                  "env": {
+                    "type": "array",
+                    "items": {
+                      "properties": {"name": {}, "value": {}},
+                      "additionalProperties": false
+                    }
+                  },
                   "volumeMounts": {"type": "array"},
                   "resources": {"type": "object"},
                   "securityContext": {"type": "object"}
                 },
-                "required": ["name", "image"]
+                "required": ["name", "image"],
+                "additionalProperties": false
               }
             }
           },
