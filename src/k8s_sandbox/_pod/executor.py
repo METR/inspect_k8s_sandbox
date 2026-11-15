@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import os
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, TypeVar
 
 from inspect_ai.util import concurrency
@@ -29,21 +30,21 @@ class PodOpExecutor:
     def __init__(self, max_pod_ops: int | None = None) -> None:
         if max_pod_ops is not None:
             self._max_workers = max_pod_ops
-            source = "max_pod_ops argument"
+            self._source = "max_pod_ops argument"
         else:
             try:
                 self._max_workers = int(os.environ["INSPECT_MAX_POD_OPS"])
-                source = "INSPECT_MAX_POD_OPS env var"
+                self._source = "INSPECT_MAX_POD_OPS env var"
             except (KeyError, ValueError):
                 cpu_count = os.cpu_count() or 1
                 # Pod operations are typically I/O-bound (from the
                 # client's perspective).
                 self._max_workers = cpu_count * 4
-                source = f"default (cpu_count={cpu_count} * 4)"
+                self._source = f"default (cpu_count={cpu_count} * 4)"
         log_debug(
             "Creating PodOpExecutor.",
             max_workers=self._max_workers,
-            source=source,
+            source=self._source,
         )
         self._executor = ThreadPoolExecutor(
             max_workers=self._max_workers, thread_name_prefix="pod-op-executor"
@@ -67,12 +68,18 @@ class PodOpExecutor:
         elif max_pod_ops is not None and cls._instance._max_workers != max_pod_ops:
             raise ValueError(
                 "PodOpExecutor is already initialized with "
-                f"max_pod_ops={cls._instance._max_workers}; cannot use "
-                f"max_pod_ops={max_pod_ops}."
+                f"max_pod_ops={cls._instance._max_workers} (from "
+                f"{cls._instance._source}); cannot use max_pod_ops={max_pod_ops}. "
+                "The limit is process-wide: set the same max_pod_ops on every "
+                "task, or use the INSPECT_MAX_POD_OPS env var."
             )
         return cls._instance
 
-    async def queue_operation(self, callable: Callable[[], T]) -> T:
+    async def queue_operation(
+        self,
+        callable: Callable[[], T],
+        discard: Callable[[T], object] | None = None,
+    ) -> T:
         """
         Queue a synchronous pod operation to run asynchronously and return the result.
 
@@ -82,13 +89,26 @@ class PodOpExecutor:
         of the number of ongoing operations. Other than the user display, the
         use of the semaphore is redundant.
 
+        `discard` gets a result that comes once the caller has stopped waiting.
+
         This method is async-safe but not thread-safe.
         """
-        async with concurrency("pod-op", self._max_workers):
-            # run_in_executor does not propagate the caller's context into the
-            # worker thread, so pass it directly to preserve Inspect
-            # sandbox config overrides
-            context = contextvars.copy_context()
-            return await asyncio.get_event_loop().run_in_executor(
-                self._executor, lambda: context.run(callable)
-            )
+        future: Future[T] | None = None
+        try:
+            async with concurrency("pod-op", self._max_workers):
+                # The executor does not propagate the caller's context into the
+                # worker thread, so pass it directly to preserve Inspect
+                # sandbox config overrides
+                context = contextvars.copy_context()
+                future = self._executor.submit(context.run, callable)
+                return await asyncio.wrap_future(future)
+        except BaseException:
+            if discard is not None and future is not None:
+                # Runs once: now if the result is already in, else when it is.
+                future.add_done_callback(lambda done: _discard(done, discard))
+            raise
+
+
+def _discard(future: Future[T], discard: Callable[[T], object]) -> None:
+    if not future.cancelled() and future.exception() is None:
+        threading.Thread(target=discard, args=(future.result(),), daemon=True).start()

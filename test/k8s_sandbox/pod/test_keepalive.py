@@ -36,3 +36,17 @@ def test_send_keepalive_exits_when_socket_closes():
 
     assert t.is_alive() is False
     ws_client.write_channel.assert_not_called()
+
+
+def test_send_keepalive_sends_nothing_on_v5():
+    """There, resize frames stop the server reading the exec's stdin."""
+    ws_client = Mock()
+    ws_client.subprotocol = "v5.channel.k8s.io"
+    ws_client.is_open.return_value = True
+    stop = threading.Event()
+    ws_client.write_channel.side_effect = lambda *args: stop.set()
+
+    with patch("k8s_sandbox._pod.op._KEEPALIVE_INTERVAL_SECONDS", 0):
+        _send_keepalive(ws_client, stop)
+
+    ws_client.write_channel.assert_not_called()

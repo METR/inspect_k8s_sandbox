@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 import k8s_sandbox
+from k8s_sandbox._helm import validate_no_null_values
 from k8s_sandbox.compose._converter import (
     ComposeConverterError,
     convert_compose_to_helm_values,
@@ -173,6 +174,7 @@ services:
     result = convert_compose_to_helm_values(compose_path)
 
     assert result["services"]["my-service"]["args"] == ["foo"]
+    assert result["services"]["my-service"]["command"] is None
 
 
 def test_converts_command_with_spaces(tmp_compose: TmpComposeFixture) -> None:
@@ -185,6 +187,7 @@ services:
     result = convert_compose_to_helm_values(compose_path)
 
     assert result["services"]["my-service"]["args"] == ["foo", "bar"]
+    assert result["services"]["my-service"]["command"] is None
 
 
 def test_converts_command_list(tmp_compose: TmpComposeFixture) -> None:
@@ -200,6 +203,105 @@ services:
     result = convert_compose_to_helm_values(compose_path)
 
     assert result["services"]["my-service"]["args"] == ["foo", "bar", "baz"]
+    assert result["services"]["my-service"]["command"] is None
+
+
+def test_command_without_entrypoint_unsets_chart_default_command(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    # Chart values.yaml sets services.default.command to an idle loop.
+    # A null deletes that key so the image ENTRYPOINT is used (compose semantics).
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: busybox:1.37
+    command: ["sh", "-c", "touch /tmp/i-ran && tail -f /dev/null"]
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["default"]["command"] is None
+    assert result["services"]["default"]["args"] == [
+        "sh",
+        "-c",
+        "touch /tmp/i-ran && tail -f /dev/null",
+    ]
+
+
+def test_command_with_entrypoint_keeps_explicit_helm_command(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: busybox:1.37
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["echo hello"]
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["default"]["command"] == ["/bin/sh", "-c"]
+    assert result["services"]["default"]["args"] == ["echo hello"]
+
+
+def test_entrypoint_only_does_not_emit_null_command(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: busybox:1.37
+    entrypoint: ["/bin/sh"]
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["default"]["command"] == ["/bin/sh"]
+    assert "args" not in result["services"]["default"]
+
+
+def test_command_null_survives_values_plumbing(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    # ComposeValuesSource validates converted values before writing the Helm
+    # values file. `command: null` must not be rejected, and must dump as YAML null
+    # so Helm can delete the chart default.
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: busybox:1.37
+    command: ["sh", "-c", "touch /tmp/i-ran && tail -f /dev/null"]
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+    dumped = yaml.dump(result, sort_keys=False)
+
+    validate_no_null_values(result, f"compose file {compose_path}")
+    assert "command: null" in dumped
+
+
+def test_command_null_output_validates_against_chart_schema(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: busybox:1.37
+    command: ["sh", "-c", "touch /tmp/i-ran && tail -f /dev/null"]
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    schema_path = (
+        Path(k8s_sandbox.__file__).parent
+        / "resources"
+        / "helm"
+        / "agent-env"
+        / "values.schema.json"
+    )
+    schema = json.loads(schema_path.read_text())
+    jsonschema.validate({**result, "global": {}}, schema)
 
 
 def test_converts_working_dir(tmp_compose: TmpComposeFixture) -> None:
@@ -952,24 +1054,194 @@ services:
     assert "Invalid seccomp profile" in str(exc_info.value)
 
 
-def test_rejects_non_seccomp_security_opt(
+def test_rejects_unsupported_security_opt(
     tmp_compose: TmpComposeFixture,
 ) -> None:
-    # Non-seccomp security_opt entries have no k8s mapping and must be rejected rather
-    # than silently dropped (so a security control isn't believed-applied when it
-    # isn't).
+    # Remaining non-seccomp/non-no-new-privileges security_opt entries have no k8s
+    # mapping and must be rejected rather than silently dropped (so a security control
+    # isn't believed-applied when it isn't).
     compose_path = tmp_compose("""
 services:
   my-service:
     image: my-image
     security_opt:
-      - no-new-privileges:true
+      - apparmor=unconfined
 """)
 
     with pytest.raises(ComposeConverterError) as exc_info:
         convert_compose_to_helm_values(compose_path)
 
     assert "Unsupported 'security_opt' entries" in str(exc_info.value)
+    assert "apparmor=unconfined" in str(exc_info.value)
+
+
+def test_converts_bare_no_new_privileges(tmp_compose: TmpComposeFixture) -> None:
+    # Docker treats a bare flag the same as no-new-privileges:true.
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    security_opt:
+      - no-new-privileges
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert (
+        result["services"]["my-service"]["securityContext"]["allowPrivilegeEscalation"]
+        is False
+    )
+
+
+@pytest.mark.parametrize("sep", ["=", ":"])
+def test_converts_security_opt_no_new_privileges(
+    sep: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    security_opt:
+      - "no-new-privileges{sep}true"
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert (
+        result["services"]["my-service"]["securityContext"]["allowPrivilegeEscalation"]
+        is False
+    )
+
+
+@pytest.mark.parametrize("sep", ["=", ":"])
+def test_omits_allow_privilege_escalation_when_no_new_privileges_false(
+    sep: str, tmp_compose: TmpComposeFixture
+) -> None:
+    # Emitting allowPrivilegeEscalation: true would override a stricter cluster policy.
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    security_opt:
+      - "no-new-privileges{sep}false"
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert "securityContext" not in result["services"]["my-service"]
+
+
+def test_no_new_privileges_false_does_not_clear_user_security_context(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    user: "1000"
+    security_opt:
+      - no-new-privileges:false
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["securityContext"] == {"runAsUser": 1000}
+
+
+def test_merges_no_new_privileges_into_user_and_seccomp_security_context(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    user: 1000:1001
+    security_opt:
+      - seccomp=./profiles/no-aslr.json
+      - no-new-privileges:true
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["securityContext"] == {
+        "runAsUser": 1000,
+        "runAsGroup": 1001,
+        "seccompProfile": {
+            "type": "Localhost",
+            "localhostProfile": "./profiles/no-aslr.json",
+        },
+        "allowPrivilegeEscalation": False,
+    }
+
+
+def test_no_new_privileges_output_validates_against_chart_schema(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: my-image
+    security_opt:
+      - no-new-privileges:true
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    schema_path = (
+        Path(k8s_sandbox.__file__).parent
+        / "resources"
+        / "helm"
+        / "agent-env"
+        / "values.schema.json"
+    )
+    schema = json.loads(schema_path.read_text())
+    jsonschema.validate({**result, "global": {}}, schema)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "no-new-privileges:",
+        "no-new-privileges=",
+        "no-new-privileges:TRUE",
+        "no-new-privileges=yes",
+        "no-new-privileges:1",
+    ],
+)
+def test_rejects_malformed_no_new_privileges(
+    value: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    security_opt:
+      - "{value}"
+""")
+
+    with pytest.raises(ComposeConverterError) as exc_info:
+        convert_compose_to_helm_values(compose_path)
+
+    assert "Invalid 'no-new-privileges' value" in str(exc_info.value)
+
+
+def test_converts_no_new_privileges_with_space_after_separator(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    security_opt:
+      - "no-new-privileges: true"
+""")
+
+    result = convert_compose_to_helm_values(compose_path)
+
+    assert (
+        result["services"]["my-service"]["securityContext"]["allowPrivilegeEscalation"]
+        is False
+    )
 
 
 def test_rejects_non_seccomp_security_opt_alongside_seccomp(
@@ -1052,17 +1324,42 @@ services:
     )
 
 
-def test_ignores_init_true(tmp_compose: TmpComposeFixture) -> None:
-    compose_path = tmp_compose("""
+@pytest.mark.parametrize(
+    ("service_name", "command_key", "expected_warning"),
+    [
+        ("default", None, False),
+        ("default", "entrypoint", True),
+        ("default", "command", True),
+        ("web", None, True),
+    ],
+)
+def test_ignores_init_true(
+    tmp_compose: TmpComposeFixture,
+    caplog: pytest.LogCaptureFixture,
+    service_name: str,
+    command_key: str | None,
+    expected_warning: bool,
+) -> None:
+    compose = f"""
 services:
-  my-service:
+  {service_name}:
     image: my-image
     init: true
-""")
+"""
+    if command_key:
+        compose += f'    {command_key}: ["tail", "-f", "/dev/null"]\n'
+    if service_name != "default":
+        compose += "  default:\n    image: my-image\n"
+    compose_path = tmp_compose(compose)
 
-    result = convert_compose_to_helm_values(compose_path)
+    with caplog.at_level(logging.WARNING):
+        result = convert_compose_to_helm_values(compose_path)
 
-    assert "my-service" in result["services"]
+    assert "init" not in result["services"][service_name]
+    assert (
+        any("Ignoring 'init: true'" in record.message for record in caplog.records)
+        == expected_warning
+    )
 
 
 def test_ignores_expose_key(tmp_compose: TmpComposeFixture) -> None:

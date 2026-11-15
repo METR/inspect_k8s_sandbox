@@ -51,7 +51,8 @@ async def test_race_window_restart_detected_on_recheck():
 
     assert exc_info.value.restart_count == 1
     assert exc_info.value.last_reason == "OOMKilled"
-    assert pod.info.initial_restart_count == 1
+    # In "raise" mode the identity stays the one the sample had.
+    assert pod.info.initial_restart_count == 0
 
 
 async def test_race_window_pod_replaced_on_recheck():
@@ -81,7 +82,7 @@ async def test_race_window_pod_replaced_on_recheck():
 
     assert exc_info.value.old_uid == "uid-OLD"
     assert exc_info.value.new_uid == "uid-NEW"
-    assert pod.info.uid == "uid-NEW"
+    assert pod.info.uid == "uid-OLD"
 
 
 async def test_failed_exec_no_restart_returns_exec_result():

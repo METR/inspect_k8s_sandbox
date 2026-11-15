@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -8,8 +9,10 @@ from textwrap import dedent
 from typing import AsyncGenerator, Generator
 from unittest.mock import patch
 
+import anyio
 import pytest
 import pytest_asyncio
+from anyio.streams.buffered import BufferedByteStream
 from inspect_ai.util import OutputLimitExceededError, SandboxEnvironmentLimits
 from kubernetes.stream.ws_client import ApiException, WSClient  # type: ignore
 from pytest import LogCaptureFixture
@@ -295,31 +298,49 @@ async def test_exec_user_when_specified_user_does_not_exist(
 
 
 async def test_exec_user_when_not_running_as_root(
-    sandbox_non_root: K8sSandboxEnvironment,
+    sandbox_non_root: K8sSandboxEnvironment, log_warning: LogCaptureFixture
 ) -> None:
-    with pytest.raises(K8sError) as excinfo:
-        await sandbox_non_root.exec(["whoami"], user="nobody")
+    # A container that cannot perform the switch is a property of the environment
+    # rather than a bad argument, so this warns and returns a failed ExecResult. That
+    # lets a caller which probes with a user fall back to the container's own user, as
+    # inspect-ai does when injecting its sandbox tools.
+    result = await sandbox_non_root.exec(["whoami"], user="nobody")
 
-    error_msg = str(excinfo.value.__cause__)
-    assert (
-        "When a user parameter ('nobody') is provided to exec(), the container must be "
-        "running as root" in error_msg
+    assert not result.success
+    assert "may not be used by non-root users" in result.stderr
+    assert any(
+        "the container is not running as root" in record.message
+        and "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
+        in record.message
+        for record in log_warning.records
     )
-    assert "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user" in error_msg
 
 
 async def test_exec_user_when_runuser_not_installed(
-    sandbox_busybox: K8sSandboxEnvironment,
+    sandbox_busybox: K8sSandboxEnvironment, log_warning: LogCaptureFixture
 ) -> None:
-    with pytest.raises(K8sError) as excinfo:
-        await sandbox_busybox.exec(["whoami"], user="foo")
+    """A container without runuser cannot switch users, but can still be used.
 
-    error_msg = str(excinfo.value.__cause__)
-    assert (
-        "When a user parameter ('foo') is provided to exec(), the runuser binary "
-        "must be installed in the container"
-    ) in error_msg
-    assert "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user" in error_msg
+    Like the non-root case, this is the environment being unable to perform the
+    switch rather than the caller naming a user that does not exist, so it warns
+    and returns the failed result instead of raising. The caller can then retry
+    without a user -- which is what inspect-ai's tool injector does.
+    """
+    result = await sandbox_busybox.exec(["whoami"], user="foo")
+
+    assert not result.success
+    assert "runuser" in result.stderr
+    assert any(
+        "runuser binary" in record.message
+        and "https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user"
+        in record.message
+        for record in log_warning.records
+    )
+
+    # The recovery the warning exists to permit.
+    fallback = await sandbox_busybox.exec(["whoami"])
+
+    assert fallback.success
 
 
 async def test_exec_does_not_raise_error_if_command_happens_to_use_runuser(
@@ -385,6 +406,16 @@ async def test_exec_non_utf8_output_is_replaced(sandbox: K8sSandboxEnvironment) 
 
     assert result.success
     assert result.stdout == "before \ufffd after"
+
+
+async def test_exec_output_cannot_end_the_exec(sandbox: K8sSandboxEnvironment) -> None:
+    # A command printing what used to end exec() with exit code 0 still runs to its end.
+    cmd = ["sh", "-c", "printf '<completed-sentinel-value-0>'; sleep 1; exit 3"]
+
+    result = await sandbox.exec(cmd)
+
+    assert result.returncode == 3
+    assert result.stdout == "<completed-sentinel-value-0>"
 
 
 async def test_exec_background_returns(sandbox: K8sSandboxEnvironment) -> None:
@@ -600,22 +631,23 @@ async def _wait_for_restart(sandbox: K8sSandboxEnvironment, timeout=30):
 
 
 async def test_exec_after_container_restart_warns(
-    sandbox: K8sSandboxEnvironment,
     log_warning: LogCaptureFixture,
 ) -> None:
-    await sandbox.exec(["kill", "1"])
-    await _wait_for_restart(sandbox)
+    async with install_sandbox_environments(__file__, "restart-values.yaml") as envs:
+        sandbox = envs["default"]
+        await sandbox.exec(["kill", "1"])
+        await _wait_for_restart(sandbox)
 
-    await sandbox.exec(["ls"])
+        await sandbox.exec(["ls"])
 
-    assert "has restarted" in log_warning.records[0].message
+        assert "has restarted" in log_warning.records[0].message
 
 
 async def test_exec_after_container_restart_raises(
     log_err: LogCaptureFixture,
 ) -> None:
     async with install_sandbox_environments(
-        __file__, "values.yaml", restarted_container_behavior="raise"
+        __file__, "restart-values.yaml", restarted_container_behavior="raise"
     ) as envs:
         sandbox = envs["default"]
         await sandbox.exec(["kill", "1"])
@@ -1002,3 +1034,51 @@ async def test_can_get_sandbox_connection_with_default_user(
     # The attachToK8sContainer command does not support passing in a user name, so
     # we don't return any VS Code command.
     assert result.vscode_command is None
+
+
+async def test_exec_stdio_carries_requests_and_replies(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo ready; exec cat"])
+    )
+    try:
+        with anyio.fail_after(60):
+            ready = await stream.receive_until(b"\n", 100)
+            await stream.send(b"echoed\n")
+            echoed = await stream.receive_until(b"\n", 100)
+    finally:
+        await stream.aclose()
+
+    assert (ready, echoed) == (b"ready", b"echoed")
+
+
+async def test_closing_exec_stdio_ends_the_command(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    """Its stdin closes with the stream, so a command reading it (the bridge) exits."""
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo $$; exec cat"])
+    )
+    with anyio.fail_after(60):
+        pid = (await stream.receive_until(b"\n", 100)).decode()
+    await stream.aclose()
+
+    with anyio.fail_after(60):
+        while (await sandbox_busybox.exec(["kill", "-0", pid])).success:
+            await anyio.sleep(0.5)
+
+
+async def test_exec_stdio_runs_as_the_default_user(
+    sandbox_with_default_user: K8sSandboxEnvironment,
+) -> None:
+    stream = await sandbox_with_default_user.exec_stdio(["id", "-un"])
+    output = b""
+    try:
+        with anyio.fail_after(60), contextlib.suppress(anyio.EndOfStream):
+            while True:
+                output += await stream.receive()
+    finally:
+        await stream.aclose()
+
+    assert output == b"ubuntu\n"

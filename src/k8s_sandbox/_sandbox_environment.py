@@ -4,11 +4,12 @@ import re
 import shlex
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Generator, Literal, cast, overload
 
 import websocket
+from anyio.abc import ByteStream
 from inspect_ai.solver._task_state import sample_state
 from inspect_ai.util import (
     ComposeConfig,
@@ -47,6 +48,8 @@ from k8s_sandbox._manager import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecdResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
@@ -82,6 +85,8 @@ _PERMANENT_TYPES = (
     TimeoutError,
     FileNotFoundError,
     IsADirectoryError,
+    ContainerStoppedError,  # a retry would reach the container that replaced it
+    ExecdResultUnknownError,  # a retry would re-run what execd couldn't resume
 )
 
 
@@ -95,6 +100,12 @@ def _retry() -> AsyncRetrying:
         retry=retry_if_exception(
             lambda e: isinstance(e, _TRANSIENT_TYPES)
             and not isinstance(e, _PERMANENT_TYPES)
+        ),
+        # Logged: over Kubernetes exec the operation may run a second time.
+        before_sleep=lambda state: log_warn(
+            "sandbox operation failed: sending it again",
+            attempt=state.attempt_number,
+            error=repr(state.outcome.exception()) if state.outcome else None,
         ),
         reraise=True,
     )
@@ -225,8 +236,21 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             sample_uuid=sample_uuid,
             extra_values=extra_values,
         )
-        await HelmReleaseManager.get_instance().install(release)
-        return reorder_default_first(await get_sandboxes(release, resolved_config))
+        manager = HelmReleaseManager.get_instance()
+        try:
+            await manager.install(release)
+            return reorder_default_first(await get_sandboxes(release, resolved_config))
+        except Exception:
+            # Inspect does not call sample_cleanup() when sample_init() raises, and
+            # uninstall_all() does not run until the whole eval ends, so nothing else
+            # removes what Helm created. Without this, each retried sample leaves a
+            # full set of sandbox pods behind.
+            # A failed uninstall must not replace the original error (which carries the
+            # pod diagnostics), and leaves the release tracked so that uninstall_all()
+            # retries it and reports it.
+            with suppress(Exception):
+                await manager.uninstall(release, quiet=True)
+            raise
 
     @classmethod
     async def sample_cleanup(
@@ -243,7 +267,20 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         sandbox: K8sSandboxEnvironment = cast(
             K8sSandboxEnvironment, next(iter(environments.values()))
         )
-        await HelmReleaseManager.get_instance().uninstall(sandbox.release, quiet=True)
+        try:
+            await HelmReleaseManager.get_instance().uninstall(
+                sandbox.release, quiet=True
+            )
+        except Exception as e:
+            # Inspect turns an exception raised here into a sample error, which would
+            # discard a sample that had otherwise succeeded. The release stays tracked
+            # for uninstall_all().
+            log_warn(
+                "Failed to uninstall Helm release during sample cleanup; it will be "
+                "retried at the end of the eval.",
+                release=sandbox.release.release_name,
+                error=e,
+            )
 
     async def exec(
         self,
@@ -283,6 +320,24 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                     )
             log_trace(f"Completed: {op}.", **(log_kwargs | {"result": result}))
             return result
+
+    async def exec_stdio(self, cmd: list[str], user: str | None = None) -> ByteStream:
+        if user is None:
+            user = self._config.default_user
+        with self._log_op("K8s open exec stdio in Pod", (), cmd=cmd):
+            # A retry may start a second: the first's stdin ends with its connection.
+            async for attempt in _retry():
+                with attempt:
+                    stream = await self._pod.exec_stdio(cmd, user)
+            try:
+                # After the open, so a restart during it is found; retried by itself.
+                async for attempt in _retry():
+                    with attempt:
+                        await self._pod.check_for_pod_restart()
+            except BaseException:
+                await stream.aclose()
+                raise
+            return stream
 
     async def write_file(self, file: str, contents: str | bytes) -> None:
         data = contents.encode("utf-8") if isinstance(contents, str) else contents
@@ -429,7 +484,13 @@ class K8sSandboxEnvironmentConfig(BaseModel, frozen=True):
     """The user to run commands as in the container if user is not specified."""
     restarted_container_behavior: Literal["warn", "raise"] = "warn"
     max_pod_ops: int | None = None
-    """Maximum number of concurrent pod operations. Defaults to cpu_count * 4."""
+    """Maximum number of concurrent pod operations. Defaults to cpu_count * 4.
+
+    The limit is process-wide, not per-task: whichever task initialises the
+    executor first fixes it for the process. Set the same value on every task
+    run in the process (a task with a conflicting value fails at startup), or
+    use the INSPECT_MAX_POD_OPS env var instead.
+    """
 
 
 def _key_to_pascal(key: str) -> str:

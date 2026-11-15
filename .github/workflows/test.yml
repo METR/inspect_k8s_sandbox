@@ -32,6 +32,12 @@ jobs:
           grep -q 'post-create.sh --no-cluster' .devcontainer/devcontainer.json
       - run: npm install -g @devcontainers/cli@v0.83.2
       - run: devcontainer up --workspace-folder=.
+      # The execd tests connect to pod IPs from here; the devcontainer can't add routes.
+      - name: Route the pod network to minikube
+        if: ${{ matrix.cluster }}
+        run: |
+          cidr=$(devcontainer exec --workspace-folder=. kubectl get ciliumnodes -o jsonpath='{.items[0].spec.ipam.podCIDRs[0]}')
+          sudo ip route add "$cidr" via "$(devcontainer exec --workspace-folder=. minikube ip)"
       - run: devcontainer exec --workspace-folder=. helm version --short
       - run: |
           devcontainer exec --workspace-folder=. \

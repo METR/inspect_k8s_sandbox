@@ -1,0 +1,70 @@
+# values.yaml's default and nonroot services, on execd (the image post-create.sh builds).
+services:
+  default:
+    workingDir: "/root"
+    resources: &resources
+      limits:
+        memory: "256Mi"
+        cpu: "100m"
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+    podAnnotations: &annotations
+      inspect-k8s-sandbox/execd: "true"
+    initContainers: &initContainers
+      - name: execd
+        image: execd:local
+        imagePullPolicy: Never
+        command: ["cp", "/execd", "/out/execd"]
+        volumeMounts:
+          - name: execd
+            mountPath: /out
+    volumes: &volumes
+      - name: execd
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Mi
+    volumeMounts: &volumeMounts
+      - name: execd
+        mountPath: /execd
+        readOnly: true
+  # ubuntu:24.04 has a `ubuntu` user with UID 1000.
+  nonroot:
+    image: "ubuntu:24.04"
+    command: ["tail", "-f", "/dev/null"]
+    workingDir: "/home/ubuntu"
+    securityContext:
+      runAsUser: 1000
+      runAsNonRoot: true
+    resources: *resources
+    podAnnotations: *annotations
+    initContainers: *initContainers
+    volumes: *volumes
+    volumeMounts: *volumeMounts
+  # Linux's own check of who may read /proc: gVisor's differs.
+  runc:
+    image: "python:3.12-bookworm"
+    command: ["tail", "-f", "/dev/null"]
+    runtimeClassName: runc
+    resources: *resources
+    podAnnotations: *annotations
+    initContainers: *initContainers
+    volumes: *volumes
+    volumeMounts: *volumeMounts
+additionalResources:
+  # The test client connects from the host, outside the cluster.
+  - apiVersion: cilium.io/v2
+    kind: CiliumNetworkPolicy
+    metadata:
+      name: '{{ template "agentEnv.fullname" $ }}-execd-ingress'
+    spec:
+      endpointSelector:
+        matchLabels:
+          app.kubernetes.io/instance: "{{ .Release.Name }}"
+      ingress:
+        - fromEntities:
+            - world
+          toPorts:
+            - ports:
+                - port: "14601"
+                  protocol: TCP

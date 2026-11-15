@@ -14,6 +14,20 @@ if [ "$CLUSTER" = true ]; then
   # github actions runner has 2 cpus, 8G memory
   minikube start --addons=gvisor --cni bridge --container-runtime=containerd --memory=4g
 
+  echo "Waiting for the gvisor addon to finish..."
+  timeout 300 sh -c 'until kubectl -n kube-system logs gvisor 2>/dev/null | grep -q "gvisor successfully enabled in cluster"; do sleep 2; done'
+
+  GVISOR_RELEASE=20260817.0
+  for gvisor_binary in runsc containerd-shim-runsc-v1; do
+    echo "Installing gVisor $GVISOR_RELEASE $gvisor_binary..."
+    curl -L --fail --remote-name-all \
+      "https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64/${gvisor_binary}"{,.sha512}
+    sha512sum --check "${gvisor_binary}.sha512"
+    chmod +x "$gvisor_binary"
+    minikube cp "$gvisor_binary" "/usr/bin/${gvisor_binary}"
+    rm "$gvisor_binary"{,.sha512}
+  done
+
   # Add the containerd RuntimeClass to the cluster.
   kubectl apply -f - <<EOF
 apiVersion: node.k8s.io/v1
@@ -33,6 +47,9 @@ provisioner: k8s.io/minikube-hostpath
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 EOF
+
+  echo "Building execd for test/k8s_sandbox/resources/execd-values.yaml..."
+  minikube image build -t execd:local execd
 
   # Install Cilium CLI. Previously, the ghcr.io/audacioustux/devcontainers/cilium:1
   # devcontainer feature was used, but it doesn't allow a specific version of the CLI to
