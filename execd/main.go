@@ -49,7 +49,7 @@ func main() {
 	run(*port, *keyHash, *replace)
 }
 
-// memoryLimit is half the container's memory limit, or 32 MiB if that is more or the limit can't be read; none where the container has none.
+// memoryLimit is half the cgroup's memory limit, or 32 MiB if that is more or the limit can't be read; none where it has none.
 func memoryLimit(cgroupMax []byte, err error) int64 {
 	limit := strings.TrimSpace(string(cgroupMax))
 	if limit == "max" {
@@ -60,6 +60,14 @@ func memoryLimit(cgroupMax []byte, err error) int64 {
 		return 32 << 20
 	}
 	return max(n/2, 32<<20)
+}
+
+// cgroupLimit reads cgroup v2's memory limit under root, or v1's where there is none, as on gVisor.
+func cgroupLimit(root string) ([]byte, error) {
+	if limit, err := os.ReadFile(root + "/memory.max"); err == nil {
+		return limit, nil
+	}
+	return os.ReadFile(root + "/memory/memory.limit_in_bytes")
 }
 
 // become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
@@ -151,7 +159,7 @@ func run(port int, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
-	debug.SetMemoryLimit(memoryLimit(os.ReadFile("/sys/fs/cgroup/memory.max"))) // soft: execd's garbage counts against the sandbox's memory
+	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())

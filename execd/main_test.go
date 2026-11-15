@@ -26,8 +26,21 @@ func TestTheMemoryLimitIsHalfTheContainers(t *testing.T) {
 			t.Errorf("memory.max %q: limit %d, want %d", cgroupMax, got, want)
 		}
 	}
-	if got := memoryLimit(nil, os.ErrNotExist); got != 32<<20 { // cgroup v1
-		t.Errorf("no memory.max: limit %d, want 32 MiB", got)
+	if got := memoryLimit(nil, os.ErrNotExist); got != 32<<20 {
+		t.Errorf("no cgroup file: limit %d, want 32 MiB", got)
+	}
+}
+
+func TestTheMemoryLimitIsReadFromCgroupV2OrV1(t *testing.T) {
+	for _, file := range []string{"memory.max", "memory/memory.limit_in_bytes"} { // v1 is all gVisor has
+		root := t.TempDir()
+		os.Mkdir(root+"/memory", 0o755)
+		if err := os.WriteFile(root+"/"+file, []byte("2147483648\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := memoryLimit(cgroupLimit(root)); got != 1<<30 {
+			t.Errorf("%s: limit %d, want half of 2 GiB", file, got)
+		}
 	}
 }
 
