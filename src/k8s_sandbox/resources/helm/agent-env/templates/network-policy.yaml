@@ -17,9 +17,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-sandbox-egress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow egress to:
@@ -127,11 +127,11 @@ spec:
     {{- end }}
     {{- with .Values.allowEntities }}
     - toEntities:
-      {{- toYaml . | nindent 6 }}
+      {{- include "agentEnv.toYaml" . | nindent 6 }}
     {{- end }}
     {{- with .Values.allowCIDR }}
     - toCIDR:
-      {{- toYaml . | nindent 6 }}
+      {{- include "agentEnv.toYaml" . | nindent 6 }}
     {{- end }}
 ---
 apiVersion: cilium.io/v2
@@ -139,9 +139,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-sandbox-default-deny-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: Default deny ingress. Allow other policies to be more specific.
   endpointSelector:
@@ -160,9 +160,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-{{ $net }}-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow ingress to workload "{{ $svcName }}" from same sandbox on network "{{ $net }}".
@@ -211,9 +211,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow ingress to workload "{{ $svcName }}" from same sandbox.
@@ -255,9 +255,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-isolate
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Isolate service "{{ $svcName }}" (network_mode: none): no ingress allow is emitted

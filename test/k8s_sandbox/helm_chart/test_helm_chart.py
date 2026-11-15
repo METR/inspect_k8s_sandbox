@@ -1,4 +1,5 @@
 import ipaddress
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -519,6 +520,46 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     # The chart upper-cases an allowDomainsPorts protocol.
     assert protocols["8008"] == ("TCP" + spliced).upper()
     assert protocols["22"] == ("TCP" + spliced).upper()
+
+
+def test_fails_on_a_value_helm_cannot_render(chart_dir: Path) -> None:
+    # Helm's toYaml returns nothing for a DEL in a task's name.
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_helm_template(chart_dir, set_string="annotations.inspectTaskName=task\x7f")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("services.default.resources.<<.limits.cpu=7", '"<<" key'),
+        ("annotations.inspectTaskName=task\u0085", "U+0085"),
+        ("services.default.nodeSelector.zz=x\n\u2028    hostPID: true", "U+2028"),
+        ("services.default.nodeSelector.zz=x\n\u2029    hostPID: true", "U+2029"),
+    ],
+    ids=["merge-key", "next-line", "line-separator", "paragraph-separator"],
+)
+def test_fails_on_a_value_toyaml_would_change(
+    chart_dir: Path, value: str, message: str
+) -> None:
+    # toYaml writes "<<" back as a merge, U+0085 as a space, the other two as breaks.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_string=value)
+
+    assert message in exc_info.value.stderr
+
+
+def test_only_the_helper_calls_toyaml(chart_dir: Path) -> None:
+    # Helm's own toYaml renders nothing where it fails: a block that calls it vanishes.
+    calls = [
+        template.name
+        for template in (chart_dir / "templates").rglob("*")
+        if template.is_file()
+        for _ in re.finditer(
+            r"(?i)toYaml\w*\s+[.$(]|\|\s*\w*toYaml", template.read_text()
+        )
+    ]
+
+    assert calls == ["_helpers.tpl"]
 
 
 def test_cluster_default_magic_string(

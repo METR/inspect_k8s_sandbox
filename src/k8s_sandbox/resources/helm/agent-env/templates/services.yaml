@@ -7,7 +7,7 @@ metadata:
     {{- include "agentEnv.labels" $ | nindent 4 }}
     inspect/service: {{ $name }}
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
 spec:
   {{- /*
     Deliberately empty. The kubelet writes the pod's FQDN --
@@ -43,7 +43,7 @@ spec:
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
       annotations:
-        {{- toYaml $podAnnotations | nindent 8 }}
+        {{- include "agentEnv.toYaml" $podAnnotations | nindent 8 }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -74,11 +74,11 @@ spec:
           {{- end }}
           {{- if .command }}
           command:
-{{ toYaml .command | nindent 12 }}
+{{ include "agentEnv.toYaml" .command | nindent 12 }}
           {{- end }}
           {{- if .args }}
           args:
-{{ toYaml .args | nindent 12 }}
+{{ include "agentEnv.toYaml" .args | nindent 12 }}
           {{- end }}
           {{- if .workingDir }}
           workingDir: {{ .workingDir | quote }}
@@ -96,15 +96,15 @@ spec:
           {{- end }}
           {{- with .volumeMounts }}
           volumeMounts:
-{{ toYaml . | nindent 12 }}
+{{ include "agentEnv.toYaml" . | nindent 12 }}
           {{- end }}
           {{- if .resources }}
           resources:
-{{ toYaml .resources | nindent 12 }}
+{{ include "agentEnv.toYaml" .resources | nindent 12 }}
           {{- end }}
           {{- with .securityContext }}
           securityContext:
-{{ toYaml . | nindent 12 }}
+{{ include "agentEnv.toYaml" . | nindent 12 }}
           {{- end }}
       {{- end }}
       {{- end }}
@@ -117,11 +117,11 @@ spec:
         {{- end }}
         {{- if $service.command }}
         command:
-          {{- toYaml $service.command | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.command | nindent 10 }}
         {{- end }}
         {{- if $service.args }}
         args:
-          {{- toYaml $service.args | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.args | nindent 10 }}
         {{- end }}
         {{- if $service.workingDir }}
         workingDir: {{ $service.workingDir | quote }}
@@ -138,15 +138,15 @@ spec:
         {{- end }}
         {{- with $service.readinessProbe }}
         readinessProbe:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         {{- with $service.livenessProbe }}
         livenessProbe:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         resources:
         {{- if $service.resources }}
-          {{- toYaml $service.resources | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.resources | nindent 10 }}
         {{- else }}
           # Equal limits and requests for Guaranteed QoS class.
           limits:
@@ -158,7 +158,7 @@ spec:
         {{- end }}
         volumeMounts:
         {{- with $service.volumeMounts }}
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         {{- range $key, $value := $service.volumes }}
           {{- if kindIs "string" $value }}
@@ -176,14 +176,14 @@ spec:
         {{- end }}
         {{- with $service.securityContext }}
         securityContext:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
       - name: coredns
         image: {{ quote $.Values.corednsImage }}
         command:
-          {{- toYaml $.Values.corednsCommand | nindent 10 }}
+          {{- include "agentEnv.toYaml" $.Values.corednsCommand | nindent 10 }}
         securityContext:
-          {{- toYaml $.Values.corednsSecurityContext | nindent 10 }}
+          {{- include "agentEnv.toYaml" $.Values.corednsSecurityContext | nindent 10 }}
         resources:
           requests:
             memory: "128Mi"
@@ -214,15 +214,15 @@ spec:
             mountPath: /etc/coredns
             readOnly: true
       {{- with $.Values.extraContainers }}
-        {{- toYaml . | nindent 6 }}
+        {{- include "agentEnv.toYaml" . | nindent 6 }}
       {{- end }}
       {{- with $service.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
       {{- with $service.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
       volumes:
         - name: coredns-config
@@ -241,12 +241,12 @@ spec:
           persistentVolumeClaim:
             claimName: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
         {{- else }}
-        -  {{- toYaml . | nindent 10 }}
+        -  {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
 ---
 {{- if include "shouldCreateDnsRecord" $service }}
@@ -255,9 +255,9 @@ kind: Service
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-{{ $name }}
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   # Make this a headless service: other pods in this agent-env may connect directly to
   # the pod on all ports. This enables the use of tools like `nc` on any port or `ping`
