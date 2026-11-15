@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix a sandbox that may reach the whole internet (`allowDomains: ["*"]`, or `world` or
+  `all` in `allowEntities`) exhausting its node's Cilium agent by looking up many names.
+  Hubble now records no DNS names for it, and `allowDomains: ["*"]` also reaches
+  addresses the sandbox never looked up.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

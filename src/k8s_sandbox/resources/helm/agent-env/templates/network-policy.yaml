@@ -34,6 +34,8 @@ spec:
     matchLabels:
       io.kubernetes.pod.namespace: {{ .Release.Namespace }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+  {{- /* Cilium's DNS proxy remembers every name it answers, and a sandbox that may reach everything has none to check. */}}
+  {{- $allowAll := or (has "*" .Values.allowDomains) (has "world" .Values.allowEntities) (has "all" .Values.allowEntities) }}
   egress:
     - toEndpoints:
       - matchLabels:
@@ -46,15 +48,14 @@ spec:
         - ports:
             - port: "53"
               protocol: ANY
+          {{- if not $allowAll }}
           rules:
             dns:
               - matchPattern: "*.{{ .Release.Namespace }}.svc.cluster.local"
               {{- range .Values.allowDomains }}
               - matchPattern: "{{ . }}"
               {{- end }}
-              {{- if or (has "all" .Values.allowEntities) (has "world" .Values.allowEntities) }}
-              - matchPattern: "*"
-              {{- end }}
+          {{- end }}
     - toEndpoints:
       - matchLabels:
           io.kubernetes.pod.namespace: {{ .Release.Namespace }}
@@ -70,14 +71,11 @@ spec:
     {{- fail (printf "allowDomainsPorts: domain %q (port %v) must also appear in allowDomains" $p.domain $p.port) }}
     {{- end }}
     {{- end }}
+    {{- if not $allowAll }}
     - toFQDNs:
     {{- range .Values.allowDomains }}
       - matchPattern: "{{ . }}"
     {{- end }}
-      {{- if has "*" .Values.allowDomains }}
-      # allowDomains includes "*" (allow all): identity enforcement is moot and
-      # serverNames has no allow-all form, so all resolved IPs are permitted.
-      {{- else }}
       # Enforce the request identity on the pinned IPs (TLS SNI on 443, HTTP Host
       # on 80) so a pinned IP cannot be reused to reach a different host. Host is a
       # case-insensitive anchored regex built from the glob. Wildcard SNI (443)
@@ -112,7 +110,6 @@ spec:
           {{- end }}
           {{- end }}
         {{- end }}
-      {{- end }}
     {{- /* Extra ports with a domain are scoped to that domain only, via their own rule. */}}
     {{- range $p := .Values.allowDomainsPorts }}
     {{- if $p.domain }}
@@ -125,7 +122,10 @@ spec:
     {{- end }}
     {{- end }}
     {{- end }}
-    {{- with .Values.allowEntities }}
+    {{- end }}
+    {{- $entities := .Values.allowEntities | default list }}
+    {{- if has "*" .Values.allowDomains }}{{ $entities = append $entities "world" }}{{ end }}
+    {{- with $entities }}
     - toEntities:
       {{- toYaml . | nindent 6 }}
     {{- end }}

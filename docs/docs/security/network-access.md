@@ -33,9 +33,8 @@ network access.
     cluster, see [Cluster-wide chart values](../tips/configuration.md#cluster-values).
 
 Cilium has tooling to observe network requests, such as
-[Hubble](https://github.com/cilium/hubble). Though note from the
-[limitations](../design/limitations.md) section that domain names will not be shown when
-using the built-in Helm chart due to how DNS resolution is handled.
+[Hubble](https://github.com/cilium/hubble). Hubble shows no domain names for a sandbox
+granted `"*"`, `world` or `all`.
 
 See the [limitations](../design/limitations.md) section for how Cilium may make certain
 Cyber misuse evals harder or impossible to solve.

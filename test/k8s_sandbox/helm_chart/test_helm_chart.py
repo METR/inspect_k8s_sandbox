@@ -983,24 +983,68 @@ def test_allow_domains_ports_rejects_unlisted_scope_domain(
         )
 
 
-def test_allow_domains_wildcard_all_skips_identity_enforcement(
+def test_allow_domains_limits_dns_lookups_to_the_named_domains(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
     documents = _run_helm_template(
-        chart_dir, test_resources_dir / "allow-domains-wildcard-all-values.yaml"
+        chart_dir,
+        test_resources_dir / "allow-domains-values.yaml",
+        set_str="allowEntities[0]=kube-apiserver",
     )
 
-    egress = next(
-        cnp
-        for cnp in _get_documents(documents, "CiliumNetworkPolicy")
-        if cnp["metadata"]["name"].endswith("-sandbox-egress")
-    )["spec"]["egress"]
-    fqdn_rule = next(r for r in egress if "toFQDNs" in r)
+    egress = _sandbox_egress(documents)
 
-    # "*" (allow all) has no valid serverNames form, so no identity-enforcing
-    # toPorts is emitted -- egress to all resolved IPs is permitted on all ports.
-    assert [m["matchPattern"] for m in fqdn_rule["toFQDNs"]] == ["*"]
-    assert "toPorts" not in fqdn_rule
+    assert egress[0]["toPorts"][0]["rules"]["dns"] == [
+        {"matchPattern": "*.default.svc.cluster.local"},
+        {"matchPattern": "pypi.org"},
+        {"matchPattern": "*.debian.org"},
+    ]
+    assert egress[-1] == {"toEntities": ["kube-apiserver"]}
+
+
+def test_no_allowlist_limits_dns_lookups_to_the_sandbox_and_grants_no_entity(
+    chart_dir: Path,
+) -> None:
+    egress = _sandbox_egress(_run_helm_template(chart_dir))
+
+    assert egress[0]["toPorts"][0]["rules"]["dns"] == [
+        {"matchPattern": "*.default.svc.cluster.local"}
+    ]
+    assert not any("toEntities" in rule for rule in egress)
+
+
+@pytest.mark.parametrize(
+    ("grant", "entities"),
+    [
+        pytest.param(
+            "allowEntities[0]=world,allowDomains[0]=pypi.org,"
+            "allowDomainsPorts[0].port=22,allowDomainsPorts[0].domain=pypi.org",
+            ["world"],
+            id="world",
+        ),
+        pytest.param("allowEntities[0]=all", ["all"], id="all"),
+        pytest.param(
+            "allowDomains[0]=*,allowEntities[0]=kube-apiserver",
+            ["kube-apiserver", "world"],
+            id="every-domain-and-an-entity",
+        ),
+        pytest.param(
+            "allowDomains[0]=*,allowEntities=null",
+            ["world"],
+            id="every-domain-and-null-entities",
+        ),
+    ],
+)
+def test_whole_internet_egress_skips_the_dns_proxy_and_fqdn_rules(
+    chart_dir: Path, grant: str, entities: list[str]
+) -> None:
+    documents = _run_helm_template(chart_dir, set_str=grant)
+
+    dns_rule, _same_sandbox, internet = _sandbox_egress(documents)
+
+    # A port rule with no `rules` is not redirected to Cilium's DNS proxy.
+    assert dns_rule["toPorts"] == [{"ports": [{"port": "53", "protocol": "ANY"}]}]
+    assert internet == {"toEntities": entities}
 
 
 def test_service_args_render_as_a_list(
@@ -1085,6 +1129,14 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+def _sandbox_egress(documents: list[Any]) -> list[dict[str, Any]]:
+    return next(
+        cnp
+        for cnp in _get_documents(documents, "CiliumNetworkPolicy")
+        if cnp["metadata"]["name"].endswith("-sandbox-egress")
+    )["spec"]["egress"]
 
 
 def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -> bool:
