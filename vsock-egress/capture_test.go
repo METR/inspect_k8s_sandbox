@@ -273,7 +273,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		t.Fatalf("bring lo up: %v", err)
 	}
 	for run := range 2 { // an init container that is started again
-		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid()), "-range", "10.77.0.9/24:5432"}); err != nil {
+		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid()), "-range", "10.77.0.0/24:5432"}); err != nil {
 			t.Fatalf("run %d: %v", run+1, err)
 		}
 	}
@@ -419,9 +419,9 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	}
 }
 
-func TestRangeOverThePodsOwnAddressesIsNoGrant(t *testing.T) {
+func TestGrantRefuses(t *testing.T) {
 	// 0.0.0.0/1 as a local route took a connection to 127.0.0.1.
-	for _, s := range []string{"0.0.0.0/1:443", "127.0.0.1/32:80", "198.19.0.0/16:443", "fd00::/64:443", "10.77.0.0/24", "10.77.0.0/24:0", "10.77.0.0/24:65536"} {
+	for _, s := range []string{"0.0.0.0/1:443", "127.0.0.1/32:80", "198.19.0.0/16:443", "fd00::/64:443", "10.77.0.9/24:443", "10.77.0.0/24", "10.77.0.0/24:0", "10.77.0.0/24:65536"} {
 		if r, err := grant(s); err == nil {
 			t.Errorf("%s is the grant %v: want it refused", s, r)
 		}

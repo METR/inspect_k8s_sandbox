@@ -13,8 +13,9 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
   NODE         the node the sandbox is put on, one set aside for the gate: its launcher is deleted in step 7, which
                resets the connections of every other sandbox there
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
-  RANGED       ADDRESS:PORT of a server in a range VALUES.yaml grants on that port, with egress capture (default: none,
-               and step 3a is skipped)
+  RANGED       ADDRESS:PORT of a server that speaks first or answers `GET /`, in a range VALUES.yaml grants on that
+               port, with egress capture (default: none, and step 3a is skipped)
+  RANGED_SHUT  a port of that address that VALUES.yaml does not grant (default: the next port)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
   KEEP=1       leave the release installed when a step fails
 It needs helm, kubectl and python3, and leaves nothing behind: one helm release, and one pod with the node's process
@@ -105,21 +106,19 @@ code=$(in_sandbox curl -sS -o /dev/null -m 30 -w '%{http_connect}/%{http_code}' 
 
 if [ -n "${RANGED:-}" ]; then
   say "3a. an address in a granted range answers on its port, and on no other, with no proxy setting"
-  # Open: the server spoke, or 8 s passed with no reset, which is longer than the proxy tries a dead address for.
+  # The pod's own forwarder takes the connection at once: only a byte from the server shows it was carried.
   got=$(in_sandbox python3 -c 'import errno, socket, sys
 address, port = sys.argv[1].rsplit(":", 1)
 def tried(port):
     try:
         s = socket.create_connection((address, port), 10)
-        s.settimeout(8)
-        try:
-            return "open" if s.recv(1) else "closed"
-        except socket.timeout:
-            return "open"
+        s.settimeout(15)
+        s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+        return "answered" if s.recv(1) else "closed"
     except OSError as e:
         return errno.errorcode.get(e.errno, type(e).__name__)
-print(tried(int(port)), tried(int(port) % 65535 + 1))' "$RANGED" 2>&1 | tail -1)
-  [ "$got" = "open EHOSTUNREACH" ] && pass "$RANGED is open, and its next port is refused at once: $got" || fail "$RANGED and its next port: $got, expected open EHOSTUNREACH"
+print(tried(int(port)), tried(int(sys.argv[2])))' "$RANGED" "${RANGED_SHUT:-$((${RANGED##*:} % 65535 + 1))}" 2>&1 | tail -1)
+  [ "$got" = "answered EHOSTUNREACH" ] && pass "$RANGED answered, and a port not granted is refused at once: $got" || fail "$RANGED and a port not granted: $got, expected answered EHOSTUNREACH"
 fi
 
 say "4. a stream that opens with a wrong key is refused"

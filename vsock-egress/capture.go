@@ -146,7 +146,7 @@ func (n *names) resolve(c net.PacketConn) error {
 	}
 }
 
-// captured carries a connection that redirect sent here to the name its address was given to, or to the address itself in a granted range, and resets any other.
+// captured carries a redirected connection to the name its address was given to, or to an address in a granted range, and resets any other.
 func (f *forwarder) captured(c *net.TCPConn) {
 	if to, err := originalDst(c); err == nil {
 		if name, ok := f.names.name(to.Addr()); ok {

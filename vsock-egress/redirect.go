@@ -33,17 +33,17 @@ func grant(s string) (granted, error) {
 		return granted{}, err
 	}
 	// As the machine's own, a range over either would take the pod's connections to itself, or to the names it looked up.
-	if !r.Addr().Is4() || r.Overlaps(captureRange) || r.Overlaps(netip.MustParsePrefix("127.0.0.0/8")) {
-		return granted{}, fmt.Errorf("%v is not an IPv4 range outside 127.0.0.0/8 and %v", r, captureRange)
+	if !r.Addr().Is4() || r != r.Masked() || r.Overlaps(captureRange) || r.Overlaps(netip.MustParsePrefix("127.0.0.0/8")) {
+		return granted{}, fmt.Errorf("%v is not an IPv4 network outside 127.0.0.0/8 and %v", r, captureRange)
 	}
 	port, err := strconv.ParseUint(s[i+1:], 10, 16)
 	if err != nil || port == 0 {
 		return granted{}, fmt.Errorf("%q is no TCP port", s[i+1:])
 	}
-	return granted{r.Masked(), uint16(port)}, nil
+	return granted{r, uint16(port)}, nil
 }
 
-// redirect sends the sandbox's DNS queries at 127.0.0.1, its TCP connections to captureRange and those to each granted range's port to the forwarder.
+// redirect sends the forwarder the sandbox's DNS queries at 127.0.0.1 and its TCP to captureRange and to each granted range's port.
 func redirect(args []string) error {
 	fs := flag.NewFlagSet("redirect", flag.ExitOnError)
 	forwarder := fs.Uint("forwarder", 0, "the uid the pod's forwarder runs as")
@@ -79,7 +79,7 @@ func redirect(args []string) error {
 	}); err != nil {
 		return err
 	}
-	// The guest has no other device, so no route to a granted range unless it is the machine's own too: ip route replace local <network> dev lo src 198.18.0.0
+	// With no other device the guest has no route to a range: ip route replace local <network> dev lo src 198.18.0.0
 	for _, r := range ranges {
 		attributes := netlink.NewAttributeEncoder()
 		attributes.Bytes(unix.RTA_DST, r.network.Addr().AsSlice())
@@ -153,7 +153,7 @@ func redirect(args []string) error {
 		&expr.Verdict{Kind: expr.VerdictDrop},
 	}})
 	for _, r := range ranges {
-		// What is still addressed to a granted range was not redirected, and the pod itself would answer it: ip daddr <network> reject with icmp type admin-prohibited
+		// The pod itself would answer a range's other ports: ip daddr <network> reject with icmp type admin-prohibited
 		c.AddRule(&nftables.Rule{Table: table, Chain: guard, Exprs: append(to(r.network), &expr.Reject{Type: unix.NFT_REJECT_ICMP_UNREACH, Code: 13})})
 	}
 	return c.Flush()
