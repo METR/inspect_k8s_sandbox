@@ -273,7 +273,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 		t.Fatalf("bring lo up: %v", err)
 	}
 	for run := range 2 { // an init container that is started again
-		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid()), "-range", "10.77.0.0/24:5432"}); err != nil {
+		if err := redirect([]string{"-forwarder", strconv.Itoa(os.Geteuid()), "-range", "10.78.0.0/16:8443", "-range", "10.77.0.0/24:5432"}); err != nil {
 			t.Fatalf("run %d: %v", run+1, err)
 		}
 	}
@@ -391,7 +391,7 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 	}
 
 	// A granted range's port reaches the proxy by address, from every address of the network.
-	for _, to := range []string{"10.77.0.10:5432", "10.77.0.255:5432"} {
+	for _, to := range []string{"10.77.0.10:5432", "10.77.0.255:5432", "10.78.3.4:8443"} {
 		if _, _, err := connected(to, nil); err != nil {
 			t.Fatalf("a connection to %v, in a granted range: %v", to, err)
 		}
