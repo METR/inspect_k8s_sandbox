@@ -43,6 +43,8 @@
   or on the default service with an explicit `command` or `entrypoint`.
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
 - Fix `read_file()` hanging on a relative file named `-`.
+- Fix `write_file()` over Kubernetes exec never returning when a large file could not
+  be written.
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
   replacement or container restart fails with the same `PodReplacedError` or
   `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when

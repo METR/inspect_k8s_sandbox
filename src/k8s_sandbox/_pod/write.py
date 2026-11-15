@@ -20,6 +20,21 @@ from k8s_sandbox._pod.op import (
 )
 
 
+def write_command(dst: Path, file_size: int) -> list[str]:
+    """The command that writes its stdin to a file, over Kubernetes exec."""
+    mkdir_command = f"mkdir -p -- {shlex.quote(dst.parent.as_posix())}"
+    # v4.channel.k8s.io cannot close stdin, so `head` reads the file's size and ends.
+    head_command = f"head -c {file_size}"
+    dst_quoted = shlex.quote(dst.as_posix())
+    # Unread input holds the exec open; a short read must not pass for the whole file.
+    write = (
+        f"{{ {head_command} || kill $$; }} | {{ {mkdir_command} && {head_command} "
+        f"> {dst_quoted}; s=$?; {head_command} > /dev/null; exit $s; }}"
+    )
+    # The script runs only helpers, which are found in the system directories.
+    return ["/bin/sh", "-c", f"PATH={SYSTEM_PATH}; {write}"]
+
+
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         with self._start_write_command(dst, len(data)) as ws_client:
@@ -37,27 +52,8 @@ class WriteFileOperation(PodOperation):
     def _start_write_command(
         self, dst: Path, file_size: int
     ) -> Generator[WSClient, None, None]:
-        mkdir_command = f"mkdir -p -- {shlex.quote(dst.parent.as_posix())}"
-        # Use `head` with `-c <file size>` because we have no way of closing the stdin
-        # stream in v4.channel.k8s.io (which means the websocket connection would never
-        # close).
-        head_command = f"head -c {file_size}"
-        dst_quoted = shlex.quote(dst.as_posix())
-        # The shell (e.g. ash) execs into the trailing `head`, whose stdout is the
-        # file, so nothing holds the exec stdout pipe open. Its EOF makes the runtime
-        # close stdin mid-write and `head -c N` then exits 0, silently truncating.
-        # fd 3 survives the exec and keeps that pipe open.
-        # https://github.com/UKGovernmentBEIS/inspect_k8s_sandbox/issues/225
-        keep_stdout_open = "exec 3>&1"
-        # The script runs only helpers, which are found in the system directories.
-        command = [
-            "/bin/sh",
-            "-c",
-            f"{keep_stdout_open}; PATH={SYSTEM_PATH}; "
-            f"{mkdir_command} && {head_command} > {dst_quoted}",
-        ]
         yield from self.create_websocket_client_for_exec(
-            command=command,
+            command=write_command(dst, file_size),
             stderr=True,
             stdin=True,
             stdout=True,
