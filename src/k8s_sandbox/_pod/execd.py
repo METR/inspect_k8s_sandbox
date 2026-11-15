@@ -95,11 +95,12 @@ KILL_WAIT = 10.0  # for a killed command's exit
 
 @dataclass(frozen=True)
 class Daemon:
-    """A started daemon: where it listens, its certificate and its key."""
+    """A started daemon: where it listens, its certificate, its key and its pod."""
 
     ip: str
     fingerprint: str
     key: bytes = field(repr=False)
+    pod: str = ""  # the pod's UID
     # Opens an exec joined to the daemon's socket, for a pod with no network card.
     stdio: Callable[[], Awaitable[ByteStream]] | None = None
 
@@ -391,9 +392,11 @@ class Link:
         strays: Strays,
         pace: Pace,
         owed: dict[int, tuple[int, ...]],
+        pod: Callable[[], str],
     ) -> None:
         self.pipe = pipe
         self.daemon = daemon
+        self._pod = pod  # the pod's UID now
         self.strays = strays
         self.pace = pace
         self.owed = owed
@@ -416,6 +419,8 @@ class Link:
         # Only a START or STDIN waits its turn: any other frame has one ahead at most.
         turn = self.bulk if kind in (START, STDIN) else contextlib.nullcontext()
         async with turn, self._wlock:
+            if kind == START and self.daemon.pod != self._pod():  # replaced meanwhile
+                await self.close()
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
@@ -541,9 +546,14 @@ class Link:
 class ExecdClient:
     """Runs commands through one pod's execd, on one connection reopened as needed."""
 
-    def __init__(self, start: Callable[[bool], Awaitable[Daemon]]) -> None:
+    def __init__(
+        self,
+        start: Callable[[bool], Awaitable[Daemon]],
+        pod: Callable[[], str] = lambda: "",
+    ) -> None:
         # start(replace) execs execd; replace stops a daemon this client never reached
         self._start = start
+        self._pod = pod  # the pod's UID now: a replaced pod may run on, with its daemon
         self._daemon: Daemon | None = None
         self._link: Link | None = None
         self._opening: asyncio.Future[Link] | None = None  # one at a time, shared
@@ -571,9 +581,13 @@ class ExecdClient:
                         raise _port_held() from e
                 daemon = self._daemon
                 pipe = await _connect(daemon, self._pace)
-                link = Link(pipe, daemon, self._strays, self._pace, self._owed)
+                link = Link(
+                    pipe, daemon, self._strays, self._pace, self._owed, self._pod
+                )
                 await link.send(AUTH, 0, daemon.key)
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
+                if daemon.pod != self._pod():  # replaced as this opened
+                    raise Dropped("the daemon's pod was replaced")
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 async with link.bulk:  # no START or STDIN goes between what is owed
@@ -599,6 +613,13 @@ class ExecdClient:
                         raise
                     self._failed = failed  # the daemon may run on: its calls can resume
 
+    async def leave_replaced(self) -> None:
+        """Forget a daemon whose pod was replaced, and drop its connection."""
+        if self._daemon is not None and self._daemon.pod != self._pod():
+            self._daemon = None
+            if self._link is not None:
+                await self._link.close()
+
     def _over(self, link: Link, call_id: int, *kinds: int) -> None:
         """Send a call's last frames, now and until a PONG follows its RELEASE."""
         self._owed[call_id] = kinds
@@ -618,6 +639,7 @@ class ExecdClient:
                 await link.send(PING, 0)
 
     async def _get(self, stale: Link | None = None) -> Link:
+        await self.leave_replaced()  # its check may have been cancelled, or not be back
         link = self._link
         if link is not None and link is not stale and not link.closed:
             return link
@@ -714,7 +736,7 @@ class ExecdClient:
                         if link.daemon is not call.daemon:
                             raise ExecdStoppedError(
                                 "execd stopped while it ran the command",
-                                pod=link.daemon.ip,
+                                pod=call.daemon.ip,
                             )
                         link.calls[call.id] = call
                         at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
@@ -924,34 +946,28 @@ class ExecdClient:
     ) -> int:
         start = None if dst is None else dst.tell()
         unread = 0  # a write's stdout
-        try:
-            run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
-            async with contextlib.aclosing(run) as chunks:
-                async for kind, payload in chunks:
-                    if kind == EXIT:
-                        return payload["code"]
-                    if kind == STDERR:
-                        stderr.append(payload)
-                    elif dst is not None and start is not None:
-                        dst.write(payload)
-                        if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
-                            raise OutputLimitExceededError(
-                                limit_str=limits.MAX_READ_FILE_SIZE_STR,
-                                truncated_output=None,
-                            )
-                    else:
-                        unread += len(payload)
-                    # As exec() does: past it, output could arrive for ever.
-                    if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
+        run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
+        async with contextlib.aclosing(run) as chunks:
+            async for kind, payload in chunks:
+                if kind == EXIT:
+                    return payload["code"]
+                if kind == STDERR:
+                    stderr.append(payload)
+                elif dst is not None and start is not None:
+                    dst.write(payload)
+                    if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
                         raise OutputLimitExceededError(
-                            limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                            limit_str=limits.MAX_READ_FILE_SIZE_STR,
                             truncated_output=None,
                         )
-        except ExecdStoppedError:
-            raise  # run again, it may reach a container that replaced its own
-        except ExecResultUnknownError as e:
-            # Unlike a command, a file operation may be run again.
-            raise PodError(str(e)) from e
+                else:
+                    unread += len(payload)
+                # As exec() does: past it, output could arrive for ever.
+                if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
+                    raise OutputLimitExceededError(
+                        limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                        truncated_output=None,
+                    )
         raise PodError("execd ended the file operation without an exit code")
 
     async def open_stream(

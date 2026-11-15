@@ -29,7 +29,7 @@ def read_command(src: Path) -> list[str]:
         f'PATH={SYSTEM_PATH}; exec head -c "$1" -- "$2"',
         "sh",
         str(limits.MAX_READ_FILE_SIZE + 1),
-        src.as_posix(),
+        "./-" if src.as_posix() == "-" else src.as_posix(),  # head's name for stdin
     ]
 
 

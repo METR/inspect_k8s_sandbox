@@ -84,6 +84,8 @@ def _shell_command(
     """
     if user is None:
         return list(command)
+    if user in ROOT_USERS:  # exec()'s own check: uid 0 with no `id` or `runuser`
+        return ["/bin/sh", "-c", f"{_ROOT_CHECK}exec {shlex.join(command)}"]
     if not user or switch:
         # An empty user matches nothing; leave runuser to reject it as it did before.
         return [_RUNUSER, "-u", user, "--", *command]

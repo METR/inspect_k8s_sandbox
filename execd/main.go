@@ -26,7 +26,7 @@ import (
 )
 
 // As early as it can be; only a binary its exec can't read (mode 111, and no CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH) closes the window.
-func init() { prctl(prSetDumpable, 0) }
+func init() { undumpable() }
 
 func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
@@ -141,8 +141,16 @@ func fail(msg string) {
 // Non-dumpable: same-uid processes can't open its /proc files. Subreaper: it reaps orphans.
 const prSetDumpable, prSetChildSubreaper = 4, 36
 
-func prctl(option, arg uintptr) {
-	syscall.RawSyscall(syscall.SYS_PRCTL, option, arg, 0)
+func prctl(option, arg uintptr) syscall.Errno {
+	_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, option, arg, 0)
+	return errno
+}
+
+// undumpable ends execd where the kernel refuses, as a seccomp profile can: its user could read its memory.
+func undumpable() {
+	if errno := prctl(prSetDumpable, 0); errno != 0 {
+		fail("prctl(PR_SET_DUMPABLE): " + errno.Error())
+	}
 }
 
 // start re-runs execd in a new session, so it outlives this exec, and relays its status line.

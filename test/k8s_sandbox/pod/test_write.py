@@ -1,10 +1,14 @@
+import concurrent.futures
 import os
+import socket
 import subprocess
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Generator
 from unittest.mock import MagicMock
 
+import kubernetes.client
 import pytest
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     ERROR_CHANNEL,
@@ -15,7 +19,11 @@ from websocket import WebSocketConnectionClosedException
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.write import WriteFileOperation
+from test.k8s_sandbox.pod import test_execute, test_op
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
+
+_frame = test_execute._frame  # pyright: ignore[reportPrivateUsage]
+_upgrade = test_op._upgrade  # pyright: ignore[reportPrivateUsage]
 
 
 def test_write_file_writes_data_via_chunked_helper(
@@ -86,6 +94,48 @@ def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
         WriteFileOperation(MagicMock())._handle_stream_output(ws)
 
     assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))
+
+
+@pytest.mark.parametrize(
+    ("code", "raised"),
+    [
+        (255, ContainerStoppedError),
+        (2, OSError),  # the upload's own, which the provider retries
+    ],
+)
+def test_a_255_sent_before_the_upload_failed_is_a_stopped_container(
+    monkeypatch: pytest.MonkeyPatch, code: int, raised: type[Exception]
+) -> None:
+    """Regression: the upload's error was retried, in the container's replacement."""
+    listening = socket.create_server(("127.0.0.1", 0))
+    listening.settimeout(30)  # only bounds a hang
+
+    def ends() -> None:  # the exec, with the upload unread
+        connection, _ = listening.accept()
+        with connection:
+            connection.settimeout(30)  # only bounds a hang
+            _upgrade(connection)
+            connection.sendall(_frame(*_status(code)))
+
+    server = threading.Thread(target=ends, daemon=True)
+    server.start()
+    host = f"http://127.0.0.1:{listening.getsockname()[1]}"
+    configuration = kubernetes.client.Configuration(host=host)
+    api = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
+    monkeypatch.setattr(op_module, "k8s_client", lambda _: api)
+    pod = op_module.PodInfo("p", "ns", None, "default", "u", 0, "warn")
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+
+    write = pool.submit(
+        WriteFileOperation(pod).write_file, bytes(2**25), Path("/tmp/dst")
+    )
+
+    try:
+        assert isinstance(write.exception(timeout=30), raised)  # only bounds a hang
+    finally:
+        listening.close()
+        pool.shutdown(wait=False)
+        server.join(30)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")

@@ -53,7 +53,7 @@ class Daemons:
         self.ports: dict[execd.Daemon, int] = {}
         self.unstarted: list[execd.Daemon] = []
 
-    async def serve(self, handler: Handler) -> asyncio.Server:
+    async def serve(self, handler: Handler, pod: str = "") -> asyncio.Server:
         """One that answers AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -62,7 +62,7 @@ class Daemons:
             await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)
-        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key")
+        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", pod)
         self.ports[daemon] = server.sockets[0].getsockname()[1]
         self.unstarted.append(daemon)
         return server
@@ -157,7 +157,7 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
                 starts += 1
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
-    await daemons.serve(exits)
+    await daemons.serve(exits, pod="u")
     # As in test_helm.py: no cluster config needed.
     monkeypatch.setattr("k8s_sandbox._helm.get_default_namespace", lambda _: "default")
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
@@ -2505,7 +2505,151 @@ async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
     execd_starts(monkeypatch, lambda: vars(cluster).update(uid="v", ip="10.0.0.2"))
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
 
-    assert (await pod._start_execd(False)).ip == "10.0.0.2"
+    daemon = await asyncio.wait_for(pod._start_execd(False), 30)
+
+    assert (daemon.ip, daemon.pod) == ("10.0.0.2", "v")
+
+
+def runs_in(pod: str, ran: list[str]) -> Handler:
+    """A stand-in for a pod's execd, which notes each connection and command it gets."""
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        ran.append(f"{pod} dialed")
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind == execd.START:
+                ran.append(pod)
+                if json.loads(payload)["argv"] == ["true"]:  # any other runs on
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    return runs
+
+
+async def test_a_replacement_found_in_warn_mode_moves_operations_to_its_execd(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon, cluster: Cluster
+) -> None:
+    """Regression: commands went on to a replaced pod's execd while that pod ran."""
+    ran: list[str] = []
+    started: list[str] = []
+
+    async def start(replace: bool) -> execd.Daemon:
+        started.append(cluster.uid)
+        return execd.Daemon("127.0.0.1", tls[1], b"key", cluster.uid)
+
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd=True)
+    assert pod._execd is not None
+    pod._execd._start = start
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        sleep = pod.exec(["sleep", "inf"], None, None, {}, None, None)
+        running = asyncio.ensure_future(sleep)
+        await until(lambda: ran == ["replaced dialed", "replaced"])
+        # Force-deleted: Kubernetes shows the replacement, and the pod replaced runs on.
+        await tls_daemon(runs_in("replacement", ran))
+        cluster.uid = "v"
+
+        await pod.check_for_pod_restart()
+        with pytest.raises(error.ExecdStoppedError):  # and it is not run again
+            await running
+        await pod.exec(["true"], None, None, {}, None, None)
+        await pod.check_for_pod_restart()  # nothing new: the replacement's execd stays
+        await pod.exec(["true"], None, None, {}, None, None)
+
+    assert started == ["u", "v"]
+    assert ran[2:] == ["replacement dialed", "replacement", "replacement"]
+
+
+async def test_a_command_goes_to_the_replacement_though_no_check_left_the_old_pod(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: a check cancelled as it found the replacement left the old in use."""
+    ran: list[str] = []
+    pod = "u"
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        await client.exec(["true"], None, None, {}, None, None)
+        await tls_daemon(runs_in("replacement", ran))
+        pod = "v"
+
+        await client.exec(["true"], None, None, {}, None, None)
+
+    assert ran[2:] == ["replacement dialed", "replacement"]
+
+
+async def test_a_command_waiting_its_turn_is_not_sent_to_a_pod_replaced_meanwhile(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: a command queued as a check found the replacement ran in the old."""
+    ran: list[str] = []
+    pod = "u"
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        sleep = client.exec(["sleep", "inf"], None, None, {}, None, None)
+        running = asyncio.ensure_future(sleep)
+        await until(lambda: ran == ["replaced dialed", "replaced"])
+        link = await client._get()
+        async with link._wlock:  # another call's write
+            call = client.exec(["true"], None, None, {}, None, None)
+            queued = asyncio.ensure_future(call)
+            await until(lambda: len(link.calls) == 2)  # it waits to send its START
+            await tls_daemon(runs_in("replacement", ran))
+            pod = "v"
+
+        with pytest.raises(execd.NotSent):  # nothing ran: the provider sends it again
+            await queued
+        with pytest.raises(error.ExecdStoppedError):  # its connection went with that
+            await running
+
+    assert ran == ["replaced dialed", "replaced", "replacement dialed"]
+
+
+async def test_a_connection_opened_as_its_pod_is_replaced_is_not_used(
+    tls: tuple[ssl.SSLContext, str],
+    tls_daemon: TlsDaemon,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a connection opened to a replaced pod was kept: commands failed."""
+    ran: list[str] = []
+    pod = "u"
+    asked, replaced = asyncio.Event(), asyncio.Event()
+
+    async def answers_once_replaced(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)  # AUTH
+        asked.set()
+        await replaced.wait()
+        w.write(frame(execd.OK, 0))
+        await runs_in("replaced", ran)(r, w)
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    listen = asyncio.start_server(answers_once_replaced, "127.0.0.1", 0, ssl=tls[0])
+    with anyio.fail_after(30):  # only bounds a hang
+        async with await listen as old:
+            monkeypatch.setattr(execd, "EXECD_PORT", old.sockets[0].getsockname()[1])
+            call = client.exec(["true"], None, None, {}, None, None)
+            running = asyncio.ensure_future(call)
+            await asked.wait()
+            await tls_daemon(runs_in("replacement", ran))
+            pod = "v"
+
+            replaced.set()
+            await running
+
+    assert ran == ["replaced dialed", "replacement dialed", "replacement"]
 
 
 async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
@@ -2689,43 +2833,19 @@ async def test_a_command_stops_at_the_output_limit(
 
 
 @pytest.mark.parametrize(
-    "operation",
+    ("next_daemon", "raised"),
     [
-        pytest.param(
-            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
-        ),
-        pytest.param(
-            lambda c: c.read_file(pathlib.Path("/x"), io.BytesIO()), id="read_file"
-        ),
+        ("answers", error.ExecdStoppedError),
+        ("answers too late", error.ExecdStoppedError),
+        ("starts only once the pod is found", error.ExecdResultUnknownError),
     ],
-)
-async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
-    tls_daemon: TlsDaemon,
-    operation: collections.abc.Callable[
-        [execd.ExecdClient], collections.abc.Awaitable[None]
-    ],
-) -> None:
-    async def loses_it(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.ERROR, call_id, b"call id in use"))
-        await r.read()
-
-    client = await tls_daemon(loses_it)
-
-    with pytest.raises(error.PodError) as lost:
-        await asyncio.wait_for(operation(client), 30)
-    # Not a command's lost result, which is never retried: the sample would fail.
-    assert type(lost.value) is error.PodError
-
-
-@pytest.mark.parametrize(
-    "reached", [True, False], ids=["the next answers", "the next answers too late"]
 )
 async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     tls: tuple[ssl.SSLContext, str],
     monkeypatch: pytest.MonkeyPatch,
     clock: types.SimpleNamespace,
-    reached: bool,
+    next_daemon: str,
+    raised: type[Exception],
 ) -> None:
     """Regression: it was read again, from the container that had replaced its own."""
     context, pin = tls
@@ -2734,7 +2854,7 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     attempts = 0
 
     async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        if len(servers) == 2 and not reached and attempts == 1:
+        if len(servers) == 2 and next_daemon == "answers too late" and attempts == 1:
             return w.close()  # started, and not reached while the read reconnects
         await read_frame(r)  # AUTH
         w.write(frame(execd.OK, 0))
@@ -2750,6 +2870,8 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     async def start(replace: bool) -> execd.Daemon:
         if len(servers) == 2:
             raise execd.DaemonRunning("address already in use")
+        if servers and attempts == 1 and next_daemon.startswith("starts only once"):
+            raise kubernetes.client.exceptions.ApiException(status=404)
         server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
         servers.append(server)
         monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
@@ -2757,14 +2879,15 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
 
     client = execd.ExecdClient(start)
 
-    with pytest.raises(error.ExecdStoppedError):
+    with pytest.raises(error.ExecdResultUnknownError) as stopped:
         async for attempt in _sandbox_environment._retry():  # the provider's own
             with attempt:
                 attempts += 1
                 read = client.read_file(pathlib.Path("/x"), io.BytesIO())
                 await asyncio.wait_for(read, 30)  # only bounds a hang
-    assert len(starts) == 1
-    servers[1].close()
+    assert (type(stopped.value), len(starts)) == (raised, 1)
+    for server in servers:
+        server.close()
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
@@ -3056,7 +3179,24 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
-async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> None:
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(
+            lambda c: c.exec(["touch", "/once"], None, None, {}, None, 30), id="exec"
+        ),
+        pytest.param(
+            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
+        ),
+    ],
+)
+async def test_a_call_execd_abandoned_is_not_started_again(
+    daemons: Daemons,
+    operation: collections.abc.Callable[
+        [execd.ExecdClient], collections.abc.Awaitable[object]
+    ],
+) -> None:
+    """Regression: for a file operation it raised a PodError, which is retried."""
     starts = 0
 
     async def abandons(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -3076,7 +3216,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
     await daemons.serve(abandons)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
+        await asyncio.wait_for(operation(daemons.client()), 30)
     assert starts == 1
 
 
@@ -3249,7 +3389,7 @@ async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
 
     async def start(replace: bool) -> execd.Daemon:
         address = server.sockets[0].getsockname()  # as `execd connect` joins a stdio
-        return execd.Daemon("", pin, b"key", lambda: anyio.connect_tcp(*address))
+        return execd.Daemon("", pin, b"key", stdio=lambda: anyio.connect_tcp(*address))
 
     call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
@@ -3347,7 +3487,7 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
         execs.append(Ended(await anyio.connect_tcp(*address)))
         return execs[-1]
 
-    daemon = execd.Daemon("", pin, b"key", stdio)
+    daemon = execd.Daemon("", pin, b"key", stdio=stdio)
 
     async def start(replace: bool) -> execd.Daemon:
         return daemon
@@ -3388,7 +3528,7 @@ async def test_an_exec_that_just_ends_is_a_connection_execd_closed(
     async def start(replace: bool) -> execd.Daemon:
         address = (server if starts else gone).sockets[0].getsockname()
         starts.append(replace)
-        return execd.Daemon("", pin, b"key", lambda: anyio.connect_tcp(*address))
+        return execd.Daemon("", pin, b"key", stdio=lambda: anyio.connect_tcp(*address))
 
     call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
@@ -3426,7 +3566,7 @@ async def test_a_connection_closed_under_a_silent_exec_closes_the_exec(
         return Silent()
 
     connecting = asyncio.ensure_future(
-        execd._connect(execd.Daemon("", "0" * 64, b"key", stdio), execd.Pace())
+        execd._connect(execd.Daemon("", "0" * 64, b"key", stdio=stdio), execd.Pace())
     )
     await until(lambda: bool(senders))  # the handshake's first bytes have gone
     connecting.cancel()

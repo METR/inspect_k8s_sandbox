@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import types
+import uuid
 from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
@@ -51,6 +52,7 @@ from k8s_sandbox._pod.error import (
 from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio, _shell_command
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.pod import Pod
+from test.k8s_sandbox.pod import test_execd_binary
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
 
@@ -594,6 +596,44 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
         assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
     if status is None:  # The shell says why before the refusal.
         assert str(status_file).encode() in result.stderr
+
+
+@pytest.fixture(scope="module")
+def bare_image() -> Generator[str, None, None]:
+    """An image with no `id` or `runuser`, whose uid 0 is not named root."""
+    if shutil.which("docker") is None:
+        pytest.skip("needs Docker")
+    name = f"exec-stdio-test-{uuid.uuid4().hex[:8]}"
+    dockerfile = (
+        "FROM public.ecr.aws/docker/library/busybox:1.37\n"
+        "RUN rm /bin/id && sed -i s/^root:/toor:/ /etc/passwd\n"
+    )
+    built = test_execd_binary.docker("build", "-q", "-t", name, "-", stdin=dockerfile)
+    assert built.returncode == 0, built.stderr
+    yield name
+    test_execd_binary.docker("rmi", "-f", name)
+
+
+@pytest.mark.parametrize("user", ["root", "0"])
+@pytest.mark.parametrize(
+    ("uid", "out", "err"),
+    [
+        ("0", "a request\n", ""),
+        ("1000", "", "runuser: may not be used by non-root users\n"),
+    ],
+    ids=["uid-0", "uid-1000"],
+)
+def test_a_root_stream_runs_its_command_only_as_uid_0(
+    bare_image: str, user: str, uid: str, out: str, err: str
+) -> None:
+    """Regression: exec_stdio() asked `id` for root's name, then `runuser`."""
+    command = execute_module._shell_command(user, command=["cat"])
+    run = ["run", "--rm", "-i", "--user", uid, bare_image, *command]
+
+    ran = test_execd_binary.docker(*run, stdin="a request\n")
+
+    # The check leaves stdin to the command.
+    assert (ran.stdout, ran.stderr) == (out, err)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")

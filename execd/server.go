@@ -814,7 +814,7 @@ func setids(uid, gid uint32) {
 	if uid == 0 {
 		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
 	}
-	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
+	undumpable() // a change of identity resets it, for the whole process
 }
 
 func (cl *call) finish(code int, startErr string) {

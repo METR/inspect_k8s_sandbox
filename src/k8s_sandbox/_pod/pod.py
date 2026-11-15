@@ -82,7 +82,9 @@ class Pod:
         self._restart_lock = threading.Lock()
         # Operations go to execd, if the pod has it: at its address, or through an exec.
         self._execd = (
-            ExecdClient(self._start_execd) if execd in ("true", "stdio") else None
+            ExecdClient(self._start_execd, lambda: self._info.uid)
+            if execd in ("true", "stdio")
+            else None
         )
         self._execd_by_stdio = execd == "stdio"
         self._execd_lost = False  # a daemon started whose key a failure then lost
@@ -123,7 +125,7 @@ class Pod:
         self._execd_lost = False
         self._execd_started = time.monotonic()
         stdio = self._execd_stdio if self._execd_by_stdio else None
-        return Daemon(pod.ip, stdout.decode().strip(), key, stdio)
+        return Daemon(pod.ip, stdout.decode().strip(), key, pod.uid, stdio)
 
     async def _execd_stdio(self) -> PodStdio:
         """An exec whose stdin and stdout are joined to the daemon's socket."""
@@ -163,7 +165,10 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        return await self._run_async(self._check_for_pod_restart_sync)
+        found = await self._run_async(self._check_for_pod_restart_sync)
+        if self._execd is not None:  # "warn" mode refreshes a replaced pod's UID
+            await self._execd.leave_replaced()
+        return found
 
     def _check_for_pod_restart_sync(
         self,

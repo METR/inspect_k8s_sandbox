@@ -36,7 +36,7 @@
   group under a command run as another user; those of a command that has ended are left
   running. A command that ends execd, by killing every process or taking the pod's last
   PID, makes each running `exec()` raise `ExecResultUnknownError`, as it does each
-  `read_file()` and `write_file()` once execd can start again, and commands still
+  `read_file()` and `write_file()`, and commands still
   running lose their timeout. Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
@@ -59,6 +59,7 @@
 - A warning is logged when Compose `init: true` is ignored on non-default services
   or on the default service with an explicit `command` or `entrypoint`.
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
+- Fix `read_file()` hanging on a relative file named `-`.
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
   replacement or container restart fails with the same `PodReplacedError` or
   `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
