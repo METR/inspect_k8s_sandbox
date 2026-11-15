@@ -171,20 +171,21 @@ func (f *forwarder) stream(c *net.TCPConn, target string) {
 		c.Close()
 		return
 	}
-	if _, err := up.Write(f.key[:]); err != nil {
+	fit := &fitted{File: up}
+	if _, err := fit.Write(f.key[:]); err != nil {
 		log.Print(err)
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
 		return
 	}
-	if target != "" && !tunnel(up, c, target) { // not logged: the sandbox chooses how many the proxy refuses
+	if target != "" && !tunnel(fit, c, target) { // not logged: the sandbox chooses how many the proxy refuses
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
 		return
 	}
-	join(up, c, nil)
+	join(fit, c, nil)
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.

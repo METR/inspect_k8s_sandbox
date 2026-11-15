@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -360,5 +361,186 @@ func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 		}
 	case err := <-refused:
 		t.Fatalf("the client's connection ended (%v) before the worker was up", err)
+	}
+}
+
+// nodeEnd is a vsock listener whose connections take peerBuffer bytes at a time, as Firecracker does of a guest's.
+func nodeEnd(t *testing.T) (*vsockListener, uint32) {
+	t.Helper()
+	node, port := loopback(t)
+	listener, _ := node.f.SyscallConn()
+	var err error
+	listener.Control(func(fd uintptr) {
+		err = unix.SetsockoptUint64(int(fd), unix.AF_VSOCK, unix.SO_VM_SOCKETS_BUFFER_SIZE, peerBuffer)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return node, port
+}
+
+// carrying accepts until a connection has a byte to read: an interrupted dial leaves an ended one first.
+func carrying(t *testing.T, node *vsockListener, deadline time.Time) *os.File {
+	t.Helper()
+	node.f.SetDeadline(deadline)
+	for {
+		up, _, err := node.accept()
+		if err != nil {
+			t.Fatalf("no connection that carries a byte reached the node: %v", err)
+		}
+		up.SetReadDeadline(deadline)
+		end, _ := up.SyscallConn()
+		var n int
+		end.Read(func(fd uintptr) bool {
+			var errno error
+			n, _, errno = unix.Recvfrom(int(fd), make([]byte, 1), unix.MSG_PEEK)
+			return errno != unix.EAGAIN
+		})
+		if n > 0 {
+			return up
+		}
+		up.Close()
+	}
+}
+
+// atNode reads the stream a full buffer at a time: what the frames after skip carry, and how many cross a buffer's end.
+func atNode(t *testing.T, up *os.File, skip int, deadline time.Time) (carried []byte, crossed int) {
+	t.Helper()
+	frames := func(stream []byte) (carried []byte, crossed int, ended bool) {
+		for at := skip; at+4 <= len(stream); {
+			length := int(binary.BigEndian.Uint32(stream[at:]))
+			if length == 0 {
+				return carried, crossed, true
+			}
+			if at+4+length > len(stream) {
+				break
+			}
+			carried = append(carried, stream[at+4:at+4+length]...)
+			if at/peerBuffer != (at+4+length-1)/peerBuffer {
+				crossed++
+			}
+			at += 4 + length
+		}
+		return carried, crossed, false
+	}
+	var stream []byte
+	end, _ := up.SyscallConn()
+	queued := make([]byte, peerBuffer)
+	for ; ; time.Sleep(time.Millisecond) {
+		var n int
+		end.Control(func(fd uintptr) { n, _, _ = unix.Recvfrom(int(fd), queued, unix.MSG_PEEK|unix.MSG_DONTWAIT) })
+		n = max(n, 0)
+		_, _, ended := frames(append(stream[:len(stream):len(stream)], queued[:n]...))
+		if n < peerBuffer && !ended {
+			if time.Now().After(deadline) {
+				t.Fatalf("the stream has neither filled the peer's buffer nor ended: %d bytes wait", n)
+			}
+			continue
+		}
+		end.Control(func(fd uintptr) { unix.Read(int(fd), queued[:n]) })
+		if stream = append(stream, queued[:n]...); ended {
+			carried, crossed, _ = frames(stream)
+			return carried, crossed
+		}
+	}
+}
+
+func TestUploadsFramesEndWhereThePeersBufferEnds(t *testing.T) {
+	node, port := nodeEnd(t)
+	client := proxyPort(t, keyedForwarder(unix.VMADDR_CID_LOCAL, port))
+	deadline := time.Now().Add(budget)
+	up := carrying(t, node, deadline)
+	defer up.Close()
+	// Two writes, the second once the first is at the node: each read is then a known size, and no frame need cross.
+	sent := make([]byte, 2*60000)
+	rand.Read(sent)
+	client.Write(sent[:60000])
+	end, _ := up.SyscallConn()
+	if err := end.Read(func(fd uintptr) bool {
+		n, _, _ := unix.Recvfrom(int(fd), make([]byte, peerBuffer), unix.MSG_PEEK)
+		return n >= keySize+4+60000
+	}); err != nil {
+		t.Fatalf("the first write did not reach the node: %v", err)
+	}
+	client.Write(sent[60000:])
+	client.CloseWrite()
+	carried, crossed := atNode(t, up, keySize, deadline)
+	if !bytes.Equal(carried, sent) {
+		t.Fatalf("the frames carry %d bytes: want the %d sent, unchanged", len(carried), len(sent))
+	}
+	if crossed > 0 {
+		t.Fatalf("%d frames cross the end of the peer's buffer: each is sent in two packets", crossed)
+	}
+}
+
+// gate is a reader that ends once it is closed: in a MultiReader it holds back the readers after it.
+type gate chan struct{}
+
+func (g gate) Read([]byte) (int, error) {
+	<-g
+	return 0, io.EOF
+}
+
+// crossings frames reads of these sizes onto a fitted connection and counts the frames that cross the peer buffer's end.
+func crossings(t *testing.T, early bool, sizes ...int) int {
+	t.Helper()
+	node, port := nodeEnd(t)
+	guest, err := vsockDial(unix.VMADDR_CID_LOCAL, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	deadline := time.Now().Add(budget)
+	guest.SetWriteDeadline(deadline)
+	taken := make(gate)
+	var reads []io.Reader
+	var sent []byte
+	for i, size := range sizes {
+		read := make([]byte, size)
+		rand.Read(read)
+		reads, sent = append(reads, bytes.NewReader(read)), append(sent, read...)
+		if early && i == 0 {
+			reads = append(reads, taken)
+		}
+	}
+	written := make(chan error, 1)
+	go func() { written <- toFrames(&fitted{File: guest}, io.MultiReader(reads...), nil) }()
+	up := carrying(t, node, deadline)
+	defer up.Close()
+	var first []byte
+	if early { // the node takes the first frame before its buffer is full, and the other reads wait for that
+		first = make([]byte, 4+sizes[0])
+		if _, err := io.ReadFull(up, first); err != nil {
+			t.Fatal(err)
+		}
+		close(taken)
+		first = first[4:]
+	}
+	carried, crossed := atNode(t, up, 0, deadline)
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("the writing did not end")
+	}
+	if carried = append(first, carried...); !bytes.Equal(carried, sent) {
+		t.Fatalf("the frames carry %d bytes: want the %d sent, unchanged", len(carried), len(sent))
+	}
+	return crossed
+}
+
+func TestFrameAfterOneThatLeftNoRoomForAFrameStillEndsWhereThePeersBufferEnds(t *testing.T) {
+	// A first frame that ends four bytes before the buffer does, then an upload: the frame sent four bytes short crosses.
+	if crossed := crossings(t, false, peerBuffer-8, 4*maxFrame); crossed > 1 {
+		t.Fatalf("%d frames cross the end of the peer's buffer: with under five bytes of room every full frame does", crossed)
+	}
+}
+
+func TestFramesEndWhereThePeersBufferEndsAgainAfterItMadeRoomEarly(t *testing.T) {
+	// As Firecracker does with under 4 KiB free: one frame then finds the buffer's end again.
+	if crossed := crossings(t, true, peerBuffer-4000, 8*maxFrame); crossed > 1 {
+		t.Fatalf("%d frames cross the end of the peer's buffer: a write cut short did not show where it ends", crossed)
 	}
 }

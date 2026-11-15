@@ -36,7 +36,7 @@ func (l *vsockListener) accept() (*os.File, uint32, error) {
 	var errno error
 	if err := raw.Read(func(listener uintptr) bool {
 		fd, peer, errno = unix.Accept4(int(listener), unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK)
-		return errno != unix.EAGAIN
+		return errno != unix.EAGAIN && errno != unix.EINTR // the kernel says EINTR, not EAGAIN, while a signal is pending
 	}); err != nil { // the listener was closed while this waited
 		return nil, 0, os.ErrClosed
 	}
@@ -73,4 +73,58 @@ func vsockDial(cid, port uint32) (*os.File, error) {
 			return nil, fmt.Errorf("vsock connect %d:%d: %w", cid, port, err)
 		}
 	}
+}
+
+// peerBuffer is Firecracker's CONN_TX_BUF_SIZE: all it holds of a connection's bytes from the guest.
+const peerBuffer = 64 << 10
+
+// fitted is a dialled vsock connection whose frames end where the peer's buffer ends.
+type fitted struct {
+	*os.File
+	used int // bytes in the peer's buffer since it was last empty
+}
+
+// payload is the most the next frame carries: what fills the peer's buffer. A nil fitted fits nothing.
+func (f *fitted) payload() int {
+	if f == nil {
+		return maxFrame
+	}
+	if room := peerBuffer - f.used; room > 4 {
+		return room - 4
+	}
+	return maxFrame - 4 // no frame fits in under five bytes of room: four bytes short leaves the next one five to eight
+}
+
+func (f *fitted) Write(p []byte) (int, error) {
+	raw, err := f.File.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	done, full := 0, -1 // full: where in p the peer's buffer was found full
+	var failed error
+	if err := raw.Write(func(fd uintptr) bool {
+		for done < len(p) {
+			n, err := unix.Write(int(fd), p[done:])
+			switch err {
+			case nil:
+				if done += n; done < len(p) { // the kernel cuts a write short only where the peer's buffer is full
+					full = done
+				}
+			case unix.EINTR:
+			case unix.EAGAIN:
+				return false
+			default:
+				failed = fmt.Errorf("vsock write: %w", err)
+				return true
+			}
+		}
+		return true
+	}); err != nil {
+		return done, err
+	}
+	if full >= 0 {
+		f.used = -full // the rest of p went into an emptied buffer
+	}
+	f.used = (f.used + len(p)) % peerBuffer
+	return done, failed
 }

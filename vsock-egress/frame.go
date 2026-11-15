@@ -71,8 +71,9 @@ func frame(payload string) []byte {
 func toFrames(dst io.Writer, src io.Reader, pace *pacer) error {
 	buf := chunks.Get().(*[4 + maxFrame]byte)
 	defer chunks.Put(buf)
+	fit, _ := dst.(*fitted)
 	for {
-		n, err := src.Read(buf[4:])
+		n, err := src.Read(buf[4 : 4+fit.payload()])
 		if n > 0 {
 			pace.wait(n)
 			binary.BigEndian.PutUint32(buf[:], uint32(n))
