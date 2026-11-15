@@ -79,7 +79,9 @@ class Pod:
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
         self._restart_lock = threading.Lock()
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
-        self._execd = ExecdClient(self._start_execd) if execd else None
+        self._execd = (
+            ExecdClient(self._start_execd, lambda: self._info.uid) if execd else None
+        )
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
         self._execd_started: float | None = None  # a start whose late check is owed
@@ -115,7 +117,7 @@ class Pod:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
-        return Daemon(pod.ip, stdout.decode().strip(), key)
+        return Daemon(pod.ip, stdout.decode().strip(), key, pod.uid)
 
     @property
     def info(self) -> PodInfo:
@@ -140,7 +142,10 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        return await self._run_async(self._check_for_pod_restart_sync)
+        found = await self._run_async(self._check_for_pod_restart_sync)
+        if self._execd is not None:  # "warn" mode refreshes a replaced pod's UID
+            await self._execd.leave_replaced()
+        return found
 
     def _check_for_pod_restart_sync(
         self,
