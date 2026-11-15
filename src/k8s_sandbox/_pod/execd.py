@@ -252,7 +252,7 @@ class Call:
     stdin_put: int = 0  # stdin execd has written to the process
     stdin_sent: int = 0  # stdin sent to execd: more can't have been written
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
-    closed: bool = False  # by its caller
+    closed: bool = False  # left by its caller, or timed out
     exited: bool = False
     resuming: bool = False  # a RESUME awaits its one RESUMED
     ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
@@ -612,6 +612,7 @@ class ExecdClient:
                     try:
                         item = await _next(call.queue, left())
                     except asyncio.TimeoutError:
+                        call.closed = True  # the cancel can be lost before Python 3.12
                         sender.cancel()  # its write could hold the lock the KILL needs
                         try:
                             await asyncio.wait_for(
@@ -705,6 +706,7 @@ class ExecdClient:
                     pod=link.daemon.ip,
                 ) from e
         finally:
+            call.closed = True  # as at our timeout: the cancel alone can be lost
             if sender is not None:
                 sender.cancel()
             try:
