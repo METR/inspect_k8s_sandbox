@@ -792,6 +792,84 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(
     assert "egressForwarderImage" in exc_info.value.stderr
 
 
+_EGRESS_CAPTURE = "inspect-k8s-sandbox/egress-capture=true"
+
+
+@pytest.mark.parametrize(
+    ("records", "own_names"),
+    [
+        pytest.param(
+            "dnsRecord=true",
+            ["-own", "default,agent-env-my-release-default"],
+            id="own",
+        ),
+        pytest.param(
+            "additionalDnsRecords={Site.test,my_db}",
+            ["-own", "default,agent-env-my-release-default,Site.test,my_db"],
+            id="additional records",
+        ),
+        pytest.param("dnsRecord=false", [], id="no record"),
+    ],
+)
+def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
+    chart_dir: Path, records: str, own_names: list[str]
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,"
+        f"services.default.{records},"
+        "services.default.initContainers[0].name=setup,"
+        "services.default.initContainers[0].image=busybox",
+        set_string=r"services.default.podAnnotations.sandbox\.amazonaws\.com/network-isolated=true,"
+        f"services.default.podAnnotations.{_EGRESS_PROXY},"
+        f"services.default.podAnnotations.{_EGRESS_CAPTURE}",
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    # After the forwarder listens, before `setup` and the service; it has ended by then.
+    forwarder, capture, setup = pod["initContainers"]
+    assert setup["name"] == "setup"
+    # It names the forwarder's own user, whose answers alone leave the forwarder's port.
+    assert capture["command"] == [
+        *["/vsock-egress", "redirect", "-forwarder"],
+        str(forwarder["securityContext"]["runAsUser"]),
+    ]
+    assert "restartPolicy" not in capture
+    # The forwarder is the resolver of every container, `setup` too.
+    assert (pod["dnsPolicy"], pod["dnsConfig"]) == (
+        "None",
+        {"nameservers": ["127.0.0.1"]},
+    )
+    # So a service's own names, which lead to its pod, are the forwarder's to answer.
+    assert forwarder["command"] == [
+        *["/vsock-egress", "forward", "-key", "/key/key", "-capture"],
+        *own_names,
+    ]
+
+
+@pytest.mark.parametrize(
+    "others",
+    [
+        pytest.param(
+            r"services.default.podAnnotations.sandbox\.amazonaws\.com/network-isolated=true,",
+            id="no proxy",
+        ),
+        # Its container that holds NET_ADMIN is for a pod with no network card alone.
+        pytest.param(f"services.default.podAnnotations.{_EGRESS_PROXY},", id="a card"),
+    ],
+)
+def test_egress_capture_annotation_needs_an_egress_proxy_and_no_network_card(
+    chart_dir: Path, others: str
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1",
+            set_string=f"{others}services.default.podAnnotations.{_EGRESS_CAPTURE}",
+        )
+    assert "inspect-k8s-sandbox/egress-capture needs" in exc_info.value.stderr
+
+
 @pytest.mark.parametrize(
     "proxy",
     [

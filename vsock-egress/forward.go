@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"flag"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -21,6 +23,8 @@ type forwarder struct {
 	queue   chan struct{} // one for each connection it carries or holds back
 	wait    time.Duration // how long a connection is held back for a place
 	connect func(cid, port uint32) (*os.File, error)
+
+	names *names // with capture: the address each name the sandbox looked up was given
 }
 
 func newForwarder(host, port uint32) *forwarder {
@@ -32,11 +36,18 @@ func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
+	capture := fs.Bool("capture", false, "answer the sandbox's DNS and carry the connections that vsock-egress redirect sends here")
+	own := fs.String("own", "", "with -capture: the pod's own names, with commas between, which lead to the pod itself")
 	fs.Parse(args)
 	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
 	f := newForwarder(hostCID, streamPort)
 	if err := f.loadKey(*keyFile); err != nil {
 		return err
+	}
+	if *capture {
+		if err := f.capture(*keyFile+namesSuffix, strings.Split(*own, ",")); err != nil {
+			return err
+		}
 	}
 	keys, err := vsockListen(keyPort)
 	if err != nil {
@@ -51,10 +62,30 @@ func forward(args []string) error {
 	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
 		return err
 	}
-	return f.serve(l)
+	return f.serve(l, f.proxied)
 }
 
-// readySuffix names the file beside the key that is there while the forwarder listens on both of its ports.
+// capture starts the sandbox's resolver, and the port its redirected connections arrive at.
+func (f *forwarder) capture(namesFile string, own []string) (err error) {
+	if f.names, err = loadNames(namesFile, own); err != nil {
+		return err
+	}
+	var plain net.ListenConfig
+	plain.SetMultipathTCP(false) // Go listens with MPTCP unless told, and such a connection does not say where it was going
+	redirected, err := plain.Listen(context.Background(), "tcp4", captureAddr)
+	if err != nil {
+		return err
+	}
+	queries, err := net.ListenPacket("udp4", captureAddr)
+	if err != nil {
+		return err
+	}
+	go func() { log.Fatal(f.names.resolve(queries)) }()
+	go func() { log.Fatal(f.serve(redirected, f.captured)) }()
+	return nil
+}
+
+// readySuffix names the file beside the key that is there while the forwarder listens on all of its ports.
 const readySuffix = ".ready"
 
 // ready is the forwarder's startup probe: the kubelet can reach no port of a pod with no network device.
@@ -95,7 +126,7 @@ func (f *forwarder) serveKey(l *vsockListener) {
 	}
 }
 
-func (f *forwarder) serve(l net.Listener) error {
+func (f *forwarder) serve(l net.Listener, carry func(*net.TCPConn)) error {
 	for {
 		c, err := l.Accept()
 		if errors.Is(err, net.ErrClosed) {
@@ -110,7 +141,7 @@ func (f *forwarder) serve(l net.Listener) error {
 		case f.queue <- struct{}{}:
 			go func() {
 				defer func() { <-f.queue }()
-				f.stream(c.(*net.TCPConn))
+				carry(c.(*net.TCPConn))
 			}()
 		default:
 			c.(*net.TCPConn).SetLinger(0)
@@ -119,8 +150,11 @@ func (f *forwarder) serve(l net.Listener) error {
 	}
 }
 
+// proxied carries a connection to the proxy port: its program says where it wants to go.
+func (f *forwarder) proxied(c *net.TCPConn) { f.stream(c, "") }
+
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
-func (f *forwarder) stream(c *net.TCPConn) {
+func (f *forwarder) stream(c *net.TCPConn, target string) {
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:
@@ -139,6 +173,12 @@ func (f *forwarder) stream(c *net.TCPConn) {
 	}
 	if _, err := up.Write(f.key[:]); err != nil {
 		log.Print(err)
+		c.SetLinger(0)
+		c.Close()
+		up.Close()
+		return
+	}
+	if target != "" && !tunnel(up, c, target) { // not logged: the sandbox chooses how many the proxy refuses
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
