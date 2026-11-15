@@ -100,6 +100,23 @@ func TestAConnectionFromThePodItselfIsRefused(t *testing.T) {
 	}
 }
 
+// remoteConn is a connection from a chosen address, for fromThisPod.
+type remoteConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c remoteConn) RemoteAddr() net.Addr { return c.addr }
+
+func TestAConnectionIsRefusedWhenTheInterfacesCannotBeListed(t *testing.T) {
+	interfaceAddrs = func() ([]net.Addr, error) { return nil, net.UnknownNetworkError("no netlink") }
+	t.Cleanup(func() { interfaceAddrs = net.InterfaceAddrs })
+	// A non-loopback peer execd can't place: with the error dropped it would be served.
+	if !fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1")}}) {
+		t.Fatal("a connection was admitted while execd could not list its own addresses")
+	}
+}
+
 // pipes is a listener whose connections come from no address of the pod's.
 type pipes chan net.Conn
 

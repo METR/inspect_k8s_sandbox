@@ -42,6 +42,8 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
+var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
+
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
@@ -152,7 +154,10 @@ func fromThisPod(nc net.Conn) bool {
 	if !ok || remote.IP.IsLoopback() {
 		return ok
 	}
-	addrs, _ := net.InterfaceAddrs()
+	addrs, err := interfaceAddrs()
+	if err != nil { // can't tell: refuse, rather than admit a dial from the sandbox
+		return true
+	}
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(remote.IP) {
 			return true
