@@ -2829,43 +2829,19 @@ async def test_a_command_stops_at_the_output_limit(
 
 
 @pytest.mark.parametrize(
-    "operation",
+    ("next_daemon", "raised"),
     [
-        pytest.param(
-            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
-        ),
-        pytest.param(
-            lambda c: c.read_file(pathlib.Path("/x"), io.BytesIO()), id="read_file"
-        ),
+        ("answers", error.ExecdStoppedError),
+        ("answers too late", error.ExecdStoppedError),
+        ("starts only once the pod is found", error.ExecdResultUnknownError),
     ],
-)
-async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
-    tls_daemon: TlsDaemon,
-    operation: collections.abc.Callable[
-        [execd.ExecdClient], collections.abc.Awaitable[None]
-    ],
-) -> None:
-    async def loses_it(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.ERROR, call_id, b"call id in use"))
-        await r.read()
-
-    client = await tls_daemon(loses_it)
-
-    with pytest.raises(error.PodError) as lost:
-        await asyncio.wait_for(operation(client), 30)
-    # Not a command's lost result, which is never retried: the sample would fail.
-    assert type(lost.value) is error.PodError
-
-
-@pytest.mark.parametrize(
-    "reached", [True, False], ids=["the next answers", "the next answers too late"]
 )
 async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     tls: tuple[ssl.SSLContext, str],
     monkeypatch: pytest.MonkeyPatch,
     clock: types.SimpleNamespace,
-    reached: bool,
+    next_daemon: str,
+    raised: type[Exception],
 ) -> None:
     """Regression: it was read again, from the container that had replaced its own."""
     context, pin = tls
@@ -2874,7 +2850,7 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     attempts = 0
 
     async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        if len(servers) == 2 and not reached and attempts == 1:
+        if len(servers) == 2 and next_daemon == "answers too late" and attempts == 1:
             return w.close()  # started, and not reached while the read reconnects
         await read_frame(r)  # AUTH
         w.write(frame(execd.OK, 0))
@@ -2890,6 +2866,8 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     async def start(replace: bool) -> execd.Daemon:
         if len(servers) == 2:
             raise execd.DaemonRunning("address already in use")
+        if servers and attempts == 1 and next_daemon.startswith("starts only once"):
+            raise kubernetes.client.exceptions.ApiException(status=404)
         server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
         servers.append(server)
         monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
@@ -2897,14 +2875,15 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
 
     client = execd.ExecdClient(start)
 
-    with pytest.raises(error.ExecdStoppedError):
+    with pytest.raises(error.ExecdResultUnknownError) as stopped:
         async for attempt in _sandbox_environment._retry():  # the provider's own
             with attempt:
                 attempts += 1
                 read = client.read_file(pathlib.Path("/x"), io.BytesIO())
                 await asyncio.wait_for(read, 30)  # only bounds a hang
-    assert len(starts) == 1
-    servers[1].close()
+    assert (type(stopped.value), len(starts)) == (raised, 1)
+    for server in servers:
+        server.close()
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
@@ -3196,7 +3175,24 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
-async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> None:
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(
+            lambda c: c.exec(["touch", "/once"], None, None, {}, None, 30), id="exec"
+        ),
+        pytest.param(
+            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
+        ),
+    ],
+)
+async def test_a_call_execd_abandoned_is_not_started_again(
+    daemons: Daemons,
+    operation: collections.abc.Callable[
+        [execd.ExecdClient], collections.abc.Awaitable[object]
+    ],
+) -> None:
+    """Regression: for a file operation it raised a PodError, which is retried."""
     starts = 0
 
     async def abandons(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -3216,7 +3212,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
     await daemons.serve(abandons)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
+        await asyncio.wait_for(operation(daemons.client()), 30)
     assert starts == 1
 
 

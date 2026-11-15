@@ -864,34 +864,28 @@ class ExecdClient:
     ) -> int:
         start = None if dst is None else dst.tell()
         unread = 0  # a write's stdout
-        try:
-            run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
-            async with contextlib.aclosing(run) as chunks:
-                async for kind, payload in chunks:
-                    if kind == EXIT:
-                        return payload["code"]
-                    if kind == STDERR:
-                        stderr.append(payload)
-                    elif dst is not None and start is not None:
-                        dst.write(payload)
-                        if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
-                            raise OutputLimitExceededError(
-                                limit_str=limits.MAX_READ_FILE_SIZE_STR,
-                                truncated_output=None,
-                            )
-                    else:
-                        unread += len(payload)
-                    # As exec() does: past it, output could arrive for ever.
-                    if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
+        run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
+        async with contextlib.aclosing(run) as chunks:
+            async for kind, payload in chunks:
+                if kind == EXIT:
+                    return payload["code"]
+                if kind == STDERR:
+                    stderr.append(payload)
+                elif dst is not None and start is not None:
+                    dst.write(payload)
+                    if dst.tell() - start > limits.MAX_READ_FILE_SIZE:
                         raise OutputLimitExceededError(
-                            limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                            limit_str=limits.MAX_READ_FILE_SIZE_STR,
                             truncated_output=None,
                         )
-        except ExecdStoppedError:
-            raise  # run again, it may reach a container that replaced its own
-        except ExecResultUnknownError as e:
-            # Unlike a command, a file operation may be run again.
-            raise PodError(str(e)) from e
+                else:
+                    unread += len(payload)
+                # As exec() does: past it, output could arrive for ever.
+                if stderr.truncated or unread > limits.MAX_EXEC_OUTPUT_SIZE:
+                    raise OutputLimitExceededError(
+                        limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
+                        truncated_output=None,
+                    )
         raise PodError("execd ended the file operation without an exit code")
 
     async def open_stream(
