@@ -1,4 +1,6 @@
 import contextlib
+import functools
+import importlib.util
 import json
 import logging
 import socket
@@ -9,7 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Generator, Literal
 
 import websocket
-from kubernetes.stream import stream, ws_client  # type: ignore
+from kubernetes.stream import ws_client  # type: ignore
+from kubernetes.stream.stream import _websocket_request  # type: ignore
 from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
 
 from k8s_sandbox._kubernetes_api import k8s_client
@@ -76,7 +79,11 @@ class _ConnectsInTime(websocket.WebSocket):
         self.settimeout(None)  # as kubernetes leaves it: each read sets its own
 
 
-ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
+# kubernetes' stream() over a copy of its module: its other users keep their websocket.
+_ws_client: Any = importlib.util.module_from_spec(ws_client.__spec__)
+ws_client.__spec__.loader.exec_module(_ws_client)
+_ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
+stream = functools.partial(_websocket_request, _ws_client.websocket_call, None)
 
 # Interval between WebSocket keepalive frames. Containerd's CRI streaming server
 # enforces a stream_idle_timeout (default 4h [1]) that closes connections with no

@@ -11,7 +11,9 @@ import types
 from unittest.mock import MagicMock
 
 import kubernetes.client
+import kubernetes.stream.ws_client  # type: ignore[import-untyped]
 import pytest
+import websocket
 from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 
 import k8s_sandbox._pod.execute as execute_module
@@ -216,3 +218,8 @@ def test_an_upgrade_answered_after_its_deadline_is_closed_not_used(
     finally:
         listening.close()
         pool.shutdown(wait=False)
+
+
+def test_kubernetes_keeps_its_own_websocket_for_its_other_users() -> None:
+    """Regression: every exec in the process got the provider's, and its deadline."""
+    assert kubernetes.stream.ws_client.WebSocket is websocket.WebSocket
