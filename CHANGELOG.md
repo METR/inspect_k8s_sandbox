@@ -47,7 +47,8 @@
   waiting to start again, counts as restarted.
 - With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` over
   Kubernetes exec that fails checks whether the container restarted or the pod was
-  replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead.
+  replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead, even
+  when Kubernetes shows the restart only after the failure.
 - The pod read that checks for a restart no longer waits without end on an API server
   that sends nothing: the operation fails after about four minutes.
 - An operation over Kubernetes exec no longer waits without end on an API server that
