@@ -125,6 +125,62 @@ except PermissionError:
 [ "$opened" = refused ] && pass "the call is refused there: the default seccomp profile is applied in the guest" \
   || fail "socket(AF_VSOCK) in the service's container: $opened. The default seccomp profile is not applied in the guest"
 
+# The AF_VSOCK refusal must survive the masked-family trick; the carry closes the io_uring and 32-bit routes, noted where off.
+vprobe=$(in_sandbox python3 -c '
+import base64, ctypes, errno, os, platform, socket, subprocess, tempfile
+libc = ctypes.CDLL(None, use_errno=True)
+sys_socket = 41 if platform.machine() == "x86_64" else 198  # the syscall carries the full 64-bit family, which libc may truncate
+ctypes.set_errno(0)
+fd = libc.syscall(sys_socket, ctypes.c_long((1 << 32) | socket.AF_VSOCK), socket.SOCK_STREAM, 0)
+if fd >= 0:
+    os.close(fd)
+    print("HIGHBITS=OPENED")
+else:
+    print("HIGHBITS=" + ("REFUSED" if ctypes.get_errno() in (errno.EPERM, errno.EAFNOSUPPORT) else "ERR"))
+cmd = open("/proc/cmdline").read().split()
+print("CARRY_IOURING=" + ("on" if "sysctl.kernel.io_uring_disabled=2" in cmd else "off"))
+print("CARRY_IA32=" + ("on" if "ia32_emulation=0" in cmd else "off"))
+ctypes.set_errno(0)
+ring = libc.syscall(425, 1, ctypes.create_string_buffer(120))
+if ring >= 0:
+    os.close(ring)
+print("IOURING=" + ("ENABLED" if ring >= 0 else "DISABLED" if ctypes.get_errno() == errno.EPERM else "ERR"))
+if platform.machine() != "x86_64":
+    print("I386=NA")
+else:
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        f.write(base64.b64decode("f0VMRgEBAQAAAAAAAAAAAAIAAwABAAAAVIAECDQAAAAAAAAAAAAAADQAIAABAAAAAAAAAAEAAAAAAAAAAIAECACABAhgAAAAYAAAAAUAAAAAEAAAuAEAAAC7KgAAAM2A"))
+    os.chmod(f.name, 0o755)
+    try:
+        subprocess.run([f.name])
+        print("I386=RAN")
+    except OSError as e:
+        print("I386=" + ("REFUSED" if e.errno == errno.ENOEXEC else "ERR"))
+    os.unlink(f.name)
+print("PROBE_DONE")
+' 2>&1 | tr "\n" " ")
+case "$vprobe" in *PROBE_DONE*) ;; *) fail "the bypass probe did not run to completion: $vprobe" ;; esac
+
+say "5a. the masked-family socket(AF_VSOCK) is refused too"
+case "$vprobe" in
+  *HIGHBITS=REFUSED*) pass "socket() with the family's upper bits set is refused: $vprobe" ;;
+  *) fail "a masked-family socket(AF_VSOCK) opened — seccomp compares the family as 64 bits: $vprobe" ;;
+esac
+
+say "5b. io_uring cannot open AF_VSOCK (the IORING_OP_SOCKET bypass)"
+case "$vprobe" in
+  *CARRY_IOURING=off*) echo "   note: io_uring is not disabled on this node's guests (carry off); observed $vprobe" ;;
+  *IOURING=DISABLED*) pass "io_uring_setup is refused: $vprobe" ;;
+  *) fail "the guest carries io_uring_disabled=2 but io_uring_setup was not refused with EPERM: $vprobe" ;;
+esac
+
+say "5c. a 32-bit socketcall cannot open AF_VSOCK"
+case "$vprobe" in
+  *CARRY_IA32=off*) echo "   note: 32-bit programs are not refused on this node's guests (carry off); observed $vprobe" ;;
+  *I386=REFUSED*|*I386=NA*) pass "a 32-bit program is refused: $vprobe" ;;
+  *) fail "the guest carries ia32_emulation=0 but a 32-bit program ran: $vprobe" ;;
+esac
+
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 contract=$(k -n "$LNS" exec "$(launcher)" -c launcher -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
