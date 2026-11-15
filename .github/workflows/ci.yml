@@ -24,3 +24,5 @@ jobs:
     uses: ./.github/workflows/pre-commit.yml
   execd:
     uses: ./.github/workflows/execd.yml
+  vsock-egress:
+    uses: ./.github/workflows/vsock-egress.yml
