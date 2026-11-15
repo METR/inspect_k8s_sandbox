@@ -2907,6 +2907,57 @@ async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
     servers[1].close()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        kubernetes.client.exceptions.ApiException(status=404),
+        error.PodError("execd did not start"),
+    ],
+    ids=["the pod is gone", "no daemon starts in time"],
+)
+async def test_a_file_is_not_read_again_when_its_daemon_cannot_be_reached(
+    tls: tuple[ssl.SSLContext, str],
+    monkeypatch: pytest.MonkeyPatch,
+    clock: types.SimpleNamespace,
+    failure: Exception,
+) -> None:
+    """Regression: it was read again, from the daemon its next attempt started."""
+    context, pin = tls
+    servers: list[asyncio.Server] = []
+    starts: list[int] = []
+    attempts = 0
+
+    async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) == 1:  # gone, as with its pod: its port refuses
+                    servers[0].close()
+                    return w.close()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    async def start(replace: bool) -> execd.Daemon:
+        if servers and attempts == 1:  # none starts while the read reconnects
+            raise failure
+        server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
+        servers.append(server)
+        monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    client = execd.ExecdClient(start)
+
+    with pytest.raises(error.ExecdStoppedError):
+        async for attempt in _sandbox_environment._retry():  # the provider's own
+            with attempt:
+                attempts += 1
+                read = client.read_file(pathlib.Path("/x"), io.BytesIO())
+                await asyncio.wait_for(read, 30)  # only bounds a hang
+    assert len(starts) == 1
+
+
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
     tls_daemon: TlsDaemon, tmp_path: pathlib.Path
 ) -> None:

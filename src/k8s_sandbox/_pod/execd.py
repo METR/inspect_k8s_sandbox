@@ -650,7 +650,15 @@ class ExecdClient:
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
-                        link = await asyncio.wait_for(self._get(stale=link), left())
+                        try:
+                            link = await asyncio.wait_for(self._get(stale=link), left())
+                        except (asyncio.TimeoutError, K8sError):
+                            raise  # the command's timeout, or a restart found
+                        except Exception as e:  # not reached: execd may have stopped
+                            raise ExecdStoppedError(
+                                f"execd connection lost during the command: {e!r}",
+                                pod=call.daemon.ip,
+                            ) from e
                         if link.daemon is not call.daemon:
                             raise ExecdStoppedError(
                                 "execd stopped while it ran the command",
