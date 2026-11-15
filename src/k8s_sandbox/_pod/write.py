@@ -1,3 +1,4 @@
+import contextlib
 import shlex
 from contextlib import contextmanager
 from pathlib import Path
@@ -7,6 +8,7 @@ from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 from websocket import WebSocketException
 
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.execute import STREAM_END_GRACE_SECONDS
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
@@ -21,7 +23,14 @@ from k8s_sandbox._pod.op import (
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         with self._start_write_command(dst, len(data)) as ws_client:
-            self._write_stdin_chunked(ws_client, data)
+            try:
+                self._write_stdin_chunked(ws_client, data)
+            except (OSError, WebSocketException) as e:
+                # A status the exec sent before the upload failed is still unread.
+                with contextlib.suppress(OSError, WebSocketException):
+                    ws_client.run_forever(timeout=STREAM_END_GRACE_SECONDS)
+                raise_if_stopped_before_lost(ws_client, e, self._pod.name)
+                raise
             self._handle_stream_output(ws_client)
 
     @contextmanager
