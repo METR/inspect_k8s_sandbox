@@ -385,8 +385,9 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                         if attempt.retry_state.attempt_number > 1:
                             # Kubernetes may show a restart only after the failure.
                             await self._pod.check_for_pod_restart()
-                        temp_file.seek(0)
-                        temp_file.truncate()
+                            # Not a new file: truncated, ext4 writes it out at close.
+                            temp_file.seek(0)
+                            temp_file.truncate()
                         await self._pod.read_file(Path(file), temp_file)
                 temp_file.seek(0)
                 return (
