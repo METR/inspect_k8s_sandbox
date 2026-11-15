@@ -116,7 +116,7 @@ func proxyPort(t *testing.T, f *forwarder) *net.TCPConn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	c, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 		}
 		return vsockDial(cid, port)
 	}
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	dialled := make(chan *os.File, 2*maxStreams)
 	go func() {
 		for {
@@ -244,7 +244,7 @@ func refused(t *testing.T, f *forwarder) (ended error, streams int32) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	c, err := net.Dial("tcp", l.Addr().String()) // a reset may be there before the dial returns
 	if err == nil {
 		t.Cleanup(func() { c.Close() })
@@ -306,7 +306,7 @@ func TestStreamsTheGuestDroppedDoNotShutOutTheNext(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 
 	for _, round := range []string{"first", "next"} {
 		clients := make([]*net.TCPConn, maxStreams)

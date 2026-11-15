@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"io"
 	"net"
 	"path/filepath"
@@ -55,10 +54,6 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 // vsockPair stands in for the vsock connection between a forwarder and its worker.
 func vsockPair(t *testing.T) (net.Conn, net.Conn) {
 	return pair(t, "unix", filepath.Join(t.TempDir(), "vsock"))
-}
-
-func frame(payload string) []byte {
-	return append(binary.BigEndian.AppendUint32(nil, uint32(len(payload))), payload...)
 }
 
 func TestHalfClosedClientGetsItsReply(t *testing.T) {
