@@ -73,6 +73,8 @@ The converter emits `command: null` so Helm deletes the chart default
 (the idle loop on the `default` service) rather than appending your command
 to it.
 
+An `entrypoint` set to `[]`, `[""]` or `""` is rejected.
+
 ## Init Process
 
 `init: true` is ignored; no init process is added. The default service's idle loop

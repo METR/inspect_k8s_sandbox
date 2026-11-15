@@ -9,6 +9,7 @@ import yaml
 
 import k8s_sandbox
 from k8s_sandbox._helm import validate_no_null_values
+from k8s_sandbox.compose import _converter
 from k8s_sandbox.compose._converter import (
     ComposeConverterError,
     convert_compose_to_helm_values,
@@ -259,6 +260,32 @@ services:
 
     assert result["services"]["default"]["command"] == ["/bin/sh"]
     assert "args" not in result["services"]["default"]
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        "entrypoint: []",
+        'entrypoint: ""',
+        'entrypoint: [""]',
+        'entrypoint: []\n    command: ["sleep", "1"]',
+    ],
+)
+def test_refuses_an_empty_entrypoint(
+    tmp_compose: TmpComposeFixture, entrypoint: str
+) -> None:
+    """Regression: it converted, and the pod ran the image's ENTRYPOINT, or nothing."""
+    compose_path = tmp_compose(f"""
+services:
+  default:
+    image: busybox:1.37
+    {entrypoint}
+""")
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert "Unsupported empty 'entrypoint'" in str(exc_info.value)
 
 
 def test_command_null_survives_values_plumbing(

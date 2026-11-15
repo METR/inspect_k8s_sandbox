@@ -276,6 +276,12 @@ class _ServiceConverter:
         has_command = src.get("command") is not None
         _transform(src, "entrypoint", result, "command", _str_to_list)
         _transform(src, "command", result, "args", _str_to_list)
+        # Compose drops the image's entrypoint for these; Kubernetes runs it, or "".
+        if result.get("command") in ([], [""]):
+            raise ComposeConverterError(
+                "Unsupported empty 'entrypoint'. Set it to the program to run. "
+                f"{self.context}"
+            )
         if has_command and not has_entrypoint:
             result["command"] = None
         _transform(src, "working_dir", result, "workingDir")
