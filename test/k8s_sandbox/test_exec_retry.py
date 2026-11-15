@@ -506,6 +506,7 @@ async def test_a_file_operation_checks_for_a_restart_before_each_further_attempt
     [
         ("refuses", True),
         ("cuts the connection", True),
+        ("cuts its answer", True),
         pytest.param(
             "drops the connect",  # as Linux does one that finds its queue full
             False,
@@ -518,8 +519,9 @@ async def test_only_a_connection_that_fails_at_once_is_tried_again(
     api: Api, caplog: pytest.LogCaptureFixture, then: str, tried_again: bool
 ) -> None:
     """Regression: an API server down at a file operation's restart check failed it."""
-    cut = [b""] if then == "cuts the connection" else []  # closed with no answer
-    api([_shows(500), _shows(200), *cut], then)  # its exec fails, no restart shows
+    cut = {"cuts the connection": [b""], "cuts its answer": [_shows(200)[:-9]]}
+    # Its exec fails, and no restart shows.
+    api([_shows(500), _shows(200), *cut.get(then, [])], then)
     sandbox, _ = _make_sandbox()
     sandbox._pod = pod.Pod("p", "ns", None, "default", "u", 0, "raise")
 
