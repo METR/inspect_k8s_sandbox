@@ -189,7 +189,7 @@ def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at, execs.connect)
+        return execd.Daemon("", *at, stdio=execs.connect)
 
     return execd.ExecdClient(start)
 

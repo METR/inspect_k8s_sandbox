@@ -2536,7 +2536,7 @@ async def test_a_replacement_found_in_warn_mode_moves_operations_to_its_execd(
         started.append(cluster.uid)
         return execd.Daemon("127.0.0.1", tls[1], b"key", cluster.uid)
 
-    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd=True)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd="true")
     assert pod._execd is not None
     pod._execd._start = start
     with anyio.fail_after(30):  # only bounds a hang
