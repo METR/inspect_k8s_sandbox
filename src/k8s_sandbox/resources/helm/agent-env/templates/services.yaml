@@ -49,7 +49,7 @@ spec:
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
-      runtimeClassName: {{ $service.runtimeClassName | default "gvisor" }}
+      runtimeClassName: {{ $service.runtimeClassName | default "gvisor" | quote }}
       {{- end }}
       automountServiceAccountToken: {{ $.Values.automountServiceAccountToken }}
       {{- if $.Values.serviceAccountName }}
@@ -77,10 +77,10 @@ spec:
       {{- if $service.initContainers }}
       initContainers:
       {{- range $service.initContainers }}
-        - name: {{ .name }}
-          image: {{ .image }}
+        - name: {{ .name | quote }}
+          image: {{ .image | quote }}
           {{- if .imagePullPolicy }}
-          imagePullPolicy: {{ .imagePullPolicy }}
+          imagePullPolicy: {{ .imagePullPolicy | quote }}
           {{- end }}
           {{- if .command }}
           command:
@@ -91,7 +91,7 @@ spec:
 {{ toYaml .args | nindent 12 }}
           {{- end }}
           {{- if .workingDir }}
-          workingDir: {{ .workingDir }}
+          workingDir: {{ .workingDir | quote }}
           {{- end }}
           # This 'magic env var' has
           # to be accessible to the initContainers,
@@ -101,7 +101,7 @@ spec:
             - name: AGENT_ENV
               value: "{{ template "agentEnv.fullname" $ }}"
           {{- range .env }}
-            - name: {{ .name }}
+            - name: {{ .name | quote }}
               value: {{ .value | quote }}
           {{- end }}
           {{- with .volumeMounts }}
@@ -121,9 +121,9 @@ spec:
 
       containers:
       - name: {{ $name }}
-        image: {{ $service.image }}
+        image: {{ $service.image | quote }}
         {{- if $service.imagePullPolicy }}
-        imagePullPolicy: {{ $service.imagePullPolicy }}
+        imagePullPolicy: {{ $service.imagePullPolicy | quote }}
         {{- end }}
         {{- if $service.command }}
         command:
@@ -134,7 +134,7 @@ spec:
           {{- toYaml $service.args | nindent 10 }}
         {{- end }}
         {{- if $service.workingDir }}
-        workingDir: {{ $service.workingDir }}
+        workingDir: {{ $service.workingDir | quote }}
         {{- end }}
         env:
           # Retained for service resolution backwards compatibility.
@@ -142,7 +142,7 @@ spec:
             value: "{{ template "agentEnv.fullname" $ -}}"
         {{- if $service.env }}
           {{ range $service.env }}
-          - name: {{ .name }}
+          - name: {{ .name | quote }}
             value: {{ .value | quote }}
           {{- end }}
         {{- end }}
@@ -284,7 +284,7 @@ spec:
   # ports are deprecated within this Helm chart. Maintained for backwards compatibility.
   ports:
     {{- range $service.ports }}
-    - protocol: {{ .protocol }}
+    - protocol: {{ .protocol | quote }}
       port: {{ .port }}
       {{- /* A name is required when multiple ports are exposed. */}}
       name: port-{{ .port }}

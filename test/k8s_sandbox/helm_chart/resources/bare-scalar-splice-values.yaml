@@ -1,0 +1,21 @@
+# Each value ends with a newline that would splice `spliced: x` as a sibling if unquoted.
+services:
+  default:
+    image: "img\nspliced: x"
+    imagePullPolicy: "Always\nspliced: x"
+    workingDir: "/w\nspliced: x"
+    runtimeClassName: "gvisor\nspliced: x"
+    env:
+      - name: "ENVNAME\nspliced: x"
+        value: "v"
+    ports:
+      - port: 80
+        protocol: "TCP\nspliced: x"
+    initContainers:
+      - name: "init\nspliced: x"
+        image: "iimg\nspliced: x"
+        imagePullPolicy: "Always\nspliced: x"
+        workingDir: "/iw\nspliced: x"
+        env:
+          - name: "IENVNAME\nspliced: x"
+            value: "v"
