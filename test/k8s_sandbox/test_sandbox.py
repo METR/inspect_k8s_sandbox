@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import re
+import subprocess
 import time
 from contextlib import contextmanager
 from textwrap import dedent
@@ -805,6 +806,32 @@ async def test_write_file_is_not_truncated_when_stdin_is_delayed(
     result = await sandbox_busybox_runc.exec(["wc", "-c", dst])
     assert result.success, result.stderr
     assert int(result.stdout.split()[0]) == len(contents)
+
+
+async def test_write_file_cut_by_a_restart_does_not_land_in_the_new_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the write's retry landed in the restarted container."""
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    dst = "/tmp/test-write-file-cut-by-a-restart.bin"
+    async with install_sandbox_environments(
+        __file__, "restart-values.yaml", restarted_container_behavior="raise"
+    ) as envs:
+        sandbox = envs["default"]
+        # Armed beforehand: when the container is killed, the write is its only exec.
+        await sandbox.exec(
+            ["sh", "-c", f"(until [ -s {dst} ]; do sleep 0.1; done; kill 1) &"]
+        )
+
+        with pytest.raises(K8sError) as exc_info:
+            await sandbox.write_file(dst, bytes(256 * 1024**2))
+
+        assert "has restarted" in str(exc_info.value.__cause__)
+        await _wait_for_restart(sandbox)
+        info = sandbox._pod.info
+        kubectl = ["kubectl", "exec", "-n", info.namespace, info.name, "--"]
+        # By kubectl: in "raise" mode the sandbox refuses every operation from here on.
+        subprocess.run([*kubectl, "test", "!", "-e", dst], check=True, timeout=30)
 
 
 ### #read_file() ###

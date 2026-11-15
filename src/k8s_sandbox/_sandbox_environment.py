@@ -346,6 +346,9 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         with self._log_op("K8s write file to Pod", expected_exceptions, file=file):
             async for attempt in _retry():
                 with attempt:
+                    if attempt.retry_state.attempt_number > 1:
+                        # Kubernetes may show a restart only after the failure.
+                        await self._pod.check_for_pod_restart()
                     await self._pod.write_file(data, Path(file))
 
     @overload
@@ -369,6 +372,9 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             with self._log_op("K8s read file from Pod", expected_exceptions, file=file):
                 async for attempt in _retry():
                     with attempt:
+                        if attempt.retry_state.attempt_number > 1:
+                            # Kubernetes may show a restart only after the failure.
+                            await self._pod.check_for_pod_restart()
                         temp_file.seek(0)
                         temp_file.truncate()
                         await self._pod.read_file(Path(file), temp_file)
