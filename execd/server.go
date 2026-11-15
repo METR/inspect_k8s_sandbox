@@ -804,7 +804,7 @@ func killTree(pid int) {
 			}
 		}
 	}
-	for _, p := range stopped { // stopped, as its parent is, each has kept its id: no descriptor is needed to tell
+	for _, p := range stopped { // shortcut: stopped, each keeps its id unless something else kills it now; signal as freeze does if that can matter
 		syscall.Kill(p, syscall.SIGKILL)
 	}
 	syscall.Kill(pid, syscall.SIGKILL)
