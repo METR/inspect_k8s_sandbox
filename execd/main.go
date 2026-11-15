@@ -157,7 +157,16 @@ func start() {
 		daemon.Wait() // it has exited: no zombie is left to a first process that reaps none
 		fail("daemon did not start: " + msg)
 	}
-	fmt.Println(fingerprint)
+	fmt.Println(fingerprint, container())
+}
+
+// container names the container execd is in: a client that finds another has seen a restart, whatever Kubernetes shows.
+func container() string {
+	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if f := stat(1); len(f) > 19 { // the kernel's boot, and when the container's first process started
+		return strings.TrimSpace(string(boot)) + ":" + f[19]
+	}
+	return "unknown"
 }
 
 func run(port int, keyHash string, replace bool) {

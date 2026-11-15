@@ -70,8 +70,8 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the first exec's stdout stayed open: %v", err)
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out) {
-		t.Fatalf("the first exec printed %q, want its daemon's fingerprint", out)
+	if !regexp.MustCompile(`^[0-9a-f]{64} \S+\n$`).Match(out) {
+		t.Fatalf("the first exec printed %q, want its daemon's fingerprint and its container", out)
 	}
 }
 

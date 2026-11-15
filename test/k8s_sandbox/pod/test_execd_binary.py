@@ -2,6 +2,7 @@
 
 import asyncio
 import collections.abc
+import contextlib
 import dataclasses
 import hashlib
 import os
@@ -10,11 +11,15 @@ import shutil
 import ssl
 import subprocess
 import sys
+import typing
 import uuid
 
+import kubernetes.client.exceptions
 import pytest
 
-from k8s_sandbox._pod import execd
+from k8s_sandbox._pod import error, execd, op
+from k8s_sandbox._pod import pod as pod_module
+from test.k8s_sandbox.pod import test_execd
 
 EXECD = pathlib.Path(__file__).parents[3] / "execd"
 PORT = execd.EXECD_PORT
@@ -138,7 +143,7 @@ def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
         if "address already in use" in started.stderr:
             raise execd.DaemonRunning(started.stderr)
         assert started.returncode == 0, started.stderr
-        return execd.Daemon("127.0.0.1", started.stdout.strip(), key)
+        return execd.Daemon("127.0.0.1", started.stdout.split()[0], key)
 
     return execd.ExecdClient(start)
 
@@ -188,6 +193,84 @@ async def test_an_upload_whose_connection_drops_arrives_whole_and_once(
     assert result.stdout.split() == [hashlib.md5(data).hexdigest(), "-"]
     ran = await asyncio.to_thread(sandbox.sh, f"cat {held}")
     assert ran.stdout == "x\n"  # by the one command
+
+
+def test_execd_started_again_names_the_same_container(sandbox: Sandbox) -> None:
+    name = f"{sandbox.name}-again"
+    listen = [execd.EXECD_PATH, "listen", "--port", str(PORT), "--replace"]
+    listen += ["--key-sha256", "00" * 32]
+    try:
+        started = docker("run", "-d", "--name", name, sandbox.name, "sleep", "3600")
+        assert started.returncode == 0, started.stderr
+        first = docker("exec", name, *listen).stdout.split()[1]
+        again = docker("exec", name, *listen).stdout.split()[1]
+    finally:
+        docker("rm", "-f", name)
+
+    assert again == first  # or a restart of execd alone would pass for the container's
+
+
+@pytest.mark.parametrize(
+    ("mode", "read_fails"),
+    [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],
+)
+async def test_a_restart_kubernetes_has_not_shown_is_found_where_execd_starts(
+    sandbox: Sandbox,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: typing.Literal["raise", "warn"],
+    read_fails: tuple[bool, ...],
+) -> None:
+    """Regression: operations ran in a restarted container Kubernetes had not shown."""
+    name = f"{sandbox.name}-{mode}-{len(read_fails)}"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    shown = test_execd.Cluster()  # the pod as Kubernetes shows it: never restarted
+    outages = iter(read_fails)
+
+    class Execute:
+        def __init__(self, info: object) -> None:
+            pass
+
+        def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
+            ran = docker("exec", name, *cmd)
+            shown.unavailable = next(outages, False)  # the pod read after this start
+            return ran.returncode, ran.stdout.encode(), ran.stderr.encode()
+
+    monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
+    monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
+    monkeypatch.setattr(op, "k8s_client", lambda _: shown)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, mode, execd=True)
+
+    async def command() -> None:
+        async def run() -> None:
+            await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
+
+        try:
+            await run()
+        except execd.NotSent:  # it never left: the provider sends it again
+            await run()
+
+    try:
+        started = docker("run", "-d", "--name", name, sandbox.name, "sleep", "3600")
+        assert started.returncode == 0, started.stderr
+        shown.ip = docker("inspect", "-f", address, name).stdout.strip()
+        if read_fails[:1] == (True,):  # execd starts, though the read after it fails
+            with pytest.raises(kubernetes.client.exceptions.ApiException):
+                await command()
+        else:
+            await command()
+        restarted = await asyncio.to_thread(docker, "restart", "-t", "0", name)
+        assert restarted.returncode == 0, restarted.stderr
+        shown.ip = docker("inspect", "-f", address, name).stdout.strip()
+
+        if mode == "raise":
+            with pytest.raises(error.ContainerRestartedError, match="execd started"):
+                await command()
+        else:  # it goes on there
+            with contextlib.suppress(error.ExecdStoppedError):
+                await command()  # execd may be found gone only under it
+            await command()
+    finally:
+        docker("rm", "-f", name)
 
 
 async def test_a_wrong_key_is_answered_with_nothing(

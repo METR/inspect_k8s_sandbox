@@ -2330,7 +2330,7 @@ async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> 
 async def test_only_one_fingerprint_line_starts_execd(
     cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    printed = b"0" * 64 + b"\n"
+    printed = b"0" * 64 + b" c\n"
 
     class Execute:
         def __init__(self, info: object) -> None:
@@ -2343,7 +2343,7 @@ async def test_only_one_fingerprint_line_starts_execd(
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
     assert (await pod._start_execd(False)).fingerprint == "0" * 64
 
-    printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
+    printed = b"1" * 64 + b" " + b"c" * 4031  # both, but cut at run_argv's 4 KiB
     with pytest.raises(error.PodError, match="execd did not start"):
         await pod._start_execd(False)
 
@@ -2364,7 +2364,7 @@ def execd_starts(
                 return 2, b"", b"listen tcp :14601: bind: address already in use\n"
             running = True
             meanwhile()
-            return 0, b"0" * 64 + b"\n", b""
+            return 0, b"0" * 64 + b" c\n", b""
 
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
 

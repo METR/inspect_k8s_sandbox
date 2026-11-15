@@ -85,6 +85,7 @@ class Pod:
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
         self._execd_started: float | None = None  # a start whose late check is owed
+        self._execd_container: bytes | None = None  # the one execd said it started in
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -99,12 +100,19 @@ class Pod:
         )
         if b"address already in use" in stderr:
             raise DaemonRunning(stderr.decode(errors="replace"))
-        # Exactly the fingerprint execd prints: anything else, cut output too, fails.
-        if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
+        # Exactly execd's line, its fingerprint and its container: cut output fails.
+        said = re.fullmatch(rb"([0-9a-f]{64}) (\S+)\n", stdout)
+        if code != 0 or said is None:
             raise PodError("execd did not start", returncode=code, stderr=stderr)
         self._execd_lost = True  # until it is returned: a failure below loses its key
         if not replace:  # the daemon reached before died, perhaps with its container
             self._execd_restarted = time.monotonic()
+        if info.restarted_container_behavior == "raise":
+            # Kubernetes can show a restart late; execd is in another container at once.
+            if self._execd_container not in (None, said[2]):
+                self._keep_stopped("execd started in another container")
+                self._raise_restart()
+            self._execd_container = said[2]
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
         # Read last: a pod that replaced the one first checked has another address.
@@ -117,7 +125,7 @@ class Pod:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
-        return Daemon(pod.ip, stdout.decode().strip(), key, pod.uid)
+        return Daemon(pod.ip, said[1].decode(), key, pod.uid)
 
     @property
     def info(self) -> PodInfo:
@@ -424,16 +432,17 @@ class Pod:
             if late and self._execd_started == started:
                 self._execd_started = None  # a restart before that start shows by now
 
-    def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
-        """Keep the restart of a container that stopped under an operation."""
+    def _keep_stopped(
+        self, reason: str = "stopped under an operation"
+    ) -> PodReplacedError | ContainerRestartedError:
+        """Keep the restart of a container found stopped before Kubernetes shows it."""
         info = self._info
-        # Gone, though Kubernetes may not show it stopped yet.
         return self._keep(
             ContainerRestartedError(
                 pod_name=info.name,
                 container_name=info.default_container_name,
                 restart_count=info.initial_restart_count + 1,
-                last_reason="stopped under an operation",
+                last_reason=reason,
             )
         )
 
