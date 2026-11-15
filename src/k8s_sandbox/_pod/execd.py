@@ -868,6 +868,11 @@ class ExecdClient:
         async with contextlib.aclosing(run) as chunks:
             async for kind, payload in chunks:
                 if kind == EXIT:
+                    if payload.get("error"):  # execd's: nothing ran to tell of the file
+                        raise PodError(
+                            "execd could not start the file operation.",
+                            error=payload["error"],
+                        )
                     return payload["code"]
                 if kind == STDERR:
                     stderr.append(payload)

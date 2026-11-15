@@ -5,6 +5,7 @@ import collections.abc
 import contextlib
 import dataclasses
 import hashlib
+import io
 import os
 import pathlib
 import shutil
@@ -54,6 +55,7 @@ class Sandbox:
 
     name: str
     ip: str
+    options: tuple[str, ...] = ()  # of the `docker exec` that starts execd
 
     def sh(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
         return docker("exec", self.name, "sh", "-c", script, "sh", *args)
@@ -139,7 +141,8 @@ def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
         listen = [execd.EXECD_PATH, "listen", "--port", str(PORT)]
         listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
         listen += ["--replace"] if replace else []
-        started = await asyncio.to_thread(docker, "exec", sandbox.name, *listen)
+        command = ["exec", *sandbox.options, sandbox.name, *listen]
+        started = await asyncio.to_thread(docker, *command)
         if "address already in use" in started.stderr:
             raise execd.DaemonRunning(started.stderr)
         assert started.returncode == 0, started.stderr
@@ -298,6 +301,21 @@ async def test_a_restart_kubernetes_has_not_shown_is_found_where_execd_starts(
             await command()
     finally:
         docker("rm", "-f", name)
+
+
+async def test_a_file_operation_execd_cannot_start_is_no_word_on_the_file(
+    sandbox: Sandbox, client: execd.ExecdClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: with the working directory gone, any file read as missing."""
+    gone = f"/tmp/{uuid.uuid4().hex}"
+    assert sandbox.sh(f"mkdir {gone}").returncode == 0
+    monkeypatch.setattr(sandbox, "options", ("--workdir", gone))
+    removed = client.exec(["rmdir", gone], None, "/", {}, None, None)
+    await asyncio.wait_for(removed, 30)  # execd starts there; only bounds a hang
+
+    with pytest.raises(error.PodError, match="cd: "):
+        read = client.read_file(pathlib.Path("/etc/hostname"), io.BytesIO())
+        await asyncio.wait_for(read, 30)  # only bounds a hang
 
 
 async def test_a_wrong_key_is_answered_with_nothing(
