@@ -3,6 +3,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from abc import ABC
 from dataclasses import dataclass
 from typing import Any, Generator, Literal
@@ -25,25 +26,54 @@ API_TIMEOUT = 60
 class _ConnectsInTime(websocket.WebSocket):
     """kubernetes' websocket, whose connect and upgrade it gives no timeout at all."""
 
-    def connect(self, url: str, **options: Any) -> None:
-        over = threading.Event()
-        threading.Thread(target=self._cut, args=(over,), daemon=True).start()
-        try:
-            super().connect(url, **{"timeout": API_TIMEOUT, **options})
-        finally:
-            over.set()
-        self.settimeout(None)  # as kubernetes leaves it: each read sets its own
+    _deadline = float("inf")  # its connect's, on the monotonic clock
+    _gate = threading.RLock()  # one for all: held for an assignment, or a close
 
-    def _cut(self, over: threading.Event) -> None:
-        """Shut the socket of a connect still going after API_TIMEOUT."""
-        if over.wait(API_TIMEOUT):
-            return
-        # A read's timeout is for each byte of the answer, which a server can drip.
-        while not over.wait(0.05):  # the socket is None until TCP and TLS are up
-            if (sock := self.sock) is not None:
-                with contextlib.suppress(OSError):
-                    # Not ssl's, which drops TLS first; close need not wake a read.
-                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    @property
+    def sock(self) -> Any:
+        return self._sock
+
+    @sock.setter
+    def sock(self, sock: Any) -> None:
+        with self._gate:
+            if sock is not None and time.monotonic() > self._deadline:
+                sock.close()  # the upgrade is the exec: not sent
+                raise TimeoutError("connected after its deadline")
+            self._sock = sock
+
+    def connect(self, url: str, **options: Any) -> None:
+        connect = super().connect
+        over = threading.Event()
+        failed: list[BaseException] = []
+        self._deadline = time.monotonic() + API_TIMEOUT
+
+        def attempt() -> None:  # in a thread: a resolver can't be interrupted
+            try:
+                connect(url, **{"timeout": API_TIMEOUT, **options})
+            except BaseException as e:
+                failed.append(e)
+            with self._gate:
+                if not failed and time.monotonic() > self._deadline:
+                    self.shutdown()  # upgraded late: closed, not used
+                    failed.append(TimeoutError("upgraded after its deadline"))
+                over.set()
+
+        threading.Thread(target=attempt, daemon=True).start()
+        over.wait(self._deadline - time.monotonic())
+        with self._gate:
+            if not over.is_set():
+                self._deadline = float("-inf")  # its caller leaves: the rest is late
+                if self._sock is not None:
+                    # A read's timeout is per byte of the answer: a server can drip.
+                    with contextlib.suppress(OSError):
+                        # Not ssl's, which drops TLS first; close need not wake a read.
+                        socket.socket.shutdown(self._sock, socket.SHUT_RDWR)
+                raise TimeoutError(
+                    f"no websocket {API_TIMEOUT} s after its connect began"
+                )
+        if failed:
+            raise failed[0]
+        self.settimeout(None)  # as kubernetes leaves it: each read sets its own
 
 
 ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
