@@ -484,6 +484,30 @@ def test_quotes_env_var_values(chart_dir: Path, test_resources_dir: Path) -> Non
     assert env[3] == {"name": "C", "value": "three"}
 
 
+def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) -> None:
+    # Each fixture value ends with "\nspliced: x", which splices a sibling if unquoted.
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "bare-scalar-splice-values.yaml"
+    )
+    spliced = "\nspliced: x"
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    assert pod_spec["runtimeClassName"] == "gvisor" + spliced
+    main = next(c for c in pod_spec["containers"] if c["name"] == "default")
+    assert main["image"] == "img" + spliced
+    assert main["imagePullPolicy"] == "Always" + spliced
+    assert main["workingDir"] == "/w" + spliced
+    assert {"name": "ENVNAME" + spliced, "value": "v"} in main["env"]
+    init = pod_spec["initContainers"][0]
+    assert init["name"] == "init" + spliced
+    assert init["image"] == "iimg" + spliced
+    assert init["imagePullPolicy"] == "Always" + spliced
+    assert init["workingDir"] == "/iw" + spliced
+    assert {"name": "IENVNAME" + spliced, "value": "v"} in init["env"]
+    port = _get_documents(documents, "Service")[0]["spec"]["ports"][0]
+    assert port["protocol"] == "TCP" + spliced
+
+
 def test_cluster_default_magic_string(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
