@@ -42,6 +42,16 @@ spec:
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
+      {{- $egressProxy := include "agentEnv.egressProxy" (dict "root" $ "service" $service) }}
+      {{- if $egressProxy }}
+      {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
+      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
+      {{- range .volumeMounts }}
+      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
       annotations:
         {{- toYaml $podAnnotations | nindent 8 }}
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
@@ -74,8 +84,36 @@ spec:
             - {{ printf "%s-%s" (include "agentEnv.fullname" $) $name | quote }}
       {{- end }}
 
-      {{- if $service.initContainers }}
+      {{- if or $service.initContainers $egressProxy }}
       initContainers:
+      {{- if $egressProxy }}
+        {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
+        - name: egress-forwarder
+          image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
+          command: ["/vsock-egress", "forward", "-key", "/key/key"]
+          restartPolicy: Always
+          {{- /* The next container starts once the forwarder listens. An exec: no probe reaches a port of a pod with no network device. */}}
+          startupProbe:
+            exec:
+              command: ["/vsock-egress", "ready", "-key", "/key/key"]
+            periodSeconds: 1
+            failureThreshold: 30
+          volumeMounts:
+            - name: egress-forwarder-key
+              mountPath: /key
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            {{- /* The runtime's default profile refuses the one thing the forwarder needs, socket(AF_VSOCK). */}}
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/vsock-egress.json
+      {{- end }}
       {{- range $service.initContainers }}
         - name: {{ .name }}
           image: {{ .image }}
@@ -257,6 +295,13 @@ spec:
         {{- else }}
         -  {{- toYaml . | nindent 10 }}
         {{- end }}
+      {{- end }}
+      {{- if $egressProxy }}
+        {{- /* Mounted by the forwarder alone: its key outlives a restart of it, and no other container reads it. */}}
+        - name: egress-forwarder-key
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
