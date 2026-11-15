@@ -161,6 +161,35 @@ async def test_a_command_whose_connection_drops_is_resumed_and_runs_once(
     assert sandbox.sh(f"cat {runs}").stdout == "run\n"
 
 
+async def test_an_upload_whose_connection_drops_arrives_whole_and_once(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    held = f"/tmp/{uuid.uuid4().hex}"
+    # It reads no stdin until let go, so the drop finds the upload part sent.
+    script = 'echo x >> "$0"; until [ -e "$0.go" ]; do sleep 0.05; done; md5sum'
+    data = os.urandom(2 * execd.STDIN_WINDOW)
+    call = asyncio.ensure_future(
+        client.exec(["sh", "-c", script, held], data, None, {}, None, None)
+    )
+    await sandbox.until(f"test -e {held}")
+
+    async def resuming() -> None:
+        while "resuming" not in caplog.text:
+            await asyncio.sleep(0.01)
+
+    relay.drop()
+    await asyncio.wait_for(resuming(), 30)  # execd holds stdin it has yet to write
+    await asyncio.to_thread(sandbox.sh, f"touch {held}.go")
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert result.stdout.split() == [hashlib.md5(data).hexdigest(), "-"]
+    ran = await asyncio.to_thread(sandbox.sh, f"cat {held}")
+    assert ran.stdout == "x\n"  # by the one command
+
+
 async def test_a_wrong_key_is_answered_with_nothing(
     sandbox: Sandbox, client: execd.ExecdClient
 ) -> None:
