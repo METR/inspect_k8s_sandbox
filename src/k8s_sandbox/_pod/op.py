@@ -83,6 +83,10 @@ class _ConnectsInTime(websocket.WebSocket):
 _ws_client: Any = importlib.util.module_from_spec(ws_client.__spec__)
 ws_client.__spec__.loader.exec_module(_ws_client)
 _ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
+# Still kubernetes' WSClient, but for the copy's __init__, which opens the websocket.
+_ws_client.WSClient = type(
+    "WSClient", (ws_client.WSClient,), {"__init__": _ws_client.WSClient.__init__}
+)
 stream = functools.partial(_websocket_request, _ws_client.websocket_call, None)
 
 # Interval between WebSocket keepalive frames. Containerd's CRI streaming server
