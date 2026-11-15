@@ -61,6 +61,8 @@ HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
 # read it by the same rule, so a release cannot pass readiness while a sandbox the
 # caller is about to ask for is missing.
 _SERVICE_LABEL = "inspect/service"
+# The label a release's pods are listed by.
+_INSTANCE_LABEL = "app.kubernetes.io/instance"
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
 _TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
@@ -240,6 +242,8 @@ class Release:
         self._extra_values = dict(extra_values) if extra_values else {}
         # The sandboxes the rendered chart declares; set by _install().
         self._expected_services: frozenset[str] = frozenset()
+        # The pods the rendered chart's StatefulSets make; set by _install().
+        self._expected_pods: frozenset[str] = frozenset()
         # The names of everything the chart rendered; set by _install(). A sandbox
         # whose controller cannot create a pod is only explained by an event on that
         # controller, which carries no pod name to be found by.
@@ -387,6 +391,9 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
+        self._expected_pods = frozenset(
+            _stateful_set_pods(docs, self.release_name, self._namespace)
+        )
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
@@ -441,7 +448,7 @@ class Release:
         return list_pods(
             k8s_client(self._context_name),
             self._namespace,
-            label_selector=f"app.kubernetes.io/instance={self.release_name}",
+            label_selector=f"{_INSTANCE_LABEL}={self.release_name}",
             resource_version="0" if allow_stale else None,
             request_timeout=_LIST_PODS_READ_TIMEOUT,
         )
@@ -452,12 +459,23 @@ class Release:
             pod.labels[_SERVICE_LABEL] for pod in _sandbox_pods(pods) if pod.ready
         }
 
+    def _missing_pods(self, pods: list[PodSnapshot]) -> frozenset[str]:
+        """The pods of the chart's StatefulSets which are not yet there and Ready."""
+        # A pod its controller has yet to create is in no list to be judged.
+        return self._expected_pods - {
+            pod.name for pod in pods if pod.phase != "Failed" and pod.ready
+        }
+
     def _is_ready(self, pods: list[PodSnapshot]) -> bool:
         """Whether `pods` means the release is ready to be handed to a caller."""
         # A terminally failed pod is replaced by its controller; a bare one that
         # cannot be replaced just leaves its sandbox missing until the deadline.
         live = [pod for pod in pods if pod.phase != "Failed"]
-        return not self._missing_services(pods) and all(map(_pod_ready, live))
+        return (
+            not self._missing_services(pods)
+            and all(map(_pod_ready, live))
+            and not self._missing_pods(pods)
+        )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
         """Wait for the release's pods to report Ready.
@@ -468,11 +486,13 @@ class Release:
         saw_a_pod = False
         poll_error: Exception | None = None
         missing: frozenset[str] = self._expected_services
+        absent: frozenset[str] = self._expected_pods
         while True:
             try:
                 pods = await asyncio.to_thread(self._list_release_pods, True)
                 saw_a_pod = saw_a_pod or bool(pods)
                 missing = self._missing_services(pods)
+                absent = self._missing_pods(pods)
                 # The cache can lag reality in either direction, so confirm against a
                 # consistent read and hand those same pods on: nothing may change
                 # between the verdict and the sandbox the caller gets. One read per
@@ -490,11 +510,17 @@ class Release:
             else:
                 poll_error = None
             if time.monotonic() >= deadline:
-                await self._raise_not_ready_error(saw_a_pod, poll_error, missing)
+                await self._raise_not_ready_error(
+                    saw_a_pod, poll_error, missing, absent
+                )
             await asyncio.sleep(_READINESS_POLL_INTERVAL)
 
     async def _raise_not_ready_error(
-        self, saw_a_pod: bool, poll_error: Exception | None, missing: frozenset[str]
+        self,
+        saw_a_pod: bool,
+        poll_error: Exception | None,
+        missing: frozenset[str],
+        absent: frozenset[str],
     ) -> NoReturn:
         extra = await self._pod_diagnostics()
         budget = f"{_get_timeout()}s"
@@ -523,6 +549,8 @@ class Release:
         extra["missing_sandboxes" if missing else "declared_sandboxes"] = ", ".join(
             sorted(missing or self._expected_services)
         )
+        if absent:
+            extra["missing_pods"] = ", ".join(sorted(absent))
         _raise_runtime_error(
             f"Helm release did not become ready within {budget}. Please see the docs "
             f"for why this might occur: {HELM_RELEASE_NOT_READY_URL}. Also consider "
@@ -836,6 +864,28 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             )
         else:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
+
+
+def _stateful_set_pods(
+    docs: Iterable[Any], release_name: str, namespace: str
+) -> Iterator[str]:
+    """The name of each pod of the release that a manifest's StatefulSets make."""
+    for doc in docs:
+        if _dig(doc, "kind") == "List":
+            yield from _stateful_set_pods(
+                _dig(doc, "items") or [], release_name, namespace
+            )
+        # The poll lists by this label in this namespace: no other pod is ever seen.
+        elif (
+            _dig(doc, "kind") == "StatefulSet"
+            and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
+            == release_name
+            and (_dig(doc, "metadata", "namespace") or namespace) == namespace
+        ):
+            replicas = _dig(doc, "spec", "replicas")
+            start = _dig(doc, "spec", "ordinals", "start") or 0
+            for ordinal in range(1 if replicas is None else replicas):
+                yield f"{_dig(doc, 'metadata', 'name')}-{start + ordinal}"
 
 
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:
