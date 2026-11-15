@@ -1,4 +1,4 @@
-# Each value ends with a newline that would splice `spliced: x` as a sibling if unquoted.
+# Unquoted, the newline in each value breaks the render or adds a field.
 services:
   default:
     image: "img\nspliced: x"
@@ -19,3 +19,11 @@ services:
         env:
           - name: "IENVNAME\nspliced: x"
             value: "v"
+allowDomains:
+  - "pypi.org"
+allowDomainsPorts:
+  - port: 8008
+    protocol: "TCP\nspliced: x"
+  - port: 22
+    protocol: "TCP\nspliced: x"
+    domain: "pypi.org"

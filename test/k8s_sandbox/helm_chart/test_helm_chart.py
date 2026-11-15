@@ -485,11 +485,11 @@ def test_quotes_env_var_values(chart_dir: Path, test_resources_dir: Path) -> Non
 
 
 def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) -> None:
-    # Each fixture value ends with "\nspliced: x", which splices a sibling if unquoted.
+    spliced = "\nspliced: x"
+
     documents = _run_helm_template(
         chart_dir, test_resources_dir / "bare-scalar-splice-values.yaml"
     )
-    spliced = "\nspliced: x"
 
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
     assert pod_spec["runtimeClassName"] == "gvisor" + spliced
@@ -506,6 +506,20 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     assert {"name": "IENVNAME" + spliced, "value": "v"} in init["env"]
     port = _get_documents(documents, "Service")[0]["spec"]["ports"][0]
     assert port["protocol"] == "TCP" + spliced
+    egress = next(
+        cnp
+        for cnp in _get_documents(documents, "CiliumNetworkPolicy")
+        if cnp["metadata"]["name"].endswith("-sandbox-egress")
+    )["spec"]["egress"]
+    protocols = {
+        p["port"]: p["protocol"]
+        for rule in egress
+        for to_ports in rule.get("toPorts", [])
+        for p in to_ports["ports"]
+    }
+    # The chart upper-cases an allowDomainsPorts protocol.
+    assert protocols["8008"] == ("TCP" + spliced).upper()
+    assert protocols["22"] == ("TCP" + spliced).upper()
 
 
 def test_cluster_default_magic_string(

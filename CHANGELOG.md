@@ -16,9 +16,10 @@
 - Wait for the Pods of every StatefulSet in the release's namespace whose Pod template
   carries the release's `app.kubernetes.io/instance` label, including those from
   `additionalResources`, before handing over a sandbox.
-- A newline in a service or init container's `image`, `runtimeClassName`, `workingDir`,
-  `imagePullPolicy`, name, env name or port `protocol` no longer splices a field into the
-  rendered manifest; the agent-env chart now quotes these, which it rendered unquoted.
+- A newline in a service's `image`, `runtimeClassName`, `workingDir`, `imagePullPolicy`,
+  env name or port `protocol`, in an init container's `name`, `image`, `workingDir`,
+  `imagePullPolicy` or env name, or in an `allowDomainsPorts` entry's `protocol`, no
+  longer splices a field into the rendered manifest.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

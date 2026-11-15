@@ -123,7 +123,7 @@ spec:
           {{- range .Values.allowDomainsPorts }}
           {{- if not .domain }}
             - port: "{{ .port }}"
-              protocol: {{ .protocol | default "ANY" | upper }}
+              protocol: {{ .protocol | default "ANY" | upper | quote }}
           {{- end }}
           {{- end }}
         {{- end }}
@@ -136,7 +136,7 @@ spec:
       toPorts:
         - ports:
             - port: "{{ $p.port }}"
-              protocol: {{ $p.protocol | default "ANY" | upper }}
+              protocol: {{ $p.protocol | default "ANY" | upper | quote }}
     {{- end }}
     {{- end }}
     {{- end }}
