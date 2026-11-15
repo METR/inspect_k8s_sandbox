@@ -210,6 +210,33 @@ def test_execd_started_again_names_the_same_container(sandbox: Sandbox) -> None:
     assert again == first  # or a restart of execd alone would pass for the container's
 
 
+async def test_a_command_for_another_user_does_not_run_with_groups_it_cannot_take(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run all the same, it would be that user with execd's own groups."""
+    name = f"{sandbox.name}-nosetgid"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    run = ["run", "-d", "--name", name, "--cap-drop", "SETGID", sandbox.name]
+    try:
+        assert docker(*run, "sleep", "3600").returncode == 0
+        # Root's own group is theirs, so only their groups are out of execd's reach.
+        user = "echo o:x:4242:0::/:/bin/sh >>/etc/passwd"
+        assert docker("exec", name, "sh", "-c", user).returncode == 0
+        monkeypatch.setattr(sandbox, "name", name)
+        ip = docker("inspect", "-f", address, name).stdout.strip()
+        monkeypatch.setattr(relay, "ip", ip)
+
+        ran = client.exec(["echo", "ran"], None, None, {}, "o", None)
+        result = await asyncio.wait_for(ran, 30)  # only bounds a hang
+    finally:
+        docker("rm", "-f", name)
+
+    assert (result.returncode, result.stdout) == (126, "")
+
+
 @pytest.mark.parametrize(
     ("mode", "read_fails"),
     [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],

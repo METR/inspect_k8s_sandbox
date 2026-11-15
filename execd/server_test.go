@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -269,6 +270,40 @@ func TestAUidWithNoPasswdEntryIsUnknownUnlessItIsRootOrExecdsOwn(t *testing.T) {
 		if _, _, _, err := lookupUser(own); err != nil && strings.HasPrefix(err.Error(), "unknown user") {
 			t.Fatalf("uid %s got %v: root and execd's own user need no passwd entry", own, err)
 		}
+	}
+	// Nor a switch, which a container without CAP_SETGID, or one that isn't root, cannot make.
+	if as, _, _, err := lookupUser(strconv.Itoa(os.Getuid())); as != nil || err != nil {
+		t.Fatalf("execd's own uid got the credential %v and %v, want neither", as, err)
+	}
+}
+
+func TestAConnectionThatDoesNotAuthenticateLosesItsPlaceInTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := newServer(strings.Repeat("00", 32))
+		ours, theirs := net.Pipe()
+		defer ours.Close()
+		s.preauth <- struct{}{}
+		go s.handle(&conn{nc: theirs, dead: make(chan struct{})})
+
+		time.Sleep(authTimeout)
+		synctest.Wait()
+
+		if len(s.preauth) != 0 {
+			t.Fatalf("a silent connection kept its place past %v: %d of them would take every one", authTimeout, maxPreauth)
+		}
+	})
+}
+
+func TestAPingIsAnswered(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fPing})
+
+	// The client takes a connection that answers none for dead.
+	if f := nextFrame(t, frames); f.kind != fPong {
+		t.Fatalf("a PING was answered with frame %d", f.kind)
 	}
 }
 
@@ -967,32 +1002,38 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	t.Setenv("RAW", "\xff") // execd's own environment, which a command inherits, need not be text
 	// GODEBUG has a Go program trace its start on stderr.
 	env := map[string]string{"GODEBUG": "inittrace=1", "GOMAXPROCS": "7", "BIG": strings.Repeat("x", 128<<10-len("BIG=")-1)}
-	script := "id -u; id -g; id -G; echo $GODEBUG $GOMAXPROCS ${#BIG} $RAW; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: env, User: "65534", Tag: "e"})
+	script := "id -u; id -g; id -G; echo $GODEBUG $GOMAXPROCS ${#BIG} $RAW; echo $HOME $USER $LOGNAME; [ ! -e /proc/$$/fd/3 ] || echo descriptor 3 is open"
+	nobody, _ := user.LookupId("65534") // HOME, USER and LOGNAME are theirs, as runuser sets them, but for one the caller set
+	run := func(id uint64, asked string) {
+		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", script}, Env: env, User: "65534", Tag: "e"})
 
-	s.dispatch(c, frame{kind: fStart, id: 27, payload: req})
+		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
 
-	var out []byte
-	deadline := time.After(30 * time.Second)
-	for {
-		select {
-		case f := <-frames:
-			if f.kind == fStdout || f.kind == fStderr {
-				out = append(out, f.payload...)
-				continue
+		var out []byte
+		deadline := time.After(30 * time.Second)
+		for {
+			select {
+			case f := <-frames:
+				if f.kind == fStdout || f.kind == fStderr {
+					out = append(out, f.payload...)
+					continue
+				}
+				if f.kind != fExit {
+					continue
+				}
+				// execd, a Go program, becomes the user itself: the environment isn't its own to read or to mark.
+				if string(out) != "65534\n65534\n65534\ninittrace=1 7 131067 \xff\n"+nobody.HomeDir+" "+asked+" "+nobody.Username+"\n" {
+					t.Fatalf("the command's output was %q", out)
+				}
+				return
+			case <-deadline:
+				t.Fatal("no EXIT")
 			}
-			if f.kind != fExit {
-				continue
-			}
-			// execd, a Go program, becomes the user itself: the environment isn't its own to read or to mark.
-			if string(out) != "65534\n65534\n65534\ninittrace=1 7 131067 \xff\n" {
-				t.Fatalf("the command's output was %q", out)
-			}
-			return
-		case <-deadline:
-			t.Fatal("no EXIT")
 		}
 	}
+	run(27, nobody.Username)
+	env["USER"] = "asked"
+	run(28, "asked")
 }
 
 func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
