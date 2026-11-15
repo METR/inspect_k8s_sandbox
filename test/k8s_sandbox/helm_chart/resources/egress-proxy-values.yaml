@@ -1,0 +1,5 @@
+egressForwarderImage: vsock-egress:1
+services:
+  default:
+    podAnnotations:
+      inspect-k8s-sandbox/egress-proxy: '{{ template "agentEnv.fullname" $ }}-egress-proxy.{{ .Release.Namespace }}.svc.cluster.local.:3128'
