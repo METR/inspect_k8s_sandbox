@@ -43,8 +43,7 @@ extraContainers: []
 # the annotation `inspect-k8s-sandbox/egress-proxy`.
 # @default -- Empty
 egressForwarderImage: ""
-# -- IPv4 ranges, each with one TCP port, as `10.20.0.0/24:5432`, that a pod annotated
-# `inspect-k8s-sandbox/egress-capture` also reaches through its egress proxy, by address.
+# -- IPv4 ranges, each with one TCP port (`10.20.0.0/24:5432`), that a pod annotated `inspect-k8s-sandbox/egress-capture` also reaches through its egress proxy.
 egressCaptureRanges: []
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []

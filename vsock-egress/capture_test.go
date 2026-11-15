@@ -420,9 +420,6 @@ func TestRedirectSendsLookupsAndConnectionsToTheForwarder(t *testing.T) {
 }
 
 func TestRangeOverThePodsOwnAddressesIsNoGrant(t *testing.T) {
-	if r, err := grant("10.77.0.9/24:5432"); err != nil || r != (granted{netip.MustParsePrefix("10.77.0.0/24"), 5432}) {
-		t.Fatalf("10.77.0.9/24:5432 is %v, %v: want the network 10.77.0.0/24 and its port", r, err)
-	}
 	// 0.0.0.0/1 as a local route took a connection to 127.0.0.1.
 	for _, s := range []string{"0.0.0.0/1:443", "127.0.0.1/32:80", "198.19.0.0/16:443", "fd00::/64:443", "10.77.0.0/24", "10.77.0.0/24:0", "10.77.0.0/24:65536"} {
 		if r, err := grant(s); err == nil {

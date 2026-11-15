@@ -13,6 +13,8 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
   NODE         the node the sandbox is put on, one set aside for the gate: its launcher is deleted in step 7, which
                resets the connections of every other sandbox there
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
+  RANGED       ADDRESS:PORT of a server in a range VALUES.yaml grants on that port, with egress capture (default: none,
+               and step 3a is skipped)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
   KEEP=1       leave the release installed when a step fails
 It needs helm, kubectl and python3, and leaves nothing behind: one helm release, and one pod with the node's process
@@ -100,6 +102,25 @@ out=$(in_sandbox sh -c 'rm -rf /tmp/gate-pip; pip download --no-cache-dir --disa
 say "3. an unlisted host is refused by the proxy"
 code=$(in_sandbox curl -sS -o /dev/null -m 30 -w '%{http_connect}/%{http_code}' "$UNLISTED" 2> /dev/null)
 [ "$code" = "403/000" ] && pass "GET $UNLISTED -> the proxy answered CONNECT with 403" || fail "GET $UNLISTED -> CONNECT/status $code, expected 403/000"
+
+if [ -n "${RANGED:-}" ]; then
+  say "3a. an address in a granted range answers on its port, and on no other, with no proxy setting"
+  # Open: the server spoke, or 8 s passed with no reset, which is longer than the proxy tries a dead address for.
+  got=$(in_sandbox python3 -c 'import errno, socket, sys
+address, port = sys.argv[1].rsplit(":", 1)
+def tried(port):
+    try:
+        s = socket.create_connection((address, port), 10)
+        s.settimeout(8)
+        try:
+            return "open" if s.recv(1) else "closed"
+        except socket.timeout:
+            return "open"
+    except OSError as e:
+        return errno.errorcode.get(e.errno, type(e).__name__)
+print(tried(int(port)), tried(int(port) % 65535 + 1))' "$RANGED" 2>&1 | tail -1)
+  [ "$got" = "open EHOSTUNREACH" ] && pass "$RANGED is open, and its next port is refused at once: $got" || fail "$RANGED and its next port: $got, expected open EHOSTUNREACH"
+fi
 
 say "4. a stream that opens with a wrong key is refused"
 answer=$(k -n "$NS" exec "$SANDBOX" -c gate-probe -- python3 -c '

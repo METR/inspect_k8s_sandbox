@@ -9,10 +9,9 @@ A connection on which no byte has moved for 300 s is ended.
 
 A pod that also carries `inspect-k8s-sandbox/egress-capture: "true"` reaches the proxy from programs that ignore proxy
 settings: its forwarder is the pod's resolver. A connection to an address is carried only into a range, and on the TCP
-port, that the release's `egressCaptureRanges` value names, as `10.20.0.0/24:5432`: the proxy is asked for the address.
-The range's other ports are refused at once. IPv6 and UDP other than DNS are not carried. The pod gets an init container
-that runs `vsock-egress redirect` as root with `NET_ADMIN` and no other capability, which a namespace at the `baseline`
-Pod Security Standard refuses.
+port, that the release's `egressCaptureRanges` value names, as `10.20.0.0/24:5432`. The range's other ports are refused
+at once. IPv6 and UDP other than DNS are not carried. The pod gets an init container that runs `vsock-egress redirect`
+as root with `NET_ADMIN` and no other capability, which a namespace at the `baseline` Pod Security Standard refuses.
 
 Each node needs:
 
