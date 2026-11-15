@@ -847,6 +847,25 @@ def test_egress_capture_annotation_redirects_before_the_pods_programs_start(
     ]
 
 
+def test_egress_capture_ranges_are_told_to_the_redirect(chart_dir: Path) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,"
+        "egressCaptureRanges={10.20.0.0/24:5432,192.0.2.7/32:22}",
+        set_string=r"services.default.podAnnotations.sandbox\.amazonaws\.com/network-isolated=true,"
+        f"services.default.podAnnotations.{_EGRESS_PROXY},"
+        f"services.default.podAnnotations.{_EGRESS_CAPTURE}",
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    _, capture = pod["initContainers"]
+    # One argument each: an admission policy can then hold every argument to one shape.
+    assert capture["command"][4:] == [
+        "-range=10.20.0.0/24:5432",
+        "-range=192.0.2.7/32:22",
+    ]
+
+
 @pytest.mark.parametrize(
     "others",
     [
