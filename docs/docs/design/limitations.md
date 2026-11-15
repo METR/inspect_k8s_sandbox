@@ -199,12 +199,8 @@ image with no `runuser` installed.
 and need neither `runuser` nor `id`. A container that does not run as uid 0 fails them
 as it fails a switch it cannot make.
 
-When the switch cannot be made, what happens depends on why. A container that is not
-root, one that has had `CAP_SETGID` dropped, and one without `runuser` installed are all
-properties of the environment rather than bad arguments: each logs a warning and returns
-a failed `ExecResult`, so a caller which probes with a user can fall back to the
-container's own user. Only naming a user that does not exist raises, since no fallback
-makes an absent account work.
+A user switch the container cannot make returns a failed `ExecResult`; naming a user
+that does not exist raises.
 
 ## Images are not automatically built, tagged or pushed
 
