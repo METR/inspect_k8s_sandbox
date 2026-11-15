@@ -8,6 +8,7 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Generator, Literal, cast, overload
 
+import urllib3.exceptions
 import websocket
 from anyio.abc import ByteStream
 from inspect_ai.solver._task_state import sample_state
@@ -90,6 +91,13 @@ _PERMANENT_TYPES = (
 )
 
 
+def _unreachable(e: BaseException) -> bool:
+    """Whether the API server refused or cut a connection, which fails at once."""
+    reason = e.reason if isinstance(e, urllib3.exceptions.MaxRetryError) else e
+    cut = (urllib3.exceptions.NewConnectionError, urllib3.exceptions.ProtocolError)
+    return isinstance(reason, cut)  # not a timeout: that has waited four minutes
+
+
 def _retry() -> AsyncRetrying:
     # Must create a new instance per call: AsyncRetrying.__aiter__ returns
     # `self` and mutates _retry_state, so a shared instance is not safe for
@@ -98,8 +106,10 @@ def _retry() -> AsyncRetrying:
         stop=stop_after_attempt(5),
         wait=wait_exponential_jitter(initial=1, max=10),
         retry=retry_if_exception(
-            lambda e: isinstance(e, _TRANSIENT_TYPES)
-            and not isinstance(e, _PERMANENT_TYPES)
+            lambda e: (
+                (isinstance(e, _TRANSIENT_TYPES) or _unreachable(e))
+                and not isinstance(e, _PERMANENT_TYPES)
+            )
         ),
         # Logged: over Kubernetes exec the operation may run a second time.
         before_sleep=lambda state: log_warn(

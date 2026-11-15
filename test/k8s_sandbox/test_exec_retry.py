@@ -1,9 +1,18 @@
+import asyncio
+import collections.abc
+import contextlib
+import json
+import socket
+import sys
+import threading
 from pathlib import Path
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
+import kubernetes.client
 import pytest
+import urllib3
 import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.client.exceptions import ApiException
@@ -403,6 +412,97 @@ class TestWriteFileRetryExhausted:
             await sandbox.write_file("/tmp/test.txt", "hello")
 
         assert mock_write.call_count == 5
+
+
+def _shows(status: int, restarts: int = 0) -> bytes:
+    """An API server's answer: the pod, its container restarted this often."""
+    container = {"name": "default", "restartCount": restarts, "state": {"running": {}}}
+    shown = {"metadata": {"name": "p", "uid": "u"}}
+    body = json.dumps(shown | {"status": {"containerStatuses": [container]}})
+    head = f"HTTP/1.1 {status} \r\nConnection: close\r\nContent-Length: {len(body)}"
+    return f"{head}\r\n\r\n{body}".encode()
+
+
+Api = collections.abc.Callable[..., list[bytes]]
+
+
+@pytest.fixture
+def api(monkeypatch: pytest.MonkeyPatch) -> collections.abc.Iterator[Api]:
+    """Starts a local API server: it gives each request the next answer, then stops."""
+    listening = socket.create_server(("127.0.0.1", 0), backlog=0)
+    listening.settimeout(30)  # only bounds a hang
+    held = socket.socket()
+    asked: list[bytes] = []
+    servers: list[threading.Thread] = []
+
+    def serve(answers: list[bytes], then: str) -> None:
+        with contextlib.suppress(OSError):  # it ends with its test, which then fails
+            for n, answer in enumerate(answers, 1):
+                connection, _ = listening.accept()
+                with connection:
+                    connection.settimeout(30)  # only bounds a hang
+                    asked.append(connection.recv(65536))
+                    last = n == len(answers)
+                    if last and then in ("drops the connect", "never answers"):
+                        monkeypatch.setattr(op, "API_TIMEOUT", 1)  # for what comes now
+                        if then == "drops the connect":
+                            held.connect(listening.getsockname())  # fills the queue
+                    elif last:
+                        listening.close()  # before the answer is read
+                    connection.sendall(answer)
+
+    def start(answers: list[bytes], then: str = "refuses") -> list[bytes]:
+        host = f"http://127.0.0.1:{listening.getsockname()[1]}"
+        configuration = kubernetes.client.Configuration(host=host)
+        # urllib3's own retries would only lengthen the wait.
+        configuration.retries = 0  # type: ignore[attr-defined]
+        client = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
+        monkeypatch.setattr(op, "k8s_client", lambda _: client)
+        server = threading.Thread(target=serve, args=(answers, then), daemon=True)
+        servers.append(server)
+        server.start()
+        return asked
+
+    # Off, so that the provider's check is the only one before an attempt.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    yield start
+    held.close()
+    listening.close()
+    for server in servers:
+        server.join(30)  # only bounds a hang
+
+
+@pytest.mark.parametrize(
+    ("then", "tried_again"),
+    [
+        ("refuses", True),
+        ("cuts the connection", True),
+        pytest.param(
+            "drops the connect",  # as Linux does one that finds its queue full
+            False,
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux only"),
+        ),
+        ("never answers", False),
+    ],
+)
+async def test_only_a_connection_that_fails_at_once_is_tried_again(
+    api: Api, caplog: pytest.LogCaptureFixture, then: str, tried_again: bool
+) -> None:
+    """Regression: an API server down at a file operation's restart check failed it."""
+    cut = [b""] if then == "cuts the connection" else []  # closed with no answer
+    api([_shows(500), _shows(200), *cut], then)  # its exec fails, no restart shows
+    sandbox, _ = _make_sandbox()
+    sandbox._pod = pod.Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(_sandbox_environment.K8sError) as raised,
+    ):
+        await asyncio.wait_for(sandbox.read_file("/tmp/f"), 30)
+
+    assert isinstance(raised.value.__cause__, urllib3.exceptions.MaxRetryError)
+    # One that waited out a timeout has cost four minutes already.
+    assert (caplog.text.count("sending it again") > 1) == tried_again
 
 
 # -- exec_stdio retry tests --

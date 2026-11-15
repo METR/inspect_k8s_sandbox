@@ -57,6 +57,9 @@
 - An operation over Kubernetes exec no longer waits without end on an API server that
   never answers its websocket upgrade: each connection attempt times out after 60
   seconds.
+- An operation is tried again when the restart check before an attempt cannot reach the
+  API server at once: its connection refused or reset, or no route or name found. A
+  check that times out there still fails the operation.
 - An operation whose container stopped under it, which Kata reports with exit code 255
   when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`:
   `exec()` no longer returns 255 as the command's exit code, and `read_file()` and
