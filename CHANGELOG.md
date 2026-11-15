@@ -38,6 +38,7 @@
 - A warning is logged when Compose `init: true` is ignored on non-default services
   or on the default service with an explicit `command` or `entrypoint`.
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
+- Fix `read_file()` hanging on a relative file named `-`.
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
   replacement or container restart fails with the same `PodReplacedError` or
   `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
