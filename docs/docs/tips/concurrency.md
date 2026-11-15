@@ -9,8 +9,13 @@ number of concurrent `helm install` operations to 8 and, independently, the numb
 Critically, there is a separate semaphore for installs and uninstalls. This prevents
 deadlocks if the cluster capacity has been reached.
 
+An install slot is held only while the release's objects are being created, not while
+the cluster finds capacity for them, so a sandbox that cannot be scheduled yet does not
+block one that can.
+
 Inspect's console output shows the number of install and uninstall operations currently
-in progress.
+in progress. Because installs release their slot as soon as the objects exist, this
+number reflects submissions in flight rather than sandboxes still starting up.
 
 The maximum values can be configured by setting the `INSPECT_MAX_HELM_INSTALL` and
 `INSPECT_MAX_HELM_UNINSTALL` environment variables.
@@ -37,3 +42,5 @@ These operations are typically I/O bound (from the client's perspective). Do bea
 mind that these operations are routed through the Kubernetes API server.
 
 Inspect's console output shows the number of Pod operations currently in progress.
+
+On a Pod with execd, these operations are neither limited nor shown.

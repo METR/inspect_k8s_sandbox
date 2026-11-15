@@ -1,17 +1,24 @@
 from pathlib import Path
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
-from k8s_sandbox import _sandbox_environment
+from k8s_sandbox import _helm, _sandbox_environment
+from k8s_sandbox._pod import execd, op, pod
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecdResultUnknownError,
+    ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
+    PodReplacedError,
 )
 from k8s_sandbox._sandbox_environment import (
     K8sError,
@@ -39,40 +46,39 @@ def _make_sandbox() -> tuple[K8sSandboxEnvironment, MagicMock]:
     specific AsyncMock methods without mypy method-assign errors.
     """
     sandbox = object.__new__(K8sSandboxEnvironment)
-    mock_pod = MagicMock()
+    mock_pod = mock.create_autospec(pod.Pod, instance=True)
     sandbox._pod = mock_pod
-    mock_pod.info = MagicMock()
-    mock_pod.info.name = "test-pod"
-    sandbox._config = MagicMock()
-    sandbox._config.default_user = None
-    sandbox.release = MagicMock()
-    sandbox.release.task_name = "test-task"
-    mock_pod.check_for_pod_restart = AsyncMock()
+    mock_pod.info = op.PodInfo("test-pod", "ns", None, "default", "uid", 0, "raise")
+    sandbox._config = _sandbox_environment._ResolvedConfig(
+        chart=None,
+        values=None,
+        context=None,
+        default_user=None,
+        restarted_container_behavior="raise",
+        max_pod_ops=None,
+    )
+    sandbox.release = mock.create_autospec(
+        _helm.Release, instance=True, task_name="test-task"
+    )
     return sandbox, mock_pod
 
 
 def _make_sandbox_with_mock_pod() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.exec."""
     sandbox, mock_pod = _make_sandbox()
-    mock_exec = AsyncMock()
-    mock_pod.exec = mock_exec
-    return sandbox, mock_exec
+    return sandbox, mock_pod.exec
 
 
 def _make_sandbox_with_mock_read() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.read_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_read = AsyncMock()
-    mock_pod.read_file = mock_read
-    return sandbox, mock_read
+    return sandbox, mock_pod.read_file
 
 
 def _make_sandbox_with_mock_write() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.write_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_write = AsyncMock()
-    mock_pod.write_file = mock_write
-    return sandbox, mock_write
+    return sandbox, mock_pod.write_file
 
 
 def _success_result() -> ExecResult[str]:
@@ -109,6 +115,10 @@ class TestExecRetryTransient:
                 GetReturncodeError("no return code"),
                 id="GetReturncodeError",
             ),
+            pytest.param(
+                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                id="ExecResultUnknownError",
+            ),
         ],
     )
     async def test_transient_error_is_retried(self, error: Exception) -> None:
@@ -134,6 +144,19 @@ class TestExecRetryTransient:
         assert result.success
         assert mock_exec.call_count == 3
 
+    async def test_each_resend_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A command sent again may have run twice: the log has to show it."""
+        sandbox, mock_exec = _make_sandbox_with_mock_pod()
+        mock_exec.side_effect = [ConnectionError("cut"), _success_result()]
+
+        with caplog.at_level("WARNING"):
+            await sandbox.exec(["echo", "hello"])
+
+        assert caplog.text.count("sending it again") == 1
+        assert "ConnectionError('cut')" in caplog.text
+
 
 class TestExecRetryPermanent:
     """Permanent errors should NOT be retried."""
@@ -155,6 +178,11 @@ class TestExecRetryPermanent:
                 PermissionError("permission denied"),
                 PermissionError,
                 id="PermissionError",
+            ),
+            pytest.param(
+                ExecdResultUnknownError("execd stopped", pod="test-pod"),
+                K8sError,
+                id="ExecdResultUnknownError",
             ),
         ],
     )
@@ -282,6 +310,16 @@ class TestReadFileRetryPermanent:
 
         assert mock_read.call_count == 1
 
+    async def test_stopped_container_not_retried(self) -> None:
+        # A retry would read from the container that replaces it.
+        sandbox, mock_read = _make_sandbox_with_mock_read()
+        mock_read.side_effect = ContainerStoppedError("stopped")
+
+        with pytest.raises(K8sError):
+            await sandbox.read_file("/tmp/test.txt")
+
+        assert mock_read.call_count == 1
+
 
 class TestReadFileRetryExhausted:
     """After 5 failed attempts, read_file should propagate the error."""
@@ -365,3 +403,79 @@ class TestWriteFileRetryExhausted:
             await sandbox.write_file("/tmp/test.txt", "hello")
 
         assert mock_write.call_count == 5
+
+
+# -- exec_stdio retry tests --
+
+
+class TestExecStdioRetry:
+    """Opening is retried as exec() is, and runs as the default user unless told."""
+
+    async def test_transient_error_is_retried(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.side_effect = [
+            ApiException(status=503, reason="Unavailable"),
+            stream,
+        ]
+
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 2
+        assert opened is stream
+
+    async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
+        """Nothing checks the pod again while the stream lasts."""
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = PodReplacedError(
+            pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
+        )
+
+        with pytest.raises(K8sError) as error:
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert isinstance(error.value.__cause__, PodReplacedError)
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = anyio.Event().wait
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools"])
+                await anyio.wait_all_tasks_blocked()
+                tasks.cancel_scope.cancel()
+
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = [
+            ApiException(status=503, reason="Unavailable"),
+            None,
+        ]
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 1
+
+    @pytest.mark.parametrize("user, expected", [(None, "agent"), ("root", "root")])
+    async def test_the_default_user_is_used_unless_one_is_given(
+        self, user: str | None, expected: str
+    ) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        sandbox._config = sandbox._config.model_copy(update={"default_user": "agent"})
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
+
+        assert mock_pod.exec_stdio.call_args.args == (
+            ["inspect-sandbox-tools", "bridge"],
+            expected,
+        )

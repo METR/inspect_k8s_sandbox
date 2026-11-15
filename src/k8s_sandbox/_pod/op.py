@@ -1,11 +1,14 @@
+import contextlib
 import json
 import logging
+import socket
 import threading
 from abc import ABC
 from dataclasses import dataclass
-from typing import Generator, Literal
+from typing import Any, Generator, Literal
 
-from kubernetes.stream import stream  # type: ignore
+import websocket
+from kubernetes.stream import stream, ws_client  # type: ignore
 from kubernetes.stream.ws_client import RESIZE_CHANNEL, WSClient  # type: ignore
 
 from k8s_sandbox._kubernetes_api import k8s_client
@@ -17,6 +20,33 @@ from k8s_sandbox._pod.snapshot import read_pod
 # long-running commands will not be affected by this timeout.
 # https://github.com/kubernetes-client/python/blob/master/examples/watch/timeout-settings.md
 API_TIMEOUT = 60
+
+
+class _ConnectsInTime(websocket.WebSocket):
+    """kubernetes' websocket, whose connect and upgrade it gives no timeout at all."""
+
+    def connect(self, url: str, **options: Any) -> None:
+        over = threading.Event()
+        threading.Thread(target=self._cut, args=(over,), daemon=True).start()
+        try:
+            super().connect(url, **{"timeout": API_TIMEOUT, **options})
+        finally:
+            over.set()
+        self.settimeout(None)  # as kubernetes leaves it: each read sets its own
+
+    def _cut(self, over: threading.Event) -> None:
+        """Shut the socket of a connect still going after API_TIMEOUT."""
+        if over.wait(API_TIMEOUT):
+            return
+        # A read's timeout is for each byte of the answer, which a server can drip.
+        while not over.wait(0.05):  # the socket is None until TCP and TLS are up
+            if (sock := self.sock) is not None:
+                with contextlib.suppress(OSError):
+                    # Not ssl's, which drops TLS first; close need not wake a read.
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+ws_client.WebSocket = _ConnectsInTime  # the name create_websocket() reads at each exec
 
 # Interval between WebSocket keepalive frames. Containerd's CRI streaming server
 # enforces a stream_idle_timeout (default 4h [1]) that closes connections with no
@@ -30,7 +60,9 @@ _KEEPALIVE_INTERVAL_SECONDS = 30
 # Maximum size of a single WebSocket stdin frame. Larger single writes (tens of
 # MiB) make the kubelet/API-server/TLS layer reset the connection
 # (ConnectionResetError / ssl.SSLEOFError), so stdin is written in chunks.
-_STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
+STDIN_CHUNK_SIZE = 1024**2  # 1 MiB
+# Helpers run as the container's user: found here, never through the image's PATH.
+SYSTEM_PATH = "/usr/bin:/bin"
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +99,17 @@ class PodOperation(ABC):
         self._pod = pod
 
     def _write_stdin_chunked(self, ws_client: WSClient, data: str | bytes) -> None:
-        """Write ``data`` to the stdin channel in ``_STDIN_CHUNK_SIZE`` frames.
+        """Write ``data`` to the stdin channel in ``STDIN_CHUNK_SIZE`` frames.
 
-        Used by both exec and write_file (see ``_STDIN_CHUNK_SIZE`` for why we
+        Used by both exec and write_file (see ``STDIN_CHUNK_SIZE`` for why we
         chunk). The slice type is preserved: ``str`` -> text frames, ``bytes``
         -> binary frames.
         """
-        for i in range(0, len(data), _STDIN_CHUNK_SIZE):
-            ws_client.write_stdin(data[i : i + _STDIN_CHUNK_SIZE])
+        for i in range(0, len(data), STDIN_CHUNK_SIZE):
+            ws_client.write_stdin(data[i : i + STDIN_CHUNK_SIZE])
 
     def create_websocket_client_for_exec(
-        self, **kwargs
+        self, send_keepalive: bool = True, **kwargs
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
         # Note: ApiException is intentionally not caught; it should fail the eval.
@@ -100,11 +132,15 @@ class PodOperation(ABC):
         )
         try:
             self._discard_duplicate_channel(ws_client)
-            keepalive.start()
+            if send_keepalive:
+                keepalive.start()
             yield ws_client
         finally:
             stop_keepalive.set()
             ws_client.close()
+            # close() leaves the socket open once the server has closed the connection.
+            if ws_client.sock:
+                ws_client.sock.shutdown()
 
     def _discard_duplicate_channel(self, ws_client: WSClient) -> None:
         # Avoid issuing a warning multiple times.
@@ -146,12 +182,15 @@ def check_for_pod_restart(pod: PodInfo) -> None:
     Raises:
         PodReplacedError: the pod's UID has changed since ``pod.uid``.
         ContainerRestartedError: the default container's restart count has
-            increased since ``pod.initial_restart_count``.
+            increased since ``pod.initial_restart_count``, or, in ``"raise"``
+            mode, it is not running.
         RuntimeError: the named container is no longer present on the pod
             (treated as a permanent misconfiguration).
     """
     api = k8s_client(pod.context_name)
-    snapshot = read_pod(api, name=pod.name, namespace=pod.namespace)
+    snapshot = read_pod(
+        api, name=pod.name, namespace=pod.namespace, request_timeout=API_TIMEOUT
+    )
     if snapshot.uid != pod.uid:
         # Capture the new pod's restart count for the default container so the
         # caller can refresh its full cached identity atomically.
@@ -179,6 +218,14 @@ def check_for_pod_restart(pod: PodInfo) -> None:
             restart_count=status.restart_count,
             last_reason=status.last_terminated_reason or "unknown",
         )
+    if not status.running and pod.restarted_container_behavior == "raise":
+        # Stopped: an operation could reach its replacement before the count moves.
+        raise ContainerRestartedError(
+            pod_name=pod.name,
+            container_name=status.name,
+            restart_count=status.restart_count + 1,
+            last_reason=status.last_terminated_reason or "unknown",
+        )
 
 
 def _send_keepalive(ws_client: WSClient, stop: threading.Event) -> None:
@@ -201,7 +248,11 @@ def _send_keepalive(ws_client: WSClient, stop: threading.Event) -> None:
     [2] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/websocket.go#L339-L349
     [3] https://github.com/golang/net/blob/2914f46773171f4fa13e276df1135bafef677801/websocket/hybi.go#L290-L302
     [4] https://github.com/kubernetes/kubernetes/blob/77b02b7ad40d36cd803856de5ba5922c947cb0aa/staging/src/k8s.io/apimachinery/pkg/util/httpstream/wsstream/conn.go#L348-L356
+
+    Nothing is sent on v5.channel.k8s.io, where a resize frame stops stdin being read.
     """
+    if getattr(ws_client, "subprotocol", None) == "v5.channel.k8s.io":
+        return
     payload = json.dumps({"Width": 80, "Height": 24}).encode()  # Size is arbitrary
     while not stop.wait(_KEEPALIVE_INTERVAL_SECONDS):
         try:

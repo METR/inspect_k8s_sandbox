@@ -9,7 +9,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check format with Ruff
-        uses: chartboost/ruff-action@v1
-        with:
-          args: 'format --check'
-          version: 0.9.6
+        run: pipx run ruff==0.9.6 format --check .

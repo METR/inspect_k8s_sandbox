@@ -9,7 +9,16 @@ metadata:
   annotations:
     {{- toYaml $.Values.annotations | nindent 4 }}
 spec:
-  serviceName: {{ $name }}-service
+  {{- /*
+    Deliberately empty. The kubelet writes the pod's FQDN --
+    <pod>.<subdomain>.<namespace>.svc.cluster.local -- into /etc/hosts, but only when
+    the pod has a subdomain, and a StatefulSet's pods take their subdomain from
+    serviceName. Left empty, the kubelet writes a plain "<pod IP> <pod name>" and the
+    namespace stays out of the sandbox, where an agent under evaluation can read it.
+    Nothing resolved the per-pod DNS name this would create: the Services below are
+    what the coredns sidecar rewrites service names to.
+  */}}
+  serviceName: ""
   replicas: 1
   selector:
     matchLabels:
@@ -29,8 +38,12 @@ spec:
         {{- end }}
         {{- end }}
         inspect/service: {{ $name }}
+      {{- $podAnnotations := deepCopy (default (dict) $.Values.annotations) }}
+      {{- range $key, $value := $service.podAnnotations }}
+      {{- $_ := set $podAnnotations $key $value }}
+      {{- end }}
       annotations:
-        {{- toYaml $.Values.annotations | nindent 8 }}
+        {{- toYaml $podAnnotations | nindent 8 }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -42,7 +55,14 @@ spec:
       {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 0
+      terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
+      {{- if $.Values.corednsUpstream }}
+      {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 127.0.0.1
+      {{- end }}
 
       {{- if $service.initContainers }}
       initContainers:
@@ -70,6 +90,14 @@ spec:
           env:
             - name: AGENT_ENV
               value: "{{ template "agentEnv.fullname" $ }}"
+          {{- range .env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+          {{- end }}
+          {{- with .volumeMounts }}
+          volumeMounts:
+{{ toYaml . | nindent 12 }}
+          {{- end }}
           {{- if .resources }}
           resources:
 {{ toYaml .resources | nindent 12 }}
@@ -92,7 +120,8 @@ spec:
           {{- toYaml $service.command | nindent 10 }}
         {{- end }}
         {{- if $service.args }}
-        args: {{ $service.args }}
+        args:
+          {{- toYaml $service.args | nindent 10 }}
         {{- end }}
         {{- if $service.workingDir }}
         workingDir: {{ $service.workingDir }}
@@ -140,9 +169,11 @@ spec:
             name: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
           {{- end }}
         {{- end }}
+        {{- if not $.Values.corednsUpstream }}
           - name: resolv-conf
             mountPath: /etc/resolv.conf
             subPath: resolv.conf
+        {{- end }}
         {{- with $service.securityContext }}
         securityContext:
           {{- toYaml . | nindent 10 }}
@@ -167,11 +198,24 @@ spec:
           - containerPort: 53
             protocol: TCP
             name: dns-tcp
+          - containerPort: {{ $.Values.corednsReadyPort }}
+            protocol: TCP
+            name: dns-ready
+        {{- /* Without it the sidecar counts as ready between crash-loop restarts. */}}
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: dns-ready
+          periodSeconds: 1
+          failureThreshold: 30
         volumeMounts:
+          {{- /* A directory mount, not subPath, which Kata Containers documents as unsupported. */}}
           - name: coredns-config
-            mountPath: /etc/coredns/Corefile
-            subPath: Corefile
+            mountPath: /etc/coredns
             readOnly: true
+      {{- with $.Values.extraContainers }}
+        {{- toYaml . | nindent 6 }}
+      {{- end }}
       {{- with $service.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
@@ -184,9 +228,11 @@ spec:
         - name: coredns-config
           configMap:
             name: {{ template "agentEnv.fullname" $ -}}-coredns-configmap
+      {{- if not $.Values.corednsUpstream }}
         - name: resolv-conf
           configMap:
             name: {{ template "agentEnv.fullname" $ -}}-resolv-conf
+      {{- end }}
       {{- range $key, $value := $service.volumes }}
         {{- if kindIs "string" $value }}
           {{- $parts := split ":" $value }}

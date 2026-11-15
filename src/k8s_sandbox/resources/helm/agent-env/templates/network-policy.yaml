@@ -1,3 +1,17 @@
+{{- if not .Values.networkPolicy.enabled }}
+{{- /* Refuse restrictions nothing would enforce, rather than silently drop them. */}}
+{{- $unenforced := list }}
+{{- range $key := list "allowDomains" "allowDomainsPorts" "allowEntities" "allowCIDR" "networks" }}
+{{- if index $.Values $key }}{{ $unenforced = append $unenforced $key }}{{ end }}
+{{- end }}
+{{- range $svcName, $svc := .Values.services }}
+{{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
+{{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
+{{- end }}
+{{- if $unenforced }}
+{{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
+{{- end }}
+{{- else -}}
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -138,7 +152,7 @@ spec:
     - {}
 {{- if .Values.networks }}
   {{- range $svcName, $svc := .Values.services }}
-    {{- if $svc.networks }}
+    {{- if and $svc.networks (not $svc.networkIsolated) }}
       {{- range $net := $svc.networks }}
 ---
 apiVersion: cilium.io/v2
@@ -190,6 +204,7 @@ spec:
 {{- else }}
   {{- /* No global networks: allow same-sandbox ingress per service (no network scoping) */}}
   {{- range $svcName, $svc := .Values.services }}
+  {{- if not $svc.networkIsolated }}
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -230,6 +245,7 @@ spec:
           - type: 128
             family: IPv6
   {{- end }}
+  {{- end }}
 {{- end }}
 {{- range $svcName, $svc := .Values.services }}
 {{- if $svc.networkIsolated }}
@@ -244,17 +260,21 @@ metadata:
     {{- toYaml $.Values.labels | nindent 4 }}
 spec:
   description: |
-    Deny all ingress and egress for isolated service "{{ $svcName }}" (network_mode: none).
+    Isolate service "{{ $svcName }}" (network_mode: none): no ingress allow is emitted
+    for this service, so sandbox-default-deny-ingress denies all ingress to it. Egress
+    is explicitly denied below. This is deliberately subtractive rather than an
+    unconditional ingressDeny, so that a policy layered on top of this chart (e.g. an
+    allow for a specific port) is not shadowed -- Cilium resolves deny before allow,
+    with no exception mechanism, so an ingressDeny here would silently defeat any such
+    allow.
   endpointSelector:
     matchLabels:
       io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
       inspect/service: {{ $svcName }}
-  ingressDeny:
-    - fromEntities:
-        - all
   egressDeny:
     - toEntities:
         - all
+{{- end }}
 {{- end }}
 {{- end }}
