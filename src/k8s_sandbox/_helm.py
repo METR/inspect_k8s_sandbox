@@ -329,7 +329,7 @@ class Release:
                 pod.uid,
                 pod.restart_count_for(default_container_name),
                 self.restarted_container_behavior,
-                execd=pod.annotations.get(EXECD_ANNOTATION) == "true",
+                execd=pod.annotations.get(EXECD_ANNOTATION),
             )
         return sandboxes
 
