@@ -454,7 +454,7 @@ func (cl *call) run(req startRequest) error {
 	killed := cl.killed
 	cl.kmu.Unlock()
 	if killed { // while it started: nothing is reaped under this lock, so the id is its own
-		syscall.Kill(-p.Pid, syscall.SIGKILL)
+		killTree(p.Pid)
 	}
 	reaper.mu.Unlock()
 	if killed { // that holds for what it left running too
@@ -733,7 +733,7 @@ func (cl *call) ackLocked(req resumeRequest) {
 	cl.room.Broadcast()
 }
 
-// kill stops the call's process group, and every process still carrying its tag.
+// kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
 // stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
@@ -754,12 +754,80 @@ func (cl *call) stop(timeout bool) {
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killTree(pid)
 	}
 	reaper.mu.Unlock()
 	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
 	}
+}
+
+// stat is /proc/PID/stat after the name, which may hold spaces and parentheses: the state, the parent, and 20th the start time.
+func stat(pid int) []string {
+	data, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	return strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
+}
+
+// killTree kills pid's group and the processes under pid, which it stops as it finds them, by the parent each one's stat names.
+func killTree(pid int) {
+	syscall.Kill(pid, syscall.SIGSTOP)  // the command by its own id too: it may have left its group for another
+	syscall.Kill(-pid, syscall.SIGSTOP) // the group at once: stopped, a process starts no other, and its children stay its own
+	var stopped []int
+	seen, waits := map[int]bool{}, 0
+	// Eight listings at most: a command that starts them faster than they are listed would hold every start and exit.
+	for pass, more := 0, true; more && pass < 8; pass++ {
+		more = false
+		children, started := map[int][]int{}, map[int]string{}
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			p, _ := strconv.Atoi(e.Name())
+			if f := stat(p); len(f) > 19 {
+				ppid, _ := strconv.Atoi(f[1])
+				children[ppid], started[p] = append(children[ppid], p), f[19]
+			}
+		}
+		first := len(stopped)
+		for queue := children[pid]; len(queue) > 0; queue = queue[1:] {
+			p := queue[0]
+			queue = append(queue, children[p]...)
+			delete(children, p) // taken once: an id given again while they were read could close a loop
+			if !seen[p] && freeze(p, started[p]) {
+				stopped, seen[p], more = append(stopped, p), true, true
+			}
+		}
+		for _, p := range stopped[first:] { // one signalled while it starts a process still starts it: listed again once it has
+			for ; waits < 1000 && stopping(p); waits++ {
+				time.Sleep(time.Millisecond) // a thousand in all: one given no processor to stop on must not hold the rest
+			}
+		}
+	}
+	for _, p := range stopped { // stopped, as its parent is, each has kept its id: no descriptor is needed to tell
+		syscall.Kill(p, syscall.SIGKILL)
+	}
+	syscall.Kill(pid, syscall.SIGKILL)
+	syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+// stopping reports whether a thread of pid still runs or sleeps: any of them may be the one starting a process.
+func stopping(pid int) bool {
+	threads, _ := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
+	for _, t := range threads {
+		tid, _ := strconv.Atoi(t.Name())
+		if f := stat(tid); len(f) > 0 && strings.Contains("RS", f[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// freeze stops process pid if it is still the one that started then: its id may be another's by now.
+func freeze(pid int, started string) bool {
+	handle, _ := os.FindProcess(pid)
+	defer handle.Release()
+	if f := stat(pid); len(f) <= 19 || f[19] != started {
+		return false
+	}
+	return handle.Signal(syscall.SIGSTOP) == nil
 }
 
 // end kills whatever carries the call's tag.

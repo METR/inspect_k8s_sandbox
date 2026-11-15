@@ -21,6 +21,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unsafe"
 	"weak"
 )
 
@@ -33,6 +34,12 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 2 && os.Args[1] == "refused" {
 		refused(os.Args[2])
 		return
+	}
+	if len(os.Args) > 2 && os.Args[1] == "leave" { // runs the rest as a command that left its group for its parent's, and its environment
+		group, _ := syscall.Getpgid(os.Getppid())
+		syscall.Setpgid(0, group)
+		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+		syscall.Exec(os.Args[2], os.Args[2:], nil)
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve") {
 		main()
@@ -1124,6 +1131,158 @@ func borrowed() (ids []string) {
 func dumpable() bool {
 	d, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, 3, 0, 0) // PR_GET_DUMPABLE
 	return d != 0
+}
+
+func TestAKillReachesAChildThatLeftTheGroupAndDroppedTheTag(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: the child is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	// As runuser --login --command leaves its child: a session of its own, no tag, its parent waiting on it.
+	leave := `env -i setsid sh -c 'echo $$; exec sleep 600' & wait`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", leave}, Env: map[string]string{}, Tag: "tree"})
+	s.dispatch(c, frame{kind: fStart, id: 50, payload: req})
+	printed := nextFrame(t, frames)
+	child, _ := strconv.Atoi(strings.TrimSpace(string(printed.payload)))
+	if printed.kind != fStdout || child <= 0 { // or the kills below would be of this process's own group
+		t.Fatalf("the command printed %q, not the process it left", printed.payload)
+	}
+	t.Cleanup(func() { syscall.Kill(child, syscall.SIGKILL) })
+
+	s.dispatch(c, frame{kind: fKill, id: 50})
+
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(child, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, which left the command's group and dropped its tag, outlived the kill", child)
+		}
+	}
+}
+
+func TestAKillReachesACommandThatLeftItsOwnGroupAndDroppedTheTag(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	this, _ := os.Executable()
+	req, _ := json.Marshal(startRequest{Argv: []string{this, "leave", "/bin/sleep", "600"}, Env: map[string]string{}, Tag: "left"})
+	s.dispatch(c, frame{kind: fStart, id: 52, payload: req})
+	printed := nextFrame(t, frames)
+	command, _ := strconv.Atoi(strings.TrimSpace(string(printed.payload)))
+	if printed.kind != fStdout || command <= 0 { // or the kill below would be of this process's own group
+		t.Fatalf("the command printed %q, not its id", printed.payload)
+	}
+	t.Cleanup(func() { syscall.Kill(command, syscall.SIGKILL) })
+
+	s.dispatch(c, frame{kind: fKill, id: 52})
+
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(command, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("command %d, which left its own group and dropped its tag, outlived its kill", command)
+		}
+	}
+}
+
+func TestAKillThatComesBeforeItsCommandHasStartedReachesAChildThatLeftTheGroupAndDroppedTheTag(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: the child is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	cl := &call{id: 51, tag: "early"}
+	cl.room = sync.NewCond(&cl.mu)
+	pid := filepath.Join(t.TempDir(), "pid")
+	leave := `env -i setsid sh -c 'echo $$ >"$0"; exec sleep 600' "$0" & wait`
+	req := startRequest{Argv: []string{"sh", "-c", leave, pid}, Env: map[string]string{}, Tag: "early"}
+
+	cl.kill()     // from another connection, while this one's START is still at work
+	cl.kmu.Lock() // and stays at work until the command's child has left it
+	noted := sync.OnceFunc(cl.kmu.Unlock)
+	t.Cleanup(noted)
+	started := make(chan error, 1)
+	go func() { started <- cl.run(req) }()
+	var child int
+	for deadline := time.Now().Add(30 * time.Second); child == 0; time.Sleep(10 * time.Millisecond) {
+		written, _ := os.ReadFile(pid)
+		child, _ = strconv.Atoi(strings.TrimSpace(string(written)))
+		if time.Now().After(deadline) {
+			t.Fatal("the command's child never left it")
+		}
+	}
+	t.Cleanup(func() { syscall.Kill(child, syscall.SIGKILL) })
+	noted()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the START never returned")
+	}
+
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(child, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, which left the command's group and dropped its tag, outlived a kill that came before it started", child)
+		}
+	}
+}
+
+func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: what the kill ends is reaped here
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	// Fewer descriptors than it has processes to kill: a kill that keeps one for each runs out.
+	var limit syscall.Rlimit
+	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit)
+	nofile := func(to syscall.Rlimit) { // not syscall.Setrlimit: after it, Go starts a command with this limit, not its own first one
+		syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
+	}
+	t.Cleanup(func() { nofile(limit) })
+	open, _ := os.ReadDir("/proc/self/fd")
+	nofile(syscall.Rlimit{Cur: uint64(len(open)) + 32, Max: limit.Max})
+	s, _ := newServer(strings.Repeat("00", 32))
+	c := testConn(t)
+	s.authenticated(c)
+	this, _ := os.Executable()
+	// In the middle of starting 3,000 processes, each out of the group and with no tag: more than eight listings take.
+	starting := `i=0; while [ $i -lt 3000 ]; do env -i setsid sleep "$0" & i=$((i+1)); done; wait`
+	for id := uint64(60); id < 72; id++ { // a kill that lists them once, or lets their starter run on, leaves one in most
+		mark := "600." + strconv.Itoa(int(id))
+		argv := []string{"sh", "-c", starting, mark} // the command starts them itself
+		switch id % 4 {
+		case 1: // or its child does, out of the group itself
+			argv = []string{"sh", "-c", `setsid sh -c "$1" "$0" & wait`, mark, starting}
+		case 2: // or it does, out of its own group
+			argv = []string{this, "leave", "/bin/sh", "-c", starting, mark}
+		case 3: // or its child does, for longer than a kill waits for a process to stop
+			argv = []string{"sh", "-c", `setsid sh -c "$1" "$0" & wait`, mark, strings.Replace(starting, "&", "& sleep 0.001;", 1)}
+		}
+		req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, Tag: "starting"})
+		live := func() (pids []int) { // what it started, and itself, by their last argument
+			entries, _ := os.ReadDir("/proc")
+			for _, e := range entries {
+				cmdline, _ := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+				if pid, _ := strconv.Atoi(e.Name()); strings.HasSuffix(string(cmdline), "\x00"+mark+"\x00") {
+					pids = append(pids, pid)
+				}
+			}
+			return pids
+		}
+		t.Cleanup(func() {
+			for _, pid := range live() {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+		})
+		s.dispatch(c, frame{kind: fStart, id: id, payload: req})
+		for deadline := time.Now().Add(30 * time.Second); len(live()) < 100; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the command never started its processes")
+			}
+		}
+
+		s.dispatch(c, frame{kind: fKill, id: id})
+
+		for deadline := time.Now().Add(30 * time.Second); len(live()) > 0; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d processes the command started outlived its kill", len(live()))
+			}
+		}
+	}
 }
 
 func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
