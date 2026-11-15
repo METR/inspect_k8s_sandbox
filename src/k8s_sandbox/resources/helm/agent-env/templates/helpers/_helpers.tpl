@@ -48,7 +48,7 @@ Labels from values
 */}}
 {{- define "agentEnv.labelsFromValues" -}}
 {{- range $key, $value := $.Values.labels -}}
-{{ $key }}: {{ quote $value }}
+{{ quote $key }}: {{ quote $value }}
 {{ end -}}
 {{- end -}}
 
@@ -56,8 +56,8 @@ Labels from values
 Selector labels
 */}}
 {{- define "agentEnv.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "agentEnv.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: {{ include "agentEnv.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 
 {{/*

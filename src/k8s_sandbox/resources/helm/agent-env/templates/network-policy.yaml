@@ -32,7 +32,7 @@ spec:
     - allowEntities.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
   egress:
     - toEndpoints:
@@ -50,14 +50,14 @@ spec:
             dns:
               - matchPattern: "*.{{ .Release.Namespace }}.svc.cluster.local"
               {{- range .Values.allowDomains }}
-              - matchPattern: "{{ . }}"
+              - matchPattern: {{ . | quote }}
               {{- end }}
               {{- if or (has "all" .Values.allowEntities) (has "world" .Values.allowEntities) }}
               - matchPattern: "*"
               {{- end }}
     - toEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
     {{- if .Values.allowDomains }}
     {{- /* Validate allowDomainsPorts before rendering: no identity-bypassing 80/443, scoped domains must be allowed. */}}
@@ -72,7 +72,7 @@ spec:
     {{- end }}
     - toFQDNs:
     {{- range .Values.allowDomains }}
-      - matchPattern: "{{ . }}"
+      - matchPattern: {{ . | quote }}
     {{- end }}
       {{- if has "*" .Values.allowDomains }}
       # allowDomains includes "*" (allow all): identity enforcement is moot and
@@ -88,7 +88,7 @@ spec:
               protocol: TCP
           serverNames:
           {{- range .Values.allowDomains }}
-            - "{{ . }}"
+            - {{ . | quote }}
           {{- end }}
         - ports:
             - port: "80"
@@ -96,7 +96,7 @@ spec:
           rules:
             http:
             {{- range .Values.allowDomains }}
-              - host: "(?i)^{{ . | replace "." "[.]" | replace "*" "[^.]+" }}(:[0-9]+)?$"
+              - host: {{ printf "(?i)^%s(:[0-9]+)?$" (. | replace "." "[.]" | replace "*" "[^.]+") | quote }}
             {{- end }}
         {{- /* Extra ports without a domain apply to every allowDomains IP (IP-pinned, no identity check). */}}
         {{- $hasUnscoped := false }}
@@ -107,7 +107,7 @@ spec:
         - ports:
           {{- range .Values.allowDomainsPorts }}
           {{- if not .domain }}
-            - port: "{{ .port }}"
+            - port: {{ .port | quote }}
               protocol: {{ .protocol | default "ANY" | upper | quote }}
           {{- end }}
           {{- end }}
@@ -117,10 +117,10 @@ spec:
     {{- range $p := .Values.allowDomainsPorts }}
     {{- if $p.domain }}
     - toFQDNs:
-      - matchPattern: "{{ $p.domain }}"
+      - matchPattern: {{ $p.domain | quote }}
       toPorts:
         - ports:
-            - port: "{{ $p.port }}"
+            - port: {{ $p.port | quote }}
               protocol: {{ $p.protocol | default "ANY" | upper | quote }}
     {{- end }}
     {{- end }}
@@ -146,7 +146,7 @@ spec:
   description: Default deny ingress. Allow other policies to be more specific.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
   ingress:
     - {}
@@ -170,14 +170,14 @@ spec:
     Always allow ICMP echo requests (ping)
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
       aisi.gov.uk/network-{{ $net }}: "true"
   ingress:
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
           aisi.gov.uk/network-{{ $net }}: "true"
       {{- if $svc.ports }}
@@ -187,7 +187,7 @@ spec:
       {{- end }}
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
           aisi.gov.uk/network-{{ $net }}: "true"
       icmps:
@@ -221,13 +221,13 @@ spec:
     Always allow ICMP echo requests (ping).
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
   ingress:
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
       {{- if $svc.ports }}
       toPorts:
@@ -236,7 +236,7 @@ spec:
       {{- end }}
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
       icmps:
         - fields:
@@ -269,9 +269,9 @@ spec:
     allow.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
   egressDeny:
     - toEntities:
         - all

@@ -504,6 +504,12 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     assert init["imagePullPolicy"] == "Always" + spliced
     assert init["workingDir"] == "/iw" + spliced
     assert {"name": "IENVNAME" + spliced, "value": "v"} in init["env"]
+    volume = "agent-env-my-release-vol\nspliced"
+    assert {"mountPath": "/data", "name": volume} in main["volumeMounts"]
+    claim = {"name": volume, "persistentVolumeClaim": {"claimName": volume}}
+    assert claim in pod_spec["volumes"]
+    pvc = _get_documents(documents, "PersistentVolumeClaim")[0]
+    assert pvc["metadata"]["name"] == volume
     port = _get_documents(documents, "Service")[0]["spec"]["ports"][0]
     assert port["protocol"] == "TCP" + spliced
     egress = next(
@@ -518,8 +524,47 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
         for p in to_ports["ports"]
     }
     # The chart upper-cases an allowDomainsPorts protocol.
-    assert protocols["8008"] == ("TCP" + spliced).upper()
-    assert protocols["22"] == ("TCP" + spliced).upper()
+    assert protocols["8008"] == "TCP\nSPLICED: X"
+    assert protocols["22"] == "TCP\nSPLICED: X"
+    # A `": ` in a domain would close hand-written quotes or, bare, start a mapping.
+    domain = 'a": b.org'
+    dns, _, fqdns, _, scoped = egress
+    assert {"matchPattern": domain} in dns["toPorts"][0]["rules"]["dns"]
+    assert {"matchPattern": domain} in fqdns["toFQDNs"]
+    tls, http, _ = fqdns["toPorts"]
+    assert domain in tls["serverNames"]
+    assert {"host": '(?i)^a": b[.]org(:[0-9]+)?$'} in http["rules"]["http"]
+    assert scoped["toFQDNs"] == [{"matchPattern": domain}]
+
+
+@pytest.mark.parametrize(
+    "networks",
+    ["", ",networks.net.a=b,services.no.networks[0]=net"],
+    ids=["no-networks", "networks"],
+)
+def test_names_render_as_strings(chart_dir: Path, networks: str) -> None:
+    # Unquoted, YAML reads each of these names as a boolean or a number.
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="services.no.image=img,services.no.dnsRecord=true,labels.no=x,"
+        "services.123.image=img,services.123.networkIsolated=true,"
+        "serviceAccountCreate=true,serviceAccountName=sa" + networks,
+        set_string="global.nameOverride=456",
+        release="23456789",
+        namespace="123",
+    )
+
+    assert set(_values_at(documents, "inspect/service")) == {"default", "no", "123"}
+    assert set(_values_at(documents, "app.kubernetes.io/name")) == {"456"}
+    assert set(_values_at(documents, "app.kubernetes.io/instance")) == {"23456789"}
+    namespaces = _values_at(documents, "io.kubernetes.pod.namespace")
+    assert set(namespaces) == {"123", "kube-system"}
+    account = _get_documents(documents, "ServiceAccount")[0]
+    assert account["metadata"]["namespace"] == "123"
+    pods = [s["spec"]["template"] for s in _get_documents(documents, "StatefulSet")]
+    assert all(pod["metadata"]["labels"]["no"] == "x" for pod in pods)
+    containers = {c["name"] for pod in pods for c in pod["spec"]["containers"]}
+    assert containers == {"default", "no", "123", "coredns"}
 
 
 def test_fails_on_a_value_helm_cannot_render(chart_dir: Path) -> None:
@@ -1134,11 +1179,13 @@ def _run_helm_template(
     values_file: Path | None = None,
     set_str: str | None = None,
     set_string: str | None = None,
+    release: str = "my-release",
+    namespace: str | None = None,
 ) -> list[dict[str, Any]]:
     cmd = [
         "helm",
         "template",
-        "my-release",
+        release,
         str(chart_dir),
     ]
 
@@ -1148,6 +1195,8 @@ def _run_helm_template(
         cmd += ["--set", set_str]
     if set_string:
         cmd += ["--set-string", set_string]
+    if namespace:
+        cmd += ["--namespace", namespace]
 
     # stderr is captured so that tests asserting rejection can check why helm failed.
     result = subprocess.run(
@@ -1158,6 +1207,15 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+def _values_at(node: Any, key: str) -> list[Any]:
+    """Every value under `key`, at any depth of `node`."""
+    children = node.values() if isinstance(node, dict) else node
+    if not isinstance(node, (dict, list)):
+        return []
+    found = [node[key]] if isinstance(node, dict) and key in node else []
+    return found + [value for child in children for value in _values_at(child, key)]
 
 
 def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -> bool:

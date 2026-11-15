@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A service or namespace named `no` or `123`, or a generated release name that reads as
+  a number, no longer fails the install, and a label key such as `no` or `on` is no
+  longer applied as `false` or `true`.
 - **BREAKING CHANGE**: Fail the install when a string inside a block value
   (`securityContext`, `resources`, `nodeSelector`, `tolerations`, `command`, `annotations`
   with the task's name, ...) holds DEL, a C1 control character, U+FFFE or U+FFFF, or one

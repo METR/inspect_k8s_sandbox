@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: "{{ template "agentEnv.fullname" $ -}}-{{ $name }}"
+  name: {{ printf "%s-%s" (include "agentEnv.fullname" $) $name | quote }}
   annotations:
     {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:

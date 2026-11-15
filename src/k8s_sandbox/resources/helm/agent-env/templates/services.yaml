@@ -5,7 +5,7 @@ metadata:
   name: {{ template "agentEnv.fullname" $ -}}-{{ $name }}
   labels:
     {{- include "agentEnv.labels" $ | nindent 4 }}
-    inspect/service: {{ $name }}
+    inspect/service: {{ $name | quote }}
   annotations:
     {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
 spec:
@@ -23,7 +23,7 @@ spec:
   selector:
     matchLabels:
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $name }}
+      inspect/service: {{ $name | quote }}
   template:
     metadata:
       labels:
@@ -37,7 +37,7 @@ spec:
         aisi.gov.uk/network-{{ . }}: "true"
         {{- end }}
         {{- end }}
-        inspect/service: {{ $name }}
+        inspect/service: {{ $name | quote }}
       {{- $podAnnotations := deepCopy (default (dict) $.Values.annotations) }}
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
@@ -110,7 +110,7 @@ spec:
       {{- end }}
 
       containers:
-      - name: {{ $name }}
+      - name: {{ $name | quote }}
         image: {{ $service.image | quote }}
         {{- if $service.imagePullPolicy }}
         imagePullPolicy: {{ $service.imagePullPolicy | quote }}
@@ -166,7 +166,7 @@ spec:
             {{- $volumeName := $parts._0 }}
             {{- $mountPath := $parts._1 }}
           - mountPath: {{ $mountPath | quote }}
-            name: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+            name: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
           {{- end }}
         {{- end }}
         {{- if not $.Values.corednsUpstream }}
@@ -237,9 +237,9 @@ spec:
         {{- if kindIs "string" $value }}
           {{- $parts := split ":" $value }}
           {{- $volumeName := $parts._0 }}
-        - name: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+        - name: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
           persistentVolumeClaim:
-            claimName: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+            claimName: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
         {{- else }}
         -  {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
@@ -265,7 +265,7 @@ spec:
   clusterIP: None
   selector:
     {{- include "agentEnv.selectorLabels" $ | nindent 4 }}
-    inspect/service: {{ $name }}
+    inspect/service: {{ $name | quote }}
   {{- if $service.ports }}
   # ports are deprecated within this Helm chart. Maintained for backwards compatibility.
   ports:
