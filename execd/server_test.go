@@ -41,6 +41,7 @@ func TestMain(m *testing.M) {
 		syscall.Setpgid(0, group)
 		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
 		syscall.Exec(os.Args[2], os.Args[2:], nil)
+		os.Exit(1) // not on into the tests, as the command
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve") {
 		main()
