@@ -62,6 +62,8 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
+var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
+
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
@@ -172,7 +174,10 @@ func fromThisPod(nc net.Conn) bool {
 	if !ok || remote.IP.IsLoopback() {
 		return ok
 	}
-	addrs, _ := net.InterfaceAddrs()
+	addrs, err := interfaceAddrs()
+	if err != nil { // can't tell: refuse, rather than admit a dial from the sandbox
+		return true
+	}
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(remote.IP) {
 			return true
@@ -491,7 +496,7 @@ func (cl *call) run(req startRequest) error {
 		go func() {
 			defer drained.Done()
 			defer r.Close()
-			buf := make([]byte, 256<<10)
+			buf := make([]byte, 64<<10) // a default pipe's capacity, and the most Go keeps off the heap
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
@@ -523,8 +528,8 @@ func (cl *call) run(req startRequest) error {
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
-			want[i] = buffered(r)               // before the count, so want can't fall short
-			want[i] += read[i].Load() + 256<<10 // a read under way has taken bytes it hasn't counted
+			want[i] = buffered(r)              // before the count, so want can't fall short
+			want[i] += read[i].Load() + 64<<10 // a read under way has taken bytes it hasn't counted
 		}
 		done := make(chan struct{})
 		go func() { drained.Wait(); close(done) }()
