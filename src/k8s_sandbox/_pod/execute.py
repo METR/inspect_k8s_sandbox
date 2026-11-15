@@ -61,12 +61,17 @@ _ROOT_CHECK = (
 )
 # Not found through the image's PATH (see SYSTEM_PATH): util-linux puts it here.
 _RUNUSER = "/sbin/runuser"
+# What any pipe holds: a script no larger does not hold its exec open when left unread.
+_PIPE = 4096
 
 logger = logging.getLogger(__name__)
 
 
 def _shell_command(
-    user: str | None, switch: bool = False, command: Sequence[str] = ("/bin/sh",)
+    user: str | None,
+    switch: bool = False,
+    command: Sequence[str] = ("/bin/sh",),
+    script: str = "",
 ) -> list[str]:
     """The command that runs `command` (by default, exec()'s shell) as `user`.
 
@@ -79,6 +84,7 @@ def _shell_command(
     inherits from the container instead.
 
     `switch` is whether a probe found that this user needs `runuser`, and that it works.
+    `script` is stdin's: read whole when large, since unread input holds an exec open.
     `sh -c` takes its script from argv, so stdin reaches the command it execs
     unread, and the caller's protocol is unchanged.
     """
@@ -86,16 +92,18 @@ def _shell_command(
         return list(command)
     if user in ROOT_USERS:  # exec()'s own check: uid 0 with no `id` or `runuser`
         return ["/bin/sh", "-c", f"{_ROOT_CHECK}exec {shlex.join(command)}"]
-    if not user or switch:
-        # An empty user matches nothing; leave runuser to reject it as it did before.
+    direct = shlex.join(command)
+    run = f"{_RUNUSER} -u {shlex.quote(user)} -- {direct}"
+    same = ""
+    if user and not switch:  # an empty user matches nothing: runuser rejects it
+        same = f"if {_runs_as(user)}; then exec {direct}; fi; "
+    if (size := len(script.encode())) > _PIPE:
+        read = f"PATH={SYSTEM_PATH} head -c {size}"
+        fed = f"{{ {run}; s=$?; {read} >/dev/null; exit $s; }}"
+        return ["/bin/sh", "-c", f"{same}{{ {read} || kill $$; }} | {fed}"]
+    if not same:
         return [_RUNUSER, "-u", user, "--", *command]
-    run = shlex.join(command)
-    return [
-        "/bin/sh",
-        "-c",
-        f"if {_runs_as(user)}; then exec {run}; fi; "
-        f"exec {_RUNUSER} -u {shlex.quote(user)} -- {run}",
-    ]
+    return ["/bin/sh", "-c", f"{same}exec {run}"]
 
 
 def _runs_as(user: str) -> str:
@@ -133,7 +141,9 @@ class ExecuteOperation(PodOperation):
         shell_script = self._build_shell_script(
             cmd, stdin, cwd, env, timeout, marker, root=root
         )
-        shell = ["/bin/sh"] if root else _shell_command(user, switch)
+        shell = (
+            ["/bin/sh"] if root else _shell_command(user, switch, script=shell_script)
+        )
         with self._interactive_shell(shell) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands.

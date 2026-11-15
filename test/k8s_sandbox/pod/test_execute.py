@@ -12,6 +12,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -377,6 +378,28 @@ def _run_script(
     finally:
         os.close(read_end)
         os.close(write_end)
+
+
+def _fed(command: list[str], script: str) -> tuple[int, bytes, bytes]:
+    """Run an exec's shell on its script; its stdin stays open, as an exec's does."""
+    data, pipe = script.encode(), subprocess.PIPE
+    shell = subprocess.Popen(
+        command, stdin=pipe, stdout=pipe, stderr=pipe, bufsize=0, start_new_session=True
+    )
+    assert shell.stdin is not None
+    held = os.dup(shell.stdin.fileno())  # the script's end is no end of input
+    pool = concurrent.futures.ThreadPoolExecutor()
+    try:
+        # Left unread, the script never ends its write: the budgets only bound a hang.
+        assert pool.submit(shell.stdin.write, data).result(30) == len(data)
+        out, err = shell.communicate(timeout=30)
+        return shell.returncode, out, err
+    finally:
+        os.close(held)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(shell.pid, signal.SIGKILL)  # what is left of it holds a pipe
+        shell.communicate(timeout=30)  # reaps it and closes its pipes
+        pool.shutdown(wait=False)
 
 
 def _script(cmd: list[str], stdin: str | bytes | None = None) -> str:
@@ -1391,6 +1414,41 @@ class TestShellCommand:
     def test_an_empty_user_is_left_to_runuser(self) -> None:
         """It matches nothing, and an empty `id` output must not look equal."""
         assert _shell_command("") == ["/sbin/runuser", "-u", "", "--", "/bin/sh"]
+
+    @pytest.mark.skipif(not os.path.exists("/sbin/runuser"), reason="needs runuser")
+    @pytest.mark.parametrize(
+        ("user", "switch"),
+        [("no-such-user", False), ("no-such-user", True), ("", False)],
+        ids=["unprobed", "a switch that worked before", "empty"],
+    )
+    def test_a_switch_that_runuser_refuses_reads_a_large_script(
+        self, user: str, switch: bool
+    ) -> None:
+        """Regression: its script unread, the exec never ended, nor did exec()."""
+        script = _script(["cat"], bytes(1024**2))  # more than a pipe holds
+        command = execute_module._shell_command(user, switch, script=script)
+
+        code, _, said = _fed(command, script)
+
+        assert code != 0 and b"runuser: " in said  # what exec() tells of
+
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    def test_a_switch_that_works_leaves_a_large_script_to_its_shell(
+        self, tmp_path: Path
+    ) -> None:
+        forward = tmp_path / "forward"  # runuser without the switch
+        forward.write_text(
+            '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+        )
+        forward.chmod(0o755)
+        script = _script(["sh", "-c", "echo $(($(wc -c))); exit 7"], bytes(8192))
+        command = execute_module._shell_command("someone-else", script=script)
+        command[2] = command[2].replace("/sbin/runuser", str(forward))
+
+        code, out, _ = _fed(command, script)
+
+        # All of its input, its own status and the marker: the script, read whole.
+        assert (code, out) == (7, b"8192\n" + _marker(7))
 
     @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
     @pytest.mark.parametrize("shell", _SHELLS)

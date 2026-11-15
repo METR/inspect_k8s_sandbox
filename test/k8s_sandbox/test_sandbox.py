@@ -284,11 +284,13 @@ async def test_exec_user(sandbox: K8sSandboxEnvironment, cmd: list[str]) -> None
     assert result.stdout.strip() == "nobody"
 
 
+@pytest.mark.parametrize("input", [None, bytes(1024**2)], ids=["none", "a megabyte"])
 async def test_exec_user_when_specified_user_does_not_exist(
-    sandbox: K8sSandboxEnvironment,
+    sandbox: K8sSandboxEnvironment, input: bytes | None
 ) -> None:
-    with pytest.raises(K8sError) as excinfo:
-        await sandbox.exec(["whoami"], user="foo")
+    """Regression: with a megabyte of input unread, the exec never ended."""
+    with pytest.raises(K8sError) as excinfo, anyio.fail_after(60):
+        await sandbox.exec(["whoami"], input=input, user="foo")
 
     error_msg = str(excinfo.value.__cause__)
     assert (

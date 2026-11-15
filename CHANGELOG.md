@@ -46,6 +46,8 @@
 - Fix `read_file()` hanging on a relative file named `-`.
 - Fix `write_file()` over Kubernetes exec never returning when a large file could not
   be written.
+- Fix `exec()` over Kubernetes exec never returning when its `user` could not be
+  switched to and its input was large.
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
   replacement or container restart fails with the same `PodReplacedError` or
   `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
