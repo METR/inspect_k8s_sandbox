@@ -20,9 +20,10 @@
   environment, runs as a user that is neither execd's nor the command's where execd
   lacks `CAP_SYS_PTRACE`, or on gVisor comes from a command run as another user;
   those of a command that has ended are left running. A command that ends execd, by
-  killing every process or taking the pod's last PID, makes each running `exec()`
-  raise `ExecResultUnknownError`, as it does each `read_file()` and `write_file()`,
-  and commands still running lose their timeout.
+  killing every process or taking the pod's last PID, makes each running `exec()`,
+  `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
+  timeout passes first raises `TimeoutError`. Commands still running lose their
+  timeout and get end-of-file on `stdin`.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
