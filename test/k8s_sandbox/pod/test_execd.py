@@ -2913,6 +2913,34 @@ async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
     assert dst.read_bytes() == b"data"
 
 
+async def test_a_daemon_lost_in_a_replacement_pod_is_replaced(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: in "warn" mode its port stayed taken, and every operation failed."""
+    uid = "u"
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    async def start(replace: bool) -> execd.Daemon:
+        if uid == "v" and not replace:  # execd runs there: its start's answer was lost
+            raise execd.DaemonRunning("bind: address already in use")
+        return execd.Daemon("127.0.0.1", tls[1], b"key", uid)
+
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(exits)  # both pods' execd, at the one address
+        client = execd.ExecdClient(start, lambda: uid)
+        await client.exec(["true"], None, None, {}, None, None)
+        uid = "v"
+        await client.leave_replaced()
+
+        # Not the RuntimeError of a port held by a process other than execd.
+        await client.exec(["true"], None, None, {}, None, None)
+
+
 async def test_a_port_held_at_the_first_start_says_so() -> None:
     async def held(replace: bool) -> execd.Daemon:
         raise execd.DaemonRunning("bind: address already in use")  # even with --replace

@@ -494,7 +494,7 @@ class ExecdClient:
             try:
                 if self._daemon is None:
                     try:
-                        self._daemon = await self._start(self._link is None)
+                        self._daemon = await self._start(True)  # none here is ours
                     except DaemonRunning as e:  # even past --replace: not execd
                         raise _port_held() from e
                 daemon = self._daemon
