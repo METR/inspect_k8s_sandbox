@@ -2100,6 +2100,50 @@ async def test_a_call_cancelled_as_it_exits_is_released(daemons: Daemons) -> Non
     assert execd.KILL not in got  # it exited: a KILL would end what it left running
 
 
+@pytest.mark.parametrize("left", ["cancelled", "timed out"])
+async def test_a_call_left_as_its_upload_writes_sends_no_stdin_after_its_kill(
+    tls_daemon: TlsDaemon, monkeypatch: pytest.MonkeyPatch, left: str
+) -> None:
+    """Regression: before Python 3.12 the upload's cancel was lost, and it sent on."""
+    got: list[int] = []
+    late = 0.0  # seconds the client's clock is put on
+
+    async def leaves(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal late
+        _, first, _ = await read_frame(r)  # the command that opens the connection
+        w.write(frame(execd.EXIT, first, b'{"code": 0}'))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if call_id != first:
+                got.append(kind)
+            if kind == execd.STDIN and left == "cancelled":
+                call.cancel()
+            elif kind == execd.START and left == "timed out":
+                late = 60.0  # its timeout passes, and output wakes it to that
+                w.write(frame(execd.STDOUT, call_id, b"x"))
+            elif kind == execd.KILL:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
+
+    clock = types.SimpleNamespace(
+        monotonic=lambda: time.monotonic() + late, thread_time=time.thread_time
+    )
+    monkeypatch.setattr(execd, "time", clock)
+    client = await tls_daemon(leaves)
+    opens = client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(opens, 30)  # only bounds a hang
+    link = client._link
+    assert link is not None
+    stdin = b"x" * execd.STDIN_WINDOW
+    # Room for it all: each megabyte's write returns at once, where the cancel was lost.
+    link.pipe._writer.transport.set_write_buffer_limits(high=2 * len(stdin))
+    call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 60))
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.STDIN not in got[got.index(execd.KILL) :]
+    with pytest.raises((asyncio.CancelledError, TimeoutError)):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+
+
 async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> None:
     got: list[int] = []
 
