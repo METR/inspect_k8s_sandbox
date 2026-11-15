@@ -19,6 +19,7 @@ from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
 from k8s_sandbox import _helm, _sandbox_environment
+from k8s_sandbox._pod import error as pod_error
 from k8s_sandbox._pod import execd, op, pod
 from k8s_sandbox._pod.error import (
     ContainerStoppedError,
@@ -470,6 +471,27 @@ def api(monkeypatch: pytest.MonkeyPatch) -> collections.abc.Iterator[Api]:
     listening.close()
     for server in servers:
         server.join(30)  # only bounds a hang
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [("read_file", ("/tmp/f",)), ("write_file", ("/tmp/f", "x"))],
+    ids=["read_file", "write_file"],
+)
+async def test_a_file_operation_checks_for_a_restart_before_each_further_attempt(
+    api: Api, operation: str, args: tuple[str, ...]
+) -> None:
+    """Regression: sent again unchecked, it reached its container's replacement."""
+    # Its exec fails, and no restart shows yet; a first check fails, the next finds one.
+    asked = api([_shows(500), _shows(200), _shows(503), _shows(200, restarts=1)])
+    sandbox, _ = _make_sandbox()
+    sandbox._pod = pod.Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    with pytest.raises(_sandbox_environment.K8sError) as raised:
+        await asyncio.wait_for(getattr(sandbox, operation)(*args), 30)
+
+    assert isinstance(raised.value.__cause__, pod_error.ContainerRestartedError)
+    assert sum(b"/exec?" in request for request in asked) == 1
 
 
 @pytest.mark.parametrize(
