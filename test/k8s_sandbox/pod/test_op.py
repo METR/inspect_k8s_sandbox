@@ -1,5 +1,8 @@
+import base64
 import concurrent.futures
 import contextlib
+import hashlib
+import re
 import socket
 import threading
 from unittest.mock import MagicMock
@@ -96,3 +99,36 @@ def test_an_exec_ends_when_the_api_server_never_answers(
         pool.shutdown(wait=False)
         if answers:
             server.join(30)
+
+
+def test_a_websocket_opened_elsewhere_keeps_its_timeout() -> None:
+    """Regression: one opened through kubernetes' module lost its timeout."""
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def upgrade() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += connection.recv(4096)
+            key = re.search(rb"Sec-WebSocket-Key: (\S+)", request)
+            assert key is not None
+            guid = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455's
+            accept = base64.b64encode(hashlib.sha1(key[1] + guid).digest())
+            connection.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            connection.recv(1)  # until the client goes
+
+    server = threading.Thread(target=upgrade, daemon=True)
+    server.start()
+    websocket = op_module.ws_client.WebSocket()  # the class create_websocket() makes
+
+    try:
+        websocket.connect(f"ws://127.0.0.1:{listener.getsockname()[1]}", timeout=7)
+        assert websocket.gettimeout() == 7
+    finally:
+        websocket.shutdown()
+        listener.close()
+        server.join(30)

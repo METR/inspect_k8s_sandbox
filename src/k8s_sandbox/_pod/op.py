@@ -21,11 +21,16 @@ from k8s_sandbox._pod.snapshot import read_pod
 # https://github.com/kubernetes-client/python/blob/master/examples/watch/timeout-settings.md
 API_TIMEOUT = 60
 
+_opening = threading.local()  # set while this provider opens an exec's websocket
+
 
 class _ConnectsInTime(websocket.WebSocket):
     """kubernetes' websocket, whose connect and upgrade it gives no timeout at all."""
 
     def connect(self, url: str, **options: Any) -> None:
+        if not getattr(_opening, "exec", False):  # another user of kubernetes' module
+            super().connect(url, **options)
+            return
         over = threading.Event()
         threading.Thread(target=self._cut, args=(over,), daemon=True).start()
         try:
@@ -112,17 +117,21 @@ class PodOperation(ABC):
         self, send_keepalive: bool = True, **kwargs
     ) -> Generator[WSClient, None, None]:
         client = k8s_client(self._pod.context_name)
-        # Note: ApiException is intentionally not caught; it should fail the eval.
-        ws_client: WSClient = stream(
-            client.connect_get_namespaced_pod_exec,
-            name=self._pod.name,
-            namespace=self._pod.namespace,
-            container=self._pod.default_container_name,
-            _preload_content=False,
-            # This is the timeout for the API request, not the command itself.
-            _request_timeout=API_TIMEOUT,
-            **kwargs,
-        )
+        _opening.exec = True  # stream() connects on this thread, before it returns
+        try:
+            # Note: ApiException is intentionally not caught; it should fail the eval.
+            ws_client: WSClient = stream(
+                client.connect_get_namespaced_pod_exec,
+                name=self._pod.name,
+                namespace=self._pod.namespace,
+                container=self._pod.default_container_name,
+                _preload_content=False,
+                # This is the timeout for the API request, not the command itself.
+                _request_timeout=API_TIMEOUT,
+                **kwargs,
+            )
+        finally:
+            _opening.exec = False
         stop_keepalive = threading.Event()
         keepalive = threading.Thread(
             target=_send_keepalive,
