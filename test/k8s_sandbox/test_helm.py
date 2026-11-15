@@ -1046,9 +1046,8 @@ async def _wait(
     mock = MagicMock(side_effect=polls)
     monkeypatch.setattr(Release, "_list_release_pods", mock, raising=True)
     monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 0)
-    # A short deadline of its own: the wait treats an exhausted script as a failed
-    # poll and would otherwise spin for the whole INSPECT_HELM_TIMEOUT.
-    await release._wait_until_ready(time.monotonic() + 2)
+    # Two bounds: an exhausted script fails every poll, or before Python 3.12 hangs one.
+    await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 2), 10)
     if isinstance(polls, list):
         assert mock.call_count == len(polls), (
             f"expected the wait to read the pods {len(polls)} times, not "
@@ -1091,6 +1090,107 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
     ]
 
     await _wait(release, polls, monkeypatch)
+
+
+def _helper(release: Release, spec: str = "") -> str:
+    labels = f"{{app.kubernetes.io/instance: {release.release_name}}}"
+    return (
+        "kind: StatefulSet\nmetadata: {name: helper}\n"
+        f"spec:\n{spec}  template: {{metadata: {{labels: {labels}}}}}\n"
+    )
+
+
+def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
+    return _pod(name=f"helper-{ordinal}", service=None, **status)
+
+
+def _in_a_list(manifest: str) -> str:
+    return "kind: List\nitems:\n  - " + manifest.replace("\n", "\n    ")
+
+
+@pytest.mark.parametrize(
+    ("spec", "short", "enough", "reshape"),
+    [
+        pytest.param("", [], [_helper_pod()], str, id="a-pod-that-is-no-sandbox"),
+        pytest.param("", [], [_helper_pod()], _in_a_list, id="in-a-list"),
+        # Helm installs a manifest whose namespace is empty into the release's.
+        pytest.param(
+            "",
+            [],
+            [_helper_pod()],
+            lambda manifest: manifest.replace("{name:", '{namespace: "", name:'),
+            id="in-a-namespace-left-empty",
+        ),
+        pytest.param(
+            "  replicas: 2\n",
+            [_helper_pod()],
+            [_helper_pod(), _helper_pod(1)],
+            str,
+            id="every-replica",
+        ),
+        # Failed by the pod GC, a pod stays Ready; its replacement takes its name.
+        pytest.param(
+            "",
+            [_helper_pod(phase="Failed")],
+            [_helper_pod()],
+            str,
+            id="a-pod-that-failed",
+        ),
+        pytest.param(
+            "",
+            [_helper_pod(ready=False, phase="Succeeded")],
+            [_helper_pod()],
+            str,
+            id="a-pod-that-ran-to-completion",
+        ),
+        pytest.param(
+            "  ordinals: {start: 3}\n", [], [_helper_pod(3)], str, id="a-start-ordinal"
+        ),
+    ],
+)
+async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(
+    spec: str,
+    short: list[PodSnapshot],
+    enough: list[PodSnapshot],
+    reshape: Callable[[str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, _STATEFUL_SET, reshape(_helper(release, spec)))
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    await _wait(release, [[_pod(), *short]] * 2 + [[_pod(), *enough]] * 2, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        pytest.param(
+            lambda release: _helper(release, "  replicas: 0\n"), id="scaled-to-none"
+        ),
+        # The poll lists pods by the release's label, so this one's would never be seen.
+        pytest.param(
+            lambda release: "kind: StatefulSet\nmetadata: {name: helper}\n",
+            id="not-labelled-as-the-release",
+        ),
+        pytest.param(
+            lambda release: _helper(release).replace(
+                "{name: helper}", "{name: helper, namespace: elsewhere}"
+            ),
+            id="in-another-namespace",
+        ),
+    ],
+)
+async def test_wait_until_ready_does_not_wait_for_a_pod_it_will_never_see(
+    helper: Callable[[Release], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, _STATEFUL_SET, helper(release))
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    await _wait(release, [[_pod()]] * 2, monkeypatch)
 
 
 async def test_wait_until_ready_keeps_waiting_while_no_pods_exist(
@@ -1165,6 +1265,22 @@ async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
     assert "missing_sandboxes" in str(excinfo.value)
     # The sandbox which did arrive is not a thing to go looking at.
     assert "default" not in str(excinfo.value).split("missing_sandboxes")[1]
+
+
+async def test_wait_until_ready_names_the_stateful_set_pod_which_never_arrived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run, _STATEFUL_SET, _helper(release))
+        await release._install(None, time.monotonic() + 60, upgrade=False)
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, itertools.repeat([_pod()]), monkeypatch)
+
+    assert "helper-0" in str(excinfo.value).split("missing_pods")[1]
 
 
 async def test_wait_until_ready_says_so_when_the_chart_made_no_pods(

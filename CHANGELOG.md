@@ -13,6 +13,9 @@
   from programs that ignore proxy settings: see `vsock-egress/README.md`. Its init
   container runs as root with `NET_ADMIN`, which a namespace at the `baseline` Pod
   Security Standard refuses.
+- Wait for the Pods of every StatefulSet in the release's namespace whose Pod template
+  carries the release's `app.kubernetes.io/instance` label, including those from
+  `additionalResources`, before handing over a sandbox.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
