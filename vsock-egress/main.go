@@ -19,17 +19,21 @@ const (
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second
+	idleWait      = 300 * time.Second // a stream that moves no byte either way for this long is ended: it holds a place
+
+	capturePort = 3127 // redirect sends the sandbox's DNS queries and its TCP connections here, on loopback
+	captureAddr = "127.0.0.1:3127"
 )
 
 func main() {
 	log.SetFlags(0)
 	commands := map[string]func([]string) error{
-		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
+		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, // in the sandbox
 		"launch": launch, "check": check, // on the node
 		"work": work, "probe": probe, "reap": reap, // started by launch and check
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
-		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check (on the node)")
+		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|canary (in the sandbox), launch|check (on the node)")
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {
