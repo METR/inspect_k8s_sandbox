@@ -50,7 +50,7 @@
 - Fix `write_file()` over Kubernetes exec never returning when a large file could not
   be written.
 - Fix `exec()` over Kubernetes exec never returning when its `user` could not be
-  switched to and its input was large.
+  switched to and its command, environment or input was large.
 - Fix a sandbox whose generated release name was already in use failing to start and
   uninstalling the release that had the name.
 - With `restarted_container_behavior="raise"`, every operation after a detected pod
