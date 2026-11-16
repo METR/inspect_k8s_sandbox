@@ -26,6 +26,9 @@ data:
           {{- end }}
         {{- end }}
 
+        # A Service that additionalResources adds under the release's name resolves by that name.
+        rewrite name regex ^({{ include "agentEnv.fullname" $ | regexQuoteMeta }}-[^.]+)\.$ {1}.{{ $.Release.Namespace }}.svc.cluster.local answer auto
+
         # Forward all queries to the Kubernetes cluster DNS server.
         forward . {{ if .Values.corednsUpstream }}{{ join " " .Values.corednsUpstream }}{{ else }}/etc/resolv.conf{{ end }} {
             # Bound memory use when an untrusted workload floods the local resolver.
