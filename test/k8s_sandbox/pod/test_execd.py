@@ -189,9 +189,12 @@ class Cluster:
     restarts = reads = 0
     uid, ip = "u", "10.0.0.1"
     unavailable = False  # its next read fails
+    held: threading.Event | None = None  # its reads wait for it
 
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
         self.reads += 1
+        if self.held is not None:
+            self.held.wait(60)  # past a test's bound: one never set fails its test
         if self.unavailable:
             self.unavailable = False
             raise kubernetes.client.exceptions.ApiException(status=503)
@@ -208,11 +211,14 @@ class Cluster:
 
 
 @pytest.fixture
-def cluster(monkeypatch: pytest.MonkeyPatch) -> Cluster:
+def cluster(monkeypatch: pytest.MonkeyPatch) -> collections.abc.Iterator[Cluster]:
     shown = Cluster()
     monkeypatch.setattr(op, "k8s_client", lambda _: shown)
     monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
-    return shown
+    monkeypatch.setattr(pod_module, "LATE_READ_WITHIN", 30)  # past CI's stalls
+    yield shown
+    if shown.held is not None:
+        shown.held.set()  # no test leaves a read waiting
 
 
 @pytest.mark.parametrize(
@@ -2405,6 +2411,32 @@ async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
     assert starts == 0
 
 
+async def test_a_check_that_fails_as_execd_has_just_restarted_fails_its_operation(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a late check's failed read is let pass: here it could hide a restart."""
+    starts = 0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    monkeypatch.setattr(pod_module, "time", types.SimpleNamespace(monotonic=lambda: 0))
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(False)  # execd had died: perhaps with its container
+    pod._execd = await tls_daemon(exits)
+    cluster.unavailable = True  # the next read of the pod fails
+
+    with pytest.raises(kubernetes.client.exceptions.ApiException):
+        await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
+    assert starts == 0
+
+
 async def test_a_restart_shown_after_a_start_that_lost_its_key_is_still_found(
     tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2465,15 +2497,19 @@ async def test_a_restart_shown_late_is_found_though_no_operation_ran_meanwhile(
     assert starts == 0
 
 
-async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
+async def test_after_its_late_check_a_pod_is_read_again_only_30_s_later(
     tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Regression: a pod deleted and replaced, but not stopped, served its sample on."""
+    starts = 0
     now = 0.0
 
     async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
         while True:
             kind, call_id, _ = await read_frame(r)
             if kind == execd.START:
+                starts += 1
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
     monkeypatch.setattr(
@@ -2492,6 +2528,67 @@ async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
 
     # A read of the pod for each operation is what execd takes off the API server.
     assert cluster.reads == read
+    cluster.uid = "v"  # Kubernetes shows its replacement; execd still answers
+    now += pod_module.RESTART_SHOWN_WITHIN
+
+    with pytest.raises(error.PodReplacedError):
+        await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
+    assert starts == 2
+
+
+async def test_a_late_check_costs_the_operations_around_it_no_more_than_its_wait(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regressions: it failed or held its operation, was made twice, or not at all."""
+    starts = 0
+    now = 0.0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    def run() -> asyncio.Task[inspect_ai.util.ExecResult[str]]:
+        operation = pod.exec(["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(asyncio.wait_for(operation, 30))
+
+    monkeypatch.setattr(
+        pod_module, "time", types.SimpleNamespace(monotonic=lambda: now)
+    )
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(True)
+    pod._execd = await tls_daemon(exits)
+    read = cluster.reads
+    now = pod_module.RESTART_SHOWN_WITHIN
+    cluster.unavailable = True  # the next read of the pod fails
+    await run()
+    await run()
+    # The first one's read failed and failed nothing; the second made no read.
+    assert (cluster.reads, starts) == (read + 1, 2)
+    now += pod_module.RESTART_SHOWN_WITHIN
+    cluster.held = threading.Event()  # the next reads are answered once it is set
+    left = run()
+    await until(lambda: cluster.reads == read + 2)
+    left.cancel()  # its read is still out: the check is owed as before
+    with pytest.raises(asyncio.CancelledError):
+        await left
+    beside = [run(), run()]
+    await until(lambda: cluster.reads == read + 4 or starts > 2)
+    # Each waits for a read of its own: one already out is not taken for an answer.
+    assert (cluster.reads, starts) == (read + 4, 2)
+    cluster.held.set()
+    await asyncio.gather(*beside)
+    now += pod_module.RESTART_SHOWN_WITHIN
+    monkeypatch.setattr(pod_module, "LATE_READ_WITHIN", 0.01)
+    cluster.held = threading.Event()  # and this time it is not
+
+    await run()
+
+    assert starts == 5
 
 
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(

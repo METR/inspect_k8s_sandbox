@@ -40,7 +40,8 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
-RESTART_SHOWN_WITHIN = 30.0  # of execd's death: Kubernetes can show a restart late
+RESTART_SHOWN_WITHIN = 30.0  # how late a restart may show, and between late reads
+LATE_READ_WITHIN = 5.0  # a late check holds its operation no longer than this
 
 
 def _file_op_restart_check_enabled() -> bool:
@@ -84,7 +85,7 @@ class Pod:
         )
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
-        self._execd_started: float | None = None  # a start whose late check is owed
+        self._execd_started: float | None = None  # what the next late check counts from
         self._execd_container: bytes | None = None  # the one execd said it started in
 
     async def _start_execd(self, replace: bool) -> Daemon:
@@ -421,16 +422,23 @@ class Pod:
         return result
 
     async def _check_before_execd(self) -> None:
-        """Raise a kept restart; look for one that shows only after execd restarted."""
+        """Raise a kept restart; look for one shown late, and for a pod replaced."""
         if self._restart_error is not None:
             await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
             self._raise_restart()
         now, started = time.monotonic(), self._execd_started
         late = started is not None and now - started >= RESTART_SHOWN_WITHIN
-        if late or now - self._execd_restarted < RESTART_SHOWN_WITHIN:
+        if now - self._execd_restarted < RESTART_SHOWN_WITHIN:
             await self.check_for_pod_restart()
-            if late and self._execd_started == started:
-                self._execd_started = None  # a restart before that start shows by now
+        elif late:
+            try:
+                await asyncio.wait_for(self.check_for_pod_restart(), LATE_READ_WITHIN)
+            except (PodReplacedError, ContainerRestartedError):
+                raise
+            except Exception:  # the operation itself needs no API server: left unread
+                logger.debug("Reading the pod again failed", exc_info=True)
+            self._execd_started = now  # and again: a pod deleted unstopped runs on
+            self._raise_restart()  # kept by a read answered as its wait ran out
 
     def _keep_stopped(
         self, reason: str = "stopped under an operation"
