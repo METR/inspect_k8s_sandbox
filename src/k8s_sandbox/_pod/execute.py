@@ -100,7 +100,7 @@ def _shell_command(
     if (size := len(script.encode())) > _PIPE:
         read = f"PATH={SYSTEM_PATH} head -c {size}"
         fed = f"{{ {run}; s=$?; {read} >/dev/null; exit $s; }}"
-        return ["/bin/sh", "-c", f"{same}{{ {read} || kill $$; }} | {fed}"]
+        return ["/bin/sh", "-c", f"{same}{read} | {fed}"]
     if not same:
         return [_RUNUSER, "-u", user, "--", *command]
     return ["/bin/sh", "-c", f"{same}exec {run}"]
