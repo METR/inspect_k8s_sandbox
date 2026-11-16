@@ -506,14 +506,16 @@ async def test_a_release_helm_recorded_as_its_install_was_cancelled_is_uninstall
 async def test_a_cancelled_install_gives_up_on_a_helm_that_does_not_end(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: it waited for the signalled Helm's end, or left a child its pipes."""
+    """Regression: it waited for Helm's end, left it running, or left its pipes open."""
     _stand_in_for_helm(tmp_path, monkeypatch)
-    # Its child writes once told, or after 20 s, and cannot where no one reads.
-    child = "for i in $(seq 2000); do [ -e go ] && break; sleep 0.01; done; echo x"
+    # Its child writes once told, and cannot where no one reads.
+    child = "for i in $(seq 310); do [ -e go ] && break; sleep 0.1; done; echo x"
+    # Both end by themselves, past this test's bound; the stand-in then says so.
+    lives = "for i in $(seq 310); do sleep 0.1; done; touch ended"
     (tmp_path / "does").write_text(
         f"case $1 in install) trap '' TERM PIPE; {_IS_READ}\n"
         f"({child} && touch wrote || touch closed) 2> /dev/null &\n"
-        "echo $$ > pid; touch ready; exec sleep 31;; esac\n"
+        f"echo $$ > pid; touch ready; {lives};; esac\n"
     )
     monkeypatch.setattr(_helm, "_SIGNALLED_HELM_ENDS_WITHIN", 0)
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
@@ -532,7 +534,7 @@ async def test_a_cancelled_install_gives_up_on_a_helm_that_does_not_end(
         while not (tmp_path / "wrote").exists() and not (tmp_path / "closed").exists():
             await anyio.sleep(0.01)
 
-    assert (tmp_path / "closed").exists()
+    assert (tmp_path / "closed").exists() and not (tmp_path / "ended").exists()
 
 
 async def test_a_release_name_taken_as_it_installs_is_left_to_its_release(
