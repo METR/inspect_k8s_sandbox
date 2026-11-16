@@ -245,7 +245,6 @@ def _helm_results(
     monkeypatch: pytest.MonkeyPatch,
     install_ok: bool,
     uninstall_ok: bool = True,
-    recorded: bool = False,
 ) -> list[str]:
     """Stub out helm and the cluster, returning the list of subcommands run."""
     import k8s_sandbox._helm as helm_module
@@ -274,7 +273,7 @@ def _helm_results(
     monkeypatch.setattr(helm_module, "describe_release_pods", lambda *_: None)
     monkeypatch.delenv("HELM_DRIVER", raising=False)
     # Helm's record of a release carries the label of the install that made it.
-    labelled = types.SimpleNamespace(items=["its record"] if recorded else [])
+    labelled = types.SimpleNamespace(items=["its record"])
     api = types.SimpleNamespace(list_namespaced_secret=lambda *_, **__: labelled)
     monkeypatch.setattr(helm_module, "k8s_client", lambda _: api)
     return subcommands
@@ -291,7 +290,7 @@ async def test_failed_install_uninstalls_the_release(
     # Inspect does not call sample_cleanup() when sample_init() raises and will retry
     # the sample, so a release left behind here accumulates a generation of pods per
     # attempt until the whole eval ends.
-    subcommands = _helm_results(monkeypatch, install_ok=False, recorded=True)
+    subcommands = _helm_results(monkeypatch, install_ok=False)
     manager = HelmReleaseManager()
 
     with pytest.raises(RuntimeError, match="context deadline exceeded"):
@@ -304,9 +303,7 @@ async def test_failed_install_uninstalls_the_release(
 async def test_failed_uninstall_does_not_mask_the_install_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    subcommands = _helm_results(
-        monkeypatch, install_ok=False, uninstall_ok=False, recorded=True
-    )
+    subcommands = _helm_results(monkeypatch, install_ok=False, uninstall_ok=False)
     manager = HelmReleaseManager()
 
     # The install error carries the pod diagnostics, so it must be the one raised.

@@ -250,7 +250,6 @@ class Release:
         self.release_name = self._generate_release_name()
         # On the release this installs: one of its name can be another sample's.
         self._label = f"inspectSandboxOwner={uuid()}"
-        self._installed = False  # Helm's own word that it did
         self.restarted_container_behavior = restarted_container_behavior
         self.sample_uuid = sample_uuid
         self._extra_values = dict(extra_values) if extra_values else {}
@@ -325,8 +324,7 @@ class Release:
             raise
 
     async def uninstall(self, quiet: bool) -> None:
-        if self._installed or await self._labelled():
-            self._installed = False  # once uninstalled, its name is free for another
+        if await self._labelled():  # asked each time: its name can be another's by now
             await uninstall(
                 self.release_name, self._namespace, self._context_name, quiet
             )
@@ -457,7 +455,6 @@ class Release:
         )
         if not result.success:
             await self._raise_install_error(result)
-        self._installed = True
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
         self._object_names = frozenset(_declared_object_names(docs))

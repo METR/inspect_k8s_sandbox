@@ -296,8 +296,11 @@ async def test_helm_cleanup_leaves_a_release_its_install_did_not_make(
 
 
 @pytest.mark.req_k8s
-async def test_helm_cleanup_leaves_a_release_named_as_one_uninstalled_before() -> None:
-    """Regression: the task's last cleanup uninstalled that name a second time."""
+@pytest.mark.parametrize("by_its_sample", [True, False], ids=["its-sample", "another"])
+async def test_helm_cleanup_leaves_a_release_named_as_one_uninstalled_before(
+    by_its_sample: bool,
+) -> None:
+    """Regression: a sample's cleanup uninstalled a name another had taken since."""
     values = _helm.StaticValuesSource(_SMALL)
     release = _helm.Release(__file__, None, values, None)
     other = _helm.Release(__file__, None, values, None)
@@ -305,7 +308,10 @@ async def test_helm_cleanup_leaves_a_release_named_as_one_uninstalled_before() -
     namespace = _kubernetes_api.get_default_namespace(None)
     try:
         await release.install()
-        await release.uninstall(quiet=True)
+        if by_its_sample:
+            await release.uninstall(quiet=True)
+        else:  # by name, as `inspect sandbox cleanup k8s` does: the sample is not told
+            await _helm.uninstall(release.release_name, namespace, None, quiet=True)
         await other.install()
 
         await release.uninstall(quiet=True)
