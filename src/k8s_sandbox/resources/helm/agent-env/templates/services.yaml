@@ -65,6 +65,20 @@ spec:
       {{- end }}
 
       {{- if $service.initContainers }}
+      {{- /* A mount that names no volume of the Pod means the colon-separated volume of that name. */}}
+      {{- $generated := dict }}
+      {{- $volumeNames := empty $.Values.corednsUpstream | ternary (list "coredns-config" "resolv-conf") (list "coredns-config") }}
+      {{- range $service.volumes }}
+        {{- if kindIs "string" . }}
+          {{- $volumeName := (split ":" .)._0 }}
+          {{- $_ := set $generated $volumeName (printf "%s-%s" (include "agentEnv.fullname" $) $volumeName) }}
+        {{- else }}
+          {{- $volumeNames = append $volumeNames (toString .name) }}
+        {{- end }}
+      {{- end }}
+      {{- range concat $volumeNames (values $generated) }}
+        {{- $_ := unset $generated . }}
+      {{- end }}
       initContainers:
       {{- range $service.initContainers }}
         - name: {{ .name }}
@@ -96,7 +110,9 @@ spec:
           {{- end }}
           {{- with .volumeMounts }}
           volumeMounts:
-{{ toYaml . | nindent 12 }}
+          {{- range . }}
+            - {{- toYaml (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
+          {{- end }}
           {{- end }}
           {{- if .resources }}
           resources:

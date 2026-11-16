@@ -1,4 +1,5 @@
 import ipaddress
+import pathlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -430,6 +431,43 @@ def test_init_containers_with_all_fields(
         {"name": "shared", "mountPath": "/shared"}
     ]
     assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
+
+
+def test_an_init_container_mounts_a_colon_separated_volume_by_its_name(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: the mount kept that name, which no volume of the Pod has."""
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "init-container-volumes-values.yaml"
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "env-data", "mountPath": "/data", "readOnly": True},
+        # Each names a volume of the Pod, which is the one it means.
+        {"name": "env-data", "mountPath": "/generated"},
+        {"name": "both", "mountPath": "/declared"},
+        {"name": "resolv-conf", "mountPath": "/the-charts-own"},
+    ]
+    # A template rendered later reads the name as the values gave it.
+    read = [c for c in _get_documents(documents, "ConfigMap") if "mounted" in c["data"]]
+    assert read[0]["data"] == {"mounted": "data"}
+
+
+def test_an_init_container_mounts_a_volume_named_as_one_the_chart_left_out(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: resolv-conf stayed the chart's where corednsUpstream drops that."""
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "init-container-volumes-values.yaml",
+        set_str="corednsUpstream[0]=10.96.0.10",
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"][3]["name"] == "env-resolv-conf"
 
 
 def test_resource_requests_and_limits(
