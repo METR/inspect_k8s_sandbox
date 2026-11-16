@@ -41,8 +41,8 @@ def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """Disable tenacity's exponential backoff in tests."""
     original = _sandbox_environment._retry
 
-    def _fast_retry():
-        r = original()
+    def _fast_retry(*args, **kwargs):
+        r = original(*args, **kwargs)
         r.wait = wait_none()
         return r
 
@@ -165,7 +165,14 @@ class TestExecRetryTransient:
             await sandbox.exec(["echo", "hello"])
 
         assert caplog.text.count("sending it again") == 1
-        assert "ConnectionError('cut')" in caplog.text
+        named = json.loads(caplog.messages[0].partition("again ")[2])
+        assert named["error"] == "ConnectionError: cut"
+        # Which one, among samples run at once.
+        assert (named["op"], named["pod"], named["task_name"]) == (
+            "K8s execute command in Pod",
+            sandbox._pod.info.name,
+            sandbox.release.task_name,
+        )
 
 
 class TestExecRetryPermanent:
@@ -575,18 +582,25 @@ class TestExecStdioRetry:
 
         stream.aclose.assert_awaited_once()
 
-    async def test_a_failed_pod_check_does_not_start_the_command_again(self) -> None:
+    async def test_a_failed_pod_check_does_not_start_the_command_again(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         sandbox, mock_pod = _make_sandbox()
         stream = mock.create_autospec(execd.ExecdStream, instance=True)
         mock_pod.exec_stdio.return_value = stream
         mock_pod.check_for_pod_restart.side_effect = [
-            ApiException(status=503, reason="Unavailable"),
+            kubernetes.client.ApiException(status=503, reason="Unavailable"),
             None,
         ]
 
-        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+        with caplog.at_level("WARNING"):
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
 
         assert mock_pod.exec_stdio.call_count == 1
+        # The warning says what was tried again, the check and not the command, and why.
+        assert "checking again" in caplog.text
+        assert "sending it again" not in caplog.text
+        assert "Unavailable" in caplog.text
 
     @pytest.mark.parametrize("user, expected", [(None, "agent"), ("root", "root")])
     async def test_the_default_user_is_used_unless_one_is_given(
