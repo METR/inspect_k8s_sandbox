@@ -230,8 +230,11 @@ async def test_helm_install_leaves_a_name_in_use_to_its_release() -> None:
 
 
 @pytest.mark.req_k8s
-async def test_helm_install_leaves_a_name_taken_as_it_installs() -> None:
+async def test_helm_install_leaves_a_name_taken_as_it_installs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Helm words its refusal otherwise when the name is taken after its check of it."""
+    monkeypatch.setenv("HELM_DRIVER", "secret")  # the record made below is a Secret
     release = _helm.Release(__file__, None, _helm.StaticValuesSource(_SMALL), None)
     taken = release.release_name
     namespace = _kubernetes_api.get_default_namespace(None)
