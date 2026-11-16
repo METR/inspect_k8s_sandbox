@@ -574,7 +574,8 @@ additionalResources:
 ```
 
 A Service named `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the
-agent environment as `$AGENT_ENV-<name>`.
+agent environment as `$AGENT_ENV-<name>` once `additionalResourceDnsRecords` lists
+`<name>`.
 
 For more complex resources which are not valid standalone YAML, you can use a string
 block. The following example creates a Cilium Network Policy which allows ingress from

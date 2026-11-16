@@ -1,6 +1,5 @@
 import ipaddress
 import pathlib
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -625,25 +624,34 @@ def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
     assert pod_spec["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": names}]
 
 
-def test_a_service_under_the_releases_name_resolves_by_that_name(
-    chart_dir: Path,
+def test_a_service_from_additional_resources_resolves_by_its_own_name(
+    chart_dir: pathlib.Path,
 ) -> None:
-    corefile = next(
-        cm["data"]["Corefile"]
-        for cm in _get_documents(_run_helm_template(chart_dir), "ConfigMap")
-        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
+    documents = _run_helm_template(
+        chart_dir, set_str="additionalResourceDnsRecords={proxy}"
     )
 
-    # `answer auto` keeps the namespace out of the answer.
-    [(asked, sent)] = re.findall(
-        r"rewrite name regex (\S+) (\S+) answer auto\n", corefile
+    corefile = next(
+        cm["data"]["Corefile"]
+        for cm in _get_documents(documents, "ConfigMap")
+        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
     )
-    # CoreDNS matches a question's name with its closing dot.
-    assert re.sub(asked, sent.replace("{1}", r"\1"), "agent-env-my-release-proxy.") == (
-        "agent-env-my-release-proxy.default.svc.cluster.local"
-    )
-    for other in ("agent-env-other-proxy.", "agent-env-my-release-proxy.example.com."):
-        assert not re.search(asked, other)
+    # An exact rule: CoreDNS answers under the name asked, without the namespace.
+    assert (
+        "rewrite name exact agent-env-my-release-proxy "
+        "agent-env-my-release-proxy.default.svc.cluster.local\n"
+    ) in corefile
+
+
+def test_a_dns_record_that_would_add_to_the_corefile_is_refused(
+    chart_dir: pathlib.Path,
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        _run_helm_template(
+            chart_dir, set_str="additionalResourceDnsRecords={proxy x.example}"
+        )
+
+    assert "additionalResourceDnsRecords" in e.value.stderr
 
 
 def test_coredns_upstream_defaults_to_the_kubelet_resolv_conf(chart_dir: Path) -> None:
