@@ -1,5 +1,6 @@
 import ipaddress
 import pathlib
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -622,6 +623,27 @@ def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
     names = ["default", "agent-env-my-release-default"]
     assert pod_spec["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": names}]
+
+
+def test_a_service_under_the_releases_name_resolves_by_that_name(
+    chart_dir: Path,
+) -> None:
+    corefile = next(
+        cm["data"]["Corefile"]
+        for cm in _get_documents(_run_helm_template(chart_dir), "ConfigMap")
+        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
+    )
+
+    # `answer auto` keeps the namespace out of the answer.
+    [(asked, sent)] = re.findall(
+        r"rewrite name regex (\S+) (\S+) answer auto\n", corefile
+    )
+    # CoreDNS matches a question's name with its closing dot.
+    assert re.sub(asked, sent.replace("{1}", r"\1"), "agent-env-my-release-proxy.") == (
+        "agent-env-my-release-proxy.default.svc.cluster.local"
+    )
+    for other in ("agent-env-other-proxy.", "agent-env-my-release-proxy.example.com."):
+        assert not re.search(asked, other)
 
 
 def test_coredns_upstream_defaults_to_the_kubelet_resolv_conf(chart_dir: Path) -> None:
