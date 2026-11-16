@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- A Service that `additionalResources` adds under the release's name
-  (`{{ template "agentEnv.fullname" $ }}-<name>`) resolves from within the agent
-  environment as `$AGENT_ENV-<name>`.
+- Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
+  `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
+  environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
 - Wait for the Pods of every StatefulSet in the release's namespace whose Pod template
   carries the release's `app.kubernetes.io/instance` label, including those from
   `additionalResources`, before handing over a sandbox.
