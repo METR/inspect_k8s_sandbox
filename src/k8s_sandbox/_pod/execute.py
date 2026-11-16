@@ -49,7 +49,7 @@ _CLOSE_GROUP = "}\n"
 _STDERR_TAIL_BYTES = 4096
 # How often an exec_stdio stream retries TLS that must write to read, or read to write.
 _TLS_RETRY_SECONDS = 0.01
-# The receive() calls and frames an exec_stdio stream takes before others get a turn.
+# The calls and frames an exec_stdio stream takes before others get a turn.
 _STEPS_PER_TURN = 32
 # The users that mean uid 0 whatever passwd says: their exec runs behind _ROOT_CHECK.
 ROOT_USERS = ("root", "0")
@@ -577,6 +577,7 @@ class PodStdio(ByteStream):
 
     async def send(self, item: bytes) -> None:
         async with self._send_lock:
+            await self._turn()  # under the lock: it keeps its place among later sends
             await _land_pending_cancel()  # also one that came as it waited for the lock
             self._drop_if_restarted()
             try:

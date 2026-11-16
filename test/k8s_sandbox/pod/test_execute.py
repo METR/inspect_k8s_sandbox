@@ -2185,6 +2185,45 @@ class TestExecStdio:
 
         assert sent_with == 0
 
+    async def test_sends_the_socket_has_room_for_let_other_tasks_run(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Regression: one send after another held the event loop until the last."""
+        stream = _stdio(tls_sockets[0])
+        turns = 0
+
+        async def other_task() -> None:
+            nonlocal turns
+            turns += 1
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                for _ in range(2 * execute_module._STEPS_PER_TURN):
+                    await stream.send(b"a request\n")
+                sent_with = turns
+        await stream.aclose()
+
+        assert sent_with == 1
+
+    async def test_a_send_that_takes_its_turn_keeps_its_place(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Regression: taking its turn before the lock, it let a later send go first."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        items = [bytes([i]) for i in range(2 * execute_module._STEPS_PER_TURN)]
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                for item in items:
+                    tasks.start_soon(stream.send, item)
+        sent = [reader.recv_data_frame(True)[1].data[1:] for _ in items]
+        await stream.aclose()
+
+        assert sent == items
+
     async def test_a_receive_cancelled_at_any_step_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
     ) -> None:
