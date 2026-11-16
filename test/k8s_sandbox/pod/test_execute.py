@@ -1436,12 +1436,14 @@ class TestShellCommand:
     def test_a_switch_that_works_leaves_a_large_script_to_its_shell(
         self, tmp_path: Path
     ) -> None:
+        """The pipe hands the shell its whole script, and the shell's status back."""
         forward = tmp_path / "forward"  # runuser without the switch
         forward.write_text(
             '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
         )
         forward.chmod(0o755)
-        script = _script(["sh", "-c", "echo $(($(wc -c))); exit 7"], bytes(8192))
+        # Its $0 takes more bytes than characters: a size in characters cuts the end.
+        script = _script(["sh", "-c", "echo $(($(wc -c))); exit 7", "éé"], bytes(8192))
         command = execute_module._shell_command("someone-else", script=script)
         command[2] = command[2].replace("/sbin/runuser", str(forward))
 

@@ -266,6 +266,7 @@ def _read_file_side_effect(error: Exception, content: bytes = b"file-content"):
         nonlocal calls
         calls += 1
         if calls == 1:
+            dst.write(b"cut " * 4)  # written by a read that failed: more than the file
             raise error
         dst.write(content)
 
