@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import typing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Callable, Iterable
@@ -50,6 +51,7 @@ from k8s_sandbox._helm import (
     validate_no_null_values,
 )
 from k8s_sandbox._kubernetes_api import get_default_namespace, k8s_client
+from k8s_sandbox._pod import execd, snapshot
 from k8s_sandbox._pod.snapshot import PodSnapshot
 from k8s_sandbox._sandbox_environment import _key_to_pascal, _metadata_to_extra_values
 
@@ -1661,6 +1663,56 @@ async def test_get_sandbox_pods_never_hands_over_a_terminated_pod(
     sandboxes = await release.get_sandbox_pods()
 
     assert sandboxes["default"].info.name == "live"
+
+
+_parse_pod = snapshot._parse_pod  # pyright: ignore[reportPrivateUsage]
+
+
+def _sandbox_pod(execd_: bool, **spec: bool) -> snapshot.PodSnapshot:
+    metadata = {
+        "name": "p",
+        "uid": "u",
+        "labels": {_SERVICE_LABEL: "default"},
+        "annotations": {execd.ANNOTATION: str(execd_).lower()},
+    }
+    spec_ = {"containers": [{"name": "default"}], **spec}
+    return _parse_pod({"metadata": metadata, "spec": spec_, "status": {}})
+
+
+@pytest.mark.parametrize("shared", ["shareProcessNamespace", "hostPID"])
+async def test_execd_is_refused_a_pod_whose_restarts_it_cannot_tell(
+    shared: str, _mock_release_pods: mock.MagicMock
+) -> None:
+    """Regression: PID 1 there outlives the container, whose restart went untold."""
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None, "raise")
+    _mock_release_pods.return_value = [_sandbox_pod(True, **{shared: True})]
+
+    with pytest.raises(RuntimeError, match="first process to be PID 1"):
+        await release.get_sandbox_pods()
+
+
+@pytest.mark.parametrize(
+    ("execd_", "shared", "behavior"),
+    [
+        pytest.param(False, True, "raise", id="without-execd"),
+        pytest.param(True, False, "raise", id="with-its-own-pids"),
+        pytest.param(True, True, "warn", id="in-warn-mode"),
+    ],
+)
+async def test_a_pod_is_refused_only_for_a_restart_execd_must_tell_and_cannot(
+    execd_: bool,
+    shared: bool,
+    behavior: typing.Literal["warn", "raise"],
+    _mock_release_pods: mock.MagicMock,
+) -> None:
+    """Regression guard: refused too, each of these would have no sandbox."""
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None, behavior)
+    pod = _sandbox_pod(execd_, shareProcessNamespace=shared)
+    _mock_release_pods.return_value = [pod]
+
+    sandboxes = await release.get_sandbox_pods()
+
+    assert set(sandboxes) == {"default"}
 
 
 async def test_install_permit_is_released_before_the_readiness_wait(

@@ -378,6 +378,20 @@ class Release:
         sandboxes = dict()
         for pod in _sandbox_pods(pods):
             default_container_name = pod.container_names[0]
+            execd = pod.annotations.get(EXECD_ANNOTATION) == "true"
+            if (
+                execd
+                and pod.shares_pids
+                and self.restarted_container_behavior == "raise"
+            ):
+                # execd tells a restart by PID 1's start: there, not the container's.
+                _raise_runtime_error(
+                    "With restarted_container_behavior='raise', execd needs the "
+                    "container's first process to be PID 1: set neither "
+                    "shareProcessNamespace nor hostPID.",
+                    release=self.release_name,
+                    pod=pod.name,
+                )
             sandboxes[pod.labels[_SERVICE_LABEL]] = Pod(
                 pod.name,
                 self._namespace,
@@ -386,7 +400,7 @@ class Release:
                 pod.uid,
                 pod.restart_count_for(default_container_name),
                 self.restarted_container_behavior,
-                execd=pod.annotations.get(EXECD_ANNOTATION) == "true",
+                execd=execd,
             )
         return sandboxes
 

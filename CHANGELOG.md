@@ -32,7 +32,8 @@
   the container's limit: about 7 MB idle, 5 to 16 MB for each stream (stdout, stderr) of
   a command that prints faster than the client reads, and up to about 10 MB for each
   command that leaves its stdin unread, most of it kept for minutes after the command
-  ends.
+  ends. With `restarted_container_behavior="raise"`, a pod that sets
+  `shareProcessNamespace` or `hostPID` is refused: the sample fails to start.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
