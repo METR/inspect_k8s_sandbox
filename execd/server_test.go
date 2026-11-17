@@ -559,8 +559,12 @@ func TestASignalsLineFollowsWhatTheCommandWroteItself(t *testing.T) {
 }
 
 func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
-	for _, code := range []int{3, 137} { // 137: a kill's exit code, from a command nothing killed
-		t.Run(strconv.Itoa(code), func(t *testing.T) {
+	for _, end := range []struct {
+		code int
+		late bool // the timer's kill has found the command running, and the command ends before the kill reaches it
+	}{{3, false}, {137, false}, {137, true}} { // 137: a kill's exit code, from a command nothing killed
+		code := end.code
+		t.Run(strconv.Itoa(code)+", late "+strconv.FormatBool(end.late), func(t *testing.T) {
 			var fire func()
 			afterFunc = func(_ time.Duration, f func()) *time.Timer {
 				fire = f
@@ -578,9 +582,33 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 			cl.kmu.Lock()
 			pid := cl.pid
 			cl.kmu.Unlock()
-			reaper.mu.Lock() // the command ends, and execd has yet to note it
+			fired := make(chan struct{})
 			noted := sync.OnceFunc(reaper.mu.Unlock)
-			t.Cleanup(noted)
+			if end.late {
+				found, kill := make(chan struct{}), make(chan struct{})
+				var once sync.Once
+				hold := func(bool) { once.Do(func() { close(found); <-kill }) } // the kill waits here, holding the reaper's lock
+				beforeKill.Store(&hold)
+				noted = sync.OnceFunc(func() {
+					close(kill)
+					select {
+					case <-fired:
+					case <-time.After(30 * time.Second):
+						t.Error("the timer's kill never returned")
+					}
+					beforeKill.Store(nil)
+				})
+				t.Cleanup(noted)
+				go func() { fire(); close(fired) }()
+				select {
+				case <-found:
+				case <-time.After(30 * time.Second):
+					t.Fatal("the timer's kill never found the command running")
+				}
+			} else {
+				reaper.mu.Lock() // the command ends, and execd has yet to note it
+				t.Cleanup(noted)
+			}
 			s.dispatch(c, frame{kind: fStdin, id: 8, payload: []byte("\n")})
 			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 				stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
@@ -592,14 +620,18 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 				}
 			}
 
-			fired := make(chan struct{})
-			go func() { fire(); close(fired) }() // the timer's callback runs now: its kill finds the command gone
-			select {
-			case <-fired:
-			case <-time.After(30 * time.Second):
-				t.Fatal("the timeout's kill waited to see the command reaped")
+			if !end.late {
+				go func() { fire(); close(fired) }() // the timer's callback runs now: its kill finds the command gone
+				select {
+				case <-fired:
+				case <-time.After(30 * time.Second):
+					t.Fatal("the timeout's kill waited to see the command reaped")
+				}
 			}
 			noted()
+			if t.Failed() { // the kill never returned, so no exit will come: don't wait for one
+				return
+			}
 
 			if status := exitStatus(t, frames); status["code"] != float64(code) || status["timeout"] != nil {
 				t.Fatalf("EXIT %v, want code %d and no timeout", status, code)

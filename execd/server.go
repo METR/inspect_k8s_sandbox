@@ -46,8 +46,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
-var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
+// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running.
+var afterRead, afterDrainCheck, beforeKill atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -514,7 +514,7 @@ func (cl *call) run(req startRequest) error {
 		byTimeout := cl.timeoutKilled
 		cl.kmu.Unlock()
 		cl.mu.Lock()
-		cl.timedOut = byTimeout && code == 128+int(syscall.SIGKILL)
+		cl.timedOut = byTimeout && ws.Signal() == syscall.SIGKILL
 		cl.mu.Unlock()
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
@@ -806,6 +806,7 @@ func (cl *call) stop(timeout bool) {
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
+		hook(&beforeKill, false)
 		killTree(pid)
 	}
 	reaper.mu.Unlock()
