@@ -67,7 +67,7 @@ type call struct {
 	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu
 	pid int
 	// where the reaper sends its command's exit status
-	status chan int
+	status chan syscall.WaitStatus
 	as     *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
@@ -498,7 +498,11 @@ func (cl *call) run(req startRequest) error {
 		}()
 	}
 	go func() {
-		code := <-exited
+		ws := <-exited
+		code := ws.ExitStatus()
+		if ws.Signaled() {
+			code = 128 + int(ws.Signal())
+		}
 		if stdinW != nil {
 			stdinW.Close() // or its writer waits for ever on what the command left holding its stdin
 		}
@@ -519,7 +523,13 @@ func (cl *call) run(req startRequest) error {
 			want[i] += read[i].Load() + pipeRead // a read under way has taken bytes it hasn't counted
 		}
 		done := make(chan struct{})
-		go func() { drained.Wait(); close(done) }()
+		go func() {
+			drained.Wait()
+			if said := signalLine(ws); said != "" { // after the command's own stderr, as a shell's line is
+				cl.output(1, []byte(said))
+			}
+			close(done)
+		}()
 		grace := time.Now().Add(100 * time.Millisecond)
 		for {
 			select {
@@ -754,6 +764,25 @@ func (cl *call) ackLocked(req resumeRequest) {
 		cl.sent[i] = max(cl.sent[i], cl.base[i])
 	}
 	cl.room.Broadcast()
+}
+
+// signalLine is dash's line on stderr for a command a signal ended, in glibc's words: here execd is the command's parent, not a shell.
+func signalLine(ws syscall.WaitStatus) string {
+	sig := ws.Signal()
+	if !ws.Signaled() || sig == syscall.SIGINT || sig == syscall.SIGPIPE {
+		return ""
+	}
+	said := strings.ToUpper(sig.String()[:1]) + sig.String()[1:]
+	switch { // Go names 1 to 31 as glibc does, and no other
+	case sig > 33:
+		said = "Real-time signal " + strconv.Itoa(int(sig)-34)
+	case sig > 31:
+		said = "Unknown signal " + strconv.Itoa(int(sig))
+	}
+	if ws.CoreDump() {
+		said += " (core dumped)"
+	}
+	return said + "\n"
 }
 
 // kill stops the call's process group, what descends from its command, and every process still carrying its tag.
@@ -1018,14 +1047,14 @@ func killTagged(tag string) {
 // The reaper reaps every child under mu, so an id is never reused before its status is sent.
 type reaperState struct {
 	mu      sync.Mutex
-	waiting map[int]chan int
+	waiting map[int]chan syscall.WaitStatus
 }
 
-var reaper = &reaperState{waiting: map[int]chan int{}}
+var reaper = &reaperState{waiting: map[int]chan syscall.WaitStatus{}}
 
 // watch must be called with mu held.
-func (r *reaperState) watch(pid int) chan int {
-	ch := make(chan int, 1)
+func (r *reaperState) watch(pid int) chan syscall.WaitStatus {
+	ch := make(chan syscall.WaitStatus, 1)
 	r.waiting[pid] = ch
 	return ch
 }
@@ -1043,13 +1072,9 @@ func startReaper() {
 					reaper.mu.Unlock()
 					break
 				}
-				code := ws.ExitStatus()
-				if ws.Signaled() {
-					code = 128 + int(ws.Signal())
-				}
 				if ch, ok := reaper.waiting[pid]; ok {
 					delete(reaper.waiting, pid)
-					ch <- code
+					ch <- ws
 				}
 				reaper.mu.Unlock()
 			}

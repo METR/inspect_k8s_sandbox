@@ -503,6 +503,61 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	}
 }
 
+func TestTheLineForACommandASignalEndedIsDashs(t *testing.T) {
+	const core = 0x80 // a wait status's mark of a core dump
+	for status, want := range map[syscall.WaitStatus]string{
+		syscall.WaitStatus(syscall.SIGSYS):         "Bad system call\n", // 31, the last signal Go names
+		syscall.WaitStatus(syscall.SIGSEGV | core): "Segmentation fault (core dumped)\n",
+		syscall.WaitStatus(syscall.SIGINT):         "", // dash says nothing of these two
+		syscall.WaitStatus(syscall.SIGPIPE):        "",
+		syscall.WaitStatus(32):                     "Unknown signal 32\n", // glibc keeps 32 and 33 for its threads
+		syscall.WaitStatus(33):                     "Unknown signal 33\n",
+		syscall.WaitStatus(34):                     "Real-time signal 0\n",
+	} {
+		if got := signalLine(status); got != want {
+			t.Errorf("status %#x: %q, want %q", uint32(status), got, want)
+		}
+	}
+}
+
+func TestASignalsLineFollowsWhatTheCommandWroteItself(t *testing.T) {
+	taken, passOn, reaped := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var first, once sync.Once
+	read := func(bool) { // the reader holds the command's own stderr: read, and not yet passed on
+		first.Do(func() { close(taken); <-passOn })
+	}
+	release := sync.OnceFunc(func() { close(passOn) })
+	drainChecked := func(bool) { once.Do(func() { close(reaped) }) } // the exit is at work: the command is reaped
+	afterRead.Store(&read)
+	afterDrainCheck.Store(&drainChecked)
+	t.Cleanup(func() { release(); afterRead.Store(nil); afterDrainCheck.Store(nil) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	// SIGKILL is what the out-of-memory killer sends; Inspect's bash tool shows a model stderr and no exit code.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "echo err >&2; kill -KILL $$"}, Env: map[string]string{}, Tag: "l"})
+	s.dispatch(c, frame{kind: fStart, id: 12, payload: req})
+	for _, step := range []chan struct{}{taken, reaped} {
+		select {
+		case <-step:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the reader never took the command's stderr, or the command was never reaped")
+		}
+	}
+
+	release()
+
+	var stderr string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStderr {
+			stderr += string(f.payload)
+		}
+	}
+	if stderr != "err\nKilled\n" {
+		t.Fatalf("stderr %q, want the command's own and then the line for its signal", stderr)
+	}
+}
+
 func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 	for _, code := range []int{3, 137} { // 137: a kill's exit code, from a command nothing killed
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
@@ -1538,7 +1593,7 @@ func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.
 	t.Cleanup(other.kill)
 	other.kmu.Lock()
 	// A call whose command was reaped, its end not yet noted: the id it still holds is another command's by now.
-	cl := &call{id: 37, tag: "reaped", pid: other.pid, status: make(chan int, 1)}
+	cl := &call{id: 37, tag: "reaped", pid: other.pid, status: make(chan syscall.WaitStatus, 1)}
 	other.kmu.Unlock()
 
 	cl.kill()
