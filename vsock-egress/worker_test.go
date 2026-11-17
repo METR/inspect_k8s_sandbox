@@ -447,6 +447,23 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 	}
 }
 
+func TestStreamEndedBeforeItsProxyCouldBeDialledIsNoFailure(t *testing.T) {
+	out := capture(t)
+	key := newKey()
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "127.0.0.2:9", 0) // where nothing listens
+	guest, node := net.Pipe()
+	go func() { // as the forwarder's startup probe does, before the pod's proxy is there
+		guest.Write(key)
+		guest.Close()
+	}()
+	w.unkeyed <- struct{}{}
+	w.stream(node)
+	w.report()
+	if out.String() != "" {
+		t.Fatalf("the log is %q: want nothing for a stream its guest had ended", out.String())
+	}
+}
+
 func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
 	var lookups, clock atomic.Int64
 	key := newKey()

@@ -62,7 +62,24 @@ func ready(args []string) error {
 	fs := flag.NewFlagSet("ready", flag.ExitOnError)
 	keyFile := fs.String("key", "", "where the forwarder keeps its key")
 	fs.Parse(args)
-	_, err := os.Stat(*keyFile + readySuffix)
+	return newForwarder(hostCID, streamPort).ready(*keyFile)
+}
+
+// ready passes once the forwarder listens and a worker on its node takes its streams: with none there, Firecracker resets the connection.
+func (f *forwarder) ready(keyFile string) error {
+	if _, err := os.Stat(keyFile + readySuffix); err != nil {
+		return err
+	}
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
+		return err
+	}
+	c, err := f.connect(f.host, f.port)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, err = c.Write(key) // a stream that opens with the key and ends: every worker takes that
 	return err
 }
 

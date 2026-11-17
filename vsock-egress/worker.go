@@ -48,6 +48,9 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
+// endedWait is how long a stream whose dial failed is given to show that the guest had already ended it.
+const endedWait = 10 * time.Millisecond
+
 // proxyBuffer caps a stream's socket to the proxy each way, and the kernel accounts twice it, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
 const proxyBuffer = 512 << 10
 
@@ -143,6 +146,11 @@ func (w *worker) stream(c net.Conn) {
 	c.SetReadDeadline(time.Time{})
 	t, err := w.dial()
 	if err != nil {
+		// The forwarder's startup probe ends its stream at once: one that came before the proxy is no stream that failed.
+		c.SetReadDeadline(time.Now().Add(endedWait))
+		if _, ended := c.Read(make([]byte, 1)); ended == io.EOF {
+			return
+		}
 		if w.failed.Add(1) == 1 { // the first of each report says why
 			log.Printf("proxy_unreached: %v", err)
 		}

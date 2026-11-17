@@ -21,6 +21,10 @@ Each node needs:
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
   Past the limit the kubelet kills every process in the container unless its `singleProcessOOMKill` is on.
 
+A pod's forwarder passes its startup probe once a worker on its node takes its streams, so where no launcher runs the
+pod does not start. A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on
+the wire, or the launchers be replaced before the forwarders.
+
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
 them, has one word to alarm on:

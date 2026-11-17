@@ -14,7 +14,8 @@
   yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
   `no_proxy` for a server on the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
-  seccomp profiles: see `vsock-egress/README.md`.
+  seccomp profiles (see `vsock-egress/README.md`): on a node with no launcher such a pod
+  does not start.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

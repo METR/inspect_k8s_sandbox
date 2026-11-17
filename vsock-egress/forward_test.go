@@ -73,6 +73,33 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 	}
 }
 
+func TestForwarderWithNoWorkerOnItsNodeIsNotReady(t *testing.T) {
+	node, port := loopback(t)
+	f := newForwarder(unix.VMADDR_CID_LOCAL, port)
+	file := filepath.Join(t.TempDir(), "key")
+	if err := errors.Join(f.loadKey(file), os.WriteFile(file+readySuffix, nil, 0o600)); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan *os.File, 1)
+	go func() {
+		c, _, _ := node.accept()
+		accepted <- c
+	}()
+	if err := f.ready(file); err != nil {
+		t.Fatalf("ready failed with a worker listening: %v", err)
+	}
+	probe := within(t, accepted, "stream from the probe")
+	probe.SetDeadline(time.Now().Add(budget))
+	if sent, err := io.ReadAll(probe); err != nil || !bytes.Equal(sent, f.key[:]) {
+		t.Fatalf("the node read %d bytes, %v: want the key and then the stream's end, which every worker takes", len(sent), err)
+	}
+	probe.Close()
+	node.f.Close()
+	if err := f.ready(file); err == nil {
+		t.Fatal("ready passed with no worker listening: the sandbox would be handed over with no way out")
+	}
+}
+
 func keyedForwarder(host, port uint32) *forwarder {
 	f := newForwarder(host, port)
 	rand.Read(f.key[:])
