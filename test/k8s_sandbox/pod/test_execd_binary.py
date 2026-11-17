@@ -240,6 +240,37 @@ async def test_a_command_for_another_user_does_not_run_with_groups_it_cannot_tak
     assert (result.returncode, result.stdout) == (126, "")
 
 
+async def test_an_id_no_uid_holds_is_not_narrowed_to_one(
+    sandbox: Sandbox, client: execd.ExecdClient
+) -> None:
+    """Narrowed to 32 bits, a uid or gid of 4294967296 or -4294967296 is root's."""
+    users = "cp -p /etc/passwd /etc/passwd.kept && cp -p /etc/group /etc/group.kept"
+    users += " && echo wideuid:x:4294967296:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo negative:x:-4294967296:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo widegid:x:4243:4294967296::/:/bin/sh >>/etc/passwd"
+    users += " && echo o:x:4242:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo wide:x:4294967296:o >>/etc/group"
+    users += " && echo last:x:4294967295:o >>/etc/group"  # setgroups takes no (gid_t)-1
+    users += " && sed -i s/^root:x:0:0:/root:x:0:4294967296:/ /etc/passwd"
+
+    async def run(user: str, *argv: str) -> str:
+        ran = client.exec(list(argv), None, None, {}, user, None)
+        return (await asyncio.wait_for(ran, 30)).stdout  # only bounds a hang
+
+    try:
+        assert sandbox.sh(users).returncode == 0
+        for user in ("wideuid", "negative", "widegid"):
+            with pytest.raises(RuntimeError, match="does not appear to exist"):
+                await run(user, "id")
+        groups = await run("o", "id", "-G")
+        own = await run("root", "id", "-u")  # execd's own user: nothing to switch
+    finally:  # the module's other tests share this container
+        kept = "mv /etc/passwd.kept /etc/passwd && mv /etc/group.kept /etc/group"
+        assert sandbox.sh(kept).returncode == 0
+
+    assert (groups, own) == ("4242\n", "0\n")  # o without root's group; root still runs
+
+
 @pytest.mark.parametrize(
     ("mode", "read_fails"),
     [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],

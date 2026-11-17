@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -502,9 +503,68 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	}
 }
 
+func TestTheLineForACommandASignalEndedIsDashs(t *testing.T) {
+	const core = 0x80 // a wait status's mark of a core dump
+	for status, want := range map[syscall.WaitStatus]string{
+		syscall.WaitStatus(syscall.SIGSYS):         "Bad system call\n", // 31, the last signal Go names
+		syscall.WaitStatus(syscall.SIGSEGV | core): "Segmentation fault (core dumped)\n",
+		syscall.WaitStatus(syscall.SIGINT):         "", // dash says nothing of these two
+		syscall.WaitStatus(syscall.SIGPIPE):        "",
+		syscall.WaitStatus(32):                     "Unknown signal 32\n", // glibc keeps 32 and 33 for its threads
+		syscall.WaitStatus(33):                     "Unknown signal 33\n",
+		syscall.WaitStatus(34):                     "Real-time signal 0\n",
+	} {
+		if got := signalLine(status); got != want {
+			t.Errorf("status %#x: %q, want %q", uint32(status), got, want)
+		}
+	}
+}
+
+func TestASignalsLineFollowsWhatTheCommandWroteItself(t *testing.T) {
+	taken, passOn, reaped := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var first, once sync.Once
+	read := func(bool) { // the reader holds the command's own stderr: read, and not yet passed on
+		first.Do(func() { close(taken); <-passOn })
+	}
+	release := sync.OnceFunc(func() { close(passOn) })
+	drainChecked := func(bool) { once.Do(func() { close(reaped) }) } // the exit is at work: the command is reaped
+	afterRead.Store(&read)
+	afterDrainCheck.Store(&drainChecked)
+	t.Cleanup(func() { release(); afterRead.Store(nil); afterDrainCheck.Store(nil) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	// SIGKILL is what the out-of-memory killer sends; Inspect's bash tool shows a model stderr and no exit code.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "echo err >&2; kill -KILL $$"}, Env: map[string]string{}, Tag: "l"})
+	s.dispatch(c, frame{kind: fStart, id: 12, payload: req})
+	for _, step := range []chan struct{}{taken, reaped} {
+		select {
+		case <-step:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the reader never took the command's stderr, or the command was never reaped")
+		}
+	}
+
+	release()
+
+	var stderr string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStderr {
+			stderr += string(f.payload)
+		}
+	}
+	if stderr != "err\nKilled\n" {
+		t.Fatalf("stderr %q, want the command's own and then the line for its signal", stderr)
+	}
+}
+
 func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
-	for _, code := range []int{3, 137} { // 137: a kill's exit code, from a command nothing killed
-		t.Run(strconv.Itoa(code), func(t *testing.T) {
+	for _, end := range []struct {
+		code int
+		late bool // the timer's kill has found the command running, and the command ends before the kill reaches it
+	}{{3, false}, {137, false}, {137, true}} { // 137: a kill's exit code, from a command nothing killed
+		code := end.code
+		t.Run(strconv.Itoa(code)+", late "+strconv.FormatBool(end.late), func(t *testing.T) {
 			var fire func()
 			afterFunc = func(_ time.Duration, f func()) *time.Timer {
 				fire = f
@@ -522,9 +582,33 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 			cl.kmu.Lock()
 			pid := cl.pid
 			cl.kmu.Unlock()
-			reaper.mu.Lock() // the command ends, and execd has yet to note it
+			fired := make(chan struct{})
 			noted := sync.OnceFunc(reaper.mu.Unlock)
-			t.Cleanup(noted)
+			if end.late {
+				found, kill := make(chan struct{}), make(chan struct{})
+				var once sync.Once
+				hold := func(bool) { once.Do(func() { close(found); <-kill }) } // the kill waits here, holding the reaper's lock
+				beforeKill.Store(&hold)
+				noted = sync.OnceFunc(func() {
+					close(kill)
+					select {
+					case <-fired:
+					case <-time.After(30 * time.Second):
+						t.Error("the timer's kill never returned")
+					}
+					beforeKill.Store(nil)
+				})
+				t.Cleanup(noted)
+				go func() { fire(); close(fired) }()
+				select {
+				case <-found:
+				case <-time.After(30 * time.Second):
+					t.Fatal("the timer's kill never found the command running")
+				}
+			} else {
+				reaper.mu.Lock() // the command ends, and execd has yet to note it
+				t.Cleanup(noted)
+			}
 			s.dispatch(c, frame{kind: fStdin, id: 8, payload: []byte("\n")})
 			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 				stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
@@ -536,14 +620,18 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 				}
 			}
 
-			fired := make(chan struct{})
-			go func() { fire(); close(fired) }() // the timer's callback runs now: its kill finds the command gone
-			select {
-			case <-fired:
-			case <-time.After(30 * time.Second):
-				t.Fatal("the timeout's kill waited to see the command reaped")
+			if !end.late {
+				go func() { fire(); close(fired) }() // the timer's callback runs now: its kill finds the command gone
+				select {
+				case <-fired:
+				case <-time.After(30 * time.Second):
+					t.Fatal("the timeout's kill waited to see the command reaped")
+				}
 			}
 			noted()
+			if t.Failed() { // the kill never returned, so no exit will come: don't wait for one
+				return
+			}
 
 			if status := exitStatus(t, frames); status["code"] != float64(code) || status["timeout"] != nil {
 				t.Fatalf("EXIT %v, want code %d and no timeout", status, code)
@@ -1037,6 +1125,44 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	run(28, "asked")
 }
 
+// nofile sets this process's open-file limit with a raw prlimit: where Go raised its soft limit as it started, syscall.Setrlimit makes it forget the one it started with, so once a test had put the limit back, later commands would start with the raised one.
+func nofile(to syscall.Rlimit) {
+	syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
+}
+
+func TestACommandForAnotherUserGetsRunusersOpenFileLimit(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	var was syscall.Rlimit
+	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &was)
+	if was.Max < 2048 {
+		t.Skip("needs a hard open-file limit of 2048")
+	}
+	nofile(syscall.Rlimit{Cur: 2048, Max: was.Max}) // what a command inherits here, whatever the machine's own: above runuser's 1024, as a container's is
+	t.Cleanup(func() { nofile(was) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	limits := map[string]string{}
+	for id, who := range []string{"65534", ""} {
+		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "ulimit -Sn; ulimit -Hn"}, Env: map[string]string{}, User: who, Tag: "f"})
+		s.dispatch(c, frame{kind: fStart, id: uint64(60 + id), payload: req})
+		for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+			if f.kind == fStdout {
+				limits[who] += string(f.payload)
+			}
+		}
+	}
+
+	// Over Kubernetes exec runuser resets another user's soft limit and no other; execd's own user keeps the container's.
+	hard := strconv.FormatUint(was.Max, 10)
+	if limits["65534"] != "1024\n"+hard+"\n" || limits[""] != "2048\n"+hard+"\n" {
+		t.Fatalf("soft and hard limits: another user's command %q, execd's own user's %q", limits["65534"], limits[""])
+	}
+}
+
 func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
@@ -1271,9 +1397,6 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 	// Fewer descriptors than it has processes to kill: a kill that keeps one for each runs out.
 	var limit syscall.Rlimit
 	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit)
-	nofile := func(to syscall.Rlimit) { // not syscall.Setrlimit: after it, Go starts a command with this limit, not its own first one
-		syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
-	}
 	t.Cleanup(func() { nofile(limit) })
 	open, _ := os.ReadDir("/proc/self/fd")
 	nofile(syscall.Rlimit{Cur: uint64(len(open)) + 32, Max: limit.Max})
@@ -1450,6 +1573,154 @@ func TestAnExitDoesNotWaitForWhatTheCommandLeftHoldingItsOutput(t *testing.T) {
 	}
 }
 
+// unheld waits for execd to have closed the pipe. Its tests switch collection off: a finalizer would close a pipe execd had let go of unclosed, and hide it.
+func unheld(t *testing.T, pipe, why string) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		held := false
+		fds, _ := os.ReadDir("/proc/self/fd")
+		for _, fd := range fds {
+			link, _ := os.Readlink("/proc/self/fd/" + fd.Name())
+			held = held || link == pipe
+		}
+		if !held {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("execd still holds %s, %s", pipe, why)
+		}
+	}
+}
+
+func TestACommandsPipeIsClosedWhenItsOutputEnds(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"readlink", "/proc/self/fd/1"}, Env: map[string]string{}, Tag: "ended"})
+	s.dispatch(c, frame{kind: fStart, id: 43, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+
+	unheld(t, strings.TrimSpace(pipe), "whose command has ended")
+}
+
+// mkfifo makes a FIFO and opens it for both ends, so neither a test nor the process it talks to waits to open it.
+func mkfifo(t *testing.T, path string) *os.File {
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestWhatACommandLeftRunningStillWritesToItsOutput(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged("writer") })
+	base := filepath.Join(t.TempDir(), "f")
+	let, wrote := mkfifo(t, base+".go"), mkfifo(t, base+".wrote")
+	// It says which pipe its stdout is, and leaves a process that eight times waits to be let go, writes to its stdout and its stderr and says how the writes ended.
+	left := `trap "" PIPE; readlink /proc/$$/fd/1; (for i in 1 2 3 4 5 6 7 8; do read go <"$0.go"; echo late; out=$?; echo late >&2; echo $out$? >"$0.wrote"; done) &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "writer"})
+	s.dispatch(c, frame{kind: fStart, id: 41, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+	pipe = strings.TrimSpace(pipe)
+
+	for range 8 { // more than once: a pipe closed at the first write fails a later one
+		let.Write([]byte("\n")) // the command has ended, and its call with it
+		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))
+		said := make([]byte, 8)
+		n, _ := wrote.Read(said)
+		if string(said[:n]) != "00\n" { // a server left running this way logs each request to its stderr: over Kubernetes exec it goes on answering
+			t.Fatalf("its writes to stdout and stderr ended with statuses %q, want 00", said[:n])
+		}
+	}
+	unheld(t, pipe, "which no process has open to write")
+}
+
+func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	// looks counts how often execd, past what it takes of a pipe, has looked whether its writers have gone.
+	var looks atomic.Int32
+	note := func(bool) { looks.Add(1) }
+	afterTaken.Store(&note)
+	t.Cleanup(func() { afterTaken.Store(nil) })
+	looked := func(since int32, or string) { // it looks at each wake of its wait, and no more once it has let the pipe go
+		for deadline := time.Now().Add(30 * time.Second); looks.Load() == since; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal(or)
+			}
+		}
+	}
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged("spender") })
+	base := filepath.Join(t.TempDir(), "f")
+	let, wrote := mkfifo(t, base+".go"), mkfifo(t, base+".wrote")
+	// It says which pipe its stdout is, and leaves a process that writes there as many whole pages as it is told, each time it is told, and says when the writes have gone through.
+	left := `readlink /proc/$$/fd/1; (while read n <"$0.go"; do dd if=/dev/zero bs=4096 count="$n" 2>/dev/null && echo "$n" >"$0.wrote"; done) &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "spender"})
+	s.dispatch(c, frame{kind: fStart, id: 44, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+	pipe = strings.TrimSpace(pipe)
+	var held uintptr // execd's end of that pipe, which this process has
+	fds, _ := os.ReadDir("/proc/self/fd")
+	for _, fd := range fds {
+		if link, _ := os.Readlink("/proc/self/fd/" + fd.Name()); link == pipe {
+			n, _ := strconv.Atoi(fd.Name())
+			held = uintptr(n)
+		}
+	}
+	size, _, _ := syscall.Syscall(syscall.SYS_FCNTL, held, syscall.F_GETPIPE_SZ, 0) // 64 KiB, or the 8 KiB a user with too many pipes gets
+	write := func(n int, why string) {
+		let.Write([]byte(strconv.Itoa(n/4096) + "\n"))
+		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := wrote.Read(make([]byte, 16)); err != nil {
+			t.Fatalf("its write of %d bytes has not gone through, %s", n, why)
+		}
+	}
+	if leftOutput < 136<<10 {
+		t.Fatalf("execd takes %d bytes of what a process left running writes, and Kubernetes exec 136 KiB", leftOutput)
+	}
+	write(136<<10, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
+	write(leftOutput-136<<10, "which is the rest of what execd takes")
+	looked(0, "execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go") // read without end, a writer that never stops has the sandbox's CPU; over Kubernetes exec it waits
+	seen := looks.Load()
+	write(int(size), "which the pipe itself holds")
+	looked(seen, "execd no longer waits on the pipe: a process that writes on would fail, where over Kubernetes exec it waits")
+
+	var unread int32
+	syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&unread)))
+	if uintptr(unread) != size {
+		t.Fatalf("%d of the last %d bytes wait unread, want all: execd has read on, or has let the pipe go", unread, size)
+	}
+	seen = looks.Load()
+	killTagged("spender")
+	looked(seen, "execd had let go of the pipe before its writers went")
+	unheld(t, pipe, "which it had stopped reading and no process has open to write")
+}
+
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
@@ -1459,7 +1730,7 @@ func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.
 	t.Cleanup(other.kill)
 	other.kmu.Lock()
 	// A call whose command was reaped, its end not yet noted: the id it still holds is another command's by now.
-	cl := &call{id: 37, tag: "reaped", pid: other.pid, status: make(chan int, 1)}
+	cl := &call{id: 37, tag: "reaped", pid: other.pid, status: make(chan syscall.WaitStatus, 1)}
 	other.kmu.Unlock()
 
 	cl.kill()
