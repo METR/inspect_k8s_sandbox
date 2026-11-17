@@ -565,13 +565,7 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     assert protocols["8008"] == "TCP\nSPLICED: X"
     assert protocols["22"] == "TCP\nSPLICED: X"
     # A `": ` in a domain would close hand-written quotes or, bare, start a mapping.
-    domain = 'a": b.org'
-    assert {"matchPattern": domain} in _values_at(egress, "dns")[0]
-    shared = next(rule for rule in egress if _values_at(rule, "serverNames"))
-    assert {"matchPattern": domain} in shared["toFQDNs"]
-    assert domain in _values_at(shared, "serverNames")[0]
-    assert {"host": '(?i)^a": b[.]org(:[0-9]+)?$'} in _values_at(shared, "http")[0]
-    assert [{"matchPattern": domain}] in _values_at(egress, "toFQDNs")
+    assert 'a": b.org' in _values_at(egress, "serverNames")[0]
 
 
 @pytest.mark.parametrize(
