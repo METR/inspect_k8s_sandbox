@@ -68,10 +68,9 @@ HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
 _SERVICE_LABEL = "inspect/service"
 # The label a release's pods are listed by.
 _INSTANCE_LABEL = "app.kubernetes.io/instance"
+_ReadyWaits = dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]]
 # Each namespace with a watch running: its waiting releases' loops and wake-up events.
-_ready_waits: dict[
-    tuple[str | None, str], dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]]
-] = {}
+_ready_waits: dict[tuple[str | None, str], _ReadyWaits] = {}
 _ready_waits_lock = threading.Lock()
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
@@ -609,12 +608,13 @@ class Release:
                     await self._raise_not_ready_error(
                         saw_a_pod, poll_error, missing, absent
                     )
-                # A pod that turns Ready is not held for the rest of a 2 s poll.
-                fresh = False
-                with suppress(asyncio.TimeoutError):
-                    fresh = await asyncio.wait_for(
-                        woken.wait(), _READINESS_POLL_INTERVAL
-                    )
+                # A Ready pod waits out no 2 s poll, and no wake puts the poll off.
+                if not fresh:
+                    poll_at = time.monotonic() + _READINESS_POLL_INTERVAL
+                # Not asyncio.wait_for: before 3.12 it swallows a cancel at a wake.
+                with anyio.move_on_after(poll_at - time.monotonic()):
+                    await woken.wait()
+                fresh = woken.is_set()
                 woken.clear()
 
     async def _raise_not_ready_error(
@@ -818,8 +818,12 @@ def _woken_when_ready(
     key, woken = (context_name, namespace), asyncio.Event()
     with _ready_waits_lock:
         if key not in _ready_waits:
-            _ready_waits[key] = {}
-            threading.Thread(target=_watch_ready, args=key, daemon=True).start()
+            waits: _ReadyWaits = {}
+            # Registered once it runs: a thread that cannot start stands for none.
+            threading.Thread(
+                target=_watch_ready, args=(*key, waits), daemon=True
+            ).start()
+            _ready_waits[key] = waits
         _ready_waits[key][release_name] = (asyncio.get_running_loop(), woken)
     try:
         yield woken
@@ -828,9 +832,8 @@ def _woken_when_ready(
             del _ready_waits[key][release_name]
 
 
-def _watch_ready(context_name: str | None, namespace: str) -> None:
+def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -> None:
     """Wake a namespace's waiting releases as their pods turn Ready, while any waits."""
-    waits = _ready_waits[context_name, namespace]
     while True:
         with _ready_waits_lock:
             if not waits:
@@ -847,7 +850,8 @@ def _watch_ready(context_name: str | None, namespace: str) -> None:
                     with _ready_waits_lock:
                         wait = waits.get(pod.labels[_INSTANCE_LABEL])
                     if wait is not None:
-                        wait[0].call_soon_threadsafe(wait[1].set)
+                        with suppress(RuntimeError):  # its loop has closed
+                            wait[0].call_soon_threadsafe(wait[1].set)
         except Exception as e:
             # Without the watch a release is still polled.
             log_debug("Readiness watch failed; will retry.", error=e)

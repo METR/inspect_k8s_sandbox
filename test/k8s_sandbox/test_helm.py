@@ -1688,6 +1688,46 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
+async def test_wait_until_ready_ends_for_a_cancel_that_comes_with_a_wake(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "cancelled-as-woken"  # where no other test's watch runs
+    _mock_release_pods.return_value = [_pod(ready=False)]
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    async def at_once(function: Callable[..., Any], *args: Any) -> Any:
+        return function(*args)
+
+    # With no thread for its read, the wait's first step ends where it waits for a wake.
+    monkeypatch.setattr(asyncio, "to_thread", at_once)
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        await asyncio.sleep(0)
+        waits = _helm._ready_waits[release._context_name, release._namespace]
+        waits[release.release_name][1].set()
+        wait.cancel()  # in the same turn of the loop as the wake
+        await asyncio.wait({wait}, timeout=5)
+        assert wait.cancelled()
+    finally:
+        wait.cancel()
+
+
+async def test_a_watch_whose_thread_cannot_start_leaves_its_namespace_to_the_next() -> (
+    None
+):
+    key = (None, "no-thread")
+    with (
+        patch.object(threading.Thread, "start", side_effect=RuntimeError("no thread")),
+        pytest.raises(RuntimeError, match="no thread"),
+        _helm._woken_when_ready(*key, "release"),
+    ):
+        pass
+    # Or no later release there would start a watch: each would wait out its poll.
+    assert key not in _helm._ready_waits
+
+
 async def test_wait_until_ready_retries_a_transient_api_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
