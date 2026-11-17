@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -1448,6 +1449,84 @@ func TestAnExitDoesNotWaitForWhatTheCommandLeftHoldingItsOutput(t *testing.T) {
 	if status := exitStatus(t, frames); status["code"] != 0.0 { // no EXIT: it waited for the sleeper
 		t.Fatalf("the exit was %v", status)
 	}
+}
+
+// unheld waits for execd to have closed the pipe. Its tests switch collection off: a finalizer would close a pipe execd had let go of unclosed, and hide it.
+func unheld(t *testing.T, pipe, why string) {
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		held := false
+		fds, _ := os.ReadDir("/proc/self/fd")
+		for _, fd := range fds {
+			link, _ := os.Readlink("/proc/self/fd/" + fd.Name())
+			held = held || link == pipe
+		}
+		if !held {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("execd still holds %s, %s", pipe, why)
+		}
+	}
+}
+
+func TestACommandsPipeIsClosedWhenItsOutputEnds(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"readlink", "/proc/self/fd/1"}, Env: map[string]string{}, Tag: "ended"})
+	s.dispatch(c, frame{kind: fStart, id: 43, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+
+	unheld(t, strings.TrimSpace(pipe), "whose command has ended")
+}
+
+func TestWhatACommandLeftRunningStillWritesToItsOutput(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged("writer") })
+	base := filepath.Join(t.TempDir(), "f")
+	fifo := func(name string) *os.File { // opened for both ends, so neither this test nor the process waits to open it
+		if err := syscall.Mkfifo(base+name, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(base+name, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f
+	}
+	let, wrote := fifo(".go"), fifo(".wrote")
+	// It says which pipe its stdout is, and leaves a process that eight times waits to be let go, writes to its stdout and its stderr and says how the writes ended.
+	left := `trap "" PIPE; readlink /proc/$$/fd/1; (for i in 1 2 3 4 5 6 7 8; do read go <"$0.go"; echo late; out=$?; echo late >&2; echo $out$? >"$0.wrote"; done) &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "writer"})
+	s.dispatch(c, frame{kind: fStart, id: 41, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+	pipe = strings.TrimSpace(pipe)
+
+	for range 8 { // more than once: a pipe closed at the first write fails a later one
+		let.Write([]byte("\n")) // the command has ended, and its call with it
+		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))
+		said := make([]byte, 8)
+		n, _ := wrote.Read(said)
+		if string(said[:n]) != "00\n" { // a server left running this way logs each request to its stderr: over Kubernetes exec it goes on answering
+			t.Fatalf("its writes to stdout and stderr ended with statuses %q, want 00", said[:n])
+		}
+	}
+	unheld(t, pipe, "which no process has open to write")
 }
 
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {

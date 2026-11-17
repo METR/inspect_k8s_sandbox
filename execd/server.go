@@ -478,7 +478,6 @@ func (cl *call) run(req startRequest) error {
 		drained.Add(1)
 		go func() {
 			defer drained.Done()
-			defer r.Close()
 			buf := make([]byte, pipeRead)
 			for {
 				n, err := r.Read(buf)
@@ -487,7 +486,12 @@ func (cl *call) run(req startRequest) error {
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
+				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
+					go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
+					return
+				}
 				if err != nil {
+					r.Close()
 					return
 				}
 			}
@@ -541,6 +545,22 @@ func (cl *call) run(req startRequest) error {
 		}
 	}()
 	return nil
+}
+
+// closeOnceUnheld closes the pipe when no process holds its other end, and reads nothing: what holds it writes until the pipe is full, then waits, as over Kubernetes exec.
+func closeOnceUnheld(r *os.File) {
+	defer r.Close()
+	r.SetReadDeadline(time.Time{})
+	if rc, err := r.SyscallConn(); err == nil {
+		rc.Read(func(fd uintptr) bool {
+			p := struct { // a pollfd that asks for no event: poll then reports only that every writer has closed
+				fd              int32
+				events, revents int16
+			}{fd: int32(fd)}
+			syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
+			return p.revents != 0
+		})
+	}
 }
 
 // buffered says how many bytes wait unread in a pipe (0 once it is closed).
