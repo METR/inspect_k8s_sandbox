@@ -338,7 +338,7 @@ func (l *launcher) pass() error {
 				continue
 			}
 			delete(l.workers, id)
-		} else {
+		} else if time.Since(l.tried[id]) >= faultAgain { // not sooner: one that is killed after each start would never be a fault
 			delete(l.reported, id) // it serves its sandbox: a later fault gets a minute of its own
 		}
 	}

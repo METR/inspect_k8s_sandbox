@@ -179,16 +179,20 @@ func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		l.reap = 0 // no reaper runs here, so the worker that ended stays: as one found ended after each start
+		l.reap = 0 // no reaper runs here: the test puts the next worker in the place of the one that ended, as a pass would
 		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
-		ended := make(chan struct{})
-		close(ended)
-		l.workers[id("a")] = &child{uid: vmUID, done: ended}
 		var said []int
 		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
 			time.Sleep(wait)
-			if err := l.pass(); err != nil {
-				t.Fatal(err)
+			running := make(chan struct{})
+			l.workers[id("a")], l.tried[id("a")] = &child{uid: vmUID, done: running}, time.Now()
+			for _, killed := range []bool{false, true} { // one pass finds it running, the next finds it ended
+				if killed {
+					close(running)
+				}
+				if err := l.pass(); err != nil {
+					t.Fatal(err)
+				}
 			}
 			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
 		}
@@ -253,12 +257,14 @@ func TestFaultAfterAWorkerRanGetsAMinuteOfItsOwn(t *testing.T) {
 			time.Sleep(31 * time.Second)
 		}
 		pass() // no worker can start
-		l.workers[id("a")] = &child{done: make(chan struct{})}
-		pass() // one runs
+		l.workers[id("a")], l.tried[id("a")] = &child{done: make(chan struct{})}, time.Now()
+		for range 3 { // one runs, for longer than a minute
+			pass()
+		}
 		delete(l.workers, id("a"))
 		pass() // and is gone: none can start again
 		if out.String() != "" {
-			t.Fatalf("the log is %q: want nothing 31 s after a worker that ran was lost", out.String())
+			t.Fatalf("the log is %q: want nothing 31 s after a worker that ran for a minute was lost", out.String())
 		}
 	})
 }

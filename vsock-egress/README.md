@@ -30,8 +30,8 @@ A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
 them, has one word to alarm on:
 
-- `<pod>: no_worker: <why>`: the sandbox has had no worker for a minute, so no egress. Again each minute while that
-  lasts.
+- `<pod>: no_worker: <why>`: for a minute the sandbox has had no worker, or none that ran a minute, so no egress or
+  egress that keeps breaking. Again each minute while that lasts.
 - `uid <n>: worker_not_ended: <why>`: the launcher has failed for a minute to end a worker's processes, and no
   sandbox of that uid gets a worker meanwhile. Again each minute while that lasts.
 - `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
