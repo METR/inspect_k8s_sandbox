@@ -1550,7 +1550,7 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
 def _helper(release: Release, spec: str = "") -> str:
     labels = f'{{app.kubernetes.io/instance: "{release.release_name}"}}'
     return (
-        "kind: StatefulSet\nmetadata: {name: helper}\n"
+        "apiVersion: apps/v1\nkind: StatefulSet\nmetadata: {name: helper}\n"
         f"spec:\n{spec}  template: {{metadata: {{labels: {labels}}}}}\n"
     )
 
@@ -1565,7 +1565,9 @@ def _in_a_list(manifest: str) -> str:
 
 
 def _in_a_typed_list(manifest: str) -> str:
-    items = _in_a_list(manifest.removeprefix("kind: StatefulSet\n"))
+    items = _in_a_list(
+        manifest.removeprefix("apiVersion: apps/v1\nkind: StatefulSet\n")
+    )
     return items.replace("v1\nkind: List", "apps/v1\nkind: StatefulSetList")
 
 
@@ -1650,8 +1652,15 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_t
         ),
         # The poll lists pods by the release's label, so this one's would never be seen.
         pytest.param(
-            lambda release: "kind: StatefulSet\nmetadata: {name: helper}\n",
+            lambda release: _helper(release).replace(release.release_name, "another"),
             id="not-labelled-as-the-release",
+        ),
+        # OpenKruise's StatefulSet can skip ordinals: its pods are not these names.
+        pytest.param(
+            lambda release: _helper(release).replace(
+                "apps/v1", "apps.kruise.io/v1beta1"
+            ),
+            id="of-another-api-group",
         ),
         pytest.param(
             lambda release: _helper(release).replace(

@@ -22,9 +22,9 @@
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
-- Wait for the Pods of every StatefulSet of the release, in its namespace, whose Pod
-  template carries the release's `app.kubernetes.io/instance` label, including those
-  from `additionalResources`, before handing over a sandbox.
+- Wait for the Pods of every `apps/v1` StatefulSet of the release, in its namespace,
+  whose Pod template carries the release's `app.kubernetes.io/instance` label, including
+  those from `additionalResources`, before handing over a sandbox.
 - Fix a sandbox failing to start when a value such as a `command` argument is exactly
   `=` or `<<`, or a date or time that does not exist such as `2023-02-29`.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
