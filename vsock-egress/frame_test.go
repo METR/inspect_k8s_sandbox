@@ -65,8 +65,8 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	client, inSandbox := tcpPair(t)
 	onNode, proxy := tcpPair(t)
 	guest, node := vsockPair(t)
-	go join(guest, inSandbox, nil)
-	go join(node, onNode, nil)
+	go join(guest, inSandbox, nil, 0)
+	go join(node, onNode, nil, 0)
 
 	client.Write([]byte("request"))
 	client.CloseWrite()
@@ -83,7 +83,7 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 func TestStreamCutShortIsNotACleanEnd(t *testing.T) {
 	client, inSandbox := tcpPair(t)
 	guest, node := vsockPair(t)
-	go join(guest, inSandbox, nil)
+	go join(guest, inSandbox, nil, 0)
 
 	node.Write(frame("half a body"))
 	node.Close() // the worker died: no empty frame
@@ -98,7 +98,7 @@ func TestPeerThatGoesAwayAfterItsLastFrameEndsTheStream(t *testing.T) {
 	guest, node := vsockPair(t)
 	ended := make(chan struct{})
 	go func() {
-		join(node, onNode, nil)
+		join(node, onNode, nil, 0)
 		close(ended)
 	}()
 

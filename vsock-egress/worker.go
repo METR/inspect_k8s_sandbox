@@ -26,6 +26,7 @@ type worker struct {
 	slots   chan struct{} // one for each open stream
 	unkeyed chan struct{} // one for each connection whose key has not been checked yet
 	keyWait time.Duration // how long a connection has to show its key
+	stall   time.Duration // how long the proxy may leave a write to it waiting
 
 	mu      sync.Mutex
 	key     []byte // the forwarder's
@@ -58,11 +59,14 @@ type failedLookup struct {
 // endedWait is how long a stream whose dial failed is given to show that the guest had already ended it.
 const endedWait = 10 * time.Millisecond
 
+// stallWait ends a stream whose proxy has stopped reading: it would hold its slot, and the forwarder's, for as long as the proxy kept the connection.
+const stallWait = 5 * time.Minute
+
 // proxyBuffer caps a stream's socket to the proxy each way, and the kernel accounts twice it, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait,
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait, stall: stallWait,
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -167,7 +171,7 @@ func (w *worker) stream(c net.Conn) {
 		}
 		return
 	}
-	join(c, t.(*net.TCPConn), w.pace)
+	join(c, t.(*net.TCPConn), w.pace, w.stall)
 }
 
 // dial connects to the pod's proxy. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a proxy that is down nor a name that does not resolve may cost a lookup a stream.

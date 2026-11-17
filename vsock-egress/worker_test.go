@@ -595,6 +595,32 @@ func TestProxySocketIsCappedEachWay(t *testing.T) {
 	})
 }
 
+func TestStreamWhoseProxyTakesNothingIsCutShort(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	if w.stall <= 0 {
+		t.Fatal("a worker gives a write to its proxy no bound")
+	}
+	w.stall = 100 * time.Millisecond
+	c := serve(t, w)()
+	c.Write(key)
+	up := within(t, accepted, "stream at the proxy")
+	up.SetReadDeadline(time.Now().Add(budget))
+	for range 4 { // while the proxy takes what it is sent, an upload may last longer than the wait
+		c.Write(frame("part"))
+		if _, err := io.ReadFull(up, make([]byte, len("part"))); err != nil {
+			t.Fatalf("the proxy read no more of an upload it was taking: %v", err)
+		}
+		time.Sleep(w.stall / 2)
+	}
+	go toFrames(c, zeros{}, nil) // the proxy reads no more: this upload stops once every buffer on the way to it is full
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if reply, err := io.ReadAll(c); errors.Is(err, os.ErrDeadlineExceeded) || len(reply) != 0 {
+		t.Fatalf("the guest read %q, %v: want the stream ended, and with no frame, as one cut short", reply, err)
+	}
+}
+
 func TestStreamPastTheCapIsRefused(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)

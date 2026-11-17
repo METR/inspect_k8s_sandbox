@@ -19,7 +19,7 @@ var (
 )
 
 // join carries one TCP connection over a vsock connection as frames: Firecracker passes no half-close on, so each direction ends with an empty frame.
-func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
+func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer, stall time.Duration) {
 	var running sync.WaitGroup
 	sent, received, gone := make(chan error, 1), make(chan error, 1), make(chan struct{})
 	running.Add(2)
@@ -29,7 +29,7 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 	}()
 	go func() {
 		defer running.Done()
-		err := fromFrames(tcp, vsock, pace)
+		err := fromFrames(bounded{tcp, stall}, vsock, pace)
 		if err == nil {
 			err = tcp.CloseWrite()
 		}
@@ -61,6 +61,19 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 	tcp.Close()
 	vsock.Close()
 	running.Wait()
+}
+
+// bounded gives each write to its connection wait at most: a peer that takes nothing would else keep both of a stream's pumps waiting on it after the stream's other end had gone.
+type bounded struct {
+	*net.TCPConn
+	wait time.Duration
+}
+
+func (b bounded) Write(p []byte) (int, error) {
+	if b.wait > 0 {
+		b.SetWriteDeadline(time.Now().Add(b.wait))
+	}
+	return b.TCPConn.Write(p)
 }
 
 // toFrames copies src to dst as frames, each a 4-byte length and that many bytes, then an empty frame.

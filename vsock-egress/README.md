@@ -10,7 +10,8 @@ The pod's network policy admits that port on the release's own pods alone, so th
 release's `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that port. Pods that
 `additionalResources` adds with those labels come under the release's other policies too: they need a policy that admits
 the pod on that port, and reach only what the release's egress grants and their own policies allow. For any other
-Service, add a policy that lets the pod reach it.
+Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
+has not completed in five minutes.
 
 Each node needs:
 
