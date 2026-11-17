@@ -17,9 +17,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-sandbox-egress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow egress to:
@@ -32,7 +32,7 @@ spec:
     - allowEntities.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
   egress:
     - toEndpoints:
@@ -50,14 +50,14 @@ spec:
             dns:
               - matchPattern: "*.{{ .Release.Namespace }}.svc.cluster.local"
               {{- range .Values.allowDomains }}
-              - matchPattern: "{{ . }}"
+              - matchPattern: {{ . | quote }}
               {{- end }}
               {{- if or (has "all" .Values.allowEntities) (has "world" .Values.allowEntities) }}
               - matchPattern: "*"
               {{- end }}
     - toEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
     {{- if .Values.allowDomains }}
     {{- /* Validate allowDomainsPorts before rendering: no identity-bypassing 80/443, scoped domains must be allowed. */}}
@@ -72,7 +72,7 @@ spec:
     {{- end }}
     - toFQDNs:
     {{- range .Values.allowDomains }}
-      - matchPattern: "{{ . }}"
+      - matchPattern: {{ . | quote }}
     {{- end }}
       {{- if has "*" .Values.allowDomains }}
       # allowDomains includes "*" (allow all): identity enforcement is moot and
@@ -88,7 +88,7 @@ spec:
               protocol: TCP
           serverNames:
           {{- range .Values.allowDomains }}
-            - "{{ . }}"
+            - {{ . | quote }}
           {{- end }}
         - ports:
             - port: "80"
@@ -96,7 +96,7 @@ spec:
           rules:
             http:
             {{- range .Values.allowDomains }}
-              - host: "(?i)^{{ . | replace "." "[.]" | replace "*" "[^.]+" }}(:[0-9]+)?$"
+              - host: {{ printf "(?i)^%s(:[0-9]+)?$" (. | replace "." "[.]" | replace "*" "[^.]+") | quote }}
             {{- end }}
         {{- /* Extra ports without a domain apply to every allowDomains IP (IP-pinned, no identity check). */}}
         {{- $hasUnscoped := false }}
@@ -107,8 +107,8 @@ spec:
         - ports:
           {{- range .Values.allowDomainsPorts }}
           {{- if not .domain }}
-            - port: "{{ .port }}"
-              protocol: {{ .protocol | default "ANY" | upper }}
+            - port: {{ .port | quote }}
+              protocol: {{ .protocol | default "ANY" | upper | quote }}
           {{- end }}
           {{- end }}
         {{- end }}
@@ -117,21 +117,21 @@ spec:
     {{- range $p := .Values.allowDomainsPorts }}
     {{- if $p.domain }}
     - toFQDNs:
-      - matchPattern: "{{ $p.domain }}"
+      - matchPattern: {{ $p.domain | quote }}
       toPorts:
         - ports:
-            - port: "{{ $p.port }}"
-              protocol: {{ $p.protocol | default "ANY" | upper }}
+            - port: {{ $p.port | quote }}
+              protocol: {{ $p.protocol | default "ANY" | upper | quote }}
     {{- end }}
     {{- end }}
     {{- end }}
     {{- with .Values.allowEntities }}
     - toEntities:
-      {{- toYaml . | nindent 6 }}
+      {{- include "agentEnv.toYaml" . | nindent 6 }}
     {{- end }}
     {{- with .Values.allowCIDR }}
     - toCIDR:
-      {{- toYaml . | nindent 6 }}
+      {{- include "agentEnv.toYaml" . | nindent 6 }}
     {{- end }}
 ---
 apiVersion: cilium.io/v2
@@ -139,14 +139,14 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-sandbox-default-deny-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: Default deny ingress. Allow other policies to be more specific.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
   ingress:
     - {}
@@ -160,9 +160,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-{{ $net }}-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow ingress to workload "{{ $svcName }}" from same sandbox on network "{{ $net }}".
@@ -170,14 +170,14 @@ spec:
     Always allow ICMP echo requests (ping)
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
       aisi.gov.uk/network-{{ $net }}: "true"
   ingress:
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
           aisi.gov.uk/network-{{ $net }}: "true"
       {{- if $svc.ports }}
@@ -187,7 +187,7 @@ spec:
       {{- end }}
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
           aisi.gov.uk/network-{{ $net }}: "true"
       icmps:
@@ -211,9 +211,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-ingress
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Allow ingress to workload "{{ $svcName }}" from same sandbox.
@@ -221,13 +221,13 @@ spec:
     Always allow ICMP echo requests (ping).
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
   ingress:
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
       {{- if $svc.ports }}
       toPorts:
@@ -236,7 +236,7 @@ spec:
       {{- end }}
     - fromEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
       icmps:
         - fields:
@@ -255,9 +255,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-isolate
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Isolate service "{{ $svcName }}" (network_mode: none): no ingress allow is emitted
@@ -269,9 +269,9 @@ spec:
     allow.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
   egressDeny:
     - toEntities:
         - all

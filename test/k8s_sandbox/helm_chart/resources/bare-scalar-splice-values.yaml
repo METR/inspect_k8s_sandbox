@@ -1,0 +1,36 @@
+# Unquoted, the newline or quote in each value breaks the render or adds a field.
+services:
+  default:
+    image: "img\nspliced: x"
+    imagePullPolicy: "Always\nspliced: x"
+    workingDir: "/w\nspliced: x"
+    runtimeClassName: "gvisor\nspliced: x"
+    env:
+      - name: "ENVNAME\nspliced: x"
+        value: "v"
+    ports:
+      - port: 80
+        protocol: "TCP\nspliced: x"
+    volumes:
+      - "vol\nspliced:/data"
+    initContainers:
+      - name: "init\nspliced: x"
+        image: "iimg\nspliced: x"
+        imagePullPolicy: "Always\nspliced: x"
+        workingDir: "/iw\nspliced: x"
+        env:
+          - name: "IENVNAME\nspliced: x"
+            value: "v"
+volumes:
+  "vol\nspliced": {}
+allowDomains:
+  - "pypi.org"
+  - 'a": b.org'
+allowDomainsPorts:
+  - port: 8008
+    protocol: "TCP\nspliced: x"
+  - port: 22
+    protocol: "TCP\nspliced: x"
+    domain: "pypi.org"
+  - port: 23
+    domain: 'a": b.org'

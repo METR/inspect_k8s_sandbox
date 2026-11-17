@@ -3,7 +3,7 @@
 {{- if kindIs "string" . }}
 {{- tpl . $ }}
 {{- else }}
-{{- tpl (. | toYaml) $ }}
+{{- tpl (include "agentEnv.toYaml" .) $ }}
 {{- end }}
 ---
 {{- end }}

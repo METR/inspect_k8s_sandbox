@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A service or namespace named `no` or `123`, or a generated release name that reads as
+  a number, no longer fails the install, and a label key such as `no` or `on` is no
+  longer applied as `false` or `true`.
+- **BREAKING CHANGE**: Fail the install when a string inside a block value
+  (`securityContext`, `resources`, `nodeSelector`, `tolerations`, `command`, `annotations`
+  with the task's name, ...) holds DEL, a C1 control character, U+FFFE or U+FFFF, or one
+  of the block's keys is over 1,022 characters as JSON. The block was silently left out,
+  or a U+0085 in it turned into a space. A quoted `"<<"` key in such a value fails the
+  install too. So do most strings in such a value that hold U+2028 or U+2029.
+- A newline in a service's `image`, `runtimeClassName`, `workingDir`, `imagePullPolicy`,
+  env name or port `protocol`, in an init container's `name`, `image`, `workingDir`,
+  `imagePullPolicy` or env name, or in an `allowDomainsPorts` entry's `protocol`, no
+  longer splices a field into the rendered manifest.
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)

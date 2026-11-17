@@ -48,7 +48,7 @@ Labels from values
 */}}
 {{- define "agentEnv.labelsFromValues" -}}
 {{- range $key, $value := $.Values.labels -}}
-{{ $key }}: {{ quote $value }}
+{{ quote $key }}: {{ quote $value }}
 {{ end -}}
 {{- end -}}
 
@@ -56,8 +56,8 @@ Labels from values
 Selector labels
 */}}
 {{- define "agentEnv.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "agentEnv.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/name: {{ include "agentEnv.name" . | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 
 {{/*
@@ -70,6 +70,15 @@ true
 {{- else -}}
 {{- /* An empty value represents false */ -}}
 {{- end -}}
+{{- end -}}
+
+{{/* toYaml, failing where Helm's renders nothing (it swallows its marshal errors), writes a "<<" key back as a merge, U+0085 as a space, or U+2028 or U+2029 as a line break. */}}
+{{- define "agentEnv.toYaml" -}}
+{{- if mustRegexMatch "[{,]\"<<\":" (toRawJson .) }}{{ fail "a \"<<\" key would merge into the mapping that holds it: rename it" }}{{ end -}}
+{{- if contains "\u0085" (toRawJson .) }}{{ fail "toYaml would turn the U+0085 in this value into a space: remove it" }}{{ end -}}
+{{- $yaml := toYaml . | required "toYaml rendered nothing for this value: remove DEL, C1 control characters, U+FFFE and U+FFFF from its strings, and shorten any mapping key over 1022 characters as JSON" -}}
+{{- if mustRegexMatch "[\u2028\u2029]" $yaml }}{{ fail "toYaml would break a line at the U+2028 or U+2029 in this value, and what follows can become fields: remove it" }}{{ end -}}
+{{- $yaml -}}
 {{- end -}}
 
 {{/* Render a deduped list of ports for a single service object (svc) */}}
@@ -86,5 +95,5 @@ true
     {{- end }}
   {{- end }}
 {{- end }}
-{{ toYaml $out -}}
+{{ include "agentEnv.toYaml" $out -}}
 {{- end -}}

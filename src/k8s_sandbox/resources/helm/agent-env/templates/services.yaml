@@ -5,9 +5,9 @@ metadata:
   name: {{ template "agentEnv.fullname" $ -}}-{{ $name }}
   labels:
     {{- include "agentEnv.labels" $ | nindent 4 }}
-    inspect/service: {{ $name }}
+    inspect/service: {{ $name | quote }}
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
 spec:
   {{- /*
     Deliberately empty. The kubelet writes the pod's FQDN --
@@ -23,7 +23,7 @@ spec:
   selector:
     matchLabels:
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $name }}
+      inspect/service: {{ $name | quote }}
   template:
     metadata:
       labels:
@@ -37,17 +37,17 @@ spec:
         aisi.gov.uk/network-{{ . }}: "true"
         {{- end }}
         {{- end }}
-        inspect/service: {{ $name }}
+        inspect/service: {{ $name | quote }}
       {{- $podAnnotations := deepCopy (default (dict) $.Values.annotations) }}
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
       annotations:
-        {{- toYaml $podAnnotations | nindent 8 }}
+        {{- include "agentEnv.toYaml" $podAnnotations | nindent 8 }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
-      runtimeClassName: {{ $service.runtimeClassName | default "gvisor" }}
+      runtimeClassName: {{ $service.runtimeClassName | default "gvisor" | quote }}
       {{- end }}
       {{- with $.Values.priorityClassName }}
       priorityClassName: {{ . | quote }}
@@ -84,21 +84,21 @@ spec:
       {{- end }}
       initContainers:
       {{- range $service.initContainers }}
-        - name: {{ .name }}
-          image: {{ .image }}
+        - name: {{ .name | quote }}
+          image: {{ .image | quote }}
           {{- if .imagePullPolicy }}
-          imagePullPolicy: {{ .imagePullPolicy }}
+          imagePullPolicy: {{ .imagePullPolicy | quote }}
           {{- end }}
           {{- if .command }}
           command:
-{{ toYaml .command | nindent 12 }}
+{{ include "agentEnv.toYaml" .command | nindent 12 }}
           {{- end }}
           {{- if .args }}
           args:
-{{ toYaml .args | nindent 12 }}
+{{ include "agentEnv.toYaml" .args | nindent 12 }}
           {{- end }}
           {{- if .workingDir }}
-          workingDir: {{ .workingDir }}
+          workingDir: {{ .workingDir | quote }}
           {{- end }}
           # This 'magic env var' has
           # to be accessible to the initContainers,
@@ -108,42 +108,42 @@ spec:
             - name: AGENT_ENV
               value: "{{ template "agentEnv.fullname" $ }}"
           {{- range .env }}
-            - name: {{ .name }}
+            - name: {{ .name | quote }}
               value: {{ .value | quote }}
           {{- end }}
           {{- with .volumeMounts }}
           volumeMounts:
           {{- range . }}
-            - {{- toYaml (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
+            - {{- include "agentEnv.toYaml" (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
           {{- end }}
           {{- end }}
           {{- if .resources }}
           resources:
-{{ toYaml .resources | nindent 12 }}
+{{ include "agentEnv.toYaml" .resources | nindent 12 }}
           {{- end }}
           {{- with .securityContext }}
           securityContext:
-{{ toYaml . | nindent 12 }}
+{{ include "agentEnv.toYaml" . | nindent 12 }}
           {{- end }}
       {{- end }}
       {{- end }}
 
       containers:
-      - name: {{ $name }}
-        image: {{ $service.image }}
+      - name: {{ $name | quote }}
+        image: {{ $service.image | quote }}
         {{- if $service.imagePullPolicy }}
-        imagePullPolicy: {{ $service.imagePullPolicy }}
+        imagePullPolicy: {{ $service.imagePullPolicy | quote }}
         {{- end }}
         {{- if $service.command }}
         command:
-          {{- toYaml $service.command | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.command | nindent 10 }}
         {{- end }}
         {{- if $service.args }}
         args:
-          {{- toYaml $service.args | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.args | nindent 10 }}
         {{- end }}
         {{- if $service.workingDir }}
-        workingDir: {{ $service.workingDir }}
+        workingDir: {{ $service.workingDir | quote }}
         {{- end }}
         env:
           # Retained for service resolution backwards compatibility.
@@ -151,21 +151,21 @@ spec:
             value: "{{ template "agentEnv.fullname" $ -}}"
         {{- if $service.env }}
           {{ range $service.env }}
-          - name: {{ .name }}
+          - name: {{ .name | quote }}
             value: {{ .value | quote }}
           {{- end }}
         {{- end }}
         {{- with $service.readinessProbe }}
         readinessProbe:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         {{- with $service.livenessProbe }}
         livenessProbe:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         resources:
         {{- if $service.resources }}
-          {{- toYaml $service.resources | nindent 10 }}
+          {{- include "agentEnv.toYaml" $service.resources | nindent 10 }}
         {{- else }}
           # Equal limits and requests for Guaranteed QoS class.
           limits:
@@ -177,7 +177,7 @@ spec:
         {{- end }}
         volumeMounts:
         {{- with $service.volumeMounts }}
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
         {{- range $key, $value := $service.volumes }}
           {{- if kindIs "string" $value }}
@@ -185,7 +185,7 @@ spec:
             {{- $volumeName := $parts._0 }}
             {{- $mountPath := $parts._1 }}
           - mountPath: {{ $mountPath | quote }}
-            name: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+            name: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
           {{- end }}
         {{- end }}
         {{- if not $.Values.corednsUpstream }}
@@ -195,14 +195,14 @@ spec:
         {{- end }}
         {{- with $service.securityContext }}
         securityContext:
-          {{- toYaml . | nindent 10 }}
+          {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
       - name: coredns
         image: {{ quote $.Values.corednsImage }}
         command:
-          {{- toYaml $.Values.corednsCommand | nindent 10 }}
+          {{- include "agentEnv.toYaml" $.Values.corednsCommand | nindent 10 }}
         securityContext:
-          {{- toYaml $.Values.corednsSecurityContext | nindent 10 }}
+          {{- include "agentEnv.toYaml" $.Values.corednsSecurityContext | nindent 10 }}
         resources:
           requests:
             memory: "128Mi"
@@ -233,15 +233,15 @@ spec:
             mountPath: /etc/coredns
             readOnly: true
       {{- with $.Values.extraContainers }}
-        {{- toYaml . | nindent 6 }}
+        {{- include "agentEnv.toYaml" . | nindent 6 }}
       {{- end }}
       {{- with $service.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
       {{- with $service.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
       volumes:
         - name: coredns-config
@@ -256,16 +256,16 @@ spec:
         {{- if kindIs "string" $value }}
           {{- $parts := split ":" $value }}
           {{- $volumeName := $parts._0 }}
-        - name: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+        - name: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
           persistentVolumeClaim:
-            claimName: {{ template "agentEnv.fullname" $ -}}-{{ $volumeName }}
+            claimName: {{ printf "%s-%s" (include "agentEnv.fullname" $) $volumeName | quote }}
         {{- else }}
-        -  {{- toYaml . | nindent 10 }}
+        -  {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
 ---
 {{- if include "shouldCreateDnsRecord" $service }}
@@ -274,9 +274,9 @@ kind: Service
 metadata:
   name: {{ template "agentEnv.fullname" $ -}}-{{ $name }}
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   # Make this a headless service: other pods in this agent-env may connect directly to
   # the pod on all ports. This enables the use of tools like `nc` on any port or `ping`
@@ -284,12 +284,12 @@ spec:
   clusterIP: None
   selector:
     {{- include "agentEnv.selectorLabels" $ | nindent 4 }}
-    inspect/service: {{ $name }}
+    inspect/service: {{ $name | quote }}
   {{- if $service.ports }}
   # ports are deprecated within this Helm chart. Maintained for backwards compatibility.
   ports:
     {{- range $service.ports }}
-    - protocol: {{ .protocol }}
+    - protocol: {{ .protocol | quote }}
       port: {{ .port }}
       {{- /* A name is required when multiple ports are exposed. */}}
       name: port-{{ .port }}

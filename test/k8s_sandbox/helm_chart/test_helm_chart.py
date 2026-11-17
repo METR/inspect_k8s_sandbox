@@ -1,5 +1,6 @@
 import ipaddress
 import pathlib
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -519,6 +520,128 @@ def test_quotes_env_var_values(chart_dir: Path, test_resources_dir: Path) -> Non
     assert env[1] == {"name": "A", "value": "1"}
     assert env[2] == {"name": "B", "value": "2"}
     assert env[3] == {"name": "C", "value": "three"}
+
+
+def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) -> None:
+    spliced = "\nspliced: x"
+
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "bare-scalar-splice-values.yaml"
+    )
+
+    pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    assert pod_spec["runtimeClassName"] == "gvisor" + spliced
+    main = next(c for c in pod_spec["containers"] if c["name"] == "default")
+    assert main["image"] == "img" + spliced
+    assert main["imagePullPolicy"] == "Always" + spliced
+    assert main["workingDir"] == "/w" + spliced
+    assert {"name": "ENVNAME" + spliced, "value": "v"} in main["env"]
+    init = pod_spec["initContainers"][0]
+    assert init["name"] == "init" + spliced
+    assert init["image"] == "iimg" + spliced
+    assert init["imagePullPolicy"] == "Always" + spliced
+    assert init["workingDir"] == "/iw" + spliced
+    assert {"name": "IENVNAME" + spliced, "value": "v"} in init["env"]
+    volume = "agent-env-my-release-vol\nspliced"
+    assert {"mountPath": "/data", "name": volume} in main["volumeMounts"]
+    claim = {"name": volume, "persistentVolumeClaim": {"claimName": volume}}
+    assert claim in pod_spec["volumes"]
+    pvc = _get_documents(documents, "PersistentVolumeClaim")[0]
+    assert pvc["metadata"]["name"] == volume
+    port = _get_documents(documents, "Service")[0]["spec"]["ports"][0]
+    assert port["protocol"] == "TCP" + spliced
+    egress = next(
+        cnp
+        for cnp in _get_documents(documents, "CiliumNetworkPolicy")
+        if cnp["metadata"]["name"].endswith("-sandbox-egress")
+    )["spec"]["egress"]
+    protocols = {
+        p["port"]: p["protocol"]
+        for rule in egress
+        for to_ports in rule.get("toPorts", [])
+        for p in to_ports["ports"]
+    }
+    # The chart upper-cases an allowDomainsPorts protocol.
+    assert protocols["8008"] == "TCP\nSPLICED: X"
+    assert protocols["22"] == "TCP\nSPLICED: X"
+    # A `": ` in a domain would close hand-written quotes or, bare, start a mapping.
+    domain = 'a": b.org'
+    assert {"matchPattern": domain} in _values_at(egress, "dns")[0]
+    shared = next(rule for rule in egress if _values_at(rule, "serverNames"))
+    assert {"matchPattern": domain} in shared["toFQDNs"]
+    assert domain in _values_at(shared, "serverNames")[0]
+    assert {"host": '(?i)^a": b[.]org(:[0-9]+)?$'} in _values_at(shared, "http")[0]
+    assert [{"matchPattern": domain}] in _values_at(egress, "toFQDNs")
+
+
+@pytest.mark.parametrize(
+    "networks",
+    ["", ",networks.net.a=b,services.no.networks[0]=net"],
+    ids=["no-networks", "networks"],
+)
+def test_names_render_as_strings(chart_dir: Path, networks: str) -> None:
+    # Unquoted, YAML reads each of these names as a boolean or a number.
+    documents = _run_helm_template(
+        chart_dir,
+        set_str="services.no.image=img,services.no.dnsRecord=true,labels.no=x,"
+        "services.123.image=img,services.123.networkIsolated=true,"
+        "serviceAccountCreate=true,serviceAccountName=sa" + networks,
+        set_string="global.nameOverride=456",
+        release="23456789",
+        namespace="123",
+    )
+
+    assert set(_values_at(documents, "inspect/service")) == {"default", "no", "123"}
+    assert set(_values_at(documents, "app.kubernetes.io/name")) == {"456"}
+    assert set(_values_at(documents, "app.kubernetes.io/instance")) == {"23456789"}
+    namespaces = _values_at(documents, "io.kubernetes.pod.namespace")
+    assert set(namespaces) == {"123", "kube-system"}
+    account = _get_documents(documents, "ServiceAccount")[0]
+    assert account["metadata"]["namespace"] == "123"
+    pods = [s["spec"]["template"] for s in _get_documents(documents, "StatefulSet")]
+    assert all(pod["metadata"]["labels"]["no"] == "x" for pod in pods)
+    containers = {c["name"] for pod in pods for c in pod["spec"]["containers"]}
+    assert containers == {"default", "no", "123", "coredns"}
+
+
+def test_fails_on_a_value_helm_cannot_render(chart_dir: Path) -> None:
+    # Helm's toYaml returns nothing for a DEL in a task's name.
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_helm_template(chart_dir, set_string="annotations.inspectTaskName=task\x7f")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("services.default.resources.<<.limits.cpu=7", '"<<" key'),
+        ("annotations.inspectTaskName=task\u0085", "U+0085"),
+        ("services.default.nodeSelector.zz=x\n\u2028    hostPID: true", "U+2028"),
+        ("services.default.nodeSelector.zz=x\n\u2029    hostPID: true", "U+2029"),
+    ],
+    ids=["merge-key", "next-line", "line-separator", "paragraph-separator"],
+)
+def test_fails_on_a_value_toyaml_would_change(
+    chart_dir: Path, value: str, message: str
+) -> None:
+    # toYaml writes "<<" back as a merge, U+0085 as a space, the other two as breaks.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_string=value)
+
+    assert message in exc_info.value.stderr
+
+
+def test_only_the_helper_calls_toyaml(chart_dir: Path) -> None:
+    # Helm's own toYaml renders nothing where it fails: a block that calls it vanishes.
+    calls = [
+        template.name
+        for template in (chart_dir / "templates").rglob("*")
+        if template.is_file()
+        for _ in re.finditer(
+            r"(?i)toYaml\w*\s+[.$(]|\|\s*\w*toYaml", template.read_text()
+        )
+    ]
+
+    assert calls == ["_helpers.tpl"]
 
 
 def test_cluster_default_magic_string(
@@ -1124,11 +1247,13 @@ def _run_helm_template(
     values_file: Path | None = None,
     set_str: str | None = None,
     set_string: str | None = None,
+    release: str = "my-release",
+    namespace: str | None = None,
 ) -> list[dict[str, Any]]:
     cmd = [
         "helm",
         "template",
-        "my-release",
+        release,
         str(chart_dir),
     ]
 
@@ -1138,6 +1263,8 @@ def _run_helm_template(
         cmd += ["--set", set_str]
     if set_string:
         cmd += ["--set-string", set_string]
+    if namespace:
+        cmd += ["--namespace", namespace]
 
     # stderr is captured so that tests asserting rejection can check why helm failed.
     result = subprocess.run(
@@ -1148,6 +1275,15 @@ def _run_helm_template(
 
 def _get_documents(documents: list[Any], doc_type_filter: str) -> list[dict[str, Any]]:
     return [doc for doc in documents if doc["kind"] == doc_type_filter]
+
+
+def _values_at(node: Any, key: str) -> list[Any]:
+    """Every value under `key`, at any depth of `node`."""
+    children = node.values() if isinstance(node, dict) else node
+    if not isinstance(node, (dict, list)):
+        return []
+    found = [node[key]] if isinstance(node, dict) and key in node else []
+    return found + [value for child in children for value in _values_at(child, key)]
 
 
 def _selector_matches_service(match_labels: dict[str, Any], service_name: str) -> bool:
