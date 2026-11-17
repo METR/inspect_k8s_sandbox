@@ -69,7 +69,7 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 		t.Skipf("forward did not come to listen on its proxy port: %v", err)
 	}
 	f := newForwarder(hostCID, streamPort)
-	f.connect = func(uint32, uint32) (*os.File, error) { return os.CreateTemp(t.TempDir(), "") } // a worker takes its streams
+	f.connect = func(uint32, uint32) (*os.File, error) { return os.CreateTemp(t.TempDir(), "") } // a worker listens on its node
 	if err := f.ready(file); err == nil {
 		t.Fatal("ready passed for a forwarder that does not listen")
 	}

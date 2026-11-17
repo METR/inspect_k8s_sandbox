@@ -26,9 +26,11 @@ Each node needs:
   sets the launcher's from the memory request and the node's memory. The worker that ends is the one with the most
   resident memory, whichever sandbox filled the socket buffers: one sandbox can cost another its worker.
 
-A pod's forwarder passes its startup probe once a worker on its node takes its streams, so where no launcher runs the
-pod does not start. A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on
-the wire, or the launchers be replaced before the forwarders.
+A pod's forwarder passes its startup probe once a worker listens on its node, so where no launcher runs the pod does
+not start. A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire,
+or the launchers be replaced before the forwarders. A worker built before the probe opened a stream writes
+`proxy_unreached` for that empty stream when it comes before the pod's proxy is up, so replace a node's launcher
+before its sandboxes run a forwarder whose probe opens one.
 
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
