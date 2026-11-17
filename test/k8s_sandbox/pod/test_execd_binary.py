@@ -15,6 +15,10 @@ import sys
 import typing
 import uuid
 
+import anyio
+import anyio.abc
+import anyio.streams.stapled
+import anyio.streams.tls
 import kubernetes.client.exceptions
 import pytest
 
@@ -132,21 +136,68 @@ async def relay(
     server.close()
 
 
+class Execs:
+    """`docker exec`s joined to execd's socket, as the execs to a pod with no card."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.open: list[anyio.abc.Process] = []
+
+    async def connect(self, *user: str) -> anyio.abc.ByteStream:
+        bridge = [execd.EXECD_PATH, "connect", execd.EXECD_SOCKET]
+        argv = ["docker", "exec", "-i", *user, self.name, *bridge]
+        self.open.append(await anyio.open_process(argv, stderr=subprocess.DEVNULL))
+        stdin, stdout = self.open[-1].stdin, self.open[-1].stdout
+        assert stdin is not None and stdout is not None
+        return anyio.streams.stapled.StapledByteStream(stdin, stdout)
+
+    def drop(self) -> None:
+        for process in self.open:
+            if process.returncode is None:
+                process.kill()
+
+
+@pytest.fixture
+async def execs(sandbox: Sandbox) -> collections.abc.AsyncIterator[Execs]:
+    carrier = Execs(sandbox.name)
+    yield carrier
+    carrier.drop()
+    for process in carrier.open:
+        await process.aclose()
+
+
+async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, bytes]:
+    """`docker exec` starts execd, as an exec into a pod does: its fingerprint, key."""
+    key = os.urandom(32)
+    listen = [execd.EXECD_PATH, "listen", *at]
+    listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
+    listen += ["--replace"] if replace else []
+    command = ["exec", *sandbox.options, sandbox.name, *listen]
+    started = await asyncio.to_thread(docker, *command)
+    if "address already in use" in started.stderr:
+        raise execd.DaemonRunning(started.stderr)
+    assert started.returncode == 0, started.stderr
+    return started.stdout.split()[0], key
+
+
 @pytest.fixture
 def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
-    """The real client; `docker exec` starts execd, as an exec into a pod does."""
+    """The real client, reaching execd at its port."""
 
     async def start(replace: bool) -> execd.Daemon:
-        key = os.urandom(32)
-        listen = [execd.EXECD_PATH, "listen", "--port", str(PORT)]
-        listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
-        listen += ["--replace"] if replace else []
-        command = ["exec", *sandbox.options, sandbox.name, *listen]
-        started = await asyncio.to_thread(docker, *command)
-        if "address already in use" in started.stderr:
-            raise execd.DaemonRunning(started.stderr)
-        assert started.returncode == 0, started.stderr
-        return execd.Daemon("127.0.0.1", started.stdout.split()[0], key)
+        at = await start_execd(sandbox, replace, "--port", str(PORT))
+        return execd.Daemon("127.0.0.1", *at)
+
+    return execd.ExecdClient(start)
+
+
+@pytest.fixture
+def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
+    """The real client, reaching execd through an exec's stdio."""
+
+    async def start(replace: bool) -> execd.Daemon:
+        at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
+        return execd.Daemon("", *at, stdio=execs.connect)
 
     return execd.ExecdClient(start)
 
@@ -268,7 +319,7 @@ async def test_a_restart_kubernetes_has_not_shown_is_found_where_execd_starts(
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
     monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
     monkeypatch.setattr(op, "k8s_client", lambda _: shown)
-    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, mode, execd=True)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, mode, execd="true")
 
     async def command() -> None:
         async def run() -> None:
@@ -318,6 +369,24 @@ async def test_a_file_operation_execd_cannot_start_is_no_word_on_the_file(
         await asyncio.wait_for(read, 30)  # only bounds a hang
 
 
+async def test_a_command_whose_exec_ends_is_resumed_through_another_and_runs_once(
+    sandbox: Sandbox, execs: Execs, stdio_client: execd.ExecdClient
+) -> None:
+    runs = f"/tmp/{uuid.uuid4().hex}"
+    script = 'echo run >> "$0"; until [ -e "$0.go" ]; do sleep 0.05; done; echo ran'
+    call = asyncio.ensure_future(
+        stdio_client.exec(["sh", "-c", script, runs], None, None, {}, None, None)
+    )
+    await sandbox.until(f"test -e {runs}")
+
+    execs.drop()
+    sandbox.sh(f"touch {runs}.go")
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert (result.returncode, result.stdout) == (0, "ran\n")
+    assert sandbox.sh(f"cat {runs}").stdout == "run\n"
+
+
 async def test_a_wrong_key_is_answered_with_nothing(
     sandbox: Sandbox, client: execd.ExecdClient
 ) -> None:
@@ -342,6 +411,25 @@ async def test_a_connection_from_the_sandbox_itself_is_closed(
     probe = await asyncio.to_thread(docker, "exec", sandbox.name, *dial)
 
     assert probe.stdout.split() == ["127.0.0.1", "closed", sandbox.ip, "closed"]
+
+
+async def test_another_users_process_is_refused_at_execds_socket(
+    execs: Execs, stdio_client: execd.ExecdClient
+) -> None:
+    call = stdio_client.exec(["true"], None, None, {}, None, None)  # execd runs
+    await asyncio.wait_for(call, 30)  # only bounds a hang
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
+    theirs = await execs.connect("-u", "65534")
+
+    # Closed, before the handshake or in it, where its own user is served.
+    closed = (anyio.EndOfStream, anyio.BrokenResourceError)
+    with anyio.fail_after(30), pytest.raises(closed):  # the budgets only bound a hang
+        await anyio.streams.tls.TLSStream.wrap(
+            theirs, server_side=False, ssl_context=context, standard_compatible=False
+        )
+    with anyio.fail_after(30):
+        assert await execs.open[-1].wait() == 0  # the bridge itself ran, and connected
 
 
 async def test_a_timed_out_command_is_killed(

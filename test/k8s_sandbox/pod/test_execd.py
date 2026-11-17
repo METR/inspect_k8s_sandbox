@@ -17,8 +17,10 @@ import sys
 import threading
 import time
 import types
+import urllib.parse
 
 import anyio
+import anyio.abc
 import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
@@ -80,7 +82,7 @@ class Plain(execd._Pipe):
 
     async def readexactly(self, n: int) -> bytes:
         try:
-            return await self._reader.readexactly(n)
+            return await self._reader.readexactly(n)  # type: ignore[union-attr]
         except asyncio.IncompleteReadError:  # as execd's own pipe ends
             raise ConnectionResetError("execd closed the connection") from None
 
@@ -2029,7 +2031,7 @@ async def test_a_stream_cancelled_as_it_starts_is_killed(
             await client.open_stream(argv, None)
 
     opening = asyncio.ensure_future(opens())
-    unsent = link.pipe._writer.transport.get_write_buffer_size
+    unsent = link.pipe._writer.transport.get_write_buffer_size  # type: ignore[union-attr]
     await until(lambda: unsent() > 0)  # its START is on its way
     scope.cancel()  # anyio cancels again at each await, unlike asyncio
     await asyncio.wait_for(opening, 30)
@@ -2629,7 +2631,7 @@ async def test_a_replacement_found_in_warn_mode_moves_operations_to_its_execd(
         started.append(cluster.uid)
         return execd.Daemon("127.0.0.1", tls[1], b"key", cluster.uid)
 
-    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd=True)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd="true")
     assert pod._execd is not None
     pod._execd._start = start
     with anyio.fail_after(30):  # only bounds a hang
@@ -3488,6 +3490,248 @@ async def test_only_the_pinned_certificate_is_trusted(
     pipe = await execd._connect(execd.Daemon("127.0.0.1", pin, b"key"), execd.Pace())
     await pipe.close()
     server.close()
+
+
+async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+    closed = asyncio.Event()
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"ran"))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        w.write(execd.HEADER.pack(execd.STDOUT, call_id, execd.MAX_FRAME + 1))
+        if not await r.read():  # no frame of execd's: the client ends the connection
+            closed.set()
+
+    server = await asyncio.start_server(exits, "127.0.0.1", 0, ssl=context)
+
+    async def start(replace: bool) -> execd.Daemon:
+        address = server.sockets[0].getsockname()  # as `execd connect` joins a stdio
+        return execd.Daemon("", pin, b"key", stdio=lambda: anyio.connect_tcp(*address))
+
+    call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    assert result.stdout == "ran"
+    await asyncio.wait_for(closed.wait(), 30)
+    server.close()
+
+
+async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
+    clock: types.SimpleNamespace,
+) -> None:
+    """Regression: a message a write, of any size: AWS's guest agent reordered them."""
+    sent: list[bytes] = []
+    at: list[float] = []
+
+    class Records(anyio.abc.ByteStream):
+        """An exec's stdio that keeps each message written to it, and when."""
+
+        async def send(self, item: bytes) -> None:
+            sent.append(item)
+            at.append(clock.now)
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    stdio = execd._Stdio(Records())
+    stdio.write(b"first")
+    await until(lambda: sent == [b"first"])
+    stdio.write(b"while it ")
+    stdio.write(b"is on its way")
+    await until(lambda: len(sent) == 2)
+    upload = bytes(range(251)) * 612  # 150 KiB, and no two messages of it alike
+    stdio.write(upload)
+    with anyio.fail_after(30):
+        await stdio.drain()  # in this task: a write waits here until most has gone
+    assert len(upload) - sum(map(len, sent[2:])) <= 65536
+    await until(lambda: sum(map(len, sent[2:])) == len(upload))
+    stdio.abort()
+
+    assert sent[1] == b"while it is on its way"
+    assert b"".join(sent[2:]) == upload and max(map(len, sent)) <= 65536
+    # On the fake clock: every message a millisecond or more after the one before.
+    assert all(later - earlier >= 0.001 for earlier, later in zip(at, at[1:]))
+
+
+async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+
+    class Ended(anyio.abc.ByteStream):
+        """An exec's stdio that refuses writes once it has ended, with nothing read."""
+
+        def __init__(self, inner: anyio.abc.ByteStream) -> None:
+            self.inner, self.ended = inner, False
+
+        async def send(self, item: bytes) -> None:
+            if self.ended:
+                raise anyio.BrokenResourceError
+            await self.inner.send(item)
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            return await self.inner.receive(max_bytes)
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            await self.inner.aclose()
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(asyncio.IncompleteReadError):
+            await read_frame(r)  # AUTH
+            w.write(frame(execd.OK, 0))
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.RESUME:  # of a START the ended exec never took
+                    w.write(frame(execd.ERROR, call_id, b"unknown call"))
+                elif kind == execd.START:
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    server = await asyncio.start_server(runs, "127.0.0.1", 0, ssl=context)
+    execs: list[Ended] = []
+
+    async def stdio() -> Ended:
+        address = server.sockets[0].getsockname()
+        execs.append(Ended(await anyio.connect_tcp(*address)))
+        return execs[-1]
+
+    daemon = execd.Daemon("", pin, b"key", stdio=stdio)
+
+    async def start(replace: bool) -> execd.Daemon:
+        return daemon
+
+    client = execd.ExecdClient(start)
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    execs[0].ended = True
+
+    call = client.exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    # Resumed through another exec, as a call over a port that was reset is.
+    assert (result.returncode, len(execs)) == (0, 2)
+    server.close()
+
+
+async def test_an_exec_that_just_ends_is_a_connection_execd_closed(
+    tls: tuple[ssl.SSLContext, str],
+) -> None:
+    context, pin = tls
+
+    async def ends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        w.write_eof()  # as `execd connect` ends where no daemon listens
+        await r.read()
+        w.close()
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+        await r.read()
+
+    gone = await asyncio.start_server(ends, "127.0.0.1", 0)
+    server = await asyncio.start_server(runs, "127.0.0.1", 0, ssl=context)
+    starts: list[bool] = []
+
+    async def start(replace: bool) -> execd.Daemon:
+        address = (server if starts else gone).sockets[0].getsockname()
+        starts.append(replace)
+        return execd.Daemon("", pin, b"key", stdio=lambda: anyio.connect_tcp(*address))
+
+    call = execd.ExecdClient(start).exec(["true"], None, None, {}, None, None)
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+
+    # Read as a port that closed: execd is started again, with no --replace.
+    assert (result.returncode, starts[:2]) == (0, [True, False])
+    gone.close()
+    server.close()
+
+
+async def test_a_connection_closed_under_a_silent_exec_closes_the_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execd, "CONNECT_TIMEOUT", None)  # or a stalled machine ends it
+    closed = asyncio.Event()
+    senders: list[asyncio.Task[None] | None] = []
+
+    class Silent(anyio.abc.ByteStream):
+        """An exec that takes what is written to it and answers nothing."""
+
+        async def send(self, item: bytes) -> None:
+            senders.append(asyncio.current_task())
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            closed.set()
+
+    async def stdio() -> Silent:
+        return Silent()
+
+    connecting = asyncio.ensure_future(
+        execd._connect(execd.Daemon("", "0" * 64, b"key", stdio=stdio), execd.Pace())
+    )
+    await until(lambda: bool(senders))  # the handshake's first bytes have gone
+    connecting.cancel()
+
+    # The exec is closed, and nothing is left that would write to it.
+    await asyncio.wait_for(closed.wait(), 30)
+    await until(lambda: senders[0] is not None and senders[0].done())
+
+
+@pytest.fixture
+async def refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> collections.abc.AsyncIterator[list[bytes]]:
+    """The requests of the real Kubernetes client to an API server that refuses each."""
+    requests: list[bytes] = []
+
+    async def refuse(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        requests.append(await r.readuntil(b"\r\n\r\n"))
+        w.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+        w.close()
+
+    server = await asyncio.start_server(refuse, "127.0.0.1", 0)
+    host = "http://127.0.0.1:%d" % server.sockets[0].getsockname()[1]
+    api = kubernetes.client.CoreV1Api(
+        kubernetes.client.ApiClient(kubernetes.client.Configuration(host=host))
+    )
+    monkeypatch.setattr(op, "k8s_client", lambda _: api)
+    yield requests
+    server.close()
+
+
+async def test_the_exec_that_reaches_execd_asks_for_no_stderr(
+    refused: list[bytes],
+) -> None:
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise", "stdio")
+
+    with pytest.raises(ConnectionError):  # which the client's reconnect waits out
+        await asyncio.wait_for(pod._execd_stdio(), 30)
+
+    # Nothing would pace that channel, were a guest to flood it.
+    target = urllib.parse.urlsplit(refused[0].split()[1].decode())
+    assert urllib.parse.parse_qs(target.query)["stderr"][0].lower() == "false"
 
 
 async def test_the_client_offers_one_key_exchange_group(

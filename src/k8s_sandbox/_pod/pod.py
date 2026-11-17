@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import IO, Awaitable, Callable, Literal, TypeVar
 
 from inspect_ai.util import ExecResult
+from kubernetes.client.exceptions import ApiException
 
 from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import (
@@ -24,6 +25,7 @@ from k8s_sandbox._pod.error import (
 from k8s_sandbox._pod.execd import (
     EXECD_PATH,
     EXECD_PORT,
+    EXECD_SOCKET,
     Daemon,
     DaemonRunning,
     ExecdClient,
@@ -63,7 +65,7 @@ class Pod:
         uid: str,
         initial_restart_count: int,
         restarted_container_behavior: Literal["warn", "raise"],
-        execd: bool = False,
+        execd: str | None = None,
     ) -> None:
         self._info = PodInfo(
             name,
@@ -79,10 +81,13 @@ class Pod:
         # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
         self._restart_lock = threading.Lock()
-        # Operations go over the pod network to execd, if the pod has it (see execd.py).
+        # Operations go to execd, if the pod has it: at its address, or through an exec.
         self._execd = (
-            ExecdClient(self._start_execd, lambda: self._info.uid) if execd else None
+            ExecdClient(self._start_execd, lambda: self._info.uid)
+            if execd in ("true", "stdio")
+            else None
         )
+        self._execd_by_stdio = execd == "stdio"
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
         self._execd_started: float | None = None  # what the next late check counts from
@@ -94,6 +99,8 @@ class Pod:
         info = self._info
         key = os.urandom(32)
         cmd = [EXECD_PATH, "listen", "--port", str(EXECD_PORT)]
+        if self._execd_by_stdio:
+            cmd = [EXECD_PATH, "listen", "--socket", EXECD_SOCKET]
         cmd += ["--key-sha256", hashlib.sha256(key).hexdigest()]
         cmd += ["--replace"] if replace or self._execd_lost else []
         code, stdout, stderr = await self._run_async(
@@ -126,7 +133,23 @@ class Pod:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
-        return Daemon(pod.ip, said[1].decode(), key, pod.uid)
+        stdio = self._execd_stdio if self._execd_by_stdio else None
+        return Daemon(pod.ip, said[1].decode(), key, pod.uid, stdio)
+
+    async def _execd_stdio(self) -> PodStdio:
+        """An exec whose stdin and stdout are joined to the daemon's socket."""
+        operation = ExecuteOperation(self._info)
+        try:
+            stack, ws_client = await self._run_async(
+                # No stderr: nothing would pace it, were a guest to flood it.
+                lambda: operation.open_stdio(
+                    [EXECD_PATH, "connect", EXECD_SOCKET], None, stderr=False
+                ),
+                discard=lambda opened: opened[0].close(),
+            )
+        except ApiException as e:  # every refusal reads alike: dialled again, as a port
+            raise ConnectionError(f"no exec for execd: {e.reason}") from e
+        return PodStdio(stack, ws_client)
 
     @property
     def info(self) -> PodInfo:

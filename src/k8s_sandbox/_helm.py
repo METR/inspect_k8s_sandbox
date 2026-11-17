@@ -376,9 +376,9 @@ class Release:
         sandboxes = dict()
         for pod in _sandbox_pods(pods):
             default_container_name = pod.container_names[0]
-            execd = pod.annotations.get(EXECD_ANNOTATION) == "true"
+            execd = pod.annotations.get(EXECD_ANNOTATION)
             if (
-                execd
+                execd in ("true", "stdio")
                 and pod.shares_pids
                 and self.restarted_container_behavior == "raise"
             ):
