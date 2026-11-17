@@ -65,7 +65,7 @@ func ready(args []string) error {
 	return newForwarder(hostCID, streamPort).ready(*keyFile)
 }
 
-// ready passes once the forwarder listens and a worker listens on its node: with none there, Firecracker resets the connection.
+// ready passes once the forwarder listens and its worker does: with no worker for its VM, Firecracker resets the connection.
 func (f *forwarder) ready(keyFile string) error {
 	if _, err := os.Stat(keyFile + readySuffix); err != nil {
 		return err

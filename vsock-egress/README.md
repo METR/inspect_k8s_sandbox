@@ -19,18 +19,17 @@ Each node needs:
   runs in that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
   downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
-  Past the limit the kubelet kills every process in the container unless its `singleProcessOOMKill` is on. With it
-  on the kernel ends one process; were that the launcher, every worker would end with it. Each worker sets its
-  `oom_score_adj` to 1000 so that it is a worker instead, which holds only while a thousandth of the limit for each
-  point of the launcher's own `oom_score_adj` below 1000 comes to more than about 8 MiB, as measured; the kubelet
-  sets the launcher's from the memory request and the node's memory. The worker that ends is the one with the most
-  resident memory, whichever sandbox filled the socket buffers: one sandbox can cost another its worker.
+  Past the limit the kernel kills every process in the container unless the kubelet's `singleProcessOOMKill` is on.
+  With it on the kernel ends one process; were that the launcher, every worker would end with it. Each worker sets
+  its `oom_score_adj` to 1000 so that it is a worker instead: the one with the most resident memory, whichever
+  sandbox filled the socket buffers, so one sandbox can cost another its worker. That holds only while a thousandth
+  of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
+  resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
+  the node's memory.
 
-A pod's forwarder passes its startup probe once a worker listens on its node, so where no launcher runs the pod does
-not start. A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire,
-or the launchers be replaced before the forwarders. A worker built before the probe opened a stream writes
-`proxy_unreached` for that empty stream when it comes before the pod's proxy is up, so replace a node's launcher
-before its sandboxes run a forwarder whose probe opens one.
+A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
+A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
+launchers be replaced before the forwarders.
 
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among

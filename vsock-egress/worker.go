@@ -99,7 +99,7 @@ func work(args []string) error {
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
-	// Out of memory, the kernel then ends a worker and not the launcher, whose end would end every worker of the node.
+	// Out of memory, the kernel then ends a worker before the launcher, whose end would end every worker: the README says when.
 	if err := os.WriteFile("/proc/self/oom_score_adj", []byte("1000"), 0); err != nil {
 		return err
 	}
