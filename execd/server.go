@@ -997,10 +997,13 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	} else if u, err = user.Lookup(name); err != nil {
 		return nil, "", "", fmt.Errorf("unknown user %s", name)
 	}
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
-	if uid == os.Getuid() {
+	uid, uidErr := strconv.ParseInt(u.Uid, 10, 64)
+	if uidErr == nil && uid == int64(os.Getuid()) {
 		return nil, u.HomeDir, u.Username, nil
+	}
+	gid, gidErr := strconv.ParseInt(u.Gid, 10, 64)
+	if uidErr != nil || gidErr != nil || uid>>32 != 0 || gid>>32 != 0 { // narrowed to 32 bits, 4294967296 would be root's
+		return nil, "", "", fmt.Errorf("unknown user %s", name)
 	}
 	if os.Getuid() != 0 {
 		return nil, "", "", fmt.Errorf("cannot run as %s: execd is not root", name)
@@ -1008,7 +1011,7 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var groups []uint32
 	if ids, err := u.GroupIds(); err == nil {
 		for _, g := range ids {
-			if n, err := strconv.Atoi(g); err == nil {
+			if n, err := strconv.ParseInt(g, 10, 64); err == nil && n>>32 == 0 && n != 1<<32-1 { // setgroups refuses the whole list for (gid_t)-1
 				groups = append(groups, uint32(n))
 			}
 		}
