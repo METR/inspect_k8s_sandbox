@@ -867,13 +867,38 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
     )
 
 
-class _ManifestLoader(yaml.SafeLoader):
-    """Reads untagged scalars as text: Helm writes strings bare that PyYAML types."""
+# YAML 1.2's core schema, in its order, and `<<`, so that a `<<` key still merges.
+_CORE_SCHEMA = {
+    "null": r"null|Null|NULL|~|",
+    "bool": r"true|True|TRUE|false|False|FALSE",
+    "int": r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
+    "float": r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
+    "merge": r"<<",
+}
 
-    # Only `<<` keeps its type, so that a `<<` key still merges; a `<<` value is text.
-    yaml_implicit_resolvers = {"<": yaml.SafeLoader.yaml_implicit_resolvers["<"]}
+
+def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
+    """A core schema integer, or its text where it has more digits than Python reads."""
+    text = loader.construct_scalar(node)
+    try:
+        return int(text, {"0o": 8, "0x": 16}.get(text[:2], 10))
+    except ValueError:
+        return text
+
+
+class _ManifestLoader(yaml.SafeLoader):
+    """YAML 1.2's types for untagged scalars: PyYAML's 1.1 ones fail on a bare `=`."""
+
+    yaml_implicit_resolvers = {
+        None: [
+            (f"tag:yaml.org,2002:{tag}", re.compile(f"(?:{pattern})$"))
+            for tag, pattern in _CORE_SCHEMA.items()
+        ]
+    }
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
+        "tag:yaml.org,2002:int": _core_int,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 

@@ -1349,6 +1349,15 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
     assert names == {"cm", "default", "svc"}
 
 
+def test_a_stateful_sets_counts_read_as_numbers() -> None:
+    # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
+    stdout = _manifest("kind: StatefulSet\nspec: {replicas: 3, ordinals: {start: 2}}\n")
+
+    spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
+
+    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == [2, 3, 4]
+
+
 def _services(stdout: str) -> frozenset[str]:
     docs = _helm._rendered_docs(stdout, "abcdefgh")
     return _helm._get_expected_services(docs, "abcdefgh")
@@ -1407,10 +1416,21 @@ def _services(stdout: str) -> frozenset[str]:
         pytest.param(
             _manifest(
                 _STATEFUL_SET
-                + "    spec: {containers: [{args: [=, <<, 0000-00-00, 0x_]}]}\n"
+                + "    spec: {containers: [{args: [=, <<, 0000-00-00, 0x_, "
+                + "9" * 4301
+                + "]}]}\n"
             ),
             {"default"},
             id="strings-pyyaml-types",
+        ),
+        # A bare null is no name; quoted, `null` is a name like any other.
+        pytest.param(
+            _manifest(_stateful_set("null"), _STATEFUL_SET),
+            {"default"},
+            id="null-label",
+        ),
+        pytest.param(
+            _manifest(_stateful_set("'null'")), {"null"}, id="quoted-null-label"
         ),
         # A custom chart may merge its pod's labels in.
         pytest.param(
