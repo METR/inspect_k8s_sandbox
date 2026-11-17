@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import itertools
 import json
 import logging
 import math
@@ -76,6 +77,8 @@ _ready_waits_lock = threading.Lock()
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
 _TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
+# Kubernetes is designed for 150,000 pods in a cluster: the client names no more.
+_MOST_PODS = 150_000
 
 logger = logging.getLogger(__name__)
 
@@ -469,9 +472,16 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
-        self._expected_pods = frozenset(
-            _stateful_set_pods(docs, self.release_name, self._namespace)
-        )
+        pods = _stateful_set_pods(docs, self.release_name, self._namespace)
+        # No further: a name for every replica asked for can take all of memory.
+        names = list(itertools.islice(pods, _MOST_PODS + 1))
+        if len(names) > _MOST_PODS:
+            _raise_runtime_error(
+                f"The release's StatefulSets ask for more than {_MOST_PODS} pods, the "
+                "most the client waits for by name.",
+                release=self.release_name,
+            )
+        self._expected_pods = frozenset(names)
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:

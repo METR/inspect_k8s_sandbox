@@ -1664,6 +1664,19 @@ async def test_wait_until_ready_does_not_wait_for_a_pod_it_will_never_see(
     await _wait(release, [[_pod()]] * 2, monkeypatch)
 
 
+async def test_install_refuses_more_pods_than_the_client_will_name() -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    many = _helper(release, "  replicas: 100000\n")
+    other = many.replace("helper", "other")
+    # Reading this count raises: past the bound the client must read no further.
+    unread = _helper(release, "  replicas: unread\n")
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        # Two StatefulSets: the names of both together are what take the memory.
+        _helm_installed(mock_run, _STATEFUL_SET, many, other, unread)
+        with pytest.raises(RuntimeError, match="ask for more than"):
+            await release._install(None, time.monotonic() + 60, upgrade=False)
+
+
 async def test_wait_until_ready_keeps_waiting_while_no_pods_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
