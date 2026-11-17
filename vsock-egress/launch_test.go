@@ -176,23 +176,35 @@ func TestLauncherThatStartsAfterASandboxWentRaisesNoFaultForIt(t *testing.T) {
 }
 
 func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
+	alone(t)
+	netns := podNetns(t)
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		l.reap = 0 // no reaper runs here: the test puts the next worker in the place of the one that ended, as a pass would
-		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		l.reap, l.netns = budget, netns
+		l.retry = time.Millisecond // the pass that ends a worker starts no other: the test's clock stands still while a process runs
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+5)
+		t.Cleanup(func() {
+			for _, w := range l.workers {
+				w.end(budget)
+			}
+		})
 		var said []int
 		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
 			time.Sleep(wait)
-			running := make(chan struct{})
-			l.workers[id("a")], l.tried[id("a")] = &child{uid: vmUID, done: running}, time.Now()
-			for _, killed := range []bool{false, true} { // one pass finds it running, the next finds it ended
-				if killed {
-					close(running)
-				}
+			for range 2 { // one pass starts a worker, the next finds it running
 				if err := l.pass(); err != nil {
 					t.Fatal(err)
 				}
+			}
+			w := l.workers[id("a")]
+			if w == nil || w.exited() {
+				t.Fatal("no worker runs for a sandbox that names a proxy")
+			}
+			syscall.Kill(w.cmd.Process.Pid, syscall.SIGKILL) // as the kernel does, and it writes nothing
+			<-w.done
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
 			}
 			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
 		}
