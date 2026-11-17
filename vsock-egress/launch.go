@@ -109,11 +109,11 @@ func (n *node) sandbox(r record) (sandbox, error) {
 
 // child is a process started as a VM's uid.
 type child struct {
-	cmd      *exec.Cmd
-	uid, gid uint32
-	done     chan struct{} // closed when the process has ended
-	reaper   *child        // a worker's, from when its end began until that reaper has ended
-	unended  time.Time     // when a worker's end first failed, or that was last in the log
+	cmd     *exec.Cmd
+	uid     uint32
+	done    chan struct{} // closed when the process has ended
+	reaper  *child        // a worker's, from when its end began until that reaper has ended
+	unended time.Time     // when a worker's end first failed, or that was last in the log
 }
 
 func (c *child) exited() bool {
@@ -144,7 +144,7 @@ func start(uid, gid uint32, netns string, args ...string) (*child, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &child{cmd: cmd, uid: uid, gid: gid, done: make(chan struct{})}
+	c := &child{cmd: cmd, uid: uid, done: make(chan struct{})}
 	go func() {
 		cmd.Wait()
 		close(c.done)

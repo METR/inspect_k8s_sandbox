@@ -592,9 +592,10 @@ class Release:
                     # between the verdict and the sandbox the caller gets. One read
                     # per install, not per poll.
                     if self._is_ready(pods):
-                        confirmed = await asyncio.to_thread(self._list_release_pods)
-                        if self._is_ready(confirmed):
-                            return confirmed
+                        if not fresh:
+                            pods = await asyncio.to_thread(self._list_release_pods)
+                        if self._is_ready(pods):
+                            return pods
                 except Exception as e:
                     # A blip must not fail an install. Keep the error: a persistent
                     # one (a missing RBAC rule, say) is not a capacity problem and must
