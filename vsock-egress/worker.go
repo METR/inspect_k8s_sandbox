@@ -92,6 +92,10 @@ func work(args []string) error {
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
 	}
+	// Out of memory, the kernel then ends a worker and not the launcher, whose end would end every worker of the node.
+	if err := os.WriteFile("/proc/self/oom_score_adj", []byte("1000"), 0); err != nil {
+		return err
+	}
 	path := fmt.Sprintf("%s_%d", *vsock, streamPort) // where Firecracker takes the guest's connection to (host, streamPort)
 	os.Remove(path)                                  // an earlier worker's
 	l, err := net.Listen("unix", path)

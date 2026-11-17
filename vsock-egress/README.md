@@ -19,7 +19,8 @@ Each node needs:
   runs in that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
   downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
-  Past the limit the kubelet kills every process in the container unless its `singleProcessOOMKill` is on.
+  Past the limit the kubelet kills every process in the container unless its `singleProcessOOMKill` is on; with it
+  on the kernel ends a worker, each of which sets its `oom_score_adj` to 1000, and not the launcher.
 
 A pod's forwarder passes its startup probe once a worker on its node takes its streams, so where no launcher runs the
 pod does not start. A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on

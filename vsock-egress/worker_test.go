@@ -299,6 +299,30 @@ func TestWorkerRefusesToRunAsRoot(t *testing.T) {
 	}
 }
 
+func TestWorkerIsWhatTheKernelEndsFirstWhenMemoryIsOut(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a worker does not run as root")
+	}
+	vsock := filepath.Join(t.TempDir(), "vm.vsock")
+	worker := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", vsock, "-target", "proxy.ns.svc.cluster.local:3128")
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Wait()
+	defer worker.Process.Kill()
+	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) { // it serves once its socket is there
+		if _, err := os.Stat(fmt.Sprintf("%s_%d", vsock, streamPort)); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("the worker did not come to listen")
+		}
+	}
+	score, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", worker.Process.Pid))
+	if err != nil || strings.TrimSpace(string(score)) != "1000" {
+		t.Fatalf("its oom_score_adj is %q, %v: want 1000, or the kernel ends the launcher, and with it every worker", score, err)
+	}
+}
+
 func TestWorkerThatEndsWithAnErrorSaysSoInTheWordAnAlarmReads(t *testing.T) {
 	out, err := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", filepath.Join(t.TempDir(), "none", "vm.vsock")).CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "ns/pod: work_failed: ") {
