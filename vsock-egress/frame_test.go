@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -90,6 +93,35 @@ func TestStreamCutShortIsNotACleanEnd(t *testing.T) {
 	got, err := io.ReadAll(client)
 	if err == nil {
 		t.Fatalf("the client read %q and a clean end: a cut download would pass for a whole one", got)
+	}
+}
+
+func TestProxyThatResetsWhileAWriteToItWaitsIsNoCleanEnd(t *testing.T) {
+	for range 5 { // the kernel gives the reset to the waiting write or to the read: it was the write 19 times in 20
+		onNode, proxy := tcpPair(t)
+		guest, node := vsockPair(t)
+		go join(node, onNode, nil, 0)
+
+		go toFrames(guest, zeros{}, nil) // an upload the proxy never reads: its writes wait once the buffers are full
+		time.Sleep(200 * time.Millisecond)
+		proxy.SetLinger(0)
+		proxy.Close()
+		guest.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if got, err := io.ReadAll(guest); len(got) != 0 || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("the guest read %q, %v: want the stream cut short, with no frame", got, err)
+		}
+	}
+}
+
+func TestResetThatFollowsThePeersOwnEndLeavesItsReplyWhole(t *testing.T) {
+	onNode, proxy := tcpPair(t)
+	proxy.Write([]byte("reply"))
+	proxy.Close()
+	time.Sleep(50 * time.Millisecond)
+	onNode.Write([]byte("more of the upload")) // the proxy has closed, and resets
+	time.Sleep(50 * time.Millisecond)
+	if got, err := io.ReadAll(unreset{onNode, new(atomic.Bool)}); string(got) != "reply" || err != nil {
+		t.Fatalf("the node read %q, %v: want the reply and then a clean end", got, err)
 	}
 }
 
