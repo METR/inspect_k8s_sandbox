@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A pod annotated
+  `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
+  (a template there can name a Service of the release) gets an HTTP proxy at
+  `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
+  Sandbox with no network device. Set `HTTPS_PROXY` and `HTTP_PROXY` yourself, and the
+  new `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
+  seccomp profiles: see `vsock-egress/README.md`.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
