@@ -1667,7 +1667,7 @@ async def test_wait_until_ready_does_not_wait_for_a_pod_it_will_never_see(
 async def test_install_refuses_more_pods_than_the_client_will_name() -> None:
     release = Release(__file__, None, ValuesSource.none(), None)
     many = _helper(release, "  replicas: 100000\n")
-    other = many.replace("helper", "other")
+    other = many.replace("{name: helper}", "{name: other}")
     # Reading this count raises: past the bound the client must read no further.
     unread = _helper(release, "  replicas: unread\n")
     with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
