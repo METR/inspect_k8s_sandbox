@@ -1692,7 +1692,7 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 			held = uintptr(n)
 		}
 	}
-	size, _, _ := syscall.Syscall(syscall.SYS_FCNTL, held, syscall.F_GETPIPE_SZ, 0) // 64 KiB, or the 8 KiB a crowded machine's root gets
+	size, _, _ := syscall.Syscall(syscall.SYS_FCNTL, held, syscall.F_GETPIPE_SZ, 0) // 64 KiB, or the 8 KiB a user with too many pipes gets
 	write := func(n int, why string) {
 		let.Write([]byte(strconv.Itoa(n/4096) + "\n"))
 		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))

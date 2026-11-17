@@ -557,7 +557,7 @@ func (cl *call) run(req startRequest) error {
 	return nil
 }
 
-// leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node whose root has too many pipes.
+// leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node where execd's user has too many pipes.
 const leftOutput = 1 << 20
 
 // closeOnceUnheld closes the pipe when no process holds its other end. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
