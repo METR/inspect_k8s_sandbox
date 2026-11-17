@@ -3566,6 +3566,53 @@ async def test_writes_to_a_stdio_exec_go_a_message_at_a_time(
     assert all(later - earlier >= 0.001 for earlier, later in zip(at, at[1:]))
 
 
+async def test_a_turn_of_a_busy_loop_counts_toward_the_gap_between_messages(
+    clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: each gap's timer took a busy loop up to three turns a message."""
+    at: list[float] = []
+    slept: list[float] = []
+    sleep = execd.asyncio.sleep
+
+    async def timed(seconds: float) -> None:
+        slept.append(seconds)
+        await sleep(seconds)
+
+    monkeypatch.setattr(execd.asyncio, "sleep", timed)
+
+    class Records(anyio.abc.ByteStream):
+        """An exec's stdio that keeps when each message was written to it."""
+
+        async def send(self, item: bytes) -> None:
+            at.append(clock.now)
+
+        async def receive(self, max_bytes: int = 65536) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def send_eof(self) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            pass
+
+    async def busy() -> None:
+        while True:  # every turn of the loop lasts twice the gap
+            clock.now += 2 * execd.MESSAGE_GAP
+            await asyncio.sleep(0)
+
+    others = asyncio.create_task(busy())
+    stdio = execd._Stdio(Records())
+    stdio.write(bytes(3 * execd.MESSAGE_SIZE))
+    await until(lambda: len(at) == 3)
+    stdio.abort()
+    others.cancel()
+
+    # On the fake clock: the gap is kept, and no timer was slept to keep it.
+    assert all(later - earlier >= 0.001 for earlier, later in zip(at, at[1:]))
+    assert not any(slept)
+
+
 async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
     tls: tuple[ssl.SSLContext, str],
 ) -> None:

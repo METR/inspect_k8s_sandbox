@@ -266,7 +266,11 @@ class _Stdio:
                     del self._out[:MESSAGE_SIZE]
                     self._taken.set()
                     await self._stdio.send(data)
-                    await asyncio.sleep(MESSAGE_GAP)
+                    # A timer takes a busy loop up to three turns a message: yield once.
+                    due = time.monotonic() + MESSAGE_GAP
+                    await asyncio.sleep(0)
+                    if (left := due - time.monotonic()) > 0:
+                        await asyncio.sleep(left)
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             self.abort()  # the reader sees the end, as of a port reset under a write
 
