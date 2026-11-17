@@ -85,7 +85,7 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
-workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; true' | tr '\n' ' '; }
+workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; '"${1:-true}" | tr '\n' ' '; }
 worker=$(workers); uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
   && pass "one worker for the pod on its node: pid $worker, uid $uid, CapEff $caps" \
@@ -193,13 +193,14 @@ peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory w
 old=$(launcher)
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
-wait_for 120 sh -c "! kubectl --context '$CONTEXT' -n '$NS' get pod '$SANDBOX' > /dev/null 2>&1" || fail "the sandbox pod is still there"
-wait_for 120 sh -c "[ -n \"\$(kubectl --context '$CONTEXT' -n '$LNS' get pods -l '$selector' --field-selector 'spec.nodeName=$node,status.phase=Running' -o name | grep -v '$old')\" ]" \
+wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" || fail "the sandbox pod is still there"
+wait_for 120 sh -c "[ -n \"\$(kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pods -l '$selector' --field-selector 'spec.nodeName=$node,status.phase=Running' -o name | grep -v '$old')\" ]" \
   && pass "a new launcher runs on the node: $(launcher) (the old one was $old)" || fail "no new launcher on $node"
-gone() { [ -z "$(workers)" ] && ! peek "ls -d /vms/$vm" > /dev/null 2>&1; }
+# The node names each worker and the VM directory it finds, then says `looked`: an exec that fails, or is cut short, does not.
+left() { echo $(workers "[ -e /vms/$vm ] && echo /vms/$vm; [ -e /vms/. ] && echo looked"); }
+gone() { found=$(left); [ "$found" = looked ]; }
 wait_for 60 gone || true
-[ -z "$(workers)" ] && pass "no worker of the pod is left on the node" || fail "a worker of the pod is left: pid $(workers)"
-peek "ls -d /vms/$vm" > /dev/null 2>&1 && fail "its VM directory is still there: $vm" || pass "its VM directory is gone: $vm (VM directories left on the node: $(peek 'ls /vms | wc -l'))"
+[ "$found" = looked ] && pass "no worker of the pod and no VM directory $vm is left on the node (VM directories there: $(peek 'ls /vms | wc -l'))" || fail "left on the node, or the node did not answer: '$found'"
 
 echo
 [ "$failed" = 0 ] && { echo "GATE PASSED $(date -u +%FT%TZ) on $node"; exit 0; }
