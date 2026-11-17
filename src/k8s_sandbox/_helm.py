@@ -608,13 +608,11 @@ class Release:
                     await self._raise_not_ready_error(
                         saw_a_pod, poll_error, missing, absent
                     )
-                # A Ready pod waits out no 2 s poll, and no wake puts the poll off.
-                if not fresh:
-                    poll_at = time.monotonic() + _READINESS_POLL_INTERVAL
+                # A pod that turns Ready is not held for the rest of a 2 s poll.
                 # Not wait_for or a cancel scope: each can swallow a cancel as it ends.
                 wake = asyncio.ensure_future(woken.wait())
                 try:
-                    await asyncio.wait({wake}, timeout=poll_at - time.monotonic())
+                    await asyncio.wait({wake}, timeout=_READINESS_POLL_INTERVAL)
                 finally:
                     wake.cancel()
                 fresh = woken.is_set()
