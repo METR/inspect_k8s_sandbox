@@ -16,8 +16,9 @@ has not completed in five minutes.
 Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
-  containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)`, for the pod's
-  forwarder. Any pod that names it can open the vsock, so admit it for that container alone.
+  containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)` and less the one
+  `ioctl` that `/dev/nsm`, the Nitro Secure Module, takes, for the pod's forwarder. Any pod that names it can open the
+  vsock, so admit it for that container alone.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and

@@ -345,8 +345,9 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 		var profile struct {
 			DefaultAction string `json:"defaultAction"`
 			Syscalls      []struct {
-				Names  []string `json:"names"`
-				Action string   `json:"action"`
+				Names  []string          `json:"names"`
+				Action string            `json:"action"`
+				Args   []json.RawMessage `json:"args"`
 			} `json:"syscalls"`
 		}
 		b, err := os.ReadFile(file)
@@ -364,6 +365,10 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 			for _, name := range rule.Names {
 				if rule.Action == "SCMP_ACT_ALLOW" && slices.Contains(refused, name) {
 					t.Errorf("%s allows %s", file, name)
+				}
+				// The forwarder's rules test the command, to refuse the Nitro Secure Module's: gate.sh asks a node what they refuse.
+				if name == "ioctl" && len(rule.Args) == 0 && !strings.HasSuffix(file, "-launcher.json") {
+					t.Errorf("%s allows every ioctl", file)
 				}
 			}
 		}

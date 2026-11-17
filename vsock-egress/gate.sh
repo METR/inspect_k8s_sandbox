@@ -181,6 +181,21 @@ case "$vprobe" in
   *) fail "the guest carries ia32_emulation=0 but a 32-bit program ran: $vprobe" ;;
 esac
 
+say "5d. the forwarder's profile refuses the ioctl of the Nitro Secure Module"
+nsm=$(k -n "$NS" exec "$SANDBOX" -c gate-probe -- python3 -c '
+import ctypes, errno, os, platform
+libc = ctypes.CDLL(None, use_errno=True)
+fd = os.open("/dev/null", os.O_RDONLY)
+said = []
+for command in 0xC0200A00, 1 << 32 | 0xC0200A00, 0xC0200A01:  # the module command, the same past the 32 bits the kernel reads, and another
+    ctypes.set_errno(0)
+    libc.syscall(16 if platform.machine() == "x86_64" else 29, fd, ctypes.c_ulong(command), 0)
+    said.append(errno.errorcode.get(ctypes.get_errno(), "TAKEN"))
+print(*said)
+' 2>&1 | tail -1)
+[ "$nsm" = "EPERM EPERM ENOTTY" ] && pass "under the node's profiles/vsock-egress.json the module's ioctl is refused and another reaches the driver: $nsm" \
+  || fail "under the forwarder's profile ioctl 0xC0200A00, the same with bit 32 set, and 0xC0200A01 on /dev/null gave '$nsm', not 'EPERM EPERM ENOTTY'"
+
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 contract=$(k -n "$LNS" exec "$(launcher)" -c launcher -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
