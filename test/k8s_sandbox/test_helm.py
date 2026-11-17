@@ -1355,6 +1355,8 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
         pytest.param("10", list(range(2, 12)), id="decimal"),
         # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
         pytest.param("010", list(range(2, 10)), id="leading-zero"),
+        # Helm drops the `_` and reads the `0b` as binary.
+        pytest.param("0b1_010", list(range(2, 12)), id="binary-underscore"),
     ],
 )
 def test_a_stateful_sets_counts_read_as_numbers(

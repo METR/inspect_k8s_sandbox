@@ -868,50 +868,47 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
     )
 
 
-def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
-    """A core schema integer; text past 64 bits, where Helm may write a string bare."""
-    # Helm reads a leading zero as octal, so that is the number Kubernetes has.
-    leading_zero = re.fullmatch(r"[-+]?0[0-7]+", node.value)
-    base = 8 if leading_zero else {"0o": 8, "0x": 16}.get(node.value[:2], 10)
-    try:
-        number = int(node.value, base)
-    except ValueError:  # more digits than Python reads
-        return node.value
-    return number if -(2**63) <= number < 2**64 else node.value
+# The shape go-yaml takes for a float, once it has dropped every `_`.
+_GO_FLOAT = re.compile(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?")
 
 
-def _core_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float | str:
-    """A core schema float; text where it overflows, which Helm reads as a string."""
-    number = loader.construct_yaml_float(node)
-    overflows = math.isinf(number) and "inf" not in node.value.lower()
-    return node.value if overflows else number
+def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float | str:
+    """A number as Helm's reader, go-yaml, takes it; the text where that reads none."""
+    plain = node.value.replace("_", "")
+    try:  # Go's ParseInt with base 0, where a leading zero is octal
+        number = int(re.sub(r"^([-+]?)0(?=[0-7])", r"\g<1>0o", plain), 0)
+    except ValueError:  # no integer, or more digits than Python reads
+        number = 2**64
+    # A sign leaves 63 bits: past them Go reads an integer only as unsigned.
+    if -(2**63) <= number < (2**63 if plain[0] in "+-" else 2**64):
+        return number
+    value = float(plain) if _GO_FLOAT.fullmatch(plain) else math.inf
+    return node.value if math.isinf(value) else value
 
 
-# YAML 1.2's core schema, in its order, and `<<`, so that a `<<` key still merges.
-_CORE_SCHEMA = {
+# YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
+_SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
     "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
-    int: r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
-    float: r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
-    r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
+    "tag:yaml.org,2002:float": r"[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
+    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*|\.[0-9]+([eE][-+]?[0-9]+)?",
     "tag:yaml.org,2002:merge": r"<<",
 }
 
 
 class _ManifestLoader(yaml.SafeLoader):
-    """YAML 1.2's types for untagged scalars: PyYAML's 1.1 ones fail on a bare `=`."""
+    """Helm's numbers, YAML 1.2's null and booleans: PyYAML's 1.1 types fail on `=`."""
 
     yaml_implicit_resolvers = {
         None: [
             (tag, re.compile(f"(?:{pattern})$"))
-            for tag, pattern in _CORE_SCHEMA.items()
+            for tag, pattern in _SCALAR_TAGS.items()
         ]
     }
-    # An untagged number's tag is its Python type: no manifest can write that as a tag.
+    # An untagged number's tag is its constructor: no manifest can write that as a tag.
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        int: _core_int,
-        float: _core_float,
+        _helm_number: _helm_number,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
