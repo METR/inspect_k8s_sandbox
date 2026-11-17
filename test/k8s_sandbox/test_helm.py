@@ -40,7 +40,6 @@ from k8s_sandbox._helm import (
     StaticValuesSource,
     ValuesSource,
     _declared_object_names,
-    _get_expected_services,
     _get_helm_major_version,
     _get_timeout,
     _get_uninstall_timeout,
@@ -1353,8 +1352,32 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
     assert names == {"cm", "default", "svc"}
 
 
+@pytest.mark.parametrize(
+    ("replicas", "ordinals"),
+    [
+        pytest.param("10", list(range(2, 12)), id="decimal"),
+        # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
+        pytest.param("010", list(range(2, 10)), id="leading-zero"),
+        # Helm drops every `_` and reads the `0b` as binary.
+        pytest.param("0b1__010", list(range(2, 12)), id="binary-underscores"),
+    ],
+)
+def test_a_stateful_sets_counts_read_as_numbers(
+    replicas: str, ordinals: list[int]
+) -> None:
+    # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
+    stdout = _manifest(
+        f"kind: StatefulSet\nspec: {{replicas: {replicas}, ordinals: {{start: 2}}}}\n"
+    )
+
+    spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
+
+    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == ordinals
+
+
 def _services(stdout: str) -> frozenset[str]:
-    return _get_expected_services(_rendered_docs(stdout, "abcdefgh"), "abcdefgh")
+    docs = _helm._rendered_docs(stdout, "abcdefgh")
+    return _helm._get_expected_services(docs, "abcdefgh")
 
 
 @pytest.mark.parametrize(
@@ -1405,6 +1428,42 @@ def _services(stdout: str) -> frozenset[str]:
             ),
             {"a", "b"},
             id="list-wrapping-pods",
+        ),
+        # Helm writes each of these strings bare, and PyYAML's own loader builds none.
+        pytest.param(
+            _manifest(
+                _STATEFUL_SET
+                + "    spec: {containers: [{args: [=, <<, 0000-00-00, 0x_, "
+                + "9" * 4301
+                + "]}]}\n"
+            ),
+            {"default"},
+            id="strings-pyyaml-types",
+        ),
+        # Helm reads a hex past 64 bits, or a number past a float, as a string: a name.
+        pytest.param(
+            _manifest(_stateful_set("1e400"), _stateful_set(hex(2**64))),
+            {"1e400", hex(2**64)},
+            id="numbers-too-large",
+        ),
+        # A bare null is no name; quoted, `null` is a name like any other.
+        pytest.param(
+            _manifest(_stateful_set("null"), _stateful_set("nullable")),
+            {"nullable"},
+            id="null-label",
+        ),
+        pytest.param(
+            _manifest(_stateful_set("'null'")), {"null"}, id="quoted-null-label"
+        ),
+        # Helm reads a scalar tagged `!` as text.
+        pytest.param(_manifest(_stateful_set("! 012")), {"012"}, id="bang-label"),
+        # A custom chart may merge its pod's labels in.
+        pytest.param(
+            _manifest(
+                f"kind: Pod\nmetadata: {{labels: {{<<: {{{_SERVICE_LABEL}: a}}}}}}"
+            ),
+            {"a"},
+            id="merged-labels",
         ),
     ],
 )

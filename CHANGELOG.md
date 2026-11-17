@@ -25,6 +25,8 @@
 - Wait for the Pods of every StatefulSet of the release, in its namespace, whose Pod
   template carries the release's `app.kubernetes.io/instance` label, including those
   from `additionalResources`, before handing over a sandbox.
+- Fix a sandbox failing to start when a value such as a `command` argument is exactly
+  `=` or `<<`, or a date or time that does not exist such as `2023-02-29`.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
   a number, no longer fails the install, and a label key such as `no` or `on` is no
   longer applied as `false` or `true`.
