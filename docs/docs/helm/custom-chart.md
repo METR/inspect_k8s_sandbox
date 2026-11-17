@@ -33,7 +33,7 @@ kind: Pod
 metadata:
   name: my-custom-chart-pod-{{ .Release.Name }}
   labels:
-    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/name: {{ .Chart.Name | quote }}
     app.kubernetes.io/instance: {{ .Release.Name | quote }}
     inspect/service: default
   annotations:
