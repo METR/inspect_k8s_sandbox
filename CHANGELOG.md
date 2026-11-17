@@ -10,9 +10,7 @@
   with the task's name, ...) holds DEL, a C1 control character, U+FFFE or U+FFFF, or one
   of the block's keys is over 1,022 characters as JSON. The block was silently left out,
   or a U+0085 in it turned into a space. A quoted `"<<"` key in such a value fails the
-  install too: it was merged into the mapping that held it. So do most strings in such a
-  value that hold U+2028 or U+2029: the rest of the string could become fields of the
-  manifest.
+  install too. So do most strings in such a value that hold U+2028 or U+2029.
 - A newline in a service's `image`, `runtimeClassName`, `workingDir`, `imagePullPolicy`,
   env name or port `protocol`, in an init container's `name`, `image`, `workingDir`,
   `imagePullPolicy` or env name, or in an `allowDomainsPorts` entry's `protocol`, no
