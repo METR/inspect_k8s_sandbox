@@ -1548,7 +1548,7 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
 
 
 def _helper(release: Release, spec: str = "") -> str:
-    labels = f"{{app.kubernetes.io/instance: {release.release_name}}}"
+    labels = f'{{app.kubernetes.io/instance: "{release.release_name}"}}'
     return (
         "kind: StatefulSet\nmetadata: {name: helper}\n"
         f"spec:\n{spec}  template: {{metadata: {{labels: {labels}}}}}\n"
