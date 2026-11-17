@@ -1125,7 +1125,7 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	run(28, "asked")
 }
 
-// nofile sets this process's open-file limit, and not with syscall.Setrlimit: after it, Go starts a command with this limit, not its own first one.
+// nofile sets this process's open-file limit with a raw prlimit: where Go raised its soft limit as it started, syscall.Setrlimit makes it forget the one it started with, so once a test had put the limit back, later commands would start with the raised one.
 func nofile(to syscall.Rlimit) {
 	syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
 }
