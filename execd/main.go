@@ -104,6 +104,11 @@ func become(cwd string, ids, argv []string) {
 		for i, kv := range raw {
 			env[i] = string(kv)
 		}
+		var files syscall.Rlimit
+		if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) == nil && files.Max >= 1024 { // as runuser leaves it (util-linux 2.38 on): a soft limit of FD_SETSIZE
+			files.Cur = 1024
+			syscall.Setrlimit(syscall.RLIMIT_NOFILE, &files)
+		}
 		if err = syscall.Exec(argv[0], argv, env); errors.Is(err, syscall.ENOENT) {
 			code = 127
 		}

@@ -1125,6 +1125,44 @@ func TestACommandRunAsAnotherUserHasTheirIdentityAndItsOwnEnvironment(t *testing
 	run(28, "asked")
 }
 
+// nofile sets this process's open-file limit, and not with syscall.Setrlimit: after it, Go starts a command with this limit, not its own first one.
+func nofile(to syscall.Rlimit) {
+	syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
+}
+
+func TestACommandForAnotherUserGetsRunusersOpenFileLimit(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	var was syscall.Rlimit
+	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &was)
+	if was.Max < 2048 {
+		t.Skip("needs a hard open-file limit of 2048")
+	}
+	nofile(syscall.Rlimit{Cur: 2048, Max: was.Max}) // what a command inherits here, whatever the machine's own: above runuser's 1024, as a container's is
+	t.Cleanup(func() { nofile(was) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	limits := map[string]string{}
+	for id, who := range []string{"65534", ""} {
+		req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "ulimit -Sn; ulimit -Hn"}, Env: map[string]string{}, User: who, Tag: "f"})
+		s.dispatch(c, frame{kind: fStart, id: uint64(60 + id), payload: req})
+		for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+			if f.kind == fStdout {
+				limits[who] += string(f.payload)
+			}
+		}
+	}
+
+	// Over Kubernetes exec runuser resets another user's soft limit and no other; execd's own user keeps the container's.
+	hard := strconv.FormatUint(was.Max, 10)
+	if limits["65534"] != "1024\n"+hard+"\n" || limits[""] != "2048\n"+hard+"\n" {
+		t.Fatalf("soft and hard limits: another user's command %q, execd's own user's %q", limits["65534"], limits[""])
+	}
+}
+
 func TestACommandForAnotherUserDoesNotRunWithoutItsEnvironment(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root runs a command as another user")
@@ -1359,9 +1397,6 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 	// Fewer descriptors than it has processes to kill: a kill that keeps one for each runs out.
 	var limit syscall.Rlimit
 	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit)
-	nofile := func(to syscall.Rlimit) { // not syscall.Setrlimit: after it, Go starts a command with this limit, not its own first one
-		syscall.RawSyscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(&to)), 0, 0, 0)
-	}
 	t.Cleanup(func() { nofile(limit) })
 	open, _ := os.ReadDir("/proc/self/fd")
 	nofile(syscall.Rlimit{Cur: uint64(len(open)) + 32, Max: limit.Max})
