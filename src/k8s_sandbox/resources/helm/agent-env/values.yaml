@@ -204,6 +204,9 @@ volumes: {}
 # passed through the Helm template engine. String values are passed through the
 # template engine then converted to YAML.
 additionalResources: []
+# -- Names of Services that `additionalResources` adds as `<fullname>-<name>`: each
+# resolves from within the agent environment as `$AGENT_ENV-<name>`.
+additionalResourceDnsRecords: []
 # -- A dict of annotations to apply to resources within the agent environment.
 annotations: {}
   # inspectTaskName: "task-name"

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
+  `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
+  environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
+- Wait for the Pods of every StatefulSet in the release's namespace whose Pod template
+  carries the release's `app.kubernetes.io/instance` label, including those from
+  `additionalResources`, before handing over a sandbox.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
   a number, no longer fails the install, and a label key such as `no` or `on` is no
   longer applied as `false` or `true`.

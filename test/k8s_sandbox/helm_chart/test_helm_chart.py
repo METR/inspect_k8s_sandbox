@@ -815,6 +815,36 @@ def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
     assert pod_spec["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": names}]
 
 
+def test_a_service_from_additional_resources_resolves_by_its_own_name(
+    chart_dir: pathlib.Path,
+) -> None:
+    documents = _run_helm_template(
+        chart_dir, set_str="additionalResourceDnsRecords={proxy}"
+    )
+
+    corefile = next(
+        cm["data"]["Corefile"]
+        for cm in _get_documents(documents, "ConfigMap")
+        if cm["metadata"]["name"] == "agent-env-my-release-coredns-configmap"
+    )
+    # An exact rule: CoreDNS answers under the name asked, without the namespace.
+    assert (
+        "rewrite name exact agent-env-my-release-proxy "
+        "agent-env-my-release-proxy.default.svc.cluster.local\n"
+    ) in corefile
+
+
+def test_a_dns_record_that_would_add_to_the_corefile_is_refused(
+    chart_dir: pathlib.Path,
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        _run_helm_template(
+            chart_dir, set_str="additionalResourceDnsRecords={proxy x.example}"
+        )
+
+    assert "additionalResourceDnsRecords" in e.value.stderr
+
+
 def test_coredns_upstream_defaults_to_the_kubelet_resolv_conf(chart_dir: Path) -> None:
     documents = _run_helm_template(chart_dir)
 

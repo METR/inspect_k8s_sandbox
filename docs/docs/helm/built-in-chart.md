@@ -584,6 +584,10 @@ additionalResources:
       password: my-password
 ```
 
+A Service named `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the
+agent environment as `$AGENT_ENV-<name>` once `additionalResourceDnsRecords` lists
+`<name>`.
+
 For more complex resources which are not valid standalone YAML, you can use a string
 block. The following example creates a Cilium Network Policy which allows ingress from
 all entities to the default service on port 2222.

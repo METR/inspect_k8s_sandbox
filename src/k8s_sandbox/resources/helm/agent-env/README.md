@@ -6,6 +6,7 @@
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| additionalResourceDnsRecords | list | `[]` | Names of Services that `additionalResources` adds as `<fullname>-<name>`: each resolves from within the agent environment as `$AGENT_ENV-<name>`. |
 | additionalResources | list | `[]` | A list of additional resources to deploy within the agent environment. They're passed through the Helm template engine. String values are passed through the template engine then converted to YAML. |
 | allowCIDR | list | Empty list (no additional CIDR ranges compared to default policies) | A list of CIDR ranges (e.g. 1.1.1.1/32) that pods within the agent environment are allowed to access. |
 | allowDomains | list | Empty list (no internet access) | Domains the agent environment may reach. Egress is restricted to ports 80/443 and the request identity must match an entry (TLS SNI on 443, HTTP Host on 80). Use allowDomainsPorts to open other ports. Wildcard entries require Cilium >= 1.18. |
