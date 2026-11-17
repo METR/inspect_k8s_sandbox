@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, Iterator, cast
 
-from kubernetes import client  # type: ignore
+from kubernetes import client, watch  # type: ignore
 from urllib3 import HTTPResponse
 
 
@@ -129,6 +129,23 @@ def list_pods(
     )
     body = json.loads(response.data)
     return [_parse_pod(item) for item in body.get("items", [])]
+
+
+def watch_pods(
+    api: client.CoreV1Api, namespace: str, *, label_selector: str, timeout_seconds: int
+) -> Iterator[PodSnapshot]:
+    """Each pod as it is and then as it changes, until the server ends the watch."""
+    for event in watch.Watch().stream(
+        api.list_namespaced_pod,
+        namespace,
+        label_selector=label_selector,
+        resource_version="0",
+        timeout_seconds=timeout_seconds,
+        _request_timeout=(5, timeout_seconds + 30),
+        deserialize=False,  # as list_pods does: see the module's docstring
+    ):
+        if event["type"] in ("ADDED", "MODIFIED"):
+            yield _parse_pod(event["object"])
 
 
 def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:

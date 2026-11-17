@@ -9,6 +9,7 @@ from k8s_sandbox._pod.snapshot import (
     _parse_pod,
     list_pods,
     read_pod,
+    watch_pods,
 )
 
 
@@ -188,6 +189,26 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     pod = list_pods(api, "ns", label_selector="app=x")[0]
 
     assert (pod.ready, pod.phase) == expected
+
+
+def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
+    api = MagicMock()
+    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    events = [
+        {"type": "ADDED", "object": _pod_body(uid="p")},
+        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
+        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
+    ]
+    stream = "".join(json.dumps(event) + "\n" for event in events).encode()
+    # The network ends a chunk where it likes, not where an event ends.
+    api.list_namespaced_pod.return_value.stream.return_value = [
+        stream[:90],
+        stream[90:],
+    ]
+
+    pods = list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
+
+    assert [pod.ready for pod in pods] == [False, True]
 
 
 @pytest.mark.parametrize(
