@@ -585,6 +585,8 @@ def test_names_render_as_strings(chart_dir: Path, networks: str) -> None:
         chart_dir,
         set_str="services.no.image=img,services.no.dnsRecord=true,labels.no=x,"
         "services.123.image=img,services.123.networkIsolated=true,"
+        "egressForwarderImage=img,services.no.podAnnotations."
+        "inspect-k8s-sandbox/egress-proxy=proxy.123.svc.cluster.local:3128,"
         "serviceAccountCreate=true,serviceAccountName=sa" + networks,
         set_string="global.nameOverride=456",
         release="23456789",

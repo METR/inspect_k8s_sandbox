@@ -308,9 +308,9 @@ spec:
     DNS record and the proxy's port on the pods of this sandbox.
   endpointSelector:
     matchLabels:
-      io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
-      inspect/service: {{ $svcName }}
+      inspect/service: {{ $svcName | quote }}
   egress:
     - toEndpoints:
       - matchLabels:
@@ -328,7 +328,7 @@ spec:
               - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
     - toEndpoints:
       - matchLabels:
-          io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
           {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
       toPorts:
         - ports:
