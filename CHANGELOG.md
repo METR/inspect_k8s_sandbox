@@ -8,14 +8,17 @@
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at
   `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
-  Sandbox with no network device. Set `https_proxy` and `http_proxy` yourself (curl reads
-  `http_proxy` in lower case only), their upper-case forms, `no_proxy` for a server on the
-  sandbox's own loopback, and the new `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
+  Sandbox with no network device. Such a pod gets none of the release's other egress
+  grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
+  sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
+  yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
+  `no_proxy` for a server on the sandbox's own loopback, and the new
+  `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
   seccomp profiles: see `vsock-egress/README.md`.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
-- Wait for the Pods of every StatefulSet in the release's namespace whose Pod template
+- Wait for the Pods of every StatefulSet of the release whose Pod template
   carries the release's `app.kubernetes.io/instance` label, including those from
   `additionalResources`, before handing over a sandbox.
 - A service or namespace named `no` or `123`, or a generated release name that reads as

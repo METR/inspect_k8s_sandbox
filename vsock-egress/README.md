@@ -10,7 +10,7 @@ Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
   containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)`, for the pod's
-  forwarder.
+  forwarder. Any pod that names it can open the vsock, so admit it for that container alone.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
@@ -19,6 +19,7 @@ Each node needs:
   runs in that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
   downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
+  Past the limit the kubelet kills every process in the container unless its `singleProcessOOMKill` is on.
 
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
