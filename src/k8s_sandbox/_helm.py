@@ -1092,13 +1092,18 @@ def _stateful_set_pods(
 ) -> Iterator[str]:
     """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
-        if _dig(doc, "kind") == "List":
-            yield from _stateful_set_pods(
-                _dig(doc, "items") or [], release_name, namespace
-            )
+        kind = _dig(doc, "kind")
+        if isinstance(kind, str) and kind.endswith("List"):
+            # Helm installs an item that names no kind as the kind its list is of.
+            items = [
+                item | {"kind": item.get("kind") or kind.removesuffix("List")}
+                for item in _dig(doc, "items") or []
+                if isinstance(item, dict)
+            ]
+            yield from _stateful_set_pods(items, release_name, namespace)
         # The poll lists by this label in this namespace: no other pod is ever seen.
         elif (
-            _dig(doc, "kind") == "StatefulSet"
+            kind == "StatefulSet"
             and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
             == release_name
             and (_dig(doc, "metadata", "namespace") or namespace) == namespace

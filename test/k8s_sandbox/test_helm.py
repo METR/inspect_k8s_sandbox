@@ -1560,7 +1560,13 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
 
 
 def _in_a_list(manifest: str) -> str:
-    return "kind: List\nitems:\n  - " + manifest.replace("\n", "\n    ")
+    items = manifest.replace("\n", "\n    ")
+    return "apiVersion: v1\nkind: List\nitems:\n  - " + items
+
+
+def _in_a_typed_list(manifest: str) -> str:
+    items = _in_a_list(manifest.removeprefix("kind: StatefulSet\n"))
+    return items.replace("v1\nkind: List", "apps/v1\nkind: StatefulSetList")
 
 
 @pytest.mark.parametrize(
@@ -1568,6 +1574,8 @@ def _in_a_list(manifest: str) -> str:
     [
         pytest.param("", [], [_helper_pod()], str, id="a-pod-that-is-no-sandbox"),
         pytest.param("", [], [_helper_pod()], _in_a_list, id="in-a-list"),
+        # Helm installs the items of a StatefulSetList, which name no kind themselves.
+        pytest.param("", [], [_helper_pod()], _in_a_typed_list, id="in-a-typed-list"),
         # Helm installs a manifest whose namespace is empty into the release's.
         pytest.param(
             "",
