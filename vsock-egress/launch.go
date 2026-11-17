@@ -364,7 +364,7 @@ func (l *launcher) pass() error {
 		}
 		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)
 		l.workers[id] = w
-		held[sb.uid] = true // or a second sandbox of this uid, were there one, would get a worker in the same pass
+		held[sb.uid] = true // wanted counts a uid's VMs, then reads each again: one whose directory came between is a second of this uid
 	}
 	return nil
 }
