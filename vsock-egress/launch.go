@@ -355,6 +355,9 @@ func (l *launcher) pass() error {
 		if l.workers[id] != nil || held[sb.uid] || time.Since(l.tried[id]) < l.retry { // one that cannot start, or dies at once, is not started twice a second
 			continue
 		}
+		if _, again := l.tried[id]; !again { // what kept it from its first start is over: a worker that ends gets a minute of its own
+			delete(l.reported, id)
+		}
 		l.tried[id] = time.Now()
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
 			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
