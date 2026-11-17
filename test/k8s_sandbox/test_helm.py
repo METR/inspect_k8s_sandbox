@@ -1431,8 +1431,8 @@ def _services(stdout: str) -> frozenset[str]:
         ),
         # A bare null is no name; quoted, `null` is a name like any other.
         pytest.param(
-            _manifest(_stateful_set("null"), _STATEFUL_SET),
-            {"default"},
+            _manifest(_stateful_set("null"), _stateful_set("nullable")),
+            {"nullable"},
             id="null-label",
         ),
         pytest.param(

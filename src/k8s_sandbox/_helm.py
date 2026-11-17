@@ -868,17 +868,6 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
     )
 
 
-# YAML 1.2's core schema, in its order, and `<<`, so that a `<<` key still merges.
-_CORE_SCHEMA = {
-    "null": r"null|Null|NULL|~|",
-    "bool": r"true|True|TRUE|false|False|FALSE",
-    "untagged-int": r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
-    "untagged-float": r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
-    r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
-    "merge": r"<<",
-}
-
-
 def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
     """A core schema integer; text past 64 bits, where Helm may write a string bare."""
     try:
@@ -895,19 +884,31 @@ def _core_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float | str:
     return node.value if overflows else number
 
 
+# YAML 1.2's core schema, in its order, and `<<`, so that a `<<` key still merges.
+_CORE_SCHEMA = {
+    "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
+    "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
+    int: r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
+    float: r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
+    "tag:yaml.org,2002:merge": r"<<",
+}
+
+
 class _ManifestLoader(yaml.SafeLoader):
     """YAML 1.2's types for untagged scalars: PyYAML's 1.1 ones fail on a bare `=`."""
 
     yaml_implicit_resolvers = {
         None: [
-            (f"tag:yaml.org,2002:{tag}", re.compile(f"(?:{pattern})$"))
+            (tag, re.compile(f"(?:{pattern})$"))
             for tag, pattern in _CORE_SCHEMA.items()
         ]
     }
+    # An untagged number's tag is its Python type: no manifest can write that as a tag.
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        "tag:yaml.org,2002:untagged-int": _core_int,
-        "tag:yaml.org,2002:untagged-float": _core_float,
+        int: _core_int,
+        float: _core_float,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
