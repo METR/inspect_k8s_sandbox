@@ -8,7 +8,10 @@
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at
   `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
-  Sandbox with no network device. Such a pod gets none of the release's other egress
+  Sandbox with no network device. The Service's pods must carry the release's
+  `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that
+  port; those that `additionalResources` adds need policies of their own (see
+  `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
   grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
   sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
   yourself (curl reads `http_proxy` in lower case only), their upper-case forms,

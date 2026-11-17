@@ -6,6 +6,12 @@ A pod annotated `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cl
 `egressForwarderImage` value is an image built from this directory, gets a proxy at `127.0.0.1:3128` that reaches only
 that Service of its own namespace. Its forwarder has no resource requests, so the pod is not of the Guaranteed QoS class.
 
+The pod's network policy admits that port on the release's own pods alone, so the Service's pods must carry the
+release's `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that port. Pods that
+`additionalResources` adds with those labels come under the release's other policies too: they need a policy that admits
+the pod on that port, and reach only what the release's egress grants and their own policies allow. For any other
+Service, add a policy that lets the pod reach it.
+
 Each node needs:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
