@@ -32,8 +32,8 @@ type worker struct {
 	fetched time.Time
 	now     func() time.Time
 
-	addr       atomic.Pointer[string] // the target's address, once looked up
-	asked      atomic.Int64           // when that was, in nanoseconds since 1970
+	addr       atomic.Pointer[string]    // the target's address, once looked up
+	asked      atomic.Pointer[time.Time] // when that was: a Time, whose monotonic reading no step of the node's clock moves
 	unresolved atomic.Pointer[failedLookup]
 	lookup     func(ctx context.Context, network, host string) ([]netip.Addr, error)
 
@@ -49,10 +49,10 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
-// failedLookup is the target's last lookup that failed, and when in nanoseconds since 1970: for a second after, streams fail as it did.
+// failedLookup is the target's last lookup that failed, and when: for a second after, streams fail as it did.
 type failedLookup struct {
 	err error
-	at  int64
+	at  time.Time
 }
 
 // endedWait is how long a stream whose dial failed is given to show that the guest had already ended it.
@@ -178,24 +178,25 @@ func (w *worker) dial() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		if last := w.unresolved.Load(); last != nil && w.now().UnixNano()-last.at < int64(time.Second) {
+		if last := w.unresolved.Load(); last != nil && w.now().Sub(last.at) < time.Second {
 			return nil, last.err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialWait)
 		ips, err := w.lookup(ctx, "ip4", host)
 		cancel()
 		if err != nil {
-			w.unresolved.Store(&failedLookup{err, w.now().UnixNano()})
+			w.unresolved.Store(&failedLookup{err, w.now()})
 			return nil, err
 		}
 		found := net.JoinHostPort(ips[0].String(), port)
 		addr = &found
-		w.asked.Store(w.now().UnixNano())
+		asked := w.now()
+		w.asked.Store(&asked)
 		w.addr.CompareAndSwap(nil, addr) // an answer that came meanwhile is the newer one
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
-		if w.now().UnixNano()-w.asked.Load() >= int64(time.Second) {
+		if asked := w.asked.Load(); asked == nil || w.now().Sub(*asked) >= time.Second {
 			w.addr.CompareAndSwap(addr, nil)
 		}
 		return nil, err
