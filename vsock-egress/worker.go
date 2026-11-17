@@ -33,6 +33,7 @@ type worker struct {
 	now     func() time.Time
 
 	addr   atomic.Pointer[string] // the target's address, once looked up
+	asked  atomic.Int64           // when that was, in nanoseconds since 1970
 	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
 
 	accepts *pacer       // new streams a second
@@ -150,7 +151,7 @@ func (w *worker) stream(c net.Conn) {
 	join(c, t.(*net.TCPConn), w.pace)
 }
 
-// dial connects to the pod's proxy, whose address it keeps until a dial fails: a Service keeps its address, a pod that is replaced does not.
+// dial connects to the pod's proxy. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and a proxy that is down must not cost a lookup a stream.
 func (w *worker) dial() (net.Conn, error) {
 	addr := w.addr.Load()
 	if addr == nil { // under no lock: a lookup that hangs holds up its own stream alone
@@ -166,11 +167,14 @@ func (w *worker) dial() (net.Conn, error) {
 		}
 		found := net.JoinHostPort(ips[0].String(), port)
 		addr = &found
+		w.asked.Store(w.now().UnixNano())
 		w.addr.CompareAndSwap(nil, addr) // an answer that came meanwhile is the newer one
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
-		w.addr.CompareAndSwap(addr, nil)
+		if w.now().UnixNano()-w.asked.Load() >= int64(time.Second) {
+			w.addr.CompareAndSwap(addr, nil)
+		}
 		return nil, err
 	}
 	c.(*net.TCPConn).SetReadBuffer(proxyBuffer)

@@ -413,6 +413,8 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 	// The proxy's pod was replaced: its name first gives an address where nothing listens any more.
 	answers := []string{"127.0.0.2", "127.0.0.1"}
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+	var clock atomic.Int64
+	w.now = func() time.Time { return time.Unix(clock.Add(1), 0) } // a second on for each reading: the dial fails a second after the lookup
 	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
 		answer := netip.MustParseAddr(answers[0])
 		answers = answers[min(1, len(answers)-1):]
@@ -442,6 +444,42 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 		t.Fatal("the worker kept the address where nothing listens")
 	case <-time.After(budget):
 		t.Fatal("the second stream was neither joined nor closed")
+	}
+}
+
+func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
+	var lookups, clock atomic.Int64
+	key := newKey()
+	target, _ := proxy(t)
+	_, port, _ := net.SplitHostPort(target)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		return []netip.Addr{netip.MustParseAddr("127.0.0.2")}, nil // where nothing listens
+	}
+	dial := serve(t, w)
+	stream := func() {
+		c := dial()
+		c.Write(key)
+		select {
+		case <-closed(c):
+		case <-time.After(budget):
+			t.Fatal("a stream was not closed while its proxy was down")
+		}
+	}
+
+	for range 5 {
+		stream()
+	}
+	if n := lookups.Load(); n != 1 {
+		t.Fatalf("5 streams within a second looked the proxy up %d times: want once", n)
+	}
+	clock.Add(1)
+	stream() // its failed dial gives the address up
+	stream()
+	if n := lookups.Load(); n != 2 {
+		t.Fatalf("streams a second later brought the lookups to %d: want 2", n)
 	}
 }
 
