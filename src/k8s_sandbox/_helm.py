@@ -868,7 +868,7 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
 
 
 class _ManifestLoader(yaml.SafeLoader):
-    """Reads every scalar as text: Helm writes strings bare that PyYAML types."""
+    """Reads untagged scalars as text: Helm writes strings bare that PyYAML types."""
 
     # Only `<<` keeps its type, so that a `<<` key still merges; a `<<` value is text.
     yaml_implicit_resolvers = {"<": yaml.SafeLoader.yaml_implicit_resolvers["<"]}

@@ -566,8 +566,8 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     assert protocols["22"] == "TCP\nSPLICED: X"
     # A `": ` in a domain would close hand-written quotes or, bare, start a mapping.
     domain = 'a": b.org'
-    assert any(domain in names for names in _values_at(egress, "serverNames"))
-    assert any({"matchPattern": domain} in dns for dns in _values_at(egress, "dns"))
+    assert {"matchPattern": domain} in _values_at(egress, "dns")[0]
+    assert domain in _values_at(egress, "serverNames")[0]
 
 
 @pytest.mark.parametrize(
