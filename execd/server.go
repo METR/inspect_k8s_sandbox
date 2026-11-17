@@ -46,8 +46,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running.
-var afterRead, afterDrainCheck, beforeKill atomic.Pointer[func(late bool)]
+// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone.
+var afterRead, afterDrainCheck, beforeKill, afterTaken atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -557,10 +557,20 @@ func (cl *call) run(req startRequest) error {
 	return nil
 }
 
-// closeOnceUnheld closes the pipe when no process holds its other end, and reads nothing: what holds it writes until the pipe is full, then waits, as over Kubernetes exec.
+// leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node whose root has too many pipes.
+const leftOutput = 1 << 20
+
+// closeOnceUnheld closes the pipe when no process holds its other end. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
 func closeOnceUnheld(r *os.File) {
 	defer r.Close()
 	r.SetReadDeadline(time.Time{})
+	var dropped [512]byte // on this goroutine's stack: io.Discard would keep 8 KiB of heap for as long as a quiet process holds the pipe
+	for left := leftOutput; left > 0; {
+		n, err := r.Read(dropped[:min(left, len(dropped))])
+		if left -= n; err != nil {
+			return
+		}
+	}
 	if rc, err := r.SyscallConn(); err == nil {
 		rc.Read(func(fd uintptr) bool {
 			p := struct { // a pollfd that asks for no event: poll then reports only that every writer has closed
@@ -568,6 +578,7 @@ func closeOnceUnheld(r *os.File) {
 				events, revents int16
 			}{fd: int32(fd)}
 			syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
+			hook(&afterTaken, false)
 			return p.revents != 0
 		})
 	}

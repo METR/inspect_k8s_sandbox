@@ -1608,6 +1608,19 @@ func TestACommandsPipeIsClosedWhenItsOutputEnds(t *testing.T) {
 	unheld(t, strings.TrimSpace(pipe), "whose command has ended")
 }
 
+// mkfifo makes a FIFO and opens it for both ends, so neither a test nor the process it talks to waits to open it.
+func mkfifo(t *testing.T, path string) *os.File {
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
 func TestWhatACommandLeftRunningStillWritesToItsOutput(t *testing.T) {
 	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
 	s, _ := newServer(strings.Repeat("00", 32))
@@ -1615,18 +1628,7 @@ func TestWhatACommandLeftRunningStillWritesToItsOutput(t *testing.T) {
 	s.authenticated(c)
 	t.Cleanup(func() { killTagged("writer") })
 	base := filepath.Join(t.TempDir(), "f")
-	fifo := func(name string) *os.File { // opened for both ends, so neither this test nor the process waits to open it
-		if err := syscall.Mkfifo(base+name, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		f, err := os.OpenFile(base+name, os.O_RDWR, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { f.Close() })
-		return f
-	}
-	let, wrote := fifo(".go"), fifo(".wrote")
+	let, wrote := mkfifo(t, base+".go"), mkfifo(t, base+".wrote")
 	// It says which pipe its stdout is, and leaves a process that eight times waits to be let go, writes to its stdout and its stderr and says how the writes ended.
 	left := `trap "" PIPE; readlink /proc/$$/fd/1; (for i in 1 2 3 4 5 6 7 8; do read go <"$0.go"; echo late; out=$?; echo late >&2; echo $out$? >"$0.wrote"; done) &`
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "writer"})
@@ -1649,6 +1651,74 @@ func TestWhatACommandLeftRunningStillWritesToItsOutput(t *testing.T) {
 		}
 	}
 	unheld(t, pipe, "which no process has open to write")
+}
+
+func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1)) // for unheld
+	// looks counts how often execd, past what it takes of a pipe, has looked whether its writers have gone.
+	var looks atomic.Int32
+	note := func(bool) { looks.Add(1) }
+	afterTaken.Store(&note)
+	t.Cleanup(func() { afterTaken.Store(nil) })
+	looked := func(since int32, or string) { // it looks at each wake of its wait, and no more once it has let the pipe go
+		for deadline := time.Now().Add(30 * time.Second); looks.Load() == since; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal(or)
+			}
+		}
+	}
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged("spender") })
+	base := filepath.Join(t.TempDir(), "f")
+	let, wrote := mkfifo(t, base+".go"), mkfifo(t, base+".wrote")
+	// It says which pipe its stdout is, and leaves a process that writes there as many whole pages as it is told, each time it is told, and says when the writes have gone through.
+	left := `readlink /proc/$$/fd/1; (while read n <"$0.go"; do dd if=/dev/zero bs=4096 count="$n" 2>/dev/null && echo "$n" >"$0.wrote"; done) &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "spender"})
+	s.dispatch(c, frame{kind: fStart, id: 44, payload: req})
+	var pipe string
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStdout {
+			pipe += string(f.payload)
+		}
+	}
+	pipe = strings.TrimSpace(pipe)
+	var held uintptr // execd's end of that pipe, which this process has
+	fds, _ := os.ReadDir("/proc/self/fd")
+	for _, fd := range fds {
+		if link, _ := os.Readlink("/proc/self/fd/" + fd.Name()); link == pipe {
+			n, _ := strconv.Atoi(fd.Name())
+			held = uintptr(n)
+		}
+	}
+	size, _, _ := syscall.Syscall(syscall.SYS_FCNTL, held, syscall.F_GETPIPE_SZ, 0) // 64 KiB, or the 8 KiB a crowded machine's root gets
+	write := func(n int, why string) {
+		let.Write([]byte(strconv.Itoa(n/4096) + "\n"))
+		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := wrote.Read(make([]byte, 16)); err != nil {
+			t.Fatalf("its write of %d bytes has not gone through, %s", n, why)
+		}
+	}
+	if leftOutput < 136<<10 {
+		t.Fatalf("execd takes %d bytes of what a process left running writes, and Kubernetes exec 136 KiB", leftOutput)
+	}
+	write(136<<10, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
+	write(leftOutput-136<<10, "which is the rest of what execd takes")
+	looked(0, "execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go") // read without end, a writer that never stops has the sandbox's CPU; over Kubernetes exec it waits
+	seen := looks.Load()
+	write(int(size), "which the pipe itself holds")
+	looked(seen, "execd no longer waits on the pipe: a process that writes on would fail, where over Kubernetes exec it waits")
+
+	var unread int32
+	syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&unread)))
+	if uintptr(unread) != size {
+		t.Fatalf("%d of the last %d bytes wait unread, want all: execd has read on, or has let the pipe go", unread, size)
+	}
+	seen = looks.Load()
+	killTagged("spender")
+	looked(seen, "execd had let go of the pipe before its writers went")
+	unheld(t, pipe, "which it had stopped reading and no process has open to write")
 }
 
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
