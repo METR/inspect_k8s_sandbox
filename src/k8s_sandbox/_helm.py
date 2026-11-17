@@ -868,11 +868,12 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
 
 
 class _ManifestLoader(yaml.SafeLoader):
-    """Reads a bare `=` or `<<` value as a string, as Helm does."""
+    """Reads every scalar as text: Helm writes strings bare that PyYAML types."""
 
+    # Only `<<` keeps its type, so that a `<<` key still merges; a `<<` value is text.
+    yaml_implicit_resolvers = {"<": yaml.SafeLoader.yaml_implicit_resolvers["<"]}
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        "tag:yaml.org,2002:value": yaml.SafeLoader.construct_yaml_str,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 

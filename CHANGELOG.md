@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Fix a sandbox failing to start when a value such as a `command` argument is exactly
-  `=` or `<<`.
+  `=`, `<<` or `0x_`, a date or time that does not exist such as `2023-02-29`, or a
+  number of more than 4,300 digits.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
   a number, no longer fails the install, and a label key such as `no` or `on` is no
   longer applied as `false` or `true`.

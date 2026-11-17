@@ -38,7 +38,6 @@ from k8s_sandbox._helm import (
     StaticValuesSource,
     ValuesSource,
     _declared_object_names,
-    _get_expected_services,
     _get_helm_major_version,
     _get_timeout,
     _get_uninstall_timeout,
@@ -1351,7 +1350,8 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
 
 
 def _services(stdout: str) -> frozenset[str]:
-    return _get_expected_services(_rendered_docs(stdout, "abcdefgh"), "abcdefgh")
+    docs = _helm._rendered_docs(stdout, "abcdefgh")
+    return _helm._get_expected_services(docs, "abcdefgh")
 
 
 @pytest.mark.parametrize(
@@ -1403,11 +1403,22 @@ def _services(stdout: str) -> frozenset[str]:
             {"a", "b"},
             id="list-wrapping-pods",
         ),
-        # Helm writes these two strings bare, and PyYAML's own loader builds neither.
+        # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
-            _manifest(_STATEFUL_SET + "    spec: {containers: [{args: [=, <<]}]}\n"),
+            _manifest(
+                _STATEFUL_SET
+                + "    spec: {containers: [{args: [=, <<, 0000-00-00, 0x_]}]}\n"
+            ),
             {"default"},
-            id="equals-and-merge-arguments",
+            id="strings-pyyaml-types",
+        ),
+        # A custom chart may merge its pod's labels in.
+        pytest.param(
+            _manifest(
+                f"kind: Pod\nmetadata: {{labels: {{<<: {{{_SERVICE_LABEL}: a}}}}}}"
+            ),
+            {"a"},
+            id="merged-labels",
         ),
     ],
 )
