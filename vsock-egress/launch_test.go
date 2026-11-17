@@ -125,6 +125,9 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 			synctest.Test(t, func(t *testing.T) {
 				out := capture(t)
 				l := fakeNode(t)
+				if _, err := l.wanted(); err != nil { // the launcher was there before the sandbox
+					t.Fatal(err)
+				}
 				proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 				vm := filepath.Join(l.vms, id("a")[:12])
@@ -152,6 +155,47 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 			})
 		})
 	}
+}
+
+func TestLauncherThatStartsAfterASandboxWentRaisesNoFaultForIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // deleted under the launcher before this one: its record can stay
+		for range 3 {
+			if _, err := l.wanted(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Minute)
+		}
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing of a sandbox that had gone before the launcher started", out.String())
+		}
+	})
+}
+
+func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.reap = 0 // no reaper runs here, so the worker that ended stays: as one found ended after each start
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		ended := make(chan struct{})
+		close(ended)
+		l.workers[id("a")] = &child{uid: vmUID, done: ended}
+		var said []int
+		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
+			time.Sleep(wait)
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
+		}
+		if !slices.Equal(said, []int{0, 0, 1, 1, 2}) {
+			t.Fatalf("lines after each pass %v, in %q: want none for a minute, then one each minute", said, out.String())
+		}
+	})
 }
 
 func TestWorkerThatCannotBeEndedIsAFaultOnceItLasts(t *testing.T) {

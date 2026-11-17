@@ -238,7 +238,7 @@ type launcher struct {
 const faultAgain = time.Minute
 
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, had: map[string]bool{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}}
 }
 
 func launch(args []string) error {
@@ -262,6 +262,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	records, err := l.records()
 	if err != nil {
 		return nil, err
+	}
+	if l.had == nil { // its first pass: a record with no directory is then a sandbox deleted before this launcher started
+		l.had = map[string]bool{}
+		for _, r := range records {
+			l.had[r.ContainerID] = true
+		}
 	}
 	wanted, present, vms := map[string]sandbox{}, map[string]bool{}, map[uint32]int{}
 	for _, r := range records {
@@ -318,7 +324,10 @@ func (l *launcher) pass() error {
 	}
 	deadline := time.Now().Add(l.reap)
 	for id, w := range l.workers {
-		if _, ok := wanted[id]; !ok || w.exited() {
+		if sb, ok := wanted[id]; !ok || w.exited() {
+			if ok { // its sandbox has none now, and no start failed: one that ends after each start is this fault alone
+				l.fault(id, sb.pod, errors.New("its worker ended"))
+			}
 			if err := w.end(time.Until(deadline)); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
 				if w.unended.IsZero() { // a pass out of time ends it on the next: only one that is faultAgain late is a fault
 					w.unended = time.Now()
@@ -355,6 +364,7 @@ func (l *launcher) pass() error {
 		}
 		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)
 		l.workers[id] = w
+		held[sb.uid] = true // or a second sandbox of this uid, were there one, would get a worker in the same pass
 	}
 	return nil
 }
