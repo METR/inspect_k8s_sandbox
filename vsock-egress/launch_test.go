@@ -239,6 +239,18 @@ func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
 	})
 }
 
+// A worker started where its pod's namespace could not be entered would run in the launcher's, past the pod's network policy.
+func TestNothingRunsWhereTheNamespaceCannotBeEntered(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "net") // a file that is no namespace
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if err := inNetns(file, func() error { ran = true; return nil }); err == nil || ran {
+		t.Fatalf("error %v, ran %v: want an error and nothing run", err, ran)
+	}
+}
+
 // A profile made again from the node's default would bring these back: io_uring, and the calls by which a worker could slow its own reaper.
 func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 	everywhere := []string{"io_uring_setup", "io_uring_enter", "io_uring_register"}
@@ -249,7 +261,8 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 	}
 	for _, file := range files {
 		var profile struct {
-			Syscalls []struct {
+			DefaultAction string `json:"defaultAction"`
+			Syscalls      []struct {
 				Names  []string `json:"names"`
 				Action string   `json:"action"`
 			} `json:"syscalls"`
@@ -257,6 +270,9 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 		b, err := os.ReadFile(file)
 		if err != nil || json.Unmarshal(b, &profile) != nil || len(profile.Syscalls) == 0 {
 			t.Fatalf("%s is no seccomp profile: %v", file, err)
+		}
+		if profile.DefaultAction != "SCMP_ACT_ERRNO" {
+			t.Errorf("%s answers a call it does not name with %q", file, profile.DefaultAction)
 		}
 		refused := everywhere
 		if strings.HasSuffix(file, "-launcher.json") {

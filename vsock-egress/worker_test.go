@@ -287,6 +287,18 @@ func TestFailedKeyFetchesAreCountedNotLoggedOneByOne(t *testing.T) {
 	}
 }
 
+func TestWorkerRefusesToRunAsRoot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second) // a worker that starts would serve until killed
+	defer cancel()
+	out, err := exec.CommandContext(ctx, os.Args[0], "work", "-pod", "ns/pod", "-vsock", filepath.Join(t.TempDir(), "vm.vsock")).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "never as root") {
+		t.Fatalf("got %v and %q: want a worker that refuses to run as root", err, out)
+	}
+}
+
 func TestWorkerThatEndsWithAnErrorSaysSoInTheWordAnAlarmReads(t *testing.T) {
 	out, err := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", filepath.Join(t.TempDir(), "none", "vm.vsock")).CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "ns/pod: work_failed: ") {
