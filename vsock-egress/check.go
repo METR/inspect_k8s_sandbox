@@ -76,18 +76,13 @@ func probeVM(vsock string, wait time.Duration) error {
 	}
 	defer l.Close()
 	l.(*net.UnixListener).SetDeadline(time.Now().Add(wait))
-	dialled := make(chan string, 1)
-	go func() { // the canary dials once a second, and says whether it could bind
-		var said string
-		if c, err := l.Accept(); err == nil {
-			c.SetDeadline(time.Now().Add(dialWait))
-			said, _ = line(c)
-			c.Close()
-		}
-		dialled <- said
-	}()
-	reach := greet(vsock)
-	said := <-dialled
+	var said string
+	if c, err := l.Accept(); err == nil { // the canary dials once a second, and says whether it could bind
+		c.SetDeadline(time.Now().Add(dialWait))
+		said, _ = line(c)
+		c.Close()
+	}
+	reach := greet(vsock) // only now: a canary that has dialled has bound its port, or cannot
 	switch {
 	case said == "" && reach != nil:
 		return fmt.Errorf("no vsock path between guest and node either way (%v; nothing reached %s in %s): "+
