@@ -248,7 +248,9 @@ services:
 
 Records are interpolated into the CoreDNS configuration, so they are restricted to
 letters, digits and `_ - .` (e.g. `_dmarc.example.com` is fine). Anything containing
-whitespace or other characters is rejected when the chart is installed.
+whitespace or other characters is rejected when the chart is installed. For a pod
+annotated `sandbox.amazonaws.com/network-isolated: "true"` each record must be a
+lower-case DNS name: `_dmarc.example.com` fails the install there.
 
 To achieve this, whilst maintaining support for deploying multiple instances of the same
 chart in a given namespace, a CoreDNS "sidecar" container is deployed in each service

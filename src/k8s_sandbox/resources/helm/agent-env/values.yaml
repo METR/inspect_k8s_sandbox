@@ -120,7 +120,9 @@ services:
     # agent environment (e.g. example.com). If one or more records are provided,
     # `dnsRecord` is automatically set to true. Records may contain letters, digits and
     # `_ - .`; whitespace and other characters are rejected at install time because
-    # these are interpolated into the CoreDNS Corefile.
+    # these are interpolated into the CoreDNS Corefile. For a pod annotated
+    # `sandbox.amazonaws.com/network-isolated: "true"` each must be a lower-case DNS
+    # name: `_dmarc.example.com` fails the install there.
     additionalDnsRecords: []
     # -- Deprecated. All ports of services with a DNS record are accessible (though not
     # necessarily open) to other services within the agent environment. If one or more
