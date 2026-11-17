@@ -173,7 +173,7 @@ func (w *worker) stream(c net.Conn) {
 // dial connects to the pod's proxy. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a proxy that is down nor a name that does not resolve may cost a lookup a stream.
 func (w *worker) dial() (net.Conn, error) {
 	addr := w.addr.Load()
-	if addr == nil { // under no lock: a lookup that hangs holds up its own stream alone
+	if addr == nil { // under no lock: streams that ask during a lookup share it, each for dialWait at most
 		host, port, err := net.SplitHostPort(w.target)
 		if err != nil {
 			return nil, err
