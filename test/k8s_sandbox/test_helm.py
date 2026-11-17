@@ -1867,7 +1867,7 @@ async def test_get_sandbox_pods_never_hands_over_a_terminated_pod(
 _parse_pod = snapshot._parse_pod  # pyright: ignore[reportPrivateUsage]
 
 
-def _sandbox_pod(execd_: bool, **spec: bool) -> snapshot.PodSnapshot:
+def _sandbox_pod(execd_: bool | str, **spec: bool) -> snapshot.PodSnapshot:
     metadata = {
         "name": "p",
         "uid": "u",
@@ -1878,13 +1878,14 @@ def _sandbox_pod(execd_: bool, **spec: bool) -> snapshot.PodSnapshot:
     return _parse_pod({"metadata": metadata, "spec": spec_, "status": {}})
 
 
+@pytest.mark.parametrize("transport", [True, "stdio"])
 @pytest.mark.parametrize("shared", ["shareProcessNamespace", "hostPID"])
 async def test_execd_is_refused_a_pod_whose_restarts_it_cannot_tell(
-    shared: str, _mock_release_pods: mock.MagicMock
+    shared: str, transport: bool | str, _mock_release_pods: mock.MagicMock
 ) -> None:
     """Regression: PID 1 there outlives the container, whose restart went untold."""
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None, "raise")
-    _mock_release_pods.return_value = [_sandbox_pod(True, **{shared: True})]
+    _mock_release_pods.return_value = [_sandbox_pod(transport, **{shared: True})]
 
     with pytest.raises(RuntimeError, match="first process to be PID 1"):
         await release.get_sandbox_pods()

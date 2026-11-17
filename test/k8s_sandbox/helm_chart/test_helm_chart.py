@@ -977,8 +977,12 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     forwarder, setup = pods["agent-env-my-release-default"]["initContainers"]
     assert (forwarder["name"], setup["name"]) == ("egress-forwarder", "setup")
     assert forwarder["restartPolicy"] == "Always"
-    # The service starts once the proxy's port is there.
-    assert "startupProbe" in forwarder
+    # The service starts once the probe finds the key where the forwarder keeps it.
+    [mount] = forwarder["volumeMounts"]
+    key = forwarder["command"][-2:]
+    assert forwarder["startupProbe"]["exec"]["command"][-2:] == key
+    assert mount["name"] == "egress-forwarder-key"
+    assert key[1].startswith(mount["mountPath"] + "/")
     # It alone may open the vsock: not root, no capability, the node's profile.
     security = forwarder["securityContext"]
     assert security["runAsUser"] == 65532
@@ -1032,7 +1036,7 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     chart_dir: pathlib.Path, proxy: str
 ) -> None:
-    # The node's vsock-egress refuses these, and the pod's policy is cut from the name.
+    # The policy is cut from the name and port; the launcher would take 0, 03128, 65536.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(
             chart_dir,
