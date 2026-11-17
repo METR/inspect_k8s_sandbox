@@ -216,6 +216,9 @@ func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 			<-w.done
 			pass() // finds it ended
 			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
+			other := addSandbox(t, l, id("b"), "eth0", nil, vmUID+5)
+			pass() // another VM of its uid for a pass: the sandbox leaves and returns, and its next worker is no first one
+			os.Remove(other)
 		}
 		if !slices.Equal(said, []int{0, 0, 1, 1, 2}) {
 			t.Fatalf("lines after each pass %v, in %q: want none for a minute, then one each minute", said, out.String())
@@ -294,10 +297,18 @@ func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
+		if _, err := l.wanted(); err != nil { // the launcher was there before the sandbox
+			t.Fatal(err)
+		}
 		l.netns = filepath.Join(l.vms, "none") // where no pod's network namespace is bound
-		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
+		addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // its VM's directory follows its record
 		var said []int
-		for range 25 { // a pass every retry, for two minutes
+		for i := range 25 { // a pass every retry, for two minutes
+			if i == 6 { // after 30 s: the minute it has had no worker goes on through its first start
+				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+			}
 			if err := l.pass(); err != nil {
 				t.Fatal(err)
 			}
