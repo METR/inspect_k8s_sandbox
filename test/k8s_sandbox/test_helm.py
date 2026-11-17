@@ -1714,6 +1714,38 @@ async def test_wait_until_ready_ends_for_a_cancel_that_comes_with_a_wake(
         wait.cancel()
 
 
+async def test_wait_until_ready_ends_for_a_cancel_that_comes_as_its_poll_falls_due(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "cancelled-at-a-poll"  # where no other test's watch runs
+    _mock_release_pods.return_value = [_pod(ready=False)]
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 0.01)
+    loop = asyncio.get_running_loop()
+    call_at = loop.call_at
+
+    def call_at_then_cancel(
+        when: float, callback: Callable[..., object], *args: Any, **kwargs: Any
+    ) -> asyncio.TimerHandle:
+        def due(*args: Any) -> None:
+            callback(*args)
+            wait.cancel()  # in the same turn of the loop as the timer
+
+        # The only timer the wait sets is its poll's.
+        timed = due if asyncio.current_task() is wait else callback
+        return call_at(when, timed, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_at", call_at_then_cancel)
+
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        await asyncio.wait({wait}, timeout=5)
+        assert wait.cancelled()
+    finally:
+        wait.cancel()
+
+
 async def test_a_watch_whose_thread_cannot_start_leaves_its_namespace_to_the_next() -> (
     None
 ):
