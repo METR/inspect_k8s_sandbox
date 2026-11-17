@@ -232,13 +232,14 @@ type launcher struct {
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]time.Time // when each sandbox without a worker was first seen so, or last in the log
 	had      map[string]bool      // sandboxes whose VM directory has been there
+	started  map[string]bool      // sandboxes that have had a worker
 }
 
 // faultAgain is how long a fault lasts before its first line, and between lines.
 const faultAgain = time.Minute
 
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, started: map[string]bool{}}
 }
 
 func launch(args []string) error {
@@ -301,6 +302,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		if !present[id] {
 			delete(l.had, id)
 			delete(l.reported, id)
+			delete(l.started, id)
 		}
 	}
 	return wanted, nil
@@ -355,15 +357,16 @@ func (l *launcher) pass() error {
 		if l.workers[id] != nil || held[sb.uid] || time.Since(l.tried[id]) < l.retry { // one that cannot start, or dies at once, is not started twice a second
 			continue
 		}
-		if _, again := l.tried[id]; !again { // what kept it from its first start is over: a worker that ends gets a minute of its own
-			delete(l.reported, id)
-		}
 		l.tried[id] = time.Now()
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
 			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
 			l.fault(id, sb.pod, err)
 			continue
+		}
+		if !l.started[id] { // what kept it from its first worker is over: one that ends gets a minute of its own
+			l.started[id] = true
+			delete(l.reported, id)
 		}
 		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)
 		l.workers[id] = w

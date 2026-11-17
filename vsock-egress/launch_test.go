@@ -181,9 +181,9 @@ func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		l.reap, l.netns = budget, netns
+		l.reap, l.netns = budget, filepath.Join(l.vms, "none")
 		l.retry = time.Millisecond // the pass that ends a worker starts no other: the test's clock stands still while a process runs
-		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, 0)
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+5)
 		t.Cleanup(func() {
 			for _, w := range l.workers {
 				w.end(budget)
@@ -194,12 +194,9 @@ func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		pass() // no worker yet: the VM's directory is root's, as it is at first
+		pass() // no worker yet: its first start fails, where no network namespace is bound for its pod
 		time.Sleep(62 * time.Second)
-		// Its VM's now. The minute before a first start is no part of the first worker's.
-		if err := os.Chown(filepath.Join(l.vms, id("a")[:12], "root"), vmUID+5, vmUID+5); err != nil {
-			t.Fatal(err)
-		}
+		l.netns = netns // bound now: the minute before a first worker is no part of that worker's
 		var said []int
 		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
 			time.Sleep(wait)
