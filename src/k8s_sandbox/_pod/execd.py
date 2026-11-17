@@ -43,6 +43,7 @@ from k8s_sandbox._pod.read import read_command
 logger = logging.getLogger(__name__)
 
 ANNOTATION = "inspect-k8s-sandbox/execd"
+TRANSPORTS = ("true", "stdio")  # its values: execd's port, or one exec's stdio
 EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
 EXECD_PORT = 14601  # below every runtime's ephemeral ports: gVisor's start at 16000
 EXECD_SOCKET = "inspect-k8s-sandbox-execd"  # abstract: where a pod has no network card

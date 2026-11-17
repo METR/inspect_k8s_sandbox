@@ -26,6 +26,7 @@ from k8s_sandbox._pod.execd import (
     EXECD_PATH,
     EXECD_PORT,
     EXECD_SOCKET,
+    TRANSPORTS,
     Daemon,
     DaemonRunning,
     ExecdClient,
@@ -84,7 +85,7 @@ class Pod:
         # Operations go to execd, if the pod has it: at its address, or through an exec.
         self._execd = (
             ExecdClient(self._start_execd, lambda: self._info.uid)
-            if execd in ("true", "stdio")
+            if execd in TRANSPORTS
             else None
         )
         self._execd_by_stdio = execd == "stdio"

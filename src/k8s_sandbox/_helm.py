@@ -38,6 +38,7 @@ from k8s_sandbox._logger import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.execd import ANNOTATION as EXECD_ANNOTATION
+from k8s_sandbox._pod.execd import TRANSPORTS as EXECD_TRANSPORTS
 from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods, watch_pods
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
@@ -389,7 +390,7 @@ class Release:
             default_container_name = pod.container_names[0]
             execd = pod.annotations.get(EXECD_ANNOTATION)
             if (
-                execd in ("true", "stdio")
+                execd in EXECD_TRANSPORTS
                 and pod.shares_pids
                 and self.restarted_container_behavior == "raise"
             ):
