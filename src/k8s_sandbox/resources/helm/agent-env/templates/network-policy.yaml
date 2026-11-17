@@ -299,9 +299,9 @@ kind: CiliumNetworkPolicy
 metadata:
   name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-egress-proxy
   annotations:
-    {{- toYaml $.Values.annotations | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
   labels:
-    {{- toYaml $.Values.labels | nindent 4 }}
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
 spec:
   description: |
     Service "{{ $svcName }}" names an egress proxy: its pod reaches only that name's

@@ -2141,7 +2141,7 @@ async def test_a_call_left_as_its_upload_writes_sends_no_stdin_after_its_kill(
     assert link is not None
     stdin = b"x" * execd.STDIN_WINDOW
     # Room for it all: each megabyte's write returns at once, where the cancel was lost.
-    link.pipe._writer.transport.set_write_buffer_limits(high=2 * len(stdin))
+    link.pipe._writer.transport.set_write_buffer_limits(high=2 * len(stdin))  # type: ignore[union-attr]
     call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 60))
     await until(lambda: execd.RELEASE in got)
 
