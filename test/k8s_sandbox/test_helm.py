@@ -1349,13 +1349,25 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
     assert names == {"cm", "default", "svc"}
 
 
-def test_a_stateful_sets_counts_read_as_numbers() -> None:
+@pytest.mark.parametrize(
+    ("replicas", "ordinals"),
+    [
+        pytest.param("10", list(range(2, 12)), id="decimal"),
+        # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
+        pytest.param("010", list(range(2, 10)), id="leading-zero"),
+    ],
+)
+def test_a_stateful_sets_counts_read_as_numbers(
+    replicas: str, ordinals: list[int]
+) -> None:
     # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
-    stdout = _manifest("kind: StatefulSet\nspec: {replicas: 3, ordinals: {start: 2}}\n")
+    stdout = _manifest(
+        f"kind: StatefulSet\nspec: {{replicas: {replicas}, ordinals: {{start: 2}}}}\n"
+    )
 
     spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
 
-    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == [2, 3, 4]
+    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == ordinals
 
 
 def _services(stdout: str) -> frozenset[str]:

@@ -870,8 +870,11 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
 
 def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
     """A core schema integer; text past 64 bits, where Helm may write a string bare."""
+    # Helm reads a leading zero as octal, so that is the number Kubernetes has.
+    leading_zero = re.fullmatch(r"[-+]?0[0-7]+", node.value)
+    base = 8 if leading_zero else {"0o": 8, "0x": 16}.get(node.value[:2], 10)
     try:
-        number = int(node.value, {"0o": 8, "0x": 16}.get(node.value[:2], 10))
+        number = int(node.value, base)
     except ValueError:  # more digits than Python reads
         return node.value
     return number if -(2**63) <= number < 2**64 else node.value
