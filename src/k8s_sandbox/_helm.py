@@ -867,6 +867,16 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
     )
 
 
+class _ManifestLoader(yaml.SafeLoader):
+    """Reads a bare `=` or `<<` value as a string, as Helm does."""
+
+    yaml_constructors = {
+        **yaml.SafeLoader.yaml_constructors,
+        "tag:yaml.org,2002:value": yaml.SafeLoader.construct_yaml_str,
+        "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
+    }
+
+
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     """The manifest Helm rendered, as parsed documents.
 
@@ -875,8 +885,8 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     """
     try:
         manifest = json.loads(install_stdout)["manifest"]
-        # safe_load_all is lazy, so force the parse inside the try.
-        return list(yaml.safe_load_all(manifest))
+        # load_all is lazy, so force the parse inside the try.
+        return list(yaml.load_all(manifest, Loader=_ManifestLoader))
     except Exception as e:
         _raise_runtime_error(
             "Could not read the rendered manifest from Helm, so the sandboxes to wait "

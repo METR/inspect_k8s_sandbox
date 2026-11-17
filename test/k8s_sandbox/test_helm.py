@@ -1403,6 +1403,12 @@ def _services(stdout: str) -> frozenset[str]:
             {"a", "b"},
             id="list-wrapping-pods",
         ),
+        # Helm writes these two strings bare, and PyYAML's own loader builds neither.
+        pytest.param(
+            _manifest(_STATEFUL_SET + "    spec: {containers: [{args: [=, <<]}]}\n"),
+            {"default"},
+            id="equals-and-merge-arguments",
+        ),
     ],
 )
 def test_expected_services(stdout: str, expected: set[str]) -> None:
