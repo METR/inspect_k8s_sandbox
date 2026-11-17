@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
+  This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

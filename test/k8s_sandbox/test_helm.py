@@ -1,14 +1,16 @@
 import asyncio
 import contextlib
+import dataclasses
 import itertools
 import json
 import logging
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncGenerator, Callable, Iterable
+from typing import Any, AsyncGenerator, Callable, Iterable, Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -109,9 +111,12 @@ def _mock_release_pods(request: pytest.FixtureRequest) -> object:
         return
     # Stub the cluster read, not _list_release_pods itself: the arguments it builds
     # are what decide whether the poll is bounded and reads the right pods.
-    with patch("k8s_sandbox._helm.k8s_client"):
-        with patch("k8s_sandbox._helm.list_pods", return_value=[_pod()]) as m:
-            yield m
+    with (
+        patch("k8s_sandbox._helm.k8s_client", autospec=True),
+        patch("k8s_sandbox._helm.watch_pods", autospec=True, return_value=()),
+        patch("k8s_sandbox._helm.list_pods", autospec=True, return_value=[_pod()]) as m,
+    ):
+        yield m
 
 
 @pytest.fixture
@@ -1221,6 +1226,75 @@ async def test_wait_until_ready_ignores_pods_which_are_not_sandboxes(
     await _wait(
         release, [strangers, [*strangers, sandbox], [*strangers, sandbox]], monkeypatch
     )
+
+
+async def test_wait_until_ready_ends_when_a_watch_sees_the_pod_ready(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "handed-over"  # where no other test's watch runs
+    polled, ready = threading.Event(), threading.Event()
+
+    def list_pods(
+        *_: Any, resource_version: str | None, **__: Any
+    ) -> list[PodSnapshot]:
+        # The cache lags the watch: only a consistent read sees the pod Ready.
+        pods = [_pod(ready=ready.is_set() and resource_version is None)]
+        polled.set()
+        return pods
+
+    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+        # The pod turns Ready once the wait's first poll has found it not.
+        polled.wait(30)
+        ready.set()
+        yield dataclasses.replace(
+            _pod(), labels={"app.kubernetes.io/instance": release.release_name}
+        )
+
+    _mock_release_pods.side_effect = list_pods
+    monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
+    # No second poll comes in time to end the wait.
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    pods = await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 60), 30)
+
+    assert [pod.ready for pod in pods] == [True]
+
+
+async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default", "other"})
+    release._namespace = "woken-once"  # where no other test's watch runs
+    polled, woken, over = threading.Event(), threading.Event(), threading.Event()
+
+    def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
+        (woken if polled.is_set() else polled).set()
+        return [_pod()]
+
+    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+        # One of the release's two pods is Ready; the other never comes.
+        polled.wait(30)
+        yield dataclasses.replace(
+            _pod(), labels={"app.kubernetes.io/instance": release.release_name}
+        )
+        over.wait(30)
+
+    _mock_release_pods.side_effect = list_pods
+    monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        assert await asyncio.to_thread(woken.wait, 30)
+        # Time for a wake-up left set to spin; a stalled machine only hides one.
+        await asyncio.sleep(0.2)
+        assert _mock_release_pods.call_count == 2
+    finally:
+        over.set()
+        wait.cancel()
 
 
 async def test_wait_until_ready_retries_a_transient_api_error(

@@ -7,8 +7,9 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import (
     Any,
@@ -36,12 +37,13 @@ from k8s_sandbox._logger import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.execd import ANNOTATION as EXECD_ANNOTATION
-from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
+from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods, watch_pods
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
 DEFAULT_TIMEOUT = 600  # 10 minutes
 MAX_INSTALL_ATTEMPTS = 3
 _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
+_READY_WATCH_SECONDS = 300  # after which the server ends a watch and it starts again
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
@@ -63,6 +65,11 @@ HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
 _SERVICE_LABEL = "inspect/service"
 # The label a release's pods are listed by.
 _INSTANCE_LABEL = "app.kubernetes.io/instance"
+# Each namespace with a watch running: its waiting releases' loops and wake-up events.
+_ready_waits: dict[
+    tuple[str | None, str], dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]]
+] = {}
+_ready_waits_lock = threading.Lock()
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
 _TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
@@ -487,33 +494,44 @@ class Release:
         poll_error: Exception | None = None
         missing: frozenset[str] = self._expected_services
         absent: frozenset[str] = self._expected_pods
-        while True:
-            try:
-                pods = await asyncio.to_thread(self._list_release_pods, True)
-                saw_a_pod = saw_a_pod or bool(pods)
-                missing = self._missing_services(pods)
-                absent = self._missing_pods(pods)
-                # The cache can lag reality in either direction, so confirm against a
-                # consistent read and hand those same pods on: nothing may change
-                # between the verdict and the sandbox the caller gets. One read per
-                # install, not per poll.
-                if self._is_ready(pods):
-                    confirmed = await asyncio.to_thread(self._list_release_pods)
-                    if self._is_ready(confirmed):
-                        return confirmed
-            except Exception as e:
-                # A blip must not fail an install. Keep the error: a persistent one
-                # (a missing RBAC rule, say) is not a capacity problem and must not
-                # be reported as one.
-                log_debug("Readiness poll failed; will retry.", error=e)
-                poll_error = e
-            else:
-                poll_error = None
-            if time.monotonic() >= deadline:
-                await self._raise_not_ready_error(
-                    saw_a_pod, poll_error, missing, absent
-                )
-            await asyncio.sleep(_READINESS_POLL_INTERVAL)
+        fresh = False
+        with _woken_when_ready(
+            self._context_name, self._namespace, self.release_name
+        ) as woken:
+            while True:
+                try:
+                    # The cache may lag the watch that woke this read.
+                    pods = await asyncio.to_thread(self._list_release_pods, not fresh)
+                    saw_a_pod = saw_a_pod or bool(pods)
+                    missing = self._missing_services(pods)
+                    absent = self._missing_pods(pods)
+                    # The cache can lag reality in either direction, so confirm against
+                    # a consistent read and hand those same pods on: nothing may change
+                    # between the verdict and the sandbox the caller gets. One read
+                    # per install, not per poll.
+                    if self._is_ready(pods):
+                        confirmed = await asyncio.to_thread(self._list_release_pods)
+                        if self._is_ready(confirmed):
+                            return confirmed
+                except Exception as e:
+                    # A blip must not fail an install. Keep the error: a persistent
+                    # one (a missing RBAC rule, say) is not a capacity problem and must
+                    # not be reported as one.
+                    log_debug("Readiness poll failed; will retry.", error=e)
+                    poll_error = e
+                else:
+                    poll_error = None
+                if time.monotonic() >= deadline:
+                    await self._raise_not_ready_error(
+                        saw_a_pod, poll_error, missing, absent
+                    )
+                # A pod that turns Ready is not held for the rest of a 2 s poll.
+                fresh = False
+                with suppress(asyncio.TimeoutError):
+                    fresh = await asyncio.wait_for(
+                        woken.wait(), _READINESS_POLL_INTERVAL
+                    )
+                woken.clear()
 
     async def _raise_not_ready_error(
         self,
@@ -703,6 +721,50 @@ def _get_uninstall_timeout() -> int:
     # Separate from INSPECT_HELM_TIMEOUT, which is legitimately set to hours: an
     # uninstall holds an uninstall permit and, on the error path, a sandbox slot.
     return _get_positive_environ_int(INSPECT_HELM_UNINSTALL_TIMEOUT, DEFAULT_TIMEOUT)
+
+
+@contextmanager
+def _woken_when_ready(
+    context_name: str | None, namespace: str, release_name: str
+) -> Generator[asyncio.Event, None, None]:
+    """An event set when the namespace's watch sees one of the release's pods Ready."""
+    key, woken = (context_name, namespace), asyncio.Event()
+    with _ready_waits_lock:
+        if key not in _ready_waits:
+            _ready_waits[key] = {}
+            threading.Thread(target=_watch_ready, args=key, daemon=True).start()
+        _ready_waits[key][release_name] = (asyncio.get_running_loop(), woken)
+    try:
+        yield woken
+    finally:
+        with _ready_waits_lock:
+            del _ready_waits[key][release_name]
+
+
+def _watch_ready(context_name: str | None, namespace: str) -> None:
+    """Wake a namespace's waiting releases as their pods turn Ready, while any waits."""
+    waits = _ready_waits[context_name, namespace]
+    while True:
+        with _ready_waits_lock:
+            if not waits:
+                del _ready_waits[context_name, namespace]
+                return
+        try:
+            for pod in watch_pods(
+                k8s_client(context_name),
+                namespace,
+                label_selector=_INSTANCE_LABEL,
+                timeout_seconds=_READY_WATCH_SECONDS,
+            ):
+                if _pod_ready(pod):
+                    with _ready_waits_lock:
+                        wait = waits.get(pod.labels[_INSTANCE_LABEL])
+                    if wait is not None:
+                        wait[0].call_soon_threadsafe(wait[1].set)
+        except Exception as e:
+            # Without the watch a release is still polled.
+            log_debug("Readiness watch failed; will retry.", error=e)
+        time.sleep(1)
 
 
 def _install_semaphore() -> AsyncContextManager[object]:
