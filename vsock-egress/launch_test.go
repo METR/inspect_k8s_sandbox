@@ -189,23 +189,29 @@ func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 				w.end(budget)
 			}
 		})
+		pass := func() {
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+		}
 		var said []int
 		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
 			time.Sleep(wait)
-			for range 2 { // one pass starts a worker, the next finds it running
-				if err := l.pass(); err != nil {
-					t.Fatal(err)
-				}
-			}
+			pass() // starts a worker
+			started := l.tried[id("a")]
+			// As one that has run for just under a minute, which the test's clock cannot show.
+			l.tried[id("a")] = started.Add(-59 * time.Second)
+			pass() // finds it running
+			l.tried[id("a")] = started
 			w := l.workers[id("a")]
 			if w == nil || w.exited() {
 				t.Fatal("no worker runs for a sandbox that names a proxy")
 			}
-			syscall.Kill(w.cmd.Process.Pid, syscall.SIGKILL) // as the kernel does, and it writes nothing
-			<-w.done
-			if err := l.pass(); err != nil {
+			if err := syscall.Kill(w.cmd.Process.Pid, syscall.SIGKILL); err != nil { // as the kernel does, and it writes nothing
 				t.Fatal(err)
 			}
+			<-w.done
+			pass() // finds it ended
 			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
 		}
 		if !slices.Equal(said, []int{0, 0, 1, 1, 2}) {
