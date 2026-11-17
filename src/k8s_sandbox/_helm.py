@@ -912,6 +912,13 @@ class _ManifestLoader(yaml.SafeLoader):
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
+    def compose_scalar_node(self, anchor: Any) -> yaml.ScalarNode:
+        event = self.peek_event()
+        # Helm reads a scalar tagged `!` as text, and still merges on a `! <<` key.
+        if event.tag == "!" and event.value != "<<":
+            event.tag = "tag:yaml.org,2002:str"
+        return super().compose_scalar_node(anchor)
+
 
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     """The manifest Helm rendered, as parsed documents.
