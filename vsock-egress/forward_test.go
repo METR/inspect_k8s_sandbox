@@ -75,7 +75,7 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 	}
 }
 
-func TestForwarderWithNoWorkerOnItsNodeIsNotReady(t *testing.T) {
+func TestForwarderWhoseWorkerDoesNotListenIsNotReady(t *testing.T) {
 	node, port := loopback(t)
 	f := newForwarder(unix.VMADDR_CID_LOCAL, port)
 	file := filepath.Join(t.TempDir(), "key")
