@@ -34,7 +34,7 @@ metadata:
   name: my-custom-chart-pod-{{ .Release.Name }}
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
-    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
     inspect/service: default
   annotations:
     {{- toYaml $.Values.annotations | nindent 4 }}
