@@ -1601,6 +1601,22 @@ def _in_a_list(manifest: str) -> str:
         pytest.param(
             "  ordinals: {start: 3}\n", [], [_helper_pod(3)], str, id="a-start-ordinal"
         ),
+        # Helm installs this as 3 replicas: read as written, it raised TypeError.
+        pytest.param(
+            "  replicas: 3.0\n",
+            [_helper_pod(n) for n in range(2)],
+            [_helper_pod(n) for n in range(3)],
+            str,
+            id="a-count-written-as-a-float",
+        ),
+        # Helm renders a start of 1000000 from values so: it named `helper-1000000.0`.
+        pytest.param(
+            "  ordinals: {start: 1e+06}\n",
+            [],
+            [_helper_pod(1000000)],
+            str,
+            id="a-start-ordinal-written-as-a-float",
+        ),
     ],
 )
 async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(

@@ -1089,8 +1089,9 @@ def _stateful_set_pods(
             and (_dig(doc, "metadata", "namespace") or namespace) == namespace
         ):
             replicas = _dig(doc, "spec", "replicas")
-            start = _dig(doc, "spec", "ordinals", "start") or 0
-            for ordinal in range(1 if replicas is None else replicas):
+            # Helm installs a whole number written as a float (`3.0`, `1e+06`).
+            start = int(_dig(doc, "spec", "ordinals", "start") or 0)
+            for ordinal in range(1 if replicas is None else int(replicas)):
                 yield f"{_dig(doc, 'metadata', 'name')}-{start + ordinal}"
 
 
