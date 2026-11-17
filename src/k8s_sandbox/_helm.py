@@ -608,8 +608,7 @@ class Release:
                     await self._raise_not_ready_error(
                         saw_a_pod, poll_error, missing, absent
                     )
-                # A pod that turns Ready is not held for the rest of a 2 s poll.
-                # Not wait_for or a cancel scope: each can swallow a cancel as it ends.
+                # Woken by a Ready pod; wait_for or a cancel scope can swallow a cancel.
                 wake = asyncio.ensure_future(woken.wait())
                 try:
                     await asyncio.wait({wake}, timeout=_READINESS_POLL_INTERVAL)
