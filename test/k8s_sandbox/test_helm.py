@@ -1834,18 +1834,25 @@ async def test_wait_until_ready_ends_for_a_cancel_that_comes_as_its_poll_falls_d
         wait.cancel()
 
 
-async def test_a_watch_whose_thread_cannot_start_leaves_its_namespace_to_the_next() -> (
-    None
-):
-    key = (None, "no-thread")
-    with (
-        patch.object(threading.Thread, "start", side_effect=RuntimeError("no thread")),
-        pytest.raises(RuntimeError, match="no thread"),
-        _helm._woken_when_ready(*key, "release"),
-    ):
-        pass
+async def test_wait_until_ready_polls_where_no_watch_thread_can_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "no-thread"  # where no other test's watch runs
+    start = threading.Thread.start
+
+    def no_watch(thread: threading.Thread) -> None:
+        if getattr(thread, "_target", None) is _helm._watch_ready:
+            raise RuntimeError("can't start new thread")
+        start(thread)  # the threads that read the pods still start
+
+    monkeypatch.setattr(threading.Thread, "start", no_watch)
+
+    await _wait(release, [[], [_pod()], [_pod()]], monkeypatch)
+
     # Or no later release there would start a watch: each would wait out its poll.
-    assert key not in _helm._ready_waits
+    assert (release._context_name, release._namespace) not in _helm._ready_waits
 
 
 async def test_wait_until_ready_retries_a_transient_api_error(

@@ -828,19 +828,24 @@ def _woken_when_ready(
     """An event set when the namespace's watch sees one of the release's pods Ready."""
     key, woken = (context_name, namespace), asyncio.Event()
     with _ready_waits_lock:
-        if key not in _ready_waits:
-            waits: _ReadyWaits = {}
-            # Registered once it runs: a thread that cannot start stands for none.
-            threading.Thread(
-                target=_watch_ready, args=(*key, waits), daemon=True
-            ).start()
-            _ready_waits[key] = waits
-        _ready_waits[key][release_name] = (asyncio.get_running_loop(), woken)
+        waits = _ready_waits.get(key)
+        if waits is None:
+            waits = {}
+            try:
+                threading.Thread(
+                    target=_watch_ready, args=(*key, waits), daemon=True
+                ).start()
+            except RuntimeError:
+                # Unregistered: this release polls unwoken, and the next asks again.
+                log_trace("No thread for the readiness watch.", release=release_name)
+            else:
+                _ready_waits[key] = waits
+        waits[release_name] = (asyncio.get_running_loop(), woken)
     try:
         yield woken
     finally:
         with _ready_waits_lock:
-            del _ready_waits[key][release_name]
+            del waits[release_name]
 
 
 def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -> None:
