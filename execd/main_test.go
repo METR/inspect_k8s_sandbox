@@ -99,6 +99,7 @@ func TestConnectWaitsWhileItsOutputIsNotRead(t *testing.T) {
 	w.Close()
 	defer bridge.Wait() // its exit status may go to the tests' reaper
 	defer stdin.Close()
+	daemon.(*net.UnixListener).SetDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
 	c, err := daemon.Accept()
 	if err != nil {
 		t.Fatal(err)
