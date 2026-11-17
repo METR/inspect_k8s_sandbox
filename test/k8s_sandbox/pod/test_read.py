@@ -12,6 +12,7 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import WebSocketConnectionClosedException
 
+from k8s_sandbox._pod import read
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.read import ReadFileOperation
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
@@ -112,6 +113,22 @@ def test_a_path_that_looks_like_an_option_is_read(
     command = _exec_kwargs(monkeypatch, Path("--help"))["command"]
 
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=30)
+
+    assert result.stdout == b"contents"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+def test_a_file_named_as_head_names_stdin_is_read(tmp_path: Path) -> None:
+    """Regression: `head` read stdin instead: nothing over execd, a hang over exec."""
+    (tmp_path / "-").write_bytes(b"contents")
+
+    result = subprocess.run(
+        read.read_command(Path("-")),
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+    )
 
     assert result.stdout == b"contents"
 

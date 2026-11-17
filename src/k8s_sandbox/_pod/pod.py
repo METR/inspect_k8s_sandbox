@@ -40,7 +40,8 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
-RESTART_SHOWN_WITHIN = 30.0  # of execd's death: Kubernetes can show a restart late
+RESTART_SHOWN_WITHIN = 30.0  # how late a restart may show, and between late reads
+LATE_READ_WITHIN = 5.0  # a late check holds its operation no longer than this
 
 
 def _file_op_restart_check_enabled() -> bool:
@@ -79,10 +80,13 @@ class Pod:
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
         self._restart_lock = threading.Lock()
         # Operations go over the pod network to execd, if the pod has it (see execd.py).
-        self._execd = ExecdClient(self._start_execd) if execd else None
+        self._execd = (
+            ExecdClient(self._start_execd, lambda: self._info.uid) if execd else None
+        )
         self._execd_lost = False  # a daemon started whose key a failure then lost
         self._execd_restarted = float("-inf")
-        self._execd_started: float | None = None  # a start whose late check is owed
+        self._execd_started: float | None = None  # what the next late check counts from
+        self._execd_container: bytes | None = None  # the one execd said it started in
 
     async def _start_execd(self, replace: bool) -> Daemon:
         """Start execd; restarts are checked here, since a restart stops the daemon."""
@@ -97,12 +101,19 @@ class Pod:
         )
         if b"address already in use" in stderr:
             raise DaemonRunning(stderr.decode(errors="replace"))
-        # Exactly the fingerprint execd prints: anything else, cut output too, fails.
-        if code != 0 or not re.fullmatch(rb"[0-9a-f]{64}\n", stdout):
+        # Exactly execd's line, its fingerprint and its container: cut output fails.
+        said = re.fullmatch(rb"([0-9a-f]{64}) (\S+)\n", stdout)
+        if code != 0 or said is None:
             raise PodError("execd did not start", returncode=code, stderr=stderr)
         self._execd_lost = True  # until it is returned: a failure below loses its key
         if not replace:  # the daemon reached before died, perhaps with its container
             self._execd_restarted = time.monotonic()
+        if info.restarted_container_behavior == "raise":
+            # Kubernetes can show a restart late; execd is in another container at once.
+            if self._execd_container not in (None, said[2]):
+                self._keep_stopped("execd started in another container")
+                self._raise_restart()
+            self._execd_container = said[2]
         # Again: a container that restarted since the first check runs this daemon.
         await self.check_for_pod_restart()
         # Read last: a pod that replaced the one first checked has another address.
@@ -115,7 +126,7 @@ class Pod:
             raise PodError("The pod has no IP address for execd", pod=info.name)
         self._execd_lost = False
         self._execd_started = time.monotonic()
-        return Daemon(pod.ip, stdout.decode().strip(), key)
+        return Daemon(pod.ip, said[1].decode(), key, pod.uid)
 
     @property
     def info(self) -> PodInfo:
@@ -140,7 +151,10 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        return await self._run_async(self._check_for_pod_restart_sync)
+        found = await self._run_async(self._check_for_pod_restart_sync)
+        if self._execd is not None:  # "warn" mode refreshes a replaced pod's UID
+            await self._execd.leave_replaced()
+        return found
 
     def _check_for_pod_restart_sync(
         self,
@@ -408,27 +422,35 @@ class Pod:
         return result
 
     async def _check_before_execd(self) -> None:
-        """Raise a kept restart; look for one that shows only after execd restarted."""
+        """Raise a kept restart; look for one shown late, and for a pod replaced."""
         if self._restart_error is not None:
             await asyncio.sleep(0)  # as _run_async() suspends a caller in a loop
             self._raise_restart()
         now, started = time.monotonic(), self._execd_started
         late = started is not None and now - started >= RESTART_SHOWN_WITHIN
-        if late or now - self._execd_restarted < RESTART_SHOWN_WITHIN:
+        if now - self._execd_restarted < RESTART_SHOWN_WITHIN:
             await self.check_for_pod_restart()
-            if late and self._execd_started == started:
-                self._execd_started = None  # a restart before that start shows by now
+        elif late:
+            try:
+                await asyncio.wait_for(self.check_for_pod_restart(), LATE_READ_WITHIN)
+            except (PodReplacedError, ContainerRestartedError):
+                raise
+            except Exception:  # the operation itself needs no API server: left unread
+                logger.debug("Reading the pod again failed", exc_info=True)
+            self._execd_started = now  # and again: a pod deleted unstopped runs on
+            self._raise_restart()  # kept by a read answered as its wait ran out
 
-    def _keep_stopped(self) -> PodReplacedError | ContainerRestartedError:
-        """Keep the restart of a container that stopped under an operation."""
+    def _keep_stopped(
+        self, reason: str = "stopped under an operation"
+    ) -> PodReplacedError | ContainerRestartedError:
+        """Keep the restart of a container found stopped before Kubernetes shows it."""
         info = self._info
-        # Gone, though Kubernetes may not show it stopped yet.
         return self._keep(
             ContainerRestartedError(
                 pod_name=info.name,
                 container_name=info.default_container_name,
                 restart_count=info.initial_restart_count + 1,
-                last_reason="stopped under an operation",
+                last_reason=reason,
             )
         )
 

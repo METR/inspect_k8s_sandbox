@@ -12,6 +12,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import threading
 import types
+import uuid
 from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
@@ -51,6 +53,7 @@ from k8s_sandbox._pod.error import (
 from k8s_sandbox._pod.execute import ExecuteOperation, PodStdio, _shell_command
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.pod import Pod
+from test.k8s_sandbox.pod import test_execd_binary
 
 MARKER = "<completed-sentinel-value-0123456789abcdef0123456789abcdef-"
 
@@ -377,6 +380,28 @@ def _run_script(
         os.close(write_end)
 
 
+def _fed(command: list[str], script: str) -> tuple[int, bytes, bytes]:
+    """Run an exec's shell on its script; its stdin stays open, as an exec's does."""
+    data, pipe = script.encode(), subprocess.PIPE
+    shell = subprocess.Popen(
+        command, stdin=pipe, stdout=pipe, stderr=pipe, bufsize=0, start_new_session=True
+    )
+    assert shell.stdin is not None
+    held = os.dup(shell.stdin.fileno())  # the script's end is no end of input
+    pool = concurrent.futures.ThreadPoolExecutor()
+    try:
+        # Left unread, the script never ends its write: the budgets only bound a hang.
+        assert pool.submit(shell.stdin.write, data).result(30) == len(data)
+        out, err = shell.communicate(timeout=30)
+        return shell.returncode, out, err
+    finally:
+        os.close(held)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(shell.pid, signal.SIGKILL)  # what is left of it holds a pipe
+        shell.communicate(timeout=30)  # reaps it and closes its pipes
+        pool.shutdown(wait=False)
+
+
 def _script(cmd: list[str], stdin: str | bytes | None = None) -> str:
     return ExecuteOperation(MagicMock())._build_shell_script(
         cmd, stdin, None, {}, None, MARKER
@@ -594,6 +619,44 @@ def test_a_root_exec_runs_its_command_only_as_uid_0(
         assert result.stderr.endswith(b"runuser: may not be used by non-root users\n")
     if status is None:  # The shell says why before the refusal.
         assert str(status_file).encode() in result.stderr
+
+
+@pytest.fixture(scope="module")
+def bare_image() -> Generator[str, None, None]:
+    """An image with no `id` or `runuser`, whose uid 0 is not named root."""
+    if shutil.which("docker") is None:
+        pytest.skip("needs Docker")
+    name = f"exec-stdio-test-{uuid.uuid4().hex[:8]}"
+    dockerfile = (
+        "FROM public.ecr.aws/docker/library/busybox:1.37\n"
+        "RUN rm /bin/id && sed -i s/^root:/toor:/ /etc/passwd\n"
+    )
+    built = test_execd_binary.docker("build", "-q", "-t", name, "-", stdin=dockerfile)
+    assert built.returncode == 0, built.stderr
+    yield name
+    test_execd_binary.docker("rmi", "-f", name)
+
+
+@pytest.mark.parametrize("user", ["root", "0"])
+@pytest.mark.parametrize(
+    ("uid", "out", "err"),
+    [
+        ("0", "a request\n", ""),
+        ("1000", "", "runuser: may not be used by non-root users\n"),
+    ],
+    ids=["uid-0", "uid-1000"],
+)
+def test_a_root_stream_runs_its_command_only_as_uid_0(
+    bare_image: str, user: str, uid: str, out: str, err: str
+) -> None:
+    """Regression: exec_stdio() asked `id` for root's name, then `runuser`."""
+    command = execute_module._shell_command(user, command=["cat"])
+    run = ["run", "--rm", "-i", "--user", uid, bare_image, *command]
+
+    ran = test_execd_binary.docker(*run, stdin="a request\n")
+
+    # The check leaves stdin to the command.
+    assert (ran.stdout, ran.stderr) == (out, err)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
@@ -1352,6 +1415,43 @@ class TestShellCommand:
         """It matches nothing, and an empty `id` output must not look equal."""
         assert _shell_command("") == ["/sbin/runuser", "-u", "", "--", "/bin/sh"]
 
+    @pytest.mark.skipif(not os.path.exists("/sbin/runuser"), reason="needs runuser")
+    @pytest.mark.parametrize(
+        ("user", "switch"),
+        [("no-such-user", False), ("no-such-user", True), ("", False)],
+        ids=["unprobed", "a switch that worked before", "empty"],
+    )
+    def test_a_switch_that_runuser_refuses_reads_a_large_script(
+        self, user: str, switch: bool
+    ) -> None:
+        """Regression: its script unread, the exec never ended, nor did exec()."""
+        script = _script(["cat"], bytes(1024**2))  # more than a pipe holds
+        command = execute_module._shell_command(user, switch, script=script)
+
+        code, _, said = _fed(command, script)
+
+        assert code != 0 and b"runuser: " in said  # what exec() tells of
+
+    @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
+    def test_a_switch_that_works_leaves_a_large_script_to_its_shell(
+        self, tmp_path: Path
+    ) -> None:
+        """The pipe hands the shell its whole script, and the shell's status back."""
+        forward = tmp_path / "forward"  # runuser without the switch
+        forward.write_text(
+            '#!/bin/sh\nwhile [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n'
+        )
+        forward.chmod(0o755)
+        # Its $0 takes more bytes than characters: a size in characters cuts the end.
+        script = _script(["sh", "-c", "echo $(($(wc -c))); exit 7", "éé"], bytes(8192))
+        command = execute_module._shell_command("someone-else", script=script)
+        command[2] = command[2].replace("/sbin/runuser", str(forward))
+
+        code, out, _ = _fed(command, script)
+
+        # All of its input, its own status and the marker: the script, read whole.
+        assert (code, out) == (7, b"8192\n" + _marker(7))
+
     @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")
     @pytest.mark.parametrize("shell", _SHELLS)
     def test_id_and_runuser_are_not_found_through_the_path(
@@ -1624,6 +1724,34 @@ class TestRunuserErrorMessages:
         executor = ExecuteOperation(MagicMock())
 
         executor._check_for_runuser_error(stderr, "agent")  # does not raise
+
+
+@pytest.mark.parametrize(
+    ("said", "raises"),
+    [
+        ("runuser: user agent does not exist", True),
+        ("runuser: may not be used by non-root users", False),
+        ("runuser: cannot set groups: Operation not permitted", False),
+        ("/bin/sh: 1: exec: runuser: not found", False),
+    ],
+)
+def test_a_user_switch_that_failed_is_told_with_only_the_end_of_stderr(
+    said: str, raises: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: a command that filled stderr had 10 MiB logged by each call."""
+    info = op_module.PodInfo("p", "ns", None, "default", "u", 0, "warn")
+    executor = execute_module.ExecuteOperation(info)
+    stderr = "x" * (1 << 20) + said
+
+    if raises:
+        with pytest.raises(RuntimeError) as unknown_user:
+            executor._check_for_runuser_error(stderr, "agent")
+        told = str(unknown_user.value)
+    else:
+        executor._check_for_runuser_error(stderr, "agent")
+        told = caplog.text
+
+    assert said in told and len(told) < 8192
 
 
 def _stdio(
@@ -2056,6 +2184,45 @@ class TestExecStdio:
         await stream.aclose()
 
         assert sent_with == 0
+
+    async def test_sends_the_socket_has_room_for_let_other_tasks_run(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Regression: one send after another held the event loop until the last."""
+        stream = _stdio(tls_sockets[0])
+        turns = 0
+
+        async def other_task() -> None:
+            nonlocal turns
+            turns += 1
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(other_task)
+                for _ in range(2 * execute_module._STEPS_PER_TURN):
+                    await stream.send(b"a request\n")
+                sent_with = turns
+        await stream.aclose()
+
+        assert sent_with == 1
+
+    async def test_a_send_that_takes_its_turn_keeps_its_place(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+    ) -> None:
+        """Regression: taking its turn before the lock, it let a later send go first."""
+        client, server = tls_sockets
+        stream = _stdio(client)
+        reader = _reader(server)
+        items = [bytes([i]) for i in range(2 * execute_module._STEPS_PER_TURN)]
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                for item in items:
+                    tasks.start_soon(stream.send, item)
+        sent = [reader.recv_data_frame(True)[1].data[1:] for _ in items]
+        await stream.aclose()
+
+        assert sent == items
 
     async def test_a_receive_cancelled_at_any_step_loses_nothing(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]

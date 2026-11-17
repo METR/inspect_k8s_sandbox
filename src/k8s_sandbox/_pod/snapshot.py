@@ -63,6 +63,8 @@ class PodSnapshot:
     ip: str | None = None
     """``status.podIP``."""
     annotations: dict[str, str] = field(default_factory=dict)
+    shares_pids: bool = False
+    """``spec.shareProcessNamespace`` or ``spec.hostPID``."""
 
     def status_for(self, container_name: str) -> ContainerStatus | None:
         if self.container_statuses is None:
@@ -156,6 +158,7 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
         ),
         ip=status.get("podIP"),
         annotations=metadata.get("annotations") or {},
+        shares_pids=bool(spec.get("shareProcessNamespace") or spec.get("hostPID")),
     )
 
 

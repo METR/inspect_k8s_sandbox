@@ -49,7 +49,7 @@ _CLOSE_GROUP = "}\n"
 _STDERR_TAIL_BYTES = 4096
 # How often an exec_stdio stream retries TLS that must write to read, or read to write.
 _TLS_RETRY_SECONDS = 0.01
-# The receive() calls and frames an exec_stdio stream takes before others get a turn.
+# The calls and frames an exec_stdio stream takes before others get a turn.
 _STEPS_PER_TURN = 32
 # The users that mean uid 0 whatever passwd says: their exec runs behind _ROOT_CHECK.
 ROOT_USERS = ("root", "0")
@@ -61,12 +61,17 @@ _ROOT_CHECK = (
 )
 # Not found through the image's PATH (see SYSTEM_PATH): util-linux puts it here.
 _RUNUSER = "/sbin/runuser"
+# What any pipe holds: a script no larger does not hold its exec open when left unread.
+_PIPE = 4096
 
 logger = logging.getLogger(__name__)
 
 
 def _shell_command(
-    user: str | None, switch: bool = False, command: Sequence[str] = ("/bin/sh",)
+    user: str | None,
+    switch: bool = False,
+    command: Sequence[str] = ("/bin/sh",),
+    script: str = "",
 ) -> list[str]:
     """The command that runs `command` (by default, exec()'s shell) as `user`.
 
@@ -79,21 +84,26 @@ def _shell_command(
     inherits from the container instead.
 
     `switch` is whether a probe found that this user needs `runuser`, and that it works.
+    `script` is stdin's: read whole when large, since unread input holds an exec open.
     `sh -c` takes its script from argv, so stdin reaches the command it execs
     unread, and the caller's protocol is unchanged.
     """
     if user is None:
         return list(command)
-    if not user or switch:
-        # An empty user matches nothing; leave runuser to reject it as it did before.
+    if user in ROOT_USERS:  # exec()'s own check: uid 0 with no `id` or `runuser`
+        return ["/bin/sh", "-c", f"{_ROOT_CHECK}exec {shlex.join(command)}"]
+    direct = shlex.join(command)
+    run = f"{_RUNUSER} -u {shlex.quote(user)} -- {direct}"
+    same = ""
+    if user and not switch:  # an empty user matches nothing: runuser rejects it
+        same = f"if {_runs_as(user)}; then exec {direct}; fi; "
+    if (size := len(script.encode())) > _PIPE:
+        read = f"PATH={SYSTEM_PATH} head -c {size}"
+        fed = f"{{ {run}; s=$?; {read} >/dev/null; exit $s; }}"
+        return ["/bin/sh", "-c", f"{same}{read} | {fed}"]
+    if not same:
         return [_RUNUSER, "-u", user, "--", *command]
-    run = shlex.join(command)
-    return [
-        "/bin/sh",
-        "-c",
-        f"if {_runs_as(user)}; then exec {run}; fi; "
-        f"exec {_RUNUSER} -u {shlex.quote(user)} -- {run}",
-    ]
+    return ["/bin/sh", "-c", f"{same}exec {run}"]
 
 
 def _runs_as(user: str) -> str:
@@ -131,7 +141,9 @@ class ExecuteOperation(PodOperation):
         shell_script = self._build_shell_script(
             cmd, stdin, cwd, env, timeout, marker, root=root
         )
-        shell = ["/bin/sh"] if root else _shell_command(user, switch)
+        shell = (
+            ["/bin/sh"] if root else _shell_command(user, switch, script=shell_script)
+        )
         with self._interactive_shell(shell) as ws_client:
             # Write the script to the shell's stdin rather than passing it as a command
             # argument (-c) to better support potentially long commands.
@@ -373,10 +385,11 @@ class ExecuteOperation(PodOperation):
         return result
 
     def _check_for_runuser_error(self, stderr: str, user: str) -> None:
+        end = stderr[-_STDERR_TAIL_BYTES:]  # a command can fill stderr to its limit
         if re.search(r"runuser: user \S+ does not exist", stderr, re.IGNORECASE):
             raise RuntimeError(
                 f"The user parameter '{user}' provided to exec() does "
-                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{stderr}"
+                f"not appear to exist in the container. Docs: {EXEC_USER_URL}\n{end}"
             )
         # The three arms below describe an environment that cannot perform the
         # switch, not a caller asking for something that does not exist. Callers
@@ -392,7 +405,7 @@ class ExecuteOperation(PodOperation):
                 "runuser cannot switch users. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # Anchored on the `runuser: ` prefix like the arms above it: `newgrp`,
@@ -406,7 +419,7 @@ class ExecuteOperation(PodOperation):
                 "been dropped. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
         # dash and busybox say "not found", bash "No such file or directory".
@@ -418,7 +431,7 @@ class ExecuteOperation(PodOperation):
                 "at /sbin/runuser, which this container lacks. Docs: %s\n%s",
                 user,
                 EXEC_USER_URL,
-                stderr,
+                end,
             )
             return
 
@@ -564,6 +577,7 @@ class PodStdio(ByteStream):
 
     async def send(self, item: bytes) -> None:
         async with self._send_lock:
+            await self._turn()  # under the lock: it keeps its place among later sends
             await _land_pending_cancel()  # also one that came as it waited for the lock
             self._drop_if_restarted()
             try:

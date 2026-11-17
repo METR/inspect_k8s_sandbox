@@ -14,16 +14,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// As early as it can be; only a binary the sandbox can't read (mode 111) closes the window.
-func init() { prctl(prSetDumpable, 0) }
+// As early as it can be; only a binary its exec can't read (mode 111, and no CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH) closes the window.
+func init() { undumpable() }
 
 func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
@@ -45,6 +47,27 @@ func main() {
 		return
 	}
 	run(*port, *keyHash, *replace)
+}
+
+// memoryLimit is half the cgroup's memory limit, or 32 MiB if that is more or the limit can't be read; none where it has none.
+func memoryLimit(cgroupMax []byte, err error) int64 {
+	limit := strings.TrimSpace(string(cgroupMax))
+	if limit == "max" {
+		return math.MaxInt64
+	}
+	n, bad := strconv.ParseInt(limit, 10, 64)
+	if err != nil || bad != nil {
+		return 32 << 20
+	}
+	return max(n/2, 32<<20)
+}
+
+// cgroupLimit reads cgroup v2's memory limit under root, or v1's where there is none, as on gVisor.
+func cgroupLimit(root string) ([]byte, error) {
+	if limit, err := os.ReadFile(root + "/memory.max"); err == nil {
+		return limit, nil
+	}
+	return os.ReadFile(root + "/memory/memory.limit_in_bytes")
 }
 
 // become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
@@ -98,8 +121,16 @@ func fail(msg string) {
 // Non-dumpable: same-uid processes can't open its /proc files. Subreaper: it reaps orphans.
 const prSetDumpable, prSetChildSubreaper = 4, 36
 
-func prctl(option, arg uintptr) {
-	syscall.RawSyscall(syscall.SYS_PRCTL, option, arg, 0)
+func prctl(option, arg uintptr) syscall.Errno {
+	_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, option, arg, 0)
+	return errno
+}
+
+// undumpable ends execd where the kernel refuses, as a seccomp profile can: its user could read its memory.
+func undumpable() {
+	if errno := prctl(prSetDumpable, 0); errno != 0 {
+		fail("prctl(PR_SET_DUMPABLE): " + errno.Error())
+	}
 }
 
 // start re-runs execd in a new session, so it outlives this exec, and relays its status line.
@@ -126,7 +157,16 @@ func start() {
 		daemon.Wait() // it has exited: no zombie is left to a first process that reaps none
 		fail("daemon did not start: " + msg)
 	}
-	fmt.Println(fingerprint)
+	fmt.Println(fingerprint, container())
+}
+
+// container names the container execd is in: a client that finds another has seen a restart, whatever Kubernetes shows.
+func container() string {
+	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if f := stat(1); len(f) > 19 { // the kernel's boot, and when the container's first process started
+		return strings.TrimSpace(string(boot)) + ":" + f[19]
+	}
+	return "unknown"
 }
 
 func run(port int, keyHash string, replace bool) {
@@ -136,6 +176,7 @@ func run(port int, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
+	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())

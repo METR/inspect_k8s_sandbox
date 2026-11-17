@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import (
     Any,
@@ -21,6 +21,7 @@ from typing import (
     Protocol,
 )
 
+import anyio
 import yaml
 from inspect_ai.util import ExecResult, concurrency
 from kubernetes.client.exceptions import ApiException  # type: ignore
@@ -45,6 +46,7 @@ _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
+_SIGNALLED_HELM_ENDS_WITHIN = 10  # seconds, before a cancelled caller kills it
 INSPECT_HELM_TIMEOUT = "INSPECT_HELM_TIMEOUT"
 INSPECT_HELM_UNINSTALL_TIMEOUT = "INSPECT_HELM_UNINSTALL_TIMEOUT"
 INSPECT_HELM_LABELS = "INSPECT_HELM_LABELS"
@@ -107,6 +109,17 @@ def _get_wait_flag() -> str:
 
 class _ResourceQuotaModifiedError(Exception):
     pass
+
+
+class _ReleaseNameInUseError(Exception):
+    pass
+
+
+# How to list what Helm records a release in, with its labels, by HELM_DRIVER.
+_HELM_RECORDS = {
+    "secret": "list_namespaced_secret",
+    "configmap": "list_namespaced_config_map",
+}
 
 
 def _is_allowed_null_value(parent_path: str, key: str) -> bool:
@@ -235,6 +248,8 @@ class Release:
         self._namespace = get_default_namespace(context_name)
         # The release name is used in pod names too, so limit it to 8 chars.
         self.release_name = self._generate_release_name()
+        # On the release this installs: one of its name can be another sample's.
+        self._label = f"inspectSandboxOwner={uuid()}"
         self.restarted_container_behavior = restarted_container_behavior
         self.sample_uuid = sample_uuid
         self._extra_values = dict(extra_values) if extra_values else {}
@@ -280,16 +295,20 @@ class Release:
                             "K8s Helm values", release=self.release_name, values=values
                         )
                         attempt = 1
+                        upgrade = False
                         while True:
                             try:
-                                await self._install(
-                                    values, deadline, upgrade=attempt > 1
-                                )
+                                await self._install(values, deadline, upgrade)
                                 break
-                            except _ResourceQuotaModifiedError:
+                            except (
+                                _ResourceQuotaModifiedError,
+                                _ReleaseNameInUseError,
+                            ) as e:
                                 if attempt >= MAX_INSTALL_ATTEMPTS:
                                     raise
                                 attempt += 1
+                                # A new name has no release of ours to upgrade.
+                                upgrade = isinstance(e, _ResourceQuotaModifiedError)
                                 await asyncio.sleep(INSTALL_RETRY_DELAY_SECONDS)
                 self._ready_pods = await self._wait_until_ready(deadline)
         except asyncio.CancelledError:
@@ -300,11 +319,47 @@ class Release:
             log_trace(
                 "Helm install was cancelled; uninstalling.", release=self.release_name
             )
-            await self.uninstall(quiet=True)
+            with suppress(Exception):  # it stays cancelled, and tracked for later
+                await self.uninstall(quiet=True)
             raise
 
     async def uninstall(self, quiet: bool) -> None:
-        await uninstall(self.release_name, self._namespace, self._context_name, quiet)
+        if await self._labelled():  # asked each time: its name can be another's by now
+            await uninstall(
+                self.release_name, self._namespace, self._context_name, quiet
+            )
+
+    async def _labelled(self) -> bool:
+        """Whether Helm recorded a release for an install of this object's."""
+        driver = os.getenv("HELM_DRIVER", "").removesuffix("s") or "secret"
+        if driver in _HELM_RECORDS:
+            # Not `helm list`: to find one release it reads every one in the namespace.
+            records = await asyncio.to_thread(
+                lambda: getattr(k8s_client(self._context_name), _HELM_RECORDS[driver])(
+                    self._namespace,
+                    label_selector=self._label,
+                    _request_timeout=_LIST_PODS_READ_TIMEOUT,
+                )
+            )
+            return bool(records.items)
+        async with _uninstall_semaphore():
+            # Helm sets no deadline on a list, and this one holds a permit.
+            listed = await asyncio.wait_for(
+                _run_subprocess(
+                    "helm",
+                    ["list", "-q", "-n", self._namespace, "-l", self._label]
+                    # Named, as Helm 3 lists only the first two unless told.
+                    + ["--deployed", "--failed", "--pending", "--uninstalling"]
+                    + _kubeconfig_context_args(self._context_name),
+                    capture_output=True,
+                ),
+                _get_uninstall_timeout(),
+            )
+        if not listed.success:  # not "none": the release would be left, and forgotten
+            _raise_runtime_error(
+                "Helm list failed.", release=self.release_name, stderr=listed.stderr
+            )
+        return bool(listed.stdout.strip())
 
     async def get_sandbox_pods(self) -> dict[str, Pod]:
         """The release's sandboxes, as confirmed ready by install()."""
@@ -321,6 +376,20 @@ class Release:
         sandboxes = dict()
         for pod in _sandbox_pods(pods):
             default_container_name = pod.container_names[0]
+            execd = pod.annotations.get(EXECD_ANNOTATION) == "true"
+            if (
+                execd
+                and pod.shares_pids
+                and self.restarted_container_behavior == "raise"
+            ):
+                # execd tells a restart by PID 1's start: there, not the container's.
+                _raise_runtime_error(
+                    "With restarted_container_behavior='raise', execd needs the "
+                    "container's first process to be PID 1: set neither "
+                    "shareProcessNamespace nor hostPID.",
+                    release=self.release_name,
+                    pod=pod.name,
+                )
             sandboxes[pod.labels[_SERVICE_LABEL]] = Pod(
                 pod.name,
                 self._namespace,
@@ -329,7 +398,7 @@ class Release:
                 pod.uid,
                 pod.restart_count_for(default_container_name),
                 self.restarted_container_behavior,
-                execd=pod.annotations.get(EXECD_ANNOTATION) == "true",
+                execd=execd,
             )
         return sandboxes
 
@@ -363,6 +432,7 @@ class Release:
                 + _helm_escape(self.task_name),
                 # Include a label to identify releases created by Inspect.
                 _labels_arg(),
+                f"--labels={self._label}",
             ]
             + (
                 [
@@ -390,6 +460,18 @@ class Release:
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
+        refused = re.search(
+            # Whole lines of Helm 3's and Helm 4's: another error can quote the words.
+            r"^Error: INSTALLATION FAILED: (release name check failed: )?"
+            r"(cannot re-?use a name that is still in use|release: already exists)$",
+            result.stderr,
+            re.MULTILINE,
+        )
+        # Unless it recorded a release: an error can hold a whole line a task wrote.
+        if refused and not await self._labelled():
+            self.release_name = self._generate_release_name()
+            log_trace("Release name in use: took another.", release=self.release_name)
+            raise _ReleaseNameInUseError(result.stderr)
         # When concurrent helm operations are modifying the same resource quota, the
         # following error occasionally occurs. Retry.
         if re.search(
@@ -651,7 +733,10 @@ async def _run_subprocess(
             proc.terminate()
             # Use communicate() over wait() to avoid potential deadlock
             # https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.subprocess.Process.wait
-            await proc.communicate()
+            with anyio.move_on_after(_SIGNALLED_HELM_ENDS_WITHIN, shield=True):
+                await proc.communicate()  # shielded: a scope cancels every await
+            # Kills it if it still runs and closes its pipes, which a child may hold.
+            proc._transport.close()  # type: ignore[attr-defined]
         # Task may have been cancelled before proc was assigned.
         except UnboundLocalError:
             pass

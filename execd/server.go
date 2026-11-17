@@ -42,6 +42,8 @@ var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name s
 
 var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and stand in for a call's deadline
 
+var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
+
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
@@ -52,6 +54,9 @@ func hook(h *atomic.Pointer[func(late bool)], late bool) {
 		(*f)(late)
 	}
 }
+
+// What one read of a command's pipe takes: a default pipe's capacity, and the most Go keeps off the heap.
+const pipeRead = 64 << 10
 
 // Bounds on unauthenticated connections: time, AUTH payload, and how many at once.
 const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
@@ -152,7 +157,10 @@ func fromThisPod(nc net.Conn) bool {
 	if !ok || remote.IP.IsLoopback() {
 		return ok
 	}
-	addrs, _ := net.InterfaceAddrs()
+	addrs, err := interfaceAddrs()
+	if err != nil { // can't tell: refuse, rather than admit a dial from the sandbox
+		return true
+	}
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(remote.IP) {
 			return true
@@ -279,7 +287,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out = true, [2]fifo{}
+		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl for six minutes
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -449,7 +457,7 @@ func (cl *call) run(req startRequest) error {
 	killed := cl.killed
 	cl.kmu.Unlock()
 	if killed { // while it started: nothing is reaped under this lock, so the id is its own
-		syscall.Kill(-p.Pid, syscall.SIGKILL)
+		killTree(p.Pid)
 	}
 	reaper.mu.Unlock()
 	if killed { // that holds for what it left running too
@@ -471,7 +479,7 @@ func (cl *call) run(req startRequest) error {
 		go func() {
 			defer drained.Done()
 			defer r.Close()
-			buf := make([]byte, 256<<10)
+			buf := make([]byte, pipeRead)
 			for {
 				n, err := r.Read(buf)
 				if n > 0 {
@@ -503,8 +511,8 @@ func (cl *call) run(req startRequest) error {
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
 		for i, r := range pipes {
-			want[i] = buffered(r)               // before the count, so want can't fall short
-			want[i] += read[i].Load() + 256<<10 // a read under way has taken bytes it hasn't counted
+			want[i] = buffered(r)                // before the count, so want can't fall short
+			want[i] += read[i].Load() + pipeRead // a read under way has taken bytes it hasn't counted
 		}
 		done := make(chan struct{})
 		go func() { drained.Wait(); close(done) }()
@@ -581,6 +589,7 @@ func (cl *call) feedStdin(w *os.File) {
 			return
 		}
 		data := cl.stdinQ[0]
+		cl.stdinQ[0] = nil // or the queue's array keeps what the command has read
 		cl.stdinQ = cl.stdinQ[1:]
 		cl.mu.Unlock()
 		// A command that exits without reading its stdin makes this fail; that is not an error.
@@ -727,7 +736,7 @@ func (cl *call) ackLocked(req resumeRequest) {
 	cl.room.Broadcast()
 }
 
-// kill stops the call's process group, and every process still carrying its tag.
+// kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
 // stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
@@ -748,12 +757,80 @@ func (cl *call) stop(timeout bool) {
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
-		syscall.Kill(-pid, syscall.SIGKILL)
+		killTree(pid)
 	}
 	reaper.mu.Unlock()
 	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
 	}
+}
+
+// stat is /proc/PID/stat after the name, which may hold spaces and parentheses: the state, the parent, and 20th the start time.
+func stat(pid int) []string {
+	data, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	return strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
+}
+
+// killTree kills pid's group and the processes under pid, which it stops as it finds them, by the parent each one's stat names.
+func killTree(pid int) {
+	syscall.Kill(pid, syscall.SIGSTOP)  // the command by its own id too: it may have left its group for another
+	syscall.Kill(-pid, syscall.SIGSTOP) // the group at once: stopped, a process starts no other, and its children stay its own
+	var stopped []int
+	seen, waits := map[int]bool{}, 0
+	// Eight listings at most: a command that starts them faster than they are listed would hold every start and exit.
+	for pass, more := 0, true; more && pass < 8; pass++ {
+		more = false
+		children, started := map[int][]int{}, map[int]string{}
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			p, _ := strconv.Atoi(e.Name())
+			if f := stat(p); len(f) > 19 {
+				ppid, _ := strconv.Atoi(f[1])
+				children[ppid], started[p] = append(children[ppid], p), f[19]
+			}
+		}
+		first := len(stopped)
+		for queue := children[pid]; len(queue) > 0; queue = queue[1:] {
+			p := queue[0]
+			queue = append(queue, children[p]...)
+			delete(children, p) // taken once: an id given again while they were read could close a loop
+			if !seen[p] && freeze(p, started[p]) {
+				stopped, seen[p], more = append(stopped, p), true, true
+			}
+		}
+		for _, p := range stopped[first:] { // one signalled while it starts a process still starts it: listed again once it has
+			for ; waits < 1000 && stopping(p); waits++ {
+				time.Sleep(time.Millisecond) // a thousand in all: one given no processor to stop on must not hold the rest
+			}
+		}
+	}
+	for _, p := range stopped { // shortcut: stopped, each keeps its id unless something else kills it now; signal as freeze does if that can matter
+		syscall.Kill(p, syscall.SIGKILL)
+	}
+	syscall.Kill(pid, syscall.SIGKILL)
+	syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+// stopping reports whether a thread of pid still runs or sleeps: any of them may be the one starting a process.
+func stopping(pid int) bool {
+	threads, _ := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
+	for _, t := range threads {
+		tid, _ := strconv.Atoi(t.Name())
+		if f := stat(tid); len(f) > 0 && strings.Contains("RS", f[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+// freeze stops process pid if it is still the one that started then: its id may be another's by now.
+func freeze(pid int, started string) bool {
+	handle, _ := os.FindProcess(pid)
+	defer handle.Release()
+	if f := stat(pid); len(f) <= 19 || f[19] != started {
+		return false
+	}
+	return handle.Signal(syscall.SIGSTOP) == nil
 }
 
 // end kills whatever carries the call's tag.
@@ -793,7 +870,7 @@ func setids(uid, gid uint32) {
 	if uid == 0 {
 		syscall.RawSyscall(syscall.SYS_SETRESGID, keep, uintptr(gid), keep)
 	}
-	prctl(prSetDumpable, 0) // a change of identity resets it, for the whole process
+	undumpable() // a change of identity resets it, for the whole process
 }
 
 func (cl *call) finish(code int, startErr string) {

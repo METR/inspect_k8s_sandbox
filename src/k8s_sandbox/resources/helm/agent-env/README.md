@@ -24,6 +24,7 @@
 | labels | object | `{}` | A dict of labels to apply to resources within the agent environment. |
 | networkPolicy.enabled | bool | `true` | Render the CiliumNetworkPolicies. Set false on a cluster without Cilium; the cluster or pod runtime must then enforce egress and isolation. While false, the allow* values, `networks` and `networkIsolated` are rejected. |
 | networks | object | `{}` | Defines network names that can be attached to services in order to specify subsets of services that can communicate with one another. Names must be lower case alphanumeric with `-` or `.`, and at most 55 characters. |
+| priorityClassName | string | `nil` | PriorityClass for every service's pod. Unset, pods get the cluster default. |
 | serviceAccountCreate | bool | `false` | Whether to create the selected ServiceAccount. Keep disabled to use an externally managed ServiceAccount across concurrent sandbox releases. |
 | serviceAccountName | string | `nil` | Service account name for sandbox pods. The account must already exist unless `serviceAccountCreate` is enabled. |
 | services | object | see [values.yaml](./values.yaml) | A collection of services to deploy within the agent environment. A service can connect to another service using DNS, e.g. `http://nginx:80`. |
@@ -44,7 +45,7 @@
 | services.default.resources | object | see [templates/services.yaml](./templates/services.yaml) | Resource requests and limits for the container. |
 | services.default.runtimeClassName | string | `"gvisor"` | The container runtime e.g. gvisor or runc. The default is gvisor if not specified or set to `null`. |
 | services.default.securityContext | object | `{}` | Privilege and access control settings for the container. |
-| services.default.terminationGracePeriodSeconds | int | `0` | Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it. |
+| services.default.terminationGracePeriodSeconds | int | `0` | Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it. The default `command` ignores SIGTERM, so a Pod running it takes that long to delete. |
 | services.default.tolerations | list | `[]` | Toleration settings for the Pod. |
 | services.default.volumeMounts | list | `[]` | Volume mounts that will be mounted in the container. Volumes defined in `volumes:` as colon-separated strings will automatically be mounted at their specified mount paths. |
 | services.default.volumes | list | `[]` | Volumes accessible to the container. Supports arbitrary yaml or colon-separated strings of the form `volume-name:/mount-path`. |

@@ -4,16 +4,48 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestTheMemoryLimitIsHalfTheContainers(t *testing.T) {
+	for cgroupMax, want := range map[string]int64{
+		"1999998976\n": 999999488,
+		"16777216\n":   32 << 20,      // never less: execd idles at 7 MiB
+		"max\n":        math.MaxInt64, // a container with no limit
+	} {
+		if got := memoryLimit([]byte(cgroupMax), nil); got != want {
+			t.Errorf("memory.max %q: limit %d, want %d", cgroupMax, got, want)
+		}
+	}
+	if got := memoryLimit(nil, os.ErrNotExist); got != 32<<20 {
+		t.Errorf("no cgroup file: limit %d, want 32 MiB", got)
+	}
+}
+
+func TestTheMemoryLimitIsReadFromCgroupV2OrV1(t *testing.T) {
+	for _, file := range []string{"memory.max", "memory/memory.limit_in_bytes"} { // v1 is all gVisor has
+		root := t.TempDir()
+		os.Mkdir(root+"/memory", 0o755)
+		if err := os.WriteFile(root+"/"+file, []byte("2147483648\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := memoryLimit(cgroupLimit(root)); got != 1<<30 {
+			t.Errorf("%s: limit %d, want half of 2 GiB", file, got)
+		}
+	}
+}
 
 func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
@@ -38,8 +70,8 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the first exec's stdout stayed open: %v", err)
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out) {
-		t.Fatalf("the first exec printed %q, want its daemon's fingerprint", out)
+	if !regexp.MustCompile(`^[0-9a-f]{64} \S+\n$`).Match(out) {
+		t.Fatalf("the first exec printed %q, want its daemon's fingerprint and its container", out)
 	}
 }
 
@@ -79,5 +111,47 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	}
 	if len(left) > 0 {
 		t.Fatalf("the start left a process behind: %s", left)
+	}
+}
+
+// refused runs execd where the kernel refuses PR_SET_DUMPABLE, as a seccomp profile can, and says so if execd then ran on.
+func refused(at string) {
+	if at != "ran on" {
+		runtime.LockOSThread() // the filter is this thread's, and an exec keeps it
+		filter := []syscall.SockFilter{
+			{Code: 0x20, K: 0},                               // the call's number
+			{Code: 0x15, Jf: 3, K: syscall.SYS_PRCTL},        // not prctl: allowed
+			{Code: 0x20, K: 16},                              // its first argument
+			{Code: 0x15, Jf: 1, K: prSetDumpable},            // another option: allowed
+			{Code: 0x06, K: 0x50000 | uint32(syscall.EPERM)}, // SECCOMP_RET_ERRNO
+			{Code: 0x06, K: 0x7fff0000},                      // SECCOMP_RET_ALLOW
+		}
+		prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+		const prSetNoNewPrivs, prSetSeccomp, seccompModeFilter = 38, 22, 2
+		prctl(prSetNoNewPrivs, 1) // without it a filter needs CAP_SYS_ADMIN
+		if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog))); errno != 0 {
+			fail("seccomp: " + errno.Error())
+		}
+		if at == "start" { // init() runs again, under the filter
+			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ran on"}, os.Environ())
+		}
+		setids(uint32(os.Getuid()), uint32(os.Getgid()))
+	}
+	os.Stdout.WriteString("ran on")
+}
+
+func TestExecdEndsWhereItCannotBeMadeNonDumpable(t *testing.T) {
+	for _, at := range []string{"start", "change of identity"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "refused", at)
+		var said strings.Builder
+		child.Stderr = &said
+
+		ran, _ := child.Output() // its exit status may go to the tests' reaper
+
+		if len(ran) > 0 || !strings.Contains(said.String(), "prctl(PR_SET_DUMPABLE): operation not permitted") {
+			t.Errorf("at its %s execd said %q, then %q: its user could read its memory", at, said.String(), ran)
+		}
 	}
 }

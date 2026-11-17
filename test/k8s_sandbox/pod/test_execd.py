@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import threading
 import time
 import types
@@ -22,7 +23,7 @@ import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
 
-from k8s_sandbox import _helm
+from k8s_sandbox import _helm, _sandbox_environment
 from k8s_sandbox._pod import error, execd, op, snapshot
 from k8s_sandbox._pod import pod as pod_module
 
@@ -50,7 +51,7 @@ class Daemons:
         self.ports: dict[execd.Daemon, int] = {}
         self.unstarted: list[execd.Daemon] = []
 
-    async def serve(self, handler: Handler) -> asyncio.Server:
+    async def serve(self, handler: Handler, pod: str = "") -> asyncio.Server:
         """One that answers AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -59,7 +60,7 @@ class Daemons:
             await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)
-        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key")
+        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", pod)
         self.ports[daemon] = server.sockets[0].getsockname()[1]
         self.unstarted.append(daemon)
         return server
@@ -154,7 +155,7 @@ async def test_an_annotated_pod_runs_every_operation_over_execd(
                 starts += 1
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
-    await daemons.serve(exits)
+    await daemons.serve(exits, pod="u")
     # As in test_helm.py: no cluster config needed.
     monkeypatch.setattr("k8s_sandbox._helm.get_default_namespace", lambda _: "default")
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
@@ -188,9 +189,12 @@ class Cluster:
     restarts = reads = 0
     uid, ip = "u", "10.0.0.1"
     unavailable = False  # its next read fails
+    held: threading.Event | None = None  # its reads wait for it
 
     def read_namespaced_pod(self, **_: object) -> types.SimpleNamespace:
         self.reads += 1
+        if self.held is not None:
+            self.held.wait(60)  # past a test's bound: one never set fails its test
         if self.unavailable:
             self.unavailable = False
             raise kubernetes.client.exceptions.ApiException(status=503)
@@ -207,11 +211,14 @@ class Cluster:
 
 
 @pytest.fixture
-def cluster(monkeypatch: pytest.MonkeyPatch) -> Cluster:
+def cluster(monkeypatch: pytest.MonkeyPatch) -> collections.abc.Iterator[Cluster]:
     shown = Cluster()
     monkeypatch.setattr(op, "k8s_client", lambda _: shown)
     monkeypatch.setattr(pod_module, "k8s_client", lambda _: shown)
-    return shown
+    monkeypatch.setattr(pod_module, "LATE_READ_WITHIN", 30)  # past CI's stalls
+    yield shown
+    if shown.held is not None:
+        shown.held.set()  # no test leaves a read waiting
 
 
 @pytest.mark.parametrize(
@@ -609,6 +616,8 @@ async def test_a_command_whose_start_was_cut_off_part_way_is_resumed(
             await r.read()
             return
         kind, call_id, _ = await read_frame(r)
+        while kind in (execd.RELEASE, execd.PING):  # the first command's, again
+            kind, call_id, _ = await read_frame(r)
         resumes.append(kind == execd.RESUME)
         w.write(frame(execd.ERROR, call_id, b"unknown call"))
         kind, call_id, _ = await read_frame(r)
@@ -742,56 +751,357 @@ async def test_a_command_cancelled_while_cut_off_is_killed_when_execd_is_back(
     assert got == [(execd.KILL, started[0]), (execd.RELEASE, started[0])]
 
 
-async def test_calls_left_while_cut_off_are_all_killed_however_far_apart(
-    daemons: Daemons, clock: types.SimpleNamespace
+async def test_a_calls_last_frames_are_sent_again_until_a_pong_follows_them(
+    tls_daemon: TlsDaemon,
 ) -> None:
-    """Regression: the second one left dropped the first, once six minutes old."""
-    auths = 0
-    answer = asyncio.Event()
-    started: list[int] = []
-    got: list[tuple[int, int]] = []
+    """Regressions: ids forgotten once written; a finished call's RELEASE not kept."""
+    got: list[list[tuple[int, int]]] = []
+    starts: list[int] = []
+    drop = False  # the connection, under the next command sent
 
-    async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal auths
-        await read_frame(r)  # AUTH
-        auths += 1
-        if auths == 1:
-            w.write(frame(execd.OK, 0))
-            for _ in range(2):
-                started.append((await read_frame(r))[1])  # START
-            w.close()  # the connection drops under both commands
-            return
-        await answer.wait()  # the client is still reconnecting
-        w.write(frame(execd.OK, 0))
+    async def answers_its_third_ping_late(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal drop
+        mine: list[tuple[int, int]] = []
+        got.append(mine)
+        pinged = False
         while True:
             kind, call_id, _ = await read_frame(r)
-            if kind == execd.START:  # the next command: what was kept came before
-                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            if kind == execd.START and drop:
                 break
-            got.append((kind, call_id))
-        await r.read()
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) > 1:  # the first command is left running
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+            elif kind == execd.PING:
+                pinged = len(got) == 3
+            elif kind in (execd.KILL, execd.RELEASE):
+                mine.append((kind, call_id))
+                if pinged:  # only now: this RELEASE came after the PING
+                    w.write(frame(execd.PONG, 0))
+                    pinged = False
+        drop = False
+        w.close()
 
-    server = await asyncio.start_server(connection, "127.0.0.1", 0)
-    daemon = execd.Daemon("127.0.0.1", "cert", b"key")
-    daemons.ports[daemon] = server.sockets[0].getsockname()[1]
-    daemons.unstarted.append(daemon)
-    client = daemons.client()
-    sleep = ["sleep", "600"]
-    first = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
-    await until(lambda: len(started) == 1)
-    second = asyncio.ensure_future(client.exec(sleep, None, None, {}, None, None))
-    await until(lambda: auths == 2)
+    async def call() -> int:
+        """Run a command; its id, once the stand-in has read its RELEASE."""
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+        await until(lambda: (execd.RELEASE, starts[-1]) in got[-1])
+        return starts[-1]
 
-    for call, later in ((first, 361), (second, 0)):  # execd lets a call go at 360 s
-        call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(call, 30)
-        clock.now += later
-    answer.set()
+    client = await tls_daemon(answers_its_third_ping_late)
+    left = asyncio.ensure_future(
+        client.exec(["sleep", "600"], None, None, {}, None, None)
+    )
+    await until(lambda: bool(starts))
+    left.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(left, 30)
+    a = starts[0]
+    await until(lambda: (execd.RELEASE, a) in got[0])
+    drop = True
+    b = await call()
+    drop = True
+    c = await call()  # on the third connection, whose PONG comes behind this RELEASE
+    d = await call()  # its EXIT comes behind the PONG: the client has read that
+    drop = True
+    e = await call()
+
+    kept = [(execd.KILL, a), (execd.RELEASE, a), (execd.RELEASE, b)]
+    after = [(execd.RELEASE, c), (execd.RELEASE, d)]
+    # No PONG: sent again. A PONG: only what its PING followed is not sent again.
+    assert got == [kept[:2], kept, kept + after, after + [(execd.RELEASE, e)]]
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12), reason="there a replay is written in one step"
+)
+async def test_a_command_sent_during_a_replay_follows_what_is_owed(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it went out between the frames owed, as each upload would."""
+    got: list[list[int]] = []  # the kinds each connection got
+    drop = False  # the first connection, under the next command sent
+    replaying = asyncio.Event()
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        mine: list[int] = []
+        got.append(mine)
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop and len(got) == 1:
+                break
+            mine.append(kind)
+            if len(got) == 2:
+                replaying.set()
+            if kind == execd.START and len(got) == 2:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    left = [call("sleep", "600") for _ in range(64)]
+    await until(lambda: bool(got) and got[0].count(execd.START) == 64)
+    for running in left:
+        running.cancel()
+    await until(lambda: got[0].count(execd.RELEASE) == 64)
+    drop = True
+    reopens = call()
+    await asyncio.wait_for(replaying.wait(), 30)
+    during = call()
+    await asyncio.wait_for(asyncio.gather(reopens, during), 30)
+
+    assert got[1].index(execd.PING) < got[1].index(execd.START)
+
+
+async def test_calls_awaiting_a_pong_are_bounded_and_each_pong_clears_its_pings(
+    tls_daemon: TlsDaemon, clock: types.SimpleNamespace
+) -> None:
+    """Regressions: no PONG, and every call was kept; a busy, or slow, execd refused."""
+    connections: list[asyncio.StreamWriter] = []
+    starts: list[int] = []
+    killed: list[int] = []
+    released: list[int] = []
+    drop = False  # the connection, under the next command sent
+    half = execd.MAX_OWED // 2
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal drop
+        connections.append(w)
+        second = len(connections) == 2
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and drop:
+                break
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) > 1 + half:  # the first, and half the bound more, run on
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+            elif kind == execd.KILL:
+                killed.append(call_id)
+            elif kind == execd.RELEASE and second:
+                released.append(call_id)
+        drop = False
+        w.close()
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    held = call("sleep", "600")
+    await until(lambda: len(starts) == 1)
+    left = [call("sleep", "600") for _ in range(half)]
+    await until(lambda: len(starts) == 1 + half)
+    for _ in range(2):  # each half is asked about with a PING
+        await asyncio.wait_for(asyncio.gather(*(call() for _ in range(half))), 30)
+    commands: list[asyncio.Future[object]] = []
+    for some in left[: half // 2], left[half // 2 :]:
+        clock.now += execd.PING_EVERY  # the second begins to wait that much later
+        commands.append(call())
+        for running in some:  # a KILL is written behind a START that did not wait
+            running.cancel()
+        await asyncio.wait(some, timeout=30)
+        await until(lambda: len(killed) == len(commands) * half // 2)
+    early, late = commands
+    waited = len(starts) == 1 + 3 * half
+    # The second has now waited 56 s; the first, 71.
+    clock.now += execd.DEAD_AFTER + execd.CONNECT_TIMEOUT + 1
+    # One PONG; then the first command's exit, behind which the client has read it.
+    exit_ = frame(execd.EXIT, starts[0], b'{"code": 0}')
+    connections[0].write(frame(execd.PONG, 0) + exit_)
+    await asyncio.wait_for(held, 30)  # as many calls as the bound still await a PONG
+    connections[0].write(frame(execd.PONG, 0))
+    with pytest.raises(ConnectionError, match="not confirmed"):  # its time was up
+        await asyncio.wait_for(early, 30)
+    await asyncio.wait_for(late, 30)
+    drop = True
+    await asyncio.wait_for(call(), 30)
+    await until(lambda: starts[-1] in released)
+
+    # The PONGs answered the first two PINGs: neither half is sent again.
+    assert waited
+    assert set(released) == {*starts[: 1 + half], starts[-2], starts[-1]}
+
+
+async def test_a_command_handed_a_closed_connection_gets_its_pong_on_the_next(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: handed a connection just closed, it waited for a PONG on that one."""
+    connections: list[asyncio.StreamWriter] = []
+
+    async def closes_its_second(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        connections.append(w)
+        nth = len(connections)
+        if nth == 2:  # with its OK, a frame too large: the client closes it as it opens
+            w.write(execd.HEADER.pack(execd.STDOUT, 1, execd.MAX_FRAME + 1))
+        with contextlib.suppress(asyncio.IncompleteReadError):  # the client has gone
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.START:
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.PING and nth > 1:  # the first answers no PING
+                    w.write(frame(execd.PONG, 0))
+
+    def call() -> collections.abc.Coroutine[object, object, object]:
+        return client.exec(["true"], None, None, {}, None, None)
+
+    client = await tls_daemon(closes_its_second)
+    calls = (call() for _ in range(execd.MAX_OWED))
+    await asyncio.wait_for(asyncio.gather(*calls), 30)
+    connections[0].close()
+
+    await asyncio.wait_for(call(), 30)
+
+    assert len(connections) == 3
+
+
+@pytest.mark.parametrize(
+    ("waits", "opened"),
+    [
+        pytest.param([3600], 1, id="on the connection it began on"),
+        pytest.param(
+            [execd.DEAD_AFTER + execd.PING_EVERY + 1, execd.CONNECT_TIMEOUT],
+            2,
+            id="on the next: its time is one",
+        ),
+    ],
+)
+async def test_a_command_out_of_time_for_its_pong_is_refused_with_no_other_connection(
+    tls_daemon: TlsDaemon,
+    clock: types.SimpleNamespace,
+    waits: list[float],
+    opened: int,
+) -> None:
+    """Regression: its time up, another connection was opened before it was refused."""
+    connections: list[asyncio.StreamWriter] = []
+    asked: list[int] = []  # the connection each PING came on
+    starts = 0
+    killed = False
+
+    async def answers_no_ping(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts, killed
+        connections.append(w)
+        nth = len(connections)
+        with contextlib.suppress(asyncio.IncompleteReadError):  # the client has gone
+            while True:
+                kind, call_id, _ = await read_frame(r)
+                if kind == execd.START:
+                    starts += 1
+                    if starts > 1:  # the first command runs on
+                        w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.KILL:
+                    killed = True
+                elif kind == execd.PING:
+                    asked.append(nth)
+
+    def call(*argv: str) -> asyncio.Future[object]:
+        run = client.exec(list(argv) or ["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(answers_no_ping)
+    running = call("sleep", "600")
+    await until(lambda: starts == 1)
+    calls = (call() for _ in range(execd.MAX_OWED))
+    await asyncio.wait_for(asyncio.gather(*calls), 30)
+    command = call()
+    running.cancel()  # its KILL is written behind a START that did not wait
+    await until(lambda: killed)
+    for nth, seconds in enumerate(waits, 1):  # the last uses up the command's time
+        await until(lambda: nth in asked)  # sent what is owed, and a PING
+        clock.now += seconds
+        connections[nth - 1].close()
+
+    with pytest.raises(ConnectionError, match="not confirmed"):
+        await asyncio.wait_for(command, 30)
+    assert len(connections) == opened
+
+
+async def test_a_call_left_once_its_connection_is_replaced_is_killed_on_the_new_one(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: it ran on until the next reconnect, or until execd let it go."""
+    got: list[tuple[int, int, int]] = []
+    connections = 0
+
+    async def prints_then_drops(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        nonlocal connections
+        connections += 1
+        nth = connections
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START and nth == 1 and got:  # under the second command
+                break
+            got.append((nth, kind, call_id))
+            if kind == execd.START and nth == 1:  # the command to be left
+                w.write(frame(execd.STDOUT, call_id, b"x"))
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.RESUME:  # its START went into the dropped connection
+                w.write(frame(execd.ERROR, call_id, b"unknown call"))
+        w.close()
+
+    client = await tls_daemon(prints_then_drops)
+    left = client.run(["cat"], env={}, cwd=None, user=None, stdin=None, timeout=None)
+    await asyncio.wait_for(anext(left), 30)
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
-    both = (execd.KILL, execd.RELEASE)
-    assert got == [(kind, call) for call in started for kind in both]
+    await asyncio.wait_for(left.aclose(), 30)
+
+    call_id = got[0][2]
+    await until(lambda: (2, execd.RELEASE, call_id) in got)
+    assert (2, execd.KILL, call_id) in got
+
+
+async def test_a_call_timed_out_as_its_connection_drops_is_killed_on_the_next(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: its RELEASE was never sent, so execd kept its record."""
+    got: list[tuple[int, int]] = []
+    starts: list[int] = []
+
+    async def drops_the_first_on_kill(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        first = not starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if first and kind == execd.START:
+                starts.append(call_id)
+            elif first and kind == execd.KILL:
+                w.transport.abort()
+                return
+            elif kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif not first:
+                got.append((kind, call_id))
+
+    client = await tls_daemon(drops_the_first_on_kill)
+    run = client.run(
+        ["sleep", "9"], env={}, cwd=None, user=None, stdin=None, timeout=0.01
+    )
+
+    async def items() -> list[tuple[int, object]]:
+        return [item async for item in run]
+
+    assert await asyncio.wait_for(items(), 30) == [(execd.EXIT, None)]
+    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+
+    assert got[:2] == [(execd.KILL, starts[0]), (execd.RELEASE, starts[0])]
 
 
 async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
@@ -834,45 +1144,6 @@ async def test_a_kill_sent_into_a_dead_connection_is_sent_again_on_each_new_one(
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
     assert got[:2] == [(execd.KILL, left[0]), (execd.RELEASE, left[0])]
-
-
-async def test_a_call_left_is_killed_and_released_once_more_after_execd_lets_it_go(
-    daemons: Daemons, clock: types.SimpleNamespace
-) -> None:
-    """Regressions: sent for ever; then dropped unsent, so execd kept its record."""
-    left: list[int] = []
-    got: list[list[int]] = []
-
-    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        mine: list[int] = []
-        got.append(mine)
-        while True:
-            kind, call_id, _ = await read_frame(r)
-            if not left:
-                left.append(call_id)  # the START of the command to be left
-            elif call_id == left[0]:
-                mine.append(kind)
-            elif kind == execd.START:
-                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
-
-    await daemons.serve(records)
-    client = daemons.client()
-    run = client.exec(["sleep", "600"], None, None, {}, None, None)
-    call = asyncio.ensure_future(run)
-    await until(lambda: bool(left))
-    call.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(call, 30)
-
-    for later in (350, 20, 0):  # execd lets it go at 360 s: before, after, again
-        clock.now += later
-        await asyncio.wait_for(client._get(stale=client._link), 30)
-    # In order behind anything the last connection was sent for the call left.
-    await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
-
-    again = [execd.KILL, execd.RELEASE]
-    await until(lambda: got[1:3] == [again, again])
-    assert got[3] == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["exec", "exec_stdio"])
@@ -1041,6 +1312,40 @@ async def test_a_call_ends_in_time_though_its_own_upload_is_stuck(
     # Its last frames still go out, once its upload has let go of the connection.
     await until(lambda: got[-1:] == [execd.RELEASE])
     assert (execd.KILL in got) is not exits
+
+
+async def test_a_calls_last_frames_wait_behind_one_start_or_upload_at_most(
+    tls_daemon: TlsDaemon,
+) -> None:
+    """Regression: a call's KILL and RELEASE waited behind every START and upload."""
+    got: list[int] = []
+    reads = asyncio.Event()
+
+    async def records(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            if got.count(execd.START) == 9:  # unread, the tenth's write waits
+                await reads.wait()
+            got.append((await read_frame(r))[0])
+
+    def call(*argv: str, stdin: bytes | None = None) -> asyncio.Future[object]:
+        run = client.exec(list(argv), stdin, None, {}, None, None)
+        return asyncio.ensure_future(run)
+
+    client = await tls_daemon(records)
+    left = call("sleep", "600")
+    uploads = [call("cat", stdin=b"x") for _ in range(8)]
+    # More than the socket buffers hold: the uploads' stdin waits behind this START.
+    uploads.append(call("echo", "x" * (16 << 20)))
+    await until(lambda: got.count(execd.START) == 9)
+    left.cancel()
+    await asyncio.wait({left}, timeout=30)
+    reads.set()
+    await until(lambda: execd.RELEASE in got)
+
+    # The KILL follows the START being written; its RELEASE, one frame more at most.
+    assert (got.index(execd.KILL), got.index(execd.RELEASE)) in [(10, 11), (10, 12)]
+    for running in uploads:
+        running.cancel()
 
 
 async def test_an_empty_user_is_refused_not_run_as_the_containers(
@@ -1799,6 +2104,50 @@ async def test_a_call_cancelled_as_it_exits_is_released(daemons: Daemons) -> Non
     assert execd.KILL not in got  # it exited: a KILL would end what it left running
 
 
+@pytest.mark.parametrize("left", ["cancelled", "timed out"])
+async def test_a_call_left_as_its_upload_writes_sends_no_stdin_after_its_kill(
+    tls_daemon: TlsDaemon, monkeypatch: pytest.MonkeyPatch, left: str
+) -> None:
+    """Regression: before Python 3.12 the upload's cancel was lost, and it sent on."""
+    got: list[int] = []
+    late = 0.0  # seconds the client's clock is put on
+
+    async def leaves(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal late
+        _, first, _ = await read_frame(r)  # the command that opens the connection
+        w.write(frame(execd.EXIT, first, b'{"code": 0}'))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if call_id != first:
+                got.append(kind)
+            if kind == execd.STDIN and left == "cancelled":
+                call.cancel()
+            elif kind == execd.START and left == "timed out":
+                late = 60.0  # its timeout passes, and output wakes it to that
+                w.write(frame(execd.STDOUT, call_id, b"x"))
+            elif kind == execd.KILL:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
+
+    clock = types.SimpleNamespace(
+        monotonic=lambda: time.monotonic() + late, thread_time=time.thread_time
+    )
+    monkeypatch.setattr(execd, "time", clock)
+    client = await tls_daemon(leaves)
+    opens = client.exec(["true"], None, None, {}, None, None)
+    await asyncio.wait_for(opens, 30)  # only bounds a hang
+    link = client._link
+    assert link is not None
+    stdin = b"x" * execd.STDIN_WINDOW
+    # Room for it all: each megabyte's write returns at once, where the cancel was lost.
+    link.pipe._writer.transport.set_write_buffer_limits(high=2 * len(stdin))
+    call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 60))
+    await until(lambda: execd.RELEASE in got)
+
+    assert execd.STDIN not in got[got.index(execd.KILL) :]
+    with pytest.raises((asyncio.CancelledError, TimeoutError)):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+
+
 async def test_a_stream_closed_while_cancelled_is_killed(daemons: Daemons) -> None:
     got: list[int] = []
 
@@ -1987,7 +2336,7 @@ async def test_an_opened_connection_is_the_clients_at_once(daemons: Daemons) -> 
 async def test_only_one_fingerprint_line_starts_execd(
     cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    printed = b"0" * 64 + b"\n"
+    printed = b"0" * 64 + b" c\n"
 
     class Execute:
         def __init__(self, info: object) -> None:
@@ -2000,7 +2349,7 @@ async def test_only_one_fingerprint_line_starts_execd(
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
     assert (await pod._start_execd(False)).fingerprint == "0" * 64
 
-    printed = b"1" * 64 + b" " * 4032  # one token, but cut at run_argv's 4 KiB
+    printed = b"1" * 64 + b" " + b"c" * 4031  # both, but cut at run_argv's 4 KiB
     with pytest.raises(error.PodError, match="execd did not start"):
         await pod._start_execd(False)
 
@@ -2021,7 +2370,7 @@ def execd_starts(
                 return 2, b"", b"listen tcp :14601: bind: address already in use\n"
             running = True
             meanwhile()
-            return 0, b"0" * 64 + b"\n", b""
+            return 0, b"0" * 64 + b" c\n", b""
 
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
 
@@ -2059,6 +2408,32 @@ async def test_a_restart_kubernetes_shows_after_execd_started_is_still_found(
 
     with pytest.raises(error.ContainerRestartedError):
         await pod.exec(["true"], None, None, {}, None, None)
+    assert starts == 0
+
+
+async def test_a_check_that_fails_as_execd_has_just_restarted_fails_its_operation(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a late check's failed read is let pass: here it could hide a restart."""
+    starts = 0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    monkeypatch.setattr(pod_module, "time", types.SimpleNamespace(monotonic=lambda: 0))
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(False)  # execd had died: perhaps with its container
+    pod._execd = await tls_daemon(exits)
+    cluster.unavailable = True  # the next read of the pod fails
+
+    with pytest.raises(kubernetes.client.exceptions.ApiException):
+        await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
     assert starts == 0
 
 
@@ -2122,15 +2497,19 @@ async def test_a_restart_shown_late_is_found_though_no_operation_ran_meanwhile(
     assert starts == 0
 
 
-async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
+async def test_after_its_late_check_a_pod_is_read_again_only_30_s_later(
     tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Regression: a pod deleted and replaced, but not stopped, served its sample on."""
+    starts = 0
     now = 0.0
 
     async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
         while True:
             kind, call_id, _ = await read_frame(r)
             if kind == execd.START:
+                starts += 1
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
     monkeypatch.setattr(
@@ -2149,6 +2528,67 @@ async def test_once_a_late_restart_is_ruled_out_operations_read_the_pod_no_more(
 
     # A read of the pod for each operation is what execd takes off the API server.
     assert cluster.reads == read
+    cluster.uid = "v"  # Kubernetes shows its replacement; execd still answers
+    now += pod_module.RESTART_SHOWN_WITHIN
+
+    with pytest.raises(error.PodReplacedError):
+        await asyncio.wait_for(pod.exec(["true"], None, None, {}, None, None), 30)
+    assert starts == 2
+
+
+async def test_a_late_check_costs_the_operations_around_it_no_more_than_its_wait(
+    tls_daemon: TlsDaemon, cluster: Cluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regressions: it failed or held its operation, was made twice, or not at all."""
+    starts = 0
+    now = 0.0
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        nonlocal starts
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts += 1
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    def run() -> asyncio.Task[inspect_ai.util.ExecResult[str]]:
+        operation = pod.exec(["true"], None, None, {}, None, None)
+        return asyncio.ensure_future(asyncio.wait_for(operation, 30))
+
+    monkeypatch.setattr(
+        pod_module, "time", types.SimpleNamespace(monotonic=lambda: now)
+    )
+    execd_starts(monkeypatch, lambda: None)
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    await pod._start_execd(True)
+    pod._execd = await tls_daemon(exits)
+    read = cluster.reads
+    now = pod_module.RESTART_SHOWN_WITHIN
+    cluster.unavailable = True  # the next read of the pod fails
+    await run()
+    await run()
+    # The first one's read failed and failed nothing; the second made no read.
+    assert (cluster.reads, starts) == (read + 1, 2)
+    now += pod_module.RESTART_SHOWN_WITHIN
+    cluster.held = threading.Event()  # the next reads are answered once it is set
+    left = run()
+    await until(lambda: cluster.reads == read + 2)
+    left.cancel()  # its read is still out: the check is owed as before
+    with pytest.raises(asyncio.CancelledError):
+        await left
+    beside = [run(), run()]
+    await until(lambda: cluster.reads == read + 4 or starts > 2)
+    # Each waits for a read of its own: one already out is not taken for an answer.
+    assert (cluster.reads, starts) == (read + 4, 2)
+    cluster.held.set()
+    await asyncio.gather(*beside)
+    now += pod_module.RESTART_SHOWN_WITHIN
+    monkeypatch.setattr(pod_module, "LATE_READ_WITHIN", 0.01)
+    cluster.held = threading.Event()  # and this time it is not
+
+    await run()
+
+    assert starts == 5
 
 
 async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
@@ -2158,7 +2598,151 @@ async def test_execd_started_in_a_replacement_pod_is_reached_at_its_address(
     execd_starts(monkeypatch, lambda: vars(cluster).update(uid="v", ip="10.0.0.2"))
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
 
-    assert (await pod._start_execd(False)).ip == "10.0.0.2"
+    daemon = await asyncio.wait_for(pod._start_execd(False), 30)
+
+    assert (daemon.ip, daemon.pod) == ("10.0.0.2", "v")
+
+
+def runs_in(pod: str, ran: list[str]) -> Handler:
+    """A stand-in for a pod's execd, which notes each connection and command it gets."""
+
+    async def runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        ran.append(f"{pod} dialed")
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind == execd.START:
+                ran.append(pod)
+                if json.loads(payload)["argv"] == ["true"]:  # any other runs on
+                    w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    return runs
+
+
+async def test_a_replacement_found_in_warn_mode_moves_operations_to_its_execd(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon, cluster: Cluster
+) -> None:
+    """Regression: commands went on to a replaced pod's execd while that pod ran."""
+    ran: list[str] = []
+    started: list[str] = []
+
+    async def start(replace: bool) -> execd.Daemon:
+        started.append(cluster.uid)
+        return execd.Daemon("127.0.0.1", tls[1], b"key", cluster.uid)
+
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn", execd=True)
+    assert pod._execd is not None
+    pod._execd._start = start
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        sleep = pod.exec(["sleep", "inf"], None, None, {}, None, None)
+        running = asyncio.ensure_future(sleep)
+        await until(lambda: ran == ["replaced dialed", "replaced"])
+        # Force-deleted: Kubernetes shows the replacement, and the pod replaced runs on.
+        await tls_daemon(runs_in("replacement", ran))
+        cluster.uid = "v"
+
+        await pod.check_for_pod_restart()
+        with pytest.raises(error.ExecdStoppedError):  # and it is not run again
+            await running
+        await pod.exec(["true"], None, None, {}, None, None)
+        await pod.check_for_pod_restart()  # nothing new: the replacement's execd stays
+        await pod.exec(["true"], None, None, {}, None, None)
+
+    assert started == ["u", "v"]
+    assert ran[2:] == ["replacement dialed", "replacement", "replacement"]
+
+
+async def test_a_command_goes_to_the_replacement_though_no_check_left_the_old_pod(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: a check cancelled as it found the replacement left the old in use."""
+    ran: list[str] = []
+    pod = "u"
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        await client.exec(["true"], None, None, {}, None, None)
+        await tls_daemon(runs_in("replacement", ran))
+        pod = "v"
+
+        await client.exec(["true"], None, None, {}, None, None)
+
+    assert ran[2:] == ["replacement dialed", "replacement"]
+
+
+async def test_a_command_waiting_its_turn_is_not_sent_to_a_pod_replaced_meanwhile(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: a command queued as a check found the replacement ran in the old."""
+    ran: list[str] = []
+    pod = "u"
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(runs_in("replaced", ran))
+        sleep = client.exec(["sleep", "inf"], None, None, {}, None, None)
+        running = asyncio.ensure_future(sleep)
+        await until(lambda: ran == ["replaced dialed", "replaced"])
+        link = await client._get()
+        async with link._wlock:  # another call's write
+            call = client.exec(["true"], None, None, {}, None, None)
+            queued = asyncio.ensure_future(call)
+            await until(lambda: len(link.calls) == 2)  # it waits to send its START
+            await tls_daemon(runs_in("replacement", ran))
+            pod = "v"
+
+        with pytest.raises(execd.NotSent):  # nothing ran: the provider sends it again
+            await queued
+        with pytest.raises(error.ExecdStoppedError):  # its connection went with that
+            await running
+
+    assert ran == ["replaced dialed", "replaced", "replacement dialed"]
+
+
+async def test_a_connection_opened_as_its_pod_is_replaced_is_not_used(
+    tls: tuple[ssl.SSLContext, str],
+    tls_daemon: TlsDaemon,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a connection opened to a replaced pod was kept: commands failed."""
+    ran: list[str] = []
+    pod = "u"
+    asked, replaced = asyncio.Event(), asyncio.Event()
+
+    async def answers_once_replaced(
+        r: asyncio.StreamReader, w: asyncio.StreamWriter
+    ) -> None:
+        await read_frame(r)  # AUTH
+        asked.set()
+        await replaced.wait()
+        w.write(frame(execd.OK, 0))
+        await runs_in("replaced", ran)(r, w)
+
+    async def start(replace: bool) -> execd.Daemon:
+        return execd.Daemon("127.0.0.1", tls[1], b"key", pod)
+
+    client = execd.ExecdClient(start, lambda: pod)
+    listen = asyncio.start_server(answers_once_replaced, "127.0.0.1", 0, ssl=tls[0])
+    with anyio.fail_after(30):  # only bounds a hang
+        async with await listen as old:
+            monkeypatch.setattr(execd, "EXECD_PORT", old.sockets[0].getsockname()[1])
+            call = client.exec(["true"], None, None, {}, None, None)
+            running = asyncio.ensure_future(call)
+            await asked.wait()
+            await tls_daemon(runs_in("replacement", ran))
+            pod = "v"
+
+            replaced.set()
+            await running
+
+    assert ran == ["replaced dialed", "replacement dialed", "replacement"]
 
 
 async def test_execd_lost_to_a_failed_pod_read_is_replaced_at_the_next_start(
@@ -2342,33 +2926,61 @@ async def test_a_command_stops_at_the_output_limit(
 
 
 @pytest.mark.parametrize(
-    "operation",
+    ("next_daemon", "raised"),
     [
-        pytest.param(
-            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
-        ),
-        pytest.param(
-            lambda c: c.read_file(pathlib.Path("/x"), io.BytesIO()), id="read_file"
-        ),
+        ("answers", error.ExecdStoppedError),
+        ("answers too late", error.ExecdStoppedError),
+        ("starts only once the pod is found", error.ExecdResultUnknownError),
     ],
 )
-async def test_a_file_operation_whose_result_is_lost_may_be_run_again(
-    tls_daemon: TlsDaemon,
-    operation: collections.abc.Callable[
-        [execd.ExecdClient], collections.abc.Awaitable[None]
-    ],
+async def test_a_file_is_not_read_again_once_its_daemon_is_gone(
+    tls: tuple[ssl.SSLContext, str],
+    monkeypatch: pytest.MonkeyPatch,
+    clock: types.SimpleNamespace,
+    next_daemon: str,
+    raised: type[Exception],
 ) -> None:
-    async def loses_it(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.ERROR, call_id, b"call id in use"))
-        await r.read()
+    """Regression: it was read again, from the container that had replaced its own."""
+    context, pin = tls
+    servers: list[asyncio.Server] = []
+    starts: list[int] = []
+    attempts = 0
 
-    client = await tls_daemon(loses_it)
+    async def daemon(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        if len(servers) == 2 and next_daemon == "answers too late" and attempts == 1:
+            return w.close()  # started, and not reached while the read reconnects
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                starts.append(call_id)
+                if len(starts) == 1:  # gone, as with its container: its port refuses
+                    servers[0].close()
+                    return w.close()
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
-    with pytest.raises(error.PodError) as lost:
-        await asyncio.wait_for(operation(client), 30)
-    # Not a command's lost result, which is never retried: the sample would fail.
-    assert type(lost.value) is error.PodError
+    async def start(replace: bool) -> execd.Daemon:
+        if len(servers) == 2:
+            raise execd.DaemonRunning("address already in use")
+        if servers and attempts == 1 and next_daemon.startswith("starts only once"):
+            raise kubernetes.client.exceptions.ApiException(status=404)
+        server = await asyncio.start_server(daemon, "127.0.0.1", 0, ssl=context)
+        servers.append(server)
+        monkeypatch.setattr(execd, "EXECD_PORT", server.sockets[0].getsockname()[1])
+        return execd.Daemon("127.0.0.1", pin, b"key")
+
+    client = execd.ExecdClient(start)
+
+    with pytest.raises(error.ExecdResultUnknownError) as stopped:
+        async for attempt in _sandbox_environment._retry():  # the provider's own
+            with attempt:
+                attempts += 1
+                read = client.read_file(pathlib.Path("/x"), io.BytesIO())
+                await asyncio.wait_for(read, 30)  # only bounds a hang
+    assert (type(stopped.value), len(starts)) == (raised, 1)
+    for server in servers:
+        server.close()
 
 
 async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
@@ -2396,6 +3008,34 @@ async def test_a_file_write_finds_mkdir_and_cat_off_the_path(
 
     assert not ran.exists()
     assert dst.read_bytes() == b"data"
+
+
+async def test_a_daemon_lost_in_a_replacement_pod_is_replaced(
+    tls: tuple[ssl.SSLContext, str], tls_daemon: TlsDaemon
+) -> None:
+    """Regression: in "warn" mode its port stayed taken, and every operation failed."""
+    uid = "u"
+
+    async def exits(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, _ = await read_frame(r)
+            if kind == execd.START:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+
+    async def start(replace: bool) -> execd.Daemon:
+        if uid == "v" and not replace:  # execd runs there: its start's answer was lost
+            raise execd.DaemonRunning("bind: address already in use")
+        return execd.Daemon("127.0.0.1", tls[1], b"key", uid)
+
+    with anyio.fail_after(30):  # only bounds a hang
+        await tls_daemon(exits)  # both pods' execd, at the one address
+        client = execd.ExecdClient(start, lambda: uid)
+        await client.exec(["true"], None, None, {}, None, None)
+        uid = "v"
+        await client.leave_replaced()
+
+        # Not the RuntimeError of a port held by a process other than execd.
+        await client.exec(["true"], None, None, {}, None, None)
 
 
 async def test_a_port_held_at_the_first_start_says_so() -> None:
@@ -2472,6 +3112,37 @@ async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(
     # Inspect tries user="root" and falls back on a failed result, not an exception.
     assert (result.returncode, result.stderr) == (126, f"execd: {why}\n")
     assert "the container is not running as root" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("why", "raises"),
+    [("cannot run as 0: execd is not root", False), ("unknown user 0", True)],
+)
+async def test_a_user_execd_cannot_run_as_is_told_with_only_the_end_of_stderr(
+    tls_daemon: TlsDaemon, caplog: pytest.LogCaptureFixture, why: str, raises: bool
+) -> None:
+    """Regression: a stand-in for execd had 10 MiB logged by each call."""
+
+    async def floods(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDERR, call_id, b"x" * execd.CHUNK + b"the end\n"))
+        status = json.dumps({"code": 126, "error": why}).encode()
+        w.write(frame(execd.EXIT, call_id, status))
+        await r.read()
+
+    client = await tls_daemon(floods)
+    call = client.exec(["true"], None, None, {}, "root", None)
+
+    with caplog.at_level("WARNING"):
+        if raises:
+            with pytest.raises(RuntimeError) as unknown_user:
+                await asyncio.wait_for(call, 30)
+            told = str(unknown_user.value)
+        else:
+            await asyncio.wait_for(call, 30)
+            told = caplog.text
+
+    assert "the end" in told and len(told) < 8192
 
 
 async def test_the_timeout_runs_from_the_start_of_the_command(
@@ -2629,7 +3300,24 @@ async def test_unasked_unknown_call_errors_start_nothing_again(
     assert starts == 1
 
 
-async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> None:
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(
+            lambda c: c.exec(["touch", "/once"], None, None, {}, None, 30), id="exec"
+        ),
+        pytest.param(
+            lambda c: c.write_file(b"x", pathlib.Path("/tmp/x")), id="write_file"
+        ),
+    ],
+)
+async def test_a_call_execd_abandoned_is_not_started_again(
+    daemons: Daemons,
+    operation: collections.abc.Callable[
+        [execd.ExecdClient], collections.abc.Awaitable[object]
+    ],
+) -> None:
+    """Regression: for a file operation it raised a PodError, which is retried."""
     starts = 0
 
     async def abandons(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -2649,7 +3337,7 @@ async def test_a_call_execd_abandoned_is_not_started_again(daemons: Daemons) -> 
     await daemons.serve(abandons)
 
     with pytest.raises(error.ExecdResultUnknownError):
-        await daemons.client().exec(["touch", "/once"], None, None, {}, None, 30)
+        await asyncio.wait_for(operation(daemons.client()), 30)
     assert starts == 1
 
 

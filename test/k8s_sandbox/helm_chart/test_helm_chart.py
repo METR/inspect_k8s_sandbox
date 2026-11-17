@@ -1,4 +1,5 @@
 import ipaddress
+import pathlib
 import re
 import subprocess
 from pathlib import Path
@@ -433,6 +434,43 @@ def test_init_containers_with_all_fields(
     assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
 
 
+def test_an_init_container_mounts_a_colon_separated_volume_by_its_name(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: the mount kept that name, which no volume of the Pod has."""
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "init-container-volumes-values.yaml"
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "env-data", "mountPath": "/data", "readOnly": True},
+        # Each names a volume of the Pod, which is the one it means.
+        {"name": "env-data", "mountPath": "/generated"},
+        {"name": "both", "mountPath": "/declared"},
+        {"name": "resolv-conf", "mountPath": "/the-charts-own"},
+    ]
+    # A template rendered later reads the name as the values gave it.
+    read = [c for c in _get_documents(documents, "ConfigMap") if "mounted" in c["data"]]
+    assert read[0]["data"] == {"mounted": "data"}
+
+
+def test_an_init_container_mounts_a_volume_named_as_one_the_chart_left_out(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: resolv-conf stayed the chart's where corednsUpstream drops that."""
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "init-container-volumes-values.yaml",
+        set_str="corednsUpstream[0]=10.96.0.10",
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"][3]["name"] == "env-resolv-conf"
+
+
 def test_resource_requests_and_limits(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
@@ -621,6 +659,37 @@ def test_cluster_default_magic_string(
         stateful_sets[2]["spec"]["template"]["spec"]["runtimeClassName"]
         == "my-runtime-class-name"
     )
+
+
+@pytest.mark.parametrize(
+    ("set_str", "expected"),
+    [
+        ("", {"default": None, "nginx": None}),
+        ("priorityClassName=low", {"default": "low", "nginx": "low"}),
+    ],
+)
+def test_priority_class_name(
+    chart_dir: Path, set_str: str, expected: dict[str, str | None]
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        set_str=",".join(filter(None, ["services.nginx.image=nginx", set_str])),
+    )
+
+    assert {
+        ss["metadata"]["name"].removeprefix("agent-env-my-release-"): ss["spec"][
+            "template"
+        ]["spec"].get("priorityClassName")
+        for ss in _get_documents(documents, "StatefulSet")
+    } == expected
+
+
+def test_priority_class_name_is_not_per_service(chart_dir: Path) -> None:
+    with pytest.raises(subprocess.CalledProcessError):
+        _run_helm_template(
+            chart_dir,
+            set_str="services.nginx.image=nginx,services.nginx.priorityClassName=high",
+        )
 
 
 @pytest.mark.parametrize(

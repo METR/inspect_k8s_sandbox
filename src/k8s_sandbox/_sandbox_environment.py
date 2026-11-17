@@ -8,6 +8,7 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Generator, Literal, cast, overload
 
+import urllib3.exceptions
 import websocket
 from anyio.abc import ByteStream
 from inspect_ai.solver._task_state import sample_state
@@ -90,7 +91,16 @@ _PERMANENT_TYPES = (
 )
 
 
-def _retry() -> AsyncRetrying:
+def _unreachable(e: BaseException) -> bool:
+    """Whether the API server refused or cut a connection, which fails at once."""
+    reason = e.reason if isinstance(e, urllib3.exceptions.MaxRetryError) else e
+    cut = (urllib3.exceptions.NewConnectionError, urllib3.exceptions.ProtocolError)
+    return isinstance(reason, cut)  # not a timeout: that has waited four minutes
+
+
+def _retry(
+    message: str = "sandbox operation failed: sending it again", **context: str
+) -> AsyncRetrying:
     # Must create a new instance per call: AsyncRetrying.__aiter__ returns
     # `self` and mutates _retry_state, so a shared instance is not safe for
     # concurrent use.
@@ -98,14 +108,19 @@ def _retry() -> AsyncRetrying:
         stop=stop_after_attempt(5),
         wait=wait_exponential_jitter(initial=1, max=10),
         retry=retry_if_exception(
-            lambda e: isinstance(e, _TRANSIENT_TYPES)
-            and not isinstance(e, _PERMANENT_TYPES)
+            lambda e: (
+                (isinstance(e, _TRANSIENT_TYPES) or _unreachable(e))
+                and not isinstance(e, _PERMANENT_TYPES)
+            )
         ),
         # Logged: over Kubernetes exec the operation may run a second time.
         before_sleep=lambda state: log_warn(
-            "sandbox operation failed: sending it again",
+            message,
+            **context,
             attempt=state.attempt_number,
-            error=repr(state.outcome.exception()) if state.outcome else None,
+            # Not its repr(): an ApiException's has neither its status nor its reason.
+            error=state.outcome
+            and f"{type(e := state.outcome.exception()).__name__}: {e}",
         ),
         reraise=True,
     )
@@ -313,7 +328,7 @@ class K8sSandboxEnvironment(SandboxEnvironment):
 
         op = "K8s execute command in Pod"
         with self._log_op(op, expected_exceptions, **log_kwargs):
-            async for attempt in _retry():
+            async for attempt in self._retry(op):
                 with attempt:
                     result = await self._pod.exec(
                         cmd, input, cwd, env or {}, user, timeout
@@ -324,14 +339,17 @@ class K8sSandboxEnvironment(SandboxEnvironment):
     async def exec_stdio(self, cmd: list[str], user: str | None = None) -> ByteStream:
         if user is None:
             user = self._config.default_user
-        with self._log_op("K8s open exec stdio in Pod", (), cmd=cmd):
+        op = "K8s open exec stdio in Pod"
+        with self._log_op(op, (), cmd=cmd):
             # A retry may start a second: the first's stdin ends with its connection.
-            async for attempt in _retry():
+            async for attempt in self._retry(op):
                 with attempt:
                     stream = await self._pod.exec_stdio(cmd, user)
             try:
                 # After the open, so a restart during it is found; retried by itself.
-                async for attempt in _retry():
+                async for attempt in self._retry(
+                    op, message="restart check failed: checking again"
+                ):
                     with attempt:
                         await self._pod.check_for_pod_restart()
             except BaseException:
@@ -343,9 +361,13 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         data = contents.encode("utf-8") if isinstance(contents, str) else contents
         # Do not log these at error level or re-raise as enriched K8sError.
         expected_exceptions = (PermissionError, IsADirectoryError)
-        with self._log_op("K8s write file to Pod", expected_exceptions, file=file):
-            async for attempt in _retry():
+        op = "K8s write file to Pod"
+        with self._log_op(op, expected_exceptions, file=file):
+            async for attempt in self._retry(op):
                 with attempt:
+                    if attempt.retry_state.attempt_number > 1:
+                        # Kubernetes may show a restart only after the failure.
+                        await self._pod.check_for_pod_restart()
                     await self._pod.write_file(data, Path(file))
 
     @overload
@@ -366,11 +388,16 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 IsADirectoryError,
                 OutputLimitExceededError,
             )
-            with self._log_op("K8s read file from Pod", expected_exceptions, file=file):
-                async for attempt in _retry():
+            op = "K8s read file from Pod"
+            with self._log_op(op, expected_exceptions, file=file):
+                async for attempt in self._retry(op):
                     with attempt:
-                        temp_file.seek(0)
-                        temp_file.truncate()
+                        if attempt.retry_state.attempt_number > 1:
+                            # Kubernetes may show a restart only after the failure.
+                            await self._pod.check_for_pod_restart()
+                            # Not a new file: truncated, ext4 writes it out at close.
+                            temp_file.seek(0)
+                            temp_file.truncate()
                         await self._pod.read_file(Path(file), temp_file)
                 temp_file.seek(0)
                 return (
@@ -385,6 +412,11 @@ class K8sSandboxEnvironment(SandboxEnvironment):
             command=self._get_kubectl_connection_command(user),
             vscode_command=self._get_vscode_connection_command(user),
             container=self._pod.info.default_container_name,
+        )
+
+    def _retry(self, op: str, **kwargs: str) -> AsyncRetrying:
+        return _retry(
+            op=op, pod=self._pod.info.name, task_name=self.release.task_name, **kwargs
         )
 
     @contextmanager

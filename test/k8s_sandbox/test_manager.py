@@ -1,5 +1,6 @@
 import json
 import logging
+import types
 from typing import cast
 from unittest.mock import patch
 
@@ -270,6 +271,11 @@ def _helm_results(
     monkeypatch.setattr(helm_module, "get_default_namespace", lambda _: "default")
     monkeypatch.setattr(helm_module, "_run_subprocess", fake_run_subprocess)
     monkeypatch.setattr(helm_module, "describe_release_pods", lambda *_: None)
+    monkeypatch.delenv("HELM_DRIVER", raising=False)
+    # Helm's record of a release carries the label of the install that made it.
+    labelled = types.SimpleNamespace(items=["its record"])
+    api = types.SimpleNamespace(list_namespaced_secret=lambda *_, **__: labelled)
+    monkeypatch.setattr(helm_module, "k8s_client", lambda _: api)
     return subcommands
 
 
