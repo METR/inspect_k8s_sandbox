@@ -74,8 +74,11 @@
   `shareProcessNamespace` or `hostPID` is refused: the sample fails to start.
 - Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
-  sidecar. A service with a DNS record finds itself there under its own name through
-  `/etc/hosts`, at `127.0.0.1`; its `additionalDnsRecords` do not resolve.
+  sidecar. A service with a DNS record finds itself there under its own name and its
+  `additionalDnsRecords` through `/etc/hosts`, at `127.0.0.1`. The install fails for a
+  record that is no lower-case DNS name (upper case, `_`, `*`, a trailing dot), and
+  where that line of `/etc/hosts`, the address and every name with a tab between, is
+  longer than the 510 bytes musl reads of one.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
