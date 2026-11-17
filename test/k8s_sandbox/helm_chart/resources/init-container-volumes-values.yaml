@@ -1,0 +1,37 @@
+global:
+  fullnameOverride: env
+services:
+  default:
+    image: "python:3.12-bookworm"
+    volumes:
+      - "data:/data"
+      - "env-data:/env-data"
+      - "both:/both"
+      - name: both
+        emptyDir: {}
+      - "resolv-conf:/resolv-conf"
+    initContainers:
+      - name: seed
+        image: busybox:1.36
+        volumeMounts:
+          - name: data
+            mountPath: /data
+            readOnly: true
+          - name: env-data
+            mountPath: /generated
+          - name: both
+            mountPath: /declared
+          - name: resolv-conf
+            mountPath: /the-charts-own
+volumes:
+  data: {}
+  env-data: {}
+  both: {}
+  resolv-conf: {}
+additionalResources:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: mounts
+    data:
+      mounted: "{{ (index (index .Values.services.default.initContainers 0).volumeMounts 0).name }}"

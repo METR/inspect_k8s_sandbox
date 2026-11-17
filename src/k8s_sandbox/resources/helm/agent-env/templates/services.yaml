@@ -38,8 +38,12 @@ spec:
         {{- end }}
         {{- end }}
         inspect/service: {{ $name }}
+      {{- $podAnnotations := deepCopy (default (dict) $.Values.annotations) }}
+      {{- range $key, $value := $service.podAnnotations }}
+      {{- $_ := set $podAnnotations $key $value }}
+      {{- end }}
       annotations:
-        {{- toYaml $.Values.annotations | nindent 8 }}
+        {{- toYaml $podAnnotations | nindent 8 }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -54,7 +58,7 @@ spec:
       {{- end }}
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
-      terminationGracePeriodSeconds: 0
+      terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
       {{- if $.Values.corednsUpstream }}
       {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
       dnsPolicy: None
@@ -64,6 +68,20 @@ spec:
       {{- end }}
 
       {{- if $service.initContainers }}
+      {{- /* A mount that names no volume of the Pod means the colon-separated volume of that name. */}}
+      {{- $generated := dict }}
+      {{- $volumeNames := empty $.Values.corednsUpstream | ternary (list "coredns-config" "resolv-conf") (list "coredns-config") }}
+      {{- range $service.volumes }}
+        {{- if kindIs "string" . }}
+          {{- $volumeName := (split ":" .)._0 }}
+          {{- $_ := set $generated $volumeName (printf "%s-%s" (include "agentEnv.fullname" $) $volumeName) }}
+        {{- else }}
+          {{- $volumeNames = append $volumeNames (toString .name) }}
+        {{- end }}
+      {{- end }}
+      {{- range concat $volumeNames (values $generated) }}
+        {{- $_ := unset $generated . }}
+      {{- end }}
       initContainers:
       {{- range $service.initContainers }}
         - name: {{ .name }}
@@ -95,7 +113,9 @@ spec:
           {{- end }}
           {{- with .volumeMounts }}
           volumeMounts:
-{{ toYaml . | nindent 12 }}
+          {{- range . }}
+            - {{- toYaml (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
+          {{- end }}
           {{- end }}
           {{- if .resources }}
           resources:

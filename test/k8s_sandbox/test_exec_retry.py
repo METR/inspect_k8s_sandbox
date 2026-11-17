@@ -1,17 +1,34 @@
+import asyncio
+import collections.abc
+import contextlib
+import json
+import socket
+import sys
+import threading
 from pathlib import Path
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
+import kubernetes.client
 import pytest
+import urllib3
 import websocket
 from inspect_ai.util import ExecResult, OutputLimitExceededError
 from kubernetes.client.exceptions import ApiException
 from tenacity import wait_none
 
-from k8s_sandbox import _sandbox_environment
+from k8s_sandbox import _helm, _sandbox_environment
+from k8s_sandbox._pod import error as pod_error
+from k8s_sandbox._pod import execd, op, pod
 from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecdResultUnknownError,
+    ExecResultUnknownError,
     ExecutableNotFoundError,
     GetReturncodeError,
     PodError,
+    PodReplacedError,
 )
 from k8s_sandbox._sandbox_environment import (
     K8sError,
@@ -24,8 +41,8 @@ def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """Disable tenacity's exponential backoff in tests."""
     original = _sandbox_environment._retry
 
-    def _fast_retry():
-        r = original()
+    def _fast_retry(*args, **kwargs):
+        r = original(*args, **kwargs)
         r.wait = wait_none()
         return r
 
@@ -39,40 +56,39 @@ def _make_sandbox() -> tuple[K8sSandboxEnvironment, MagicMock]:
     specific AsyncMock methods without mypy method-assign errors.
     """
     sandbox = object.__new__(K8sSandboxEnvironment)
-    mock_pod = MagicMock()
+    mock_pod = mock.create_autospec(pod.Pod, instance=True)
     sandbox._pod = mock_pod
-    mock_pod.info = MagicMock()
-    mock_pod.info.name = "test-pod"
-    sandbox._config = MagicMock()
-    sandbox._config.default_user = None
-    sandbox.release = MagicMock()
-    sandbox.release.task_name = "test-task"
-    mock_pod.check_for_pod_restart = AsyncMock()
+    mock_pod.info = op.PodInfo("test-pod", "ns", None, "default", "uid", 0, "raise")
+    sandbox._config = _sandbox_environment._ResolvedConfig(
+        chart=None,
+        values=None,
+        context=None,
+        default_user=None,
+        restarted_container_behavior="raise",
+        max_pod_ops=None,
+    )
+    sandbox.release = mock.create_autospec(
+        _helm.Release, instance=True, task_name="test-task"
+    )
     return sandbox, mock_pod
 
 
 def _make_sandbox_with_mock_pod() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.exec."""
     sandbox, mock_pod = _make_sandbox()
-    mock_exec = AsyncMock()
-    mock_pod.exec = mock_exec
-    return sandbox, mock_exec
+    return sandbox, mock_pod.exec
 
 
 def _make_sandbox_with_mock_read() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.read_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_read = AsyncMock()
-    mock_pod.read_file = mock_read
-    return sandbox, mock_read
+    return sandbox, mock_pod.read_file
 
 
 def _make_sandbox_with_mock_write() -> tuple[K8sSandboxEnvironment, AsyncMock]:
     """Create a K8sSandboxEnvironment with a mocked _pod.write_file."""
     sandbox, mock_pod = _make_sandbox()
-    mock_write = AsyncMock()
-    mock_pod.write_file = mock_write
-    return sandbox, mock_write
+    return sandbox, mock_pod.write_file
 
 
 def _success_result() -> ExecResult[str]:
@@ -109,6 +125,10 @@ class TestExecRetryTransient:
                 GetReturncodeError("no return code"),
                 id="GetReturncodeError",
             ),
+            pytest.param(
+                ExecResultUnknownError("WebSocket connection lost", pod="test-pod"),
+                id="ExecResultUnknownError",
+            ),
         ],
     )
     async def test_transient_error_is_retried(self, error: Exception) -> None:
@@ -134,6 +154,26 @@ class TestExecRetryTransient:
         assert result.success
         assert mock_exec.call_count == 3
 
+    async def test_each_resend_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A command sent again may have run twice: the log has to show it."""
+        sandbox, mock_exec = _make_sandbox_with_mock_pod()
+        mock_exec.side_effect = [ConnectionError("cut"), _success_result()]
+
+        with caplog.at_level("WARNING"):
+            await sandbox.exec(["echo", "hello"])
+
+        assert caplog.text.count("sending it again") == 1
+        named = json.loads(caplog.messages[0].partition("again ")[2])
+        assert named["error"] == "ConnectionError: cut"
+        # Which one, among samples run at once.
+        assert (named["op"], named["pod"], named["task_name"]) == (
+            "K8s execute command in Pod",
+            sandbox._pod.info.name,
+            sandbox.release.task_name,
+        )
+
 
 class TestExecRetryPermanent:
     """Permanent errors should NOT be retried."""
@@ -155,6 +195,11 @@ class TestExecRetryPermanent:
                 PermissionError("permission denied"),
                 PermissionError,
                 id="PermissionError",
+            ),
+            pytest.param(
+                ExecdResultUnknownError("execd stopped", pod="test-pod"),
+                K8sError,
+                id="ExecdResultUnknownError",
             ),
         ],
     )
@@ -221,6 +266,7 @@ def _read_file_side_effect(error: Exception, content: bytes = b"file-content"):
         nonlocal calls
         calls += 1
         if calls == 1:
+            dst.write(b"cut " * 4)  # written by a read that failed: more than the file
             raise error
         dst.write(content)
 
@@ -278,6 +324,16 @@ class TestReadFileRetryPermanent:
         mock_read.side_effect = FileNotFoundError("no such file")
 
         with pytest.raises(FileNotFoundError):
+            await sandbox.read_file("/tmp/test.txt")
+
+        assert mock_read.call_count == 1
+
+    async def test_stopped_container_not_retried(self) -> None:
+        # A retry would read from the container that replaces it.
+        sandbox, mock_read = _make_sandbox_with_mock_read()
+        mock_read.side_effect = ContainerStoppedError("stopped")
+
+        with pytest.raises(K8sError):
             await sandbox.read_file("/tmp/test.txt")
 
         assert mock_read.call_count == 1
@@ -365,3 +421,200 @@ class TestWriteFileRetryExhausted:
             await sandbox.write_file("/tmp/test.txt", "hello")
 
         assert mock_write.call_count == 5
+
+
+def _shows(status: int, restarts: int = 0) -> bytes:
+    """An API server's answer: the pod, its container restarted this often."""
+    container = {"name": "default", "restartCount": restarts, "state": {"running": {}}}
+    shown = {"metadata": {"name": "p", "uid": "u"}}
+    body = json.dumps(shown | {"status": {"containerStatuses": [container]}})
+    head = f"HTTP/1.1 {status} \r\nConnection: close\r\nContent-Length: {len(body)}"
+    return f"{head}\r\n\r\n{body}".encode()
+
+
+Api = collections.abc.Callable[..., list[bytes]]
+
+
+@pytest.fixture
+def api(monkeypatch: pytest.MonkeyPatch) -> collections.abc.Iterator[Api]:
+    """Starts a local API server: it gives each request the next answer, then stops."""
+    listening = socket.create_server(("127.0.0.1", 0), backlog=0)
+    listening.settimeout(30)  # only bounds a hang
+    held = socket.socket()
+    asked: list[bytes] = []
+    servers: list[threading.Thread] = []
+
+    def serve(answers: list[bytes], then: str) -> None:
+        with contextlib.suppress(OSError):  # it ends with its test, which then fails
+            for n, answer in enumerate(answers, 1):
+                connection, _ = listening.accept()
+                with connection:
+                    connection.settimeout(30)  # only bounds a hang
+                    asked.append(connection.recv(65536))
+                    last = n == len(answers)
+                    if last and then in ("drops the connect", "never answers"):
+                        monkeypatch.setattr(op, "API_TIMEOUT", 1)  # for what comes now
+                        if then == "drops the connect":
+                            held.connect(listening.getsockname())  # fills the queue
+                    elif last:
+                        listening.close()  # before the answer is read
+                    connection.sendall(answer)
+
+    def start(answers: list[bytes], then: str = "refuses") -> list[bytes]:
+        host = f"http://127.0.0.1:{listening.getsockname()[1]}"
+        configuration = kubernetes.client.Configuration(host=host)
+        # urllib3's own retries would only lengthen the wait.
+        configuration.retries = 0  # type: ignore[attr-defined]
+        client = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
+        monkeypatch.setattr(op, "k8s_client", lambda _: client)
+        server = threading.Thread(target=serve, args=(answers, then), daemon=True)
+        servers.append(server)
+        server.start()
+        return asked
+
+    # Off, so that the provider's check is the only one before an attempt.
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    yield start
+    held.close()
+    listening.close()
+    for server in servers:
+        server.join(30)  # only bounds a hang
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [("read_file", ("/tmp/f",)), ("write_file", ("/tmp/f", "x"))],
+    ids=["read_file", "write_file"],
+)
+async def test_a_file_operation_checks_for_a_restart_before_each_further_attempt(
+    api: Api, operation: str, args: tuple[str, ...]
+) -> None:
+    """Regression: sent again unchecked, it reached its container's replacement."""
+    # Its exec fails, and no restart shows yet; a first check fails, the next finds one.
+    asked = api([_shows(500), _shows(200), _shows(503), _shows(200, restarts=1)])
+    sandbox, _ = _make_sandbox()
+    sandbox._pod = pod.Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    with pytest.raises(_sandbox_environment.K8sError) as raised:
+        await asyncio.wait_for(getattr(sandbox, operation)(*args), 30)
+
+    assert isinstance(raised.value.__cause__, pod_error.ContainerRestartedError)
+    assert sum(b"/exec?" in request for request in asked) == 1
+
+
+@pytest.mark.parametrize(
+    ("then", "tried_again"),
+    [
+        ("refuses", True),
+        ("cuts the connection", True),
+        ("cuts its answer", True),
+        pytest.param(
+            "drops the connect",  # as Linux does one that finds its queue full
+            False,
+            marks=pytest.mark.skipif(sys.platform != "linux", reason="Linux only"),
+        ),
+        ("never answers", False),
+    ],
+)
+async def test_only_a_connection_that_fails_at_once_is_tried_again(
+    api: Api, caplog: pytest.LogCaptureFixture, then: str, tried_again: bool
+) -> None:
+    """Regression: an API server down at a file operation's restart check failed it."""
+    cut = {"cuts the connection": [b""], "cuts its answer": [_shows(200)[:-9]]}
+    # Its exec fails, and no restart shows.
+    api([_shows(500), _shows(200), *cut.get(then, [])], then)
+    sandbox, _ = _make_sandbox()
+    sandbox._pod = pod.Pod("p", "ns", None, "default", "u", 0, "raise")
+
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(_sandbox_environment.K8sError) as raised,
+    ):
+        await asyncio.wait_for(sandbox.read_file("/tmp/f"), 30)
+
+    assert isinstance(raised.value.__cause__, urllib3.exceptions.MaxRetryError)
+    # One that waited out a timeout has cost four minutes already.
+    assert (caplog.text.count("sending it again") > 1) == tried_again
+
+
+# -- exec_stdio retry tests --
+
+
+class TestExecStdioRetry:
+    """Opening is retried as exec() is, and runs as the default user unless told."""
+
+    async def test_transient_error_is_retried(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.side_effect = [
+            ApiException(status=503, reason="Unavailable"),
+            stream,
+        ]
+
+        opened = await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 2
+        assert opened is stream
+
+    async def test_a_pod_replaced_while_the_stream_opened_fails_the_open(self) -> None:
+        """Nothing checks the pod again while the stream lasts."""
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = PodReplacedError(
+            pod_name="test-pod", old_uid="a", new_uid="b", new_restart_count=0
+        )
+
+        with pytest.raises(K8sError) as error:
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert isinstance(error.value.__cause__, PodReplacedError)
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_stream_whose_pod_check_is_cancelled_is_closed(self) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = anyio.Event().wait
+
+        with anyio.fail_after(30):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(sandbox.exec_stdio, ["inspect-sandbox-tools"])
+                await anyio.wait_all_tasks_blocked()
+                tasks.cancel_scope.cancel()
+
+        stream.aclose.assert_awaited_once()
+
+    async def test_a_failed_pod_check_does_not_start_the_command_again(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        stream = mock.create_autospec(execd.ExecdStream, instance=True)
+        mock_pod.exec_stdio.return_value = stream
+        mock_pod.check_for_pod_restart.side_effect = [
+            kubernetes.client.ApiException(status=503, reason="Unavailable"),
+            None,
+        ]
+
+        with caplog.at_level("WARNING"):
+            await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"])
+
+        assert mock_pod.exec_stdio.call_count == 1
+        # The warning says what was tried again, the check and not the command, and why.
+        assert "checking again" in caplog.text
+        assert "sending it again" not in caplog.text
+        assert "Unavailable" in caplog.text
+
+    @pytest.mark.parametrize("user, expected", [(None, "agent"), ("root", "root")])
+    async def test_the_default_user_is_used_unless_one_is_given(
+        self, user: str | None, expected: str
+    ) -> None:
+        sandbox, mock_pod = _make_sandbox()
+        sandbox._config = sandbox._config.model_copy(update={"default_user": "agent"})
+
+        await sandbox.exec_stdio(["inspect-sandbox-tools", "bridge"], user)
+
+        assert mock_pod.exec_stdio.call_args.args == (
+            ["inspect-sandbox-tools", "bridge"],
+            expected,
+        )

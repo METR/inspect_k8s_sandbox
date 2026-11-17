@@ -155,6 +155,10 @@ services:
     tolerations: []
     # -- Node selector settings for the Pod.
     nodeSelector: {}
+    # -- Annotations added to this service's Pod alone; on a clash they win over the top-level `annotations`.
+    podAnnotations: {}
+    # -- Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it. The default `command` ignores SIGTERM, so a Pod running it takes that long to delete.
+    terminationGracePeriodSeconds: 0
   # nginx:
   #   runtimeClassName: gvisor
   #   image: "nginx"

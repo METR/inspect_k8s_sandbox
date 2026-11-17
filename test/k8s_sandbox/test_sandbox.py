@@ -1,15 +1,19 @@
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import subprocess
 import time
 from contextlib import contextmanager
 from textwrap import dedent
 from typing import AsyncGenerator, Generator
 from unittest.mock import patch
 
+import anyio
 import pytest
 import pytest_asyncio
+from anyio.streams.buffered import BufferedByteStream
 from inspect_ai.util import OutputLimitExceededError, SandboxEnvironmentLimits
 from kubernetes.stream.ws_client import ApiException, WSClient  # type: ignore
 from pytest import LogCaptureFixture
@@ -280,11 +284,13 @@ async def test_exec_user(sandbox: K8sSandboxEnvironment, cmd: list[str]) -> None
     assert result.stdout.strip() == "nobody"
 
 
+@pytest.mark.parametrize("input", [None, bytes(1024**2)], ids=["none", "a megabyte"])
 async def test_exec_user_when_specified_user_does_not_exist(
-    sandbox: K8sSandboxEnvironment,
+    sandbox: K8sSandboxEnvironment, input: bytes | None
 ) -> None:
-    with pytest.raises(K8sError) as excinfo:
-        await sandbox.exec(["whoami"], user="foo")
+    """Regression: with a megabyte of input unread, the exec never ended."""
+    with pytest.raises(K8sError) as excinfo, anyio.fail_after(60):
+        await sandbox.exec(["whoami"], input=input, user="foo")
 
     error_msg = str(excinfo.value.__cause__)
     assert (
@@ -403,6 +409,16 @@ async def test_exec_non_utf8_output_is_replaced(sandbox: K8sSandboxEnvironment) 
 
     assert result.success
     assert result.stdout == "before \ufffd after"
+
+
+async def test_exec_output_cannot_end_the_exec(sandbox: K8sSandboxEnvironment) -> None:
+    # A command printing what used to end exec() with exit code 0 still runs to its end.
+    cmd = ["sh", "-c", "printf '<completed-sentinel-value-0>'; sleep 1; exit 3"]
+
+    result = await sandbox.exec(cmd)
+
+    assert result.returncode == 3
+    assert result.stdout == "<completed-sentinel-value-0>"
 
 
 async def test_exec_background_returns(sandbox: K8sSandboxEnvironment) -> None:
@@ -794,6 +810,32 @@ async def test_write_file_is_not_truncated_when_stdin_is_delayed(
     assert int(result.stdout.split()[0]) == len(contents)
 
 
+async def test_write_file_cut_by_a_restart_does_not_land_in_the_new_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the write's retry landed in the restarted container."""
+    monkeypatch.setenv("INSPECT_POD_RESTART_CHECK", "false")
+    dst = "/tmp/test-write-file-cut-by-a-restart.bin"
+    async with install_sandbox_environments(
+        __file__, "restart-values.yaml", restarted_container_behavior="raise"
+    ) as envs:
+        sandbox = envs["default"]
+        # Armed beforehand: when the container is killed, the write is its only exec.
+        await sandbox.exec(
+            ["sh", "-c", f"(until [ -s {dst} ]; do sleep 0.1; done; kill 1) &"]
+        )
+
+        with pytest.raises(K8sError) as exc_info:
+            await sandbox.write_file(dst, bytes(256 * 1024**2))
+
+        assert "has restarted" in str(exc_info.value.__cause__)
+        await _wait_for_restart(sandbox)
+        info = sandbox._pod.info
+        kubectl = ["kubectl", "exec", "-n", info.namespace, info.name, "--"]
+        # By kubectl: in "raise" mode the sandbox refuses every operation from here on.
+        subprocess.run([*kubectl, "test", "!", "-e", dst], check=True, timeout=30)
+
+
 ### #read_file() ###
 
 
@@ -1021,3 +1063,51 @@ async def test_can_get_sandbox_connection_with_default_user(
     # The attachToK8sContainer command does not support passing in a user name, so
     # we don't return any VS Code command.
     assert result.vscode_command is None
+
+
+async def test_exec_stdio_carries_requests_and_replies(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo ready; exec cat"])
+    )
+    try:
+        with anyio.fail_after(60):
+            ready = await stream.receive_until(b"\n", 100)
+            await stream.send(b"echoed\n")
+            echoed = await stream.receive_until(b"\n", 100)
+    finally:
+        await stream.aclose()
+
+    assert (ready, echoed) == (b"ready", b"echoed")
+
+
+async def test_closing_exec_stdio_ends_the_command(
+    sandbox_busybox: K8sSandboxEnvironment,
+) -> None:
+    """Its stdin closes with the stream, so a command reading it (the bridge) exits."""
+    stream = BufferedByteStream(
+        await sandbox_busybox.exec_stdio(["sh", "-c", "echo $$; exec cat"])
+    )
+    with anyio.fail_after(60):
+        pid = (await stream.receive_until(b"\n", 100)).decode()
+    await stream.aclose()
+
+    with anyio.fail_after(60):
+        while (await sandbox_busybox.exec(["kill", "-0", pid])).success:
+            await anyio.sleep(0.5)
+
+
+async def test_exec_stdio_runs_as_the_default_user(
+    sandbox_with_default_user: K8sSandboxEnvironment,
+) -> None:
+    stream = await sandbox_with_default_user.exec_stdio(["id", "-un"])
+    output = b""
+    try:
+        with anyio.fail_after(60), contextlib.suppress(anyio.EndOfStream):
+            while True:
+                output += await stream.receive()
+    finally:
+        await stream.aclose()
+
+    assert output == b"ubuntu\n"

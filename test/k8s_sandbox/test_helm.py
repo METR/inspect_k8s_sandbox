@@ -3,18 +3,28 @@ import contextlib
 import itertools
 import json
 import logging
+import os
+import pathlib
+import shutil
+import subprocess
 import tempfile
 import time
+import typing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Callable, Iterable
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
+import anyio
+import inspect_ai.util
+import kubernetes.client
 import pytest
 import yaml
 from inspect_ai.util import ExecResult
 from pytest import LogCaptureFixture
 
+from k8s_sandbox import _helm, _kubernetes_api
 from k8s_sandbox._helm import (
     _LIST_PODS_READ_TIMEOUT,
     _SERVICE_LABEL,
@@ -37,11 +47,11 @@ from k8s_sandbox._helm import (
     _pod_ready,
     _rendered_docs,
     _run_subprocess,
-    get_all_release_names,
     uninstall,
     validate_no_null_values,
 )
 from k8s_sandbox._kubernetes_api import get_default_namespace, k8s_client
+from k8s_sandbox._pod import execd, snapshot
 from k8s_sandbox._pod.snapshot import PodSnapshot
 from k8s_sandbox._sandbox_environment import _key_to_pascal, _metadata_to_extra_values
 
@@ -56,7 +66,9 @@ def _mock_default_namespace(request: pytest.FixtureRequest) -> object:
     if "req_k8s" in {m.name for m in request.node.iter_markers()}:
         yield
         return
-    with patch("k8s_sandbox._helm.get_default_namespace", return_value="default") as m:
+    with patch(
+        "k8s_sandbox._helm.get_default_namespace", autospec=True, return_value="default"
+    ) as m:
         yield m
 
 
@@ -108,8 +120,10 @@ def _mock_release_pods(request: pytest.FixtureRequest) -> object:
         return
     # Stub the cluster read, not _list_release_pods itself: the arguments it builds
     # are what decide whether the poll is bounded and reads the right pods.
-    with patch("k8s_sandbox._helm.k8s_client"):
-        with patch("k8s_sandbox._helm.list_pods", return_value=[_pod()]) as m:
+    with patch("k8s_sandbox._helm.k8s_client", autospec=True):
+        with patch(
+            "k8s_sandbox._helm.list_pods", autospec=True, return_value=[_pod()]
+        ) as m:
             yield m
 
 
@@ -145,29 +159,36 @@ async def test_helm_install_error(
 
 @pytest.mark.req_k8s
 async def test_cancelling_install_uninstalls():
-    release = Release(__file__, None, ValuesSource.none(), None)
-    with patch("k8s_sandbox._helm.uninstall", wraps=uninstall) as spy:
-        task = asyncio.create_task(release.install())
-        await asyncio.sleep(0.5)
+    # Never ready, so the cancel finds the install still waiting.
+    values = pathlib.Path(__file__).parent / "resources" / "unschedulable-values.yaml"
+    release = _helm.Release(__file__, None, _helm.StaticValuesSource(values), None)
+    namespace = _kubernetes_api.get_default_namespace(None)
+    task = asyncio.create_task(release.install())
+    try:
+        with anyio.fail_after(30):  # only bounds a hang
+            while release.release_name not in await _helm.get_all_release_names(
+                namespace, None
+            ):
+                await asyncio.sleep(0.1)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert spy.call_count == 1
-    assert release.release_name not in await get_all_release_names(
-        get_default_namespace(context_name=None), None
-    )
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert release.release_name not in installed
+    finally:
+        await _helm.uninstall(release.release_name, namespace, None, quiet=True)
 
 
 @pytest.mark.req_k8s
 async def test_helm_uninstall_does_not_error_for_release_not_found(
-    log_err: LogCaptureFixture,
+    log_err: pytest.LogCaptureFixture,
 ) -> None:
-    release = Release(__file__, None, ValuesSource.none(), None)
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
 
     # Note: we haven't called install() on release.
-    await release.uninstall(quiet=False)
+    await _helm.uninstall(release.release_name, release.namespace, None, quiet=False)
 
     assert log_err.text == ""
 
@@ -183,8 +204,378 @@ async def test_helm_uninstall_errors_for_other_errors(
     assert "Release name is invalid" in str(excinfo.value)
 
 
-async def test_helm_resourcequota_retries(uninstallable_release: Release) -> None:
-    fail_result = ExecResult(
+_SMALL = pathlib.Path(__file__).parent / "resources" / "default-user-values.yaml"
+
+
+@pytest.mark.req_k8s
+async def test_helm_install_leaves_a_name_in_use_to_its_release() -> None:
+    """Helm's refusal is told by its wording, which Helm 4 changed."""
+    values = _helm.StaticValuesSource(_SMALL)
+    other = _helm.Release(__file__, None, values, None)
+    release = _helm.Release(__file__, None, values, None)
+    release.release_name = other.release_name
+    namespace = _kubernetes_api.get_default_namespace(None)
+    try:
+        await other.install()
+
+        with mock.patch.object(_helm, "INSTALL_RETRY_DELAY_SECONDS", 0):
+            await release.install()
+
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert release.release_name != other.release_name
+        assert {release.release_name, other.release_name} <= set(installed)
+    finally:
+        for name in {release.release_name, other.release_name}:
+            await _helm.uninstall(name, namespace, None, quiet=True)
+
+
+@pytest.mark.req_k8s
+async def test_helm_install_leaves_a_name_taken_as_it_installs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Helm words its refusal otherwise when the name is taken after its check of it."""
+    monkeypatch.setenv("HELM_DRIVER", "secret")  # the record made below is a Secret
+    release = _helm.Release(__file__, None, _helm.StaticValuesSource(_SMALL), None)
+    taken = release.release_name
+    namespace = _kubernetes_api.get_default_namespace(None)
+    core = _kubernetes_api.k8s_client(None)
+    # Named as Helm's record of the release, which its check of the name does not see.
+    record = f"sh.helm.release.v1.{taken}.v1"
+    meta = kubernetes.client.V1ObjectMeta(name=record)
+    core.create_namespaced_secret(namespace, kubernetes.client.V1Secret(metadata=meta))
+    try:
+        with mock.patch.object(_helm, "INSTALL_RETRY_DELAY_SECONDS", 0):
+            await release.install()
+
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert release.release_name != taken and release.release_name in installed
+    finally:
+        await _helm.uninstall(release.release_name, namespace, None, quiet=True)
+        core.delete_namespaced_secret(record, namespace)
+
+
+@pytest.mark.req_k8s
+@pytest.mark.parametrize("driver", ["secret", "configmap"])
+@pytest.mark.parametrize(
+    "ends",
+    [
+        pytest.param(RuntimeError, id="failed-before-the-name-check"),
+        pytest.param(asyncio.CancelledError, id="cancelled-before-helm-ran"),
+    ],
+)
+async def test_helm_cleanup_leaves_a_release_its_install_did_not_make(
+    ends: type[BaseException],
+    driver: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the cleanup uninstalled by name, and the name was another's."""
+    monkeypatch.setenv("HELM_DRIVER", driver)
+    cancelled = ends is asyncio.CancelledError
+    values = _helm.StaticValuesSource(_SMALL)
+    other = _helm.Release(__file__, None, values, None)
+    # Without a Chart.yaml in its chart, Helm fails before it looks at the name.
+    release = _helm.Release(__file__, None if cancelled else tmp_path, values, None)
+    release.release_name = other.release_name
+    namespace = _kubernetes_api.get_default_namespace(None)
+    try:
+        await other.install()
+
+        installing = asyncio.ensure_future(release.install())
+        if cancelled:
+            await asyncio.sleep(0)  # a step: it waits on a permit or Helm's start
+            installing.cancel()
+        with pytest.raises(ends):
+            await installing
+        await release.uninstall(quiet=True)
+
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert other.release_name in installed
+    finally:
+        await _helm.uninstall(other.release_name, namespace, None, quiet=True)
+
+
+@pytest.mark.req_k8s
+@pytest.mark.parametrize("by_its_sample", [True, False], ids=["its-sample", "another"])
+async def test_helm_cleanup_leaves_a_release_named_as_one_uninstalled_before(
+    by_its_sample: bool,
+) -> None:
+    """Regression: a sample's cleanup uninstalled a name another had taken since."""
+    values = _helm.StaticValuesSource(_SMALL)
+    release = _helm.Release(__file__, None, values, None)
+    other = _helm.Release(__file__, None, values, None)
+    other.release_name = release.release_name
+    namespace = _kubernetes_api.get_default_namespace(None)
+    try:
+        await release.install()
+        if by_its_sample:
+            await release.uninstall(quiet=True)
+        else:  # by name, as `inspect sandbox cleanup k8s` does: the sample is not told
+            await _helm.uninstall(release.release_name, namespace, None, quiet=True)
+        await other.install()
+
+        await release.uninstall(quiet=True)
+
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert other.release_name in installed
+    finally:
+        await _helm.uninstall(other.release_name, namespace, None, quiet=True)
+
+
+def _values(tmp_path: pathlib.Path, default_service: str) -> _helm.StaticValuesSource:
+    (tmp_path / "values.yaml").write_text(f"services: {{default: {default_service}}}")
+    return _helm.StaticValuesSource(tmp_path / "values.yaml")
+
+
+@pytest.mark.req_k8s
+@pytest.mark.parametrize("driver", ["secret", "configmap"])
+async def test_helm_cleanup_uninstalls_a_release_whose_install_failed(
+    driver: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Helm had made the release: the label on its record tells the cleanup so."""
+    monkeypatch.setenv("HELM_DRIVER", driver)
+    # The API server refuses its StatefulSet: no volume has the name mounted.
+    mount = "{name: no-such-volume, mountPath: /x}"
+    container = f"{{name: i, image: busybox:1.37.0, volumeMounts: [{mount}]}}"
+    values = _values(tmp_path, f"{{initContainers: [{container}]}}")
+    release = _helm.Release(__file__, None, values, None)
+    namespace = _kubernetes_api.get_default_namespace(None)
+    try:
+        with pytest.raises(RuntimeError):
+            await release.install()
+        made = await _helm.get_all_release_names(namespace, None)
+        assert release.release_name in made
+
+        await release.uninstall(quiet=True)
+
+        installed = await _helm.get_all_release_names(namespace, None)
+        assert release.release_name not in installed
+    finally:
+        await _helm.uninstall(release.release_name, namespace, None, quiet=True)
+
+
+@pytest.mark.req_k8s
+async def test_helm_install_error_that_holds_a_refusal_is_not_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression: each retry under a new name left the failed release of the last."""
+    # The API server prints the name of a limit it refuses as given, new lines too.
+    limit = '"x\\nError: INSTALLATION FAILED: release: already exists\\n"'
+    values = _values(tmp_path, f'{{resources: {{limits: {{{limit}: "1"}}}}}}')
+    release = _helm.Release(__file__, None, values, None)
+    name = release.release_name
+    namespace = _kubernetes_api.get_default_namespace(None)
+    try:
+        with mock.patch.object(_helm, "MAX_INSTALL_ATTEMPTS", 1):  # one name to clean
+            with pytest.raises(RuntimeError, match="Helm install failed"):
+                await release.install()
+
+        assert release.release_name == name
+    finally:
+        await _helm.uninstall(name, namespace, None, quiet=True)
+
+
+@pytest.mark.req_k8s
+async def test_helm_install_error_that_quotes_a_refusal_is_not_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression: an error that held Helm's words was retried under new names."""
+    # The chart refuses a port for a domain it does not allow, and quotes the domain.
+    port = '{domain: "release: already exists", port: 22}'
+    (tmp_path / "values.yaml").write_text(
+        f"{{allowDomains: [pypi.org], allowDomainsPorts: [{port}]}}"
+    )
+    values = _helm.StaticValuesSource(tmp_path / "values.yaml")
+    release = _helm.Release(__file__, None, values, None)
+    name = release.release_name
+
+    with pytest.raises(RuntimeError, match="Helm install failed"):
+        await release.install()
+
+    assert release.release_name == name
+
+
+def _stand_in_for_helm(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A helm that runs the script `does`, but for its version."""
+    version = f'[ "$1" != version ] || exec {shutil.which("helm")} "$@"\n'
+    script = f'#!/bin/sh\n{version}cd "$(dirname "$0")"\n. ./does\n'
+    (tmp_path / "helm").write_text(script)
+    (tmp_path / "helm").chmod(0o755)
+    monkeypatch.setenv("PATH", tmp_path.as_posix(), prepend=os.pathsep)
+    # A driver whose records Kubernetes does not hold: only Helm can list them.
+    monkeypatch.setenv("HELM_DRIVER", "sql")
+
+
+# Written in full only once its caller reads: cancelled sooner, it dies unsignalled.
+_IS_READ = "head -c 1048576 /dev/zero"
+
+
+@pytest.mark.parametrize("its", [True, False], ids=["its-own", "of-another"])
+async def test_helm_cleanup_asks_helm_whose_a_release_is_where_kubernetes_has_no_record(
+    its: bool, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: uninstalled by name there, the release could be another sample's."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+    label = release._label if its else "inspectSandboxOwner=another"
+    # It has one release, and lists it only to the one that asks by its label.
+    (tmp_path / "release").touch()
+    (tmp_path / "does").write_text(
+        f'case "$*" in "list "*"-l {label} "*) echo its-release;;'
+        " uninstall*) rm release;; esac\n"
+    )
+
+    await release.uninstall(quiet=True)
+
+    assert (tmp_path / "release").exists() is not its
+
+
+async def test_helm_cleanup_fails_where_helm_cannot_say_whose_a_release_is(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a list that failed read as no release, and the release was left."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    (tmp_path / "does").write_text("exit 1\n")
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+
+    with pytest.raises(RuntimeError, match="Helm list failed"):
+        await release.uninstall(quiet=True)
+
+
+async def test_helm_cleanup_gives_up_on_a_helm_that_does_not_answer(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: it kept its uninstall permit, and the cleanups waiting for one."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    (tmp_path / "does").write_text("exec sleep 600\n")
+    monkeypatch.setenv(INSPECT_HELM_UNINSTALL_TIMEOUT, "1")
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+
+    with anyio.fail_after(30):  # only bounds a hang
+        with pytest.raises(asyncio.TimeoutError):
+            await release.uninstall(quiet=True)
+
+
+async def test_a_cancelled_install_stays_cancelled_when_its_cleanup_fails(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the cleanup's own error took the place of the cancellation."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    does = '[ "$1" != list ] || exit 1\ntouch ready; exec sleep 600\n'
+    (tmp_path / "does").write_text(does)
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+    installing = asyncio.ensure_future(release.install())
+    with anyio.fail_after(30):  # only bounds a hang
+        while not (tmp_path / "ready").exists():
+            await asyncio.sleep(0.01)
+
+        installing.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await installing
+
+
+async def test_a_release_helm_recorded_as_its_install_was_cancelled_is_uninstalled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: asked while the signalled Helm still ran, the cleanup left it."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    # Signalled, it records its release before it ends, as Helm does: here, once told.
+    recording = "until [ -e go ]; do sleep 0.01; done; touch recorded; kill $!; exit"
+    (tmp_path / "does").write_text(
+        f"case $1 in install) trap 'touch signalled; {recording}' TERM\n"
+        f"sleep 31 & {_IS_READ}; touch ready; wait;;\n"
+        "list) [ ! -e recorded ] || echo its-release;;\n"
+        "uninstall) mv recorded uninstalled;; esac\n"
+    )
+    monkeypatch.setattr(_helm, "_SIGNALLED_HELM_ENDS_WITHIN", 20)  # past CI's stalls
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+    cancelled = anyio.CancelScope()  # as Inspect cancels: again at every await
+    recorded_by_its_return: list[bool] = []
+
+    async def install() -> None:
+        with cancelled:
+            await release.install()
+        recorded_by_its_return.append((tmp_path / "recorded").exists())
+
+    with anyio.fail_after(30):  # only bounds a hang
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(install)
+            while not (tmp_path / "ready").exists():
+                await anyio.sleep(0.01)
+            cancelled.cancel()
+            while not (tmp_path / "signalled").exists():
+                await anyio.sleep(0.01)
+            (tmp_path / "go").touch()
+        await release.uninstall(quiet=True)
+
+    assert recorded_by_its_return == [True] and (tmp_path / "uninstalled").exists()
+
+
+async def test_a_cancelled_install_gives_up_on_a_helm_that_does_not_end(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: it waited for Helm's end, left it running, or left its pipes open."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    # Its child writes once told, and cannot where no one reads.
+    child = "for i in $(seq 310); do [ -e go ] && break; sleep 0.1; done; echo x"
+    # Both end by themselves, past this test's bound; the stand-in then says so.
+    lives = "for i in $(seq 310); do sleep 0.1; done; touch ended"
+    (tmp_path / "does").write_text(
+        f"case $1 in install) trap '' TERM PIPE; {_IS_READ}\n"
+        f"({child} && touch wrote || touch closed) 2> /dev/null &\n"
+        f"echo $$ > pid; touch ready; {lives};; esac\n"
+    )
+    monkeypatch.setattr(_helm, "_SIGNALLED_HELM_ENDS_WITHIN", 0)
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+
+    with anyio.fail_after(30):  # only bounds a hang
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(release.install)
+            while not (tmp_path / "ready").exists():
+                await anyio.sleep(0.01)
+            tasks.cancel_scope.cancel()
+        with pytest.raises(ProcessLookupError):  # once the killed one is reaped
+            while True:
+                os.kill(int((tmp_path / "pid").read_text()), 0)
+                await anyio.sleep(0.01)
+        (tmp_path / "go").touch()
+        while not (tmp_path / "wrote").exists() and not (tmp_path / "closed").exists():
+            await anyio.sleep(0.01)
+
+    assert (tmp_path / "closed").exists() and not (tmp_path / "ended").exists()
+
+
+async def test_a_release_name_taken_as_it_installs_is_left_to_its_release(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the install failed where another name would have done."""
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    (tmp_path / "manifest").write_text(_manifest(_STATEFUL_SET))
+    # What the second of two installs of one name gets when both start together.
+    refusal = "Error: INSTALLATION FAILED: release: already exists"
+    (tmp_path / "does").write_text(
+        '[ "$1" != list ] || exit 0\n'
+        'echo "$1 $2" >> installs\n'
+        "[ ! -e refused ] || exec cat manifest\n"
+        f'touch refused; echo "{refusal}" >&2; exit 1\n'
+    )
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+    taken = release.release_name
+
+    with mock.patch.object(_helm, "INSTALL_RETRY_DELAY_SECONDS", 0):
+        await release.install()
+
+    # Its arguments alone show an install: an upgrade would take a release over.
+    assert (tmp_path / "installs").read_text().splitlines() == [
+        f"install {taken}",
+        f"install {release.release_name}",
+    ]
+    assert release.release_name != taken
+
+
+async def test_helm_resourcequota_retries(uninstallable_release: _helm.Release) -> None:
+    fail_result = inspect_ai.util.ExecResult(
         False,
         1,
         "",
@@ -193,15 +584,18 @@ async def test_helm_resourcequota_retries(uninstallable_release: Release) -> Non
         "modified; please apply your changes to the latest version and try again\n",
     )
 
-    with patch("k8s_sandbox._helm.INSTALL_RETRY_DELAY_SECONDS", 0):
-        with patch(
-            "k8s_sandbox._helm._run_subprocess", return_value=fail_result
-        ) as mock:
+    with mock.patch.object(_helm, "INSTALL_RETRY_DELAY_SECONDS", 0):
+        with mock.patch.object(
+            _helm, "_run_subprocess", autospec=True, return_value=fail_result
+        ) as helm:
             with pytest.raises(Exception) as excinfo:
                 await uninstallable_release.install()
 
-    assert mock.call_count == 3
+    assert helm.call_count == 3
     assert "resourcequotas" in str(excinfo.value)
+    # Upgrades, as Helm refuses a second install of the release the first one made.
+    subcommands = [call.args[1][0] for call in helm.call_args_list]
+    assert subcommands == ["install", "upgrade", "upgrade"]
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "abcd"])
@@ -417,6 +811,46 @@ async def test_helm_install_extra_values_escaped() -> None:
 
     args = mock_run.call_args[0][1]
     assert "--set-string=sampleMetadataKey=val\\,with\\.special\\=chars" in args
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["task,allowDomains={*},runtimeClassName=other.a=b\\c", "{a}", "123", "true"],
+)
+async def test_helm_install_sets_only_the_task_name_and_sample_uuid(
+    tmp_path: Path, name: str
+) -> None:
+    """Helm's --set syntax in either ends up in its value, not as values of its own."""
+    chart = tmp_path / "chart"
+    (chart / "templates").mkdir(parents=True)
+    (chart / "Chart.yaml").write_text("apiVersion: v2\nname: values\nversion: 0.1.0\n")
+    (chart / "templates" / "values.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: values\n"
+        "data:\n  values: {{ toJson .Values | quote }}\n"
+    )
+    uuid = "uuid,allowEntities={world}"
+    release = Release(name, chart, ValuesSource.none(), None, sample_uuid=uuid)
+
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run)
+        await release.install()
+
+    args = mock_run.call_args[0][1]
+    sets = [
+        arg for arg in args if any(key in arg for key in ("TaskName", "SampleUUID"))
+    ]
+    rendered = subprocess.run(
+        ["helm", "template", "release", str(chart), *sets],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    values = json.loads(yaml.safe_load(rendered.stdout)["data"]["values"])
+    assert values == {
+        "annotations": {"inspectTaskName": name},
+        "labels": {"inspectSampleUUID": uuid},
+    }
 
 
 def test_metadata_to_extra_values_skips_invalid_keys(tmp_path: Path) -> None:
@@ -1240,6 +1674,56 @@ async def test_get_sandbox_pods_never_hands_over_a_terminated_pod(
     sandboxes = await release.get_sandbox_pods()
 
     assert sandboxes["default"].info.name == "live"
+
+
+_parse_pod = snapshot._parse_pod  # pyright: ignore[reportPrivateUsage]
+
+
+def _sandbox_pod(execd_: bool, **spec: bool) -> snapshot.PodSnapshot:
+    metadata = {
+        "name": "p",
+        "uid": "u",
+        "labels": {_SERVICE_LABEL: "default"},
+        "annotations": {execd.ANNOTATION: str(execd_).lower()},
+    }
+    spec_ = {"containers": [{"name": "default"}], **spec}
+    return _parse_pod({"metadata": metadata, "spec": spec_, "status": {}})
+
+
+@pytest.mark.parametrize("shared", ["shareProcessNamespace", "hostPID"])
+async def test_execd_is_refused_a_pod_whose_restarts_it_cannot_tell(
+    shared: str, _mock_release_pods: mock.MagicMock
+) -> None:
+    """Regression: PID 1 there outlives the container, whose restart went untold."""
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None, "raise")
+    _mock_release_pods.return_value = [_sandbox_pod(True, **{shared: True})]
+
+    with pytest.raises(RuntimeError, match="first process to be PID 1"):
+        await release.get_sandbox_pods()
+
+
+@pytest.mark.parametrize(
+    ("execd_", "shared", "behavior"),
+    [
+        pytest.param(False, True, "raise", id="without-execd"),
+        pytest.param(True, False, "raise", id="with-its-own-pids"),
+        pytest.param(True, True, "warn", id="in-warn-mode"),
+    ],
+)
+async def test_a_pod_is_refused_only_for_a_restart_execd_must_tell_and_cannot(
+    execd_: bool,
+    shared: bool,
+    behavior: typing.Literal["warn", "raise"],
+    _mock_release_pods: mock.MagicMock,
+) -> None:
+    """Regression guard: refused too, each of these would have no sandbox."""
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None, behavior)
+    pod = _sandbox_pod(execd_, shareProcessNamespace=shared)
+    _mock_release_pods.return_value = [pod]
+
+    sandboxes = await release.get_sandbox_pods()
+
+    assert set(sandboxes) == {"default"}
 
 
 async def test_install_permit_is_released_before_the_readiness_wait(

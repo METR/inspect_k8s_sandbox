@@ -22,7 +22,7 @@ snake_case attributes on the generated model classes.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from kubernetes import client  # type: ignore
@@ -36,6 +36,9 @@ class ContainerStatus:
     name: str
     restart_count: int
     last_terminated_reason: str | None
+    """Why its last instance stopped: the one stopped now, else the previous one."""
+    running: bool
+    """False while the container is stopped or waiting to start."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,11 @@ class PodSnapshot:
     """``status.phase``: Pending, Running, Succeeded, Failed or Unknown."""
     ready: bool = False
     """``status.conditions[type=Ready]`` is True, which is what Helm's wait checks."""
+    ip: str | None = None
+    """``status.podIP``."""
+    annotations: dict[str, str] = field(default_factory=dict)
+    shares_pids: bool = False
+    """``spec.shareProcessNamespace`` or ``spec.hostPID``."""
 
     def status_for(self, container_name: str) -> ContainerStatus | None:
         if self.container_statuses is None:
@@ -71,14 +79,22 @@ class PodSnapshot:
         return status.restart_count if status is not None else 0
 
 
-def read_pod(api: client.CoreV1Api, name: str, namespace: str) -> PodSnapshot:
+def read_pod(
+    api: client.CoreV1Api,
+    name: str,
+    namespace: str,
+    request_timeout: int | None = None,
+) -> PodSnapshot:
     """Read a single pod, bypassing the kubernetes client's model deserialization."""
     # _preload_content is passed through to the generated client's **kwargs at
     # runtime but is absent from the typed stubs, hence the call-arg ignore.
     response = cast(
         HTTPResponse,
         api.read_namespaced_pod(  # type: ignore[call-arg]
-            name=name, namespace=namespace, _preload_content=False
+            name=name,
+            namespace=namespace,
+            _preload_content=False,
+            _request_timeout=request_timeout,
         ),
     )
     return _parse_pod(json.loads(response.data))
@@ -140,13 +156,20 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
         ready=any(
             c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         ),
+        ip=status.get("podIP"),
+        annotations=metadata.get("annotations") or {},
+        shares_pids=bool(spec.get("shareProcessNamespace") or spec.get("hostPID")),
     )
 
 
 def _parse_container_status(cs: dict[str, Any]) -> ContainerStatus:
-    terminated = (cs.get("lastState") or {}).get("terminated") or {}
+    state = cs.get("state") or {}
+    terminated = (
+        state.get("terminated") or (cs.get("lastState") or {}).get("terminated") or {}
+    )
     return ContainerStatus(
         name=cs["name"],
         restart_count=cs.get("restartCount", 0),
         last_terminated_reason=terminated.get("reason"),
+        running="terminated" not in state and "waiting" not in state,
     )

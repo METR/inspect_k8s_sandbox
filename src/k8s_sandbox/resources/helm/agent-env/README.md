@@ -39,11 +39,13 @@
 | services.default.initContainers | list | `[]` | Init containers to run before the main container starts. Useful for waiting for dependencies to become ready (e.g., database connectivity checks). Each init container supports: `name` (required), `image` (required), `command`, `args`, `imagePullPolicy`, `workingDir`, `env` (`name`/`value` pairs), `volumeMounts` (of volumes in the service's `volumes:`), `resources`, and `securityContext`. The `$AGENT_ENV` environment variable is automatically injected. Note: init containers cannot reliably access external domains from `allowDomains` due to CoreDNS starting after init containers complete. |
 | services.default.livenessProbe | object | `{}` | A probe which is used to determine when to restart a container. |
 | services.default.nodeSelector | object | `{}` | Node selector settings for the Pod. |
+| services.default.podAnnotations | object | `{}` | Annotations added to this service's Pod alone; on a clash they win over the top-level `annotations`. |
 | services.default.ports | list | `[]` | Deprecated. All ports of services with a DNS record are accessible (though not necessarily open) to other services within the agent environment. If one or more ports are provided, `dnsRecord` is automatically set to true. |
 | services.default.readinessProbe | object | `{}` | A probe which is used to determine when the container is ready to accept. traffic. |
 | services.default.resources | object | see [templates/services.yaml](./templates/services.yaml) | Resource requests and limits for the container. |
 | services.default.runtimeClassName | string | `"gvisor"` | The container runtime e.g. gvisor or runc. The default is gvisor if not specified or set to `null`. |
 | services.default.securityContext | object | `{}` | Privilege and access control settings for the container. |
+| services.default.terminationGracePeriodSeconds | int | `0` | Seconds a deleted Pod of this service may take to stop. At 0 it leaves the API at once, before its node has stopped it. The default `command` ignores SIGTERM, so a Pod running it takes that long to delete. |
 | services.default.tolerations | list | `[]` | Toleration settings for the Pod. |
 | services.default.volumeMounts | list | `[]` | Volume mounts that will be mounted in the container. Volumes defined in `volumes:` as colon-separated strings will automatically be mounted at their specified mount paths. |
 | services.default.volumes | list | `[]` | Volumes accessible to the container. Supports arbitrary yaml or colon-separated strings of the form `volume-name:/mount-path`. |

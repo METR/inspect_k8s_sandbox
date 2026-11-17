@@ -1,4 +1,5 @@
 import ipaddress
+import pathlib
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -173,6 +174,60 @@ def test_annotations(chart_dir: Path, test_resources_dir: Path) -> None:
         assert service["metadata"]["annotations"]["myValue"] == attr_value
     for deployment in _get_documents(documents, "Deployment"):
         assert deployment["metadata"]["annotations"]["myValue"] == attr_value
+
+
+def test_pod_annotations_reach_only_their_service_pod(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "annotations.shared=release,annotations.both=release,"
+        "services.default.dnsRecord=true,services.server.dnsRecord=true,"
+        "services.default.podAnnotations.both=default,"
+        "services.default.podAnnotations.mine=default,"
+        "services.server.podAnnotations.mine=server",
+    )
+
+    release = {"shared": "release", "both": "release"}
+    pods = {}
+    for stateful_set in _get_documents(documents, "StatefulSet"):
+        # The StatefulSet itself keeps the top-level annotations alone.
+        assert stateful_set["metadata"]["annotations"] == release
+        pods[stateful_set["metadata"]["name"]] = stateful_set["spec"]["template"]
+    for service in _get_documents(documents, "Service"):
+        assert service["metadata"]["annotations"] == release
+    assert pods["agent-env-my-release-default"]["metadata"]["annotations"] == {
+        "shared": "release",
+        "both": "default",
+        "mine": "default",
+    }
+    assert pods["agent-env-my-release-server"]["metadata"]["annotations"] == {
+        **release,
+        "mine": "server",
+    }
+
+
+def test_termination_grace_period_is_set_per_service(
+    chart_dir: Path, test_resources_dir: Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "multiple-services-values.yaml",
+        "services.graceful.image=nginx,"
+        "services.graceful.terminationGracePeriodSeconds=1",
+    )
+
+    assert {
+        stateful_set["metadata"]["name"]: stateful_set["spec"]["template"]["spec"][
+            "terminationGracePeriodSeconds"
+        ]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    } == {
+        "agent-env-my-release-default": 0,
+        "agent-env-my-release-server": 0,
+        "agent-env-my-release-graceful": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -376,6 +431,43 @@ def test_init_containers_with_all_fields(
         {"name": "shared", "mountPath": "/shared"}
     ]
     assert {"name": "shared", "emptyDir": {}} in app_spec["volumes"]
+
+
+def test_an_init_container_mounts_a_colon_separated_volume_by_its_name(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: the mount kept that name, which no volume of the Pod has."""
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / "init-container-volumes-values.yaml"
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "env-data", "mountPath": "/data", "readOnly": True},
+        # Each names a volume of the Pod, which is the one it means.
+        {"name": "env-data", "mountPath": "/generated"},
+        {"name": "both", "mountPath": "/declared"},
+        {"name": "resolv-conf", "mountPath": "/the-charts-own"},
+    ]
+    # A template rendered later reads the name as the values gave it.
+    read = [c for c in _get_documents(documents, "ConfigMap") if "mounted" in c["data"]]
+    assert read[0]["data"] == {"mounted": "data"}
+
+
+def test_an_init_container_mounts_a_volume_named_as_one_the_chart_left_out(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    """Regression: resolv-conf stayed the chart's where corednsUpstream drops that."""
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "init-container-volumes-values.yaml",
+        set_str="corednsUpstream[0]=10.96.0.10",
+    )
+
+    spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+
+    assert spec["initContainers"][0]["volumeMounts"][3]["name"] == "env-resolv-conf"
 
 
 def test_resource_requests_and_limits(
@@ -738,7 +830,9 @@ def test_network_policies_render_by_default(chart_dir: Path) -> None:
 def test_network_policy_disabled_renders_no_cilium_kinds(chart_dir: Path) -> None:
     documents = _run_helm_template(chart_dir, set_str="networkPolicy.enabled=false")
 
-    assert not [doc for doc in documents if "cilium.io" in doc["apiVersion"]]
+    assert not [
+        doc for doc in documents if doc["apiVersion"].split("/")[0] == "cilium.io"
+    ]
     assert _get_documents(documents, "StatefulSet")
 
 

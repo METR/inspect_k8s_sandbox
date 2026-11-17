@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
+  runtime whose node must stop a deleted Pod before another Pod takes its room.
+- A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
+  mounted read-only at `/execd/execd` and TCP port 14601 reachable from the client at
+  the pod's IP and from no other pod, runs `exec()`, `read_file()`, `write_file()` and
+  `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
+  a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
+  its environment holds `HAWK_NEXT_EXEC`, a `cwd` that does not exist ends it with
+  status 1, and with no `stdin` it reads end-of-file. If a symbolic link on the path to
+  the container's working directory is re-pointed, a command given no `cwd`, or a
+  relative one, still runs where the link pointed when execd started, and ends with
+  status 1 once that directory is gone. A timed-out `exec()` whose command is still
+  running gets SIGKILL, and so do the processes under it that execd may
+  signal: all where it has `CAP_KILL`, else its own user's. So do the
+  others it started, unless one has left its process group, or is one execd may not
+  signal, and has cleared its environment or made it unreadable to execd, runs as a
+  user that is neither execd's nor the command's where execd lacks `CAP_SYS_PTRACE`,
+  or on gVisor comes from a command run as another user;
+  those of a command that has ended are left running. A command that ends execd, by
+  killing every process or taking the pod's last PID, makes each running `exec()`,
+  `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
+  timeout passes first raises `TimeoutError`. Commands still running lose their
+  timeout and get end-of-file on `stdin`.
+  Make execd mode 111; where a container runs on gVisor as a
+  user other than root it must be readable too (555). A process running as execd's user
+  can stand in for it while it starts, unless execd is mode 111 and the container has
+  neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`. execd's memory counts against
+  the container's limit: about 7 MB idle, 5 to 16 MB for each stream (stdout, stderr) of
+  a command that prints faster than the client reads, and up to about 10 MB for each
+  command that leaves its stdin unread, most of it kept for minutes after the command
+  ends. With `restarted_container_behavior="raise"`, a pod that sets
+  `shareProcessNamespace` or `hostPID` is refused: the sample fails to start.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
@@ -14,6 +46,75 @@
 - Fix `read_file()` failing with a `ValidationError` on `kubernetes` 37.
 - Add a `priorityClassName` value for the sandbox pods' PriorityClass. It is a cluster
   setting, so set it in the `INSPECT_SANDBOX_VALUES` file.
+- Fix `read_file()` hanging on a relative file named `-`.
+- Fix `write_file()` over Kubernetes exec never returning when a large file could not
+  be written.
+- Fix `exec()` over Kubernetes exec never returning when its `user` could not be
+  switched to and its command, environment or input was large.
+- Fix a sandbox whose generated release name was already in use failing to start and
+  uninstalling the release that had the name.
+- With `restarted_container_behavior="raise"`, every operation after a detected pod
+  replacement or container restart fails with the same `PodReplacedError` or
+  `ContainerRestartedError` (as the cause of a `K8sError`), and so does one running when
+  it was detected. `read_file()` and `write_file()` do too when
+  `INSPECT_POD_RESTART_CHECK=false`. A container that Kubernetes shows stopped, or
+  waiting to start again, counts as restarted.
+- With `restarted_container_behavior="raise"`, a `read_file()` or `write_file()` over
+  Kubernetes exec that fails checks whether the container restarted or the pod was
+  replaced, also when `INSPECT_POD_RESTART_CHECK=false`, and raises that instead.
+- The pod read that checks for a restart no longer waits without end on an API server
+  that sends nothing: the operation fails after about four minutes.
+- An operation over Kubernetes exec no longer waits without end on an API server that
+  never answers its websocket upgrade: each connection attempt times out after 60
+  seconds.
+- An operation is tried again when the restart check before an attempt cannot reach the
+  API server at once: its connection refused or reset, or no route or name found. A
+  check that times out there still fails the operation.
+- An operation whose container stopped under it, which Kata reports with exit code 255
+  when the VM stopped, raises `ContainerStoppedError`, an `ExecResultUnknownError`:
+  `exec()` no longer returns 255 as the command's exit code, and `read_file()` and
+  `write_file()` are no longer retried. With `restarted_container_behavior="raise"`, or
+  for an `exec()` whose check after it sees the restart, it raises
+  `ContainerRestartedError` instead.
+- Fix a command that printed `<completed-sentinel-value-N>` making `exec()` return
+  before it finished, with exit code `N`, and that marker being left at the end of
+  stdout when it arrived in two pieces. `exec()` of a command that leaves a
+  background process holding its stdout or stderr open now returns a tenth of a
+  second after the command exits.
+- `exec()` no longer returns a successful result whose output lost its end on the way.
+  That, and a connection to the pod lost while the command runs, are retried,
+  so the command may run a second time; if every attempt fails, `exec()` raises
+  `ExecResultUnknownError` (a `GetReturncodeError`, as the cause of a `K8sError`). They
+  are not retried once the container has restarted or been replaced. A pod with execd
+  resumes the command instead and never runs it a second time; if it can't resume, it
+  raises `ExecResultUnknownError`.
+- Images no longer need `sync`, and need `printf` (a shell builtin in dash, bash and
+  busybox).
+- Add a per-service `podAnnotations` value: annotations for that service's Pod
+  alone, over the top-level `annotations`, for a runtime that reads per-pod
+  settings from annotations.
+- Fix an exec's input, such as a large `write_file()`, going unread after about a minute
+  with the `kubernetes` Python client 36 or later.
+- Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
+  `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
+  taking one each. Needs anyio 4.14 or later. With
+  `restarted_container_behavior="raise"`, `exec_stdio()` raises a detected restart
+  before starting its command, as `exec()` does, and a stream already open raises
+  `anyio.BrokenResourceError` at its next `receive()` or `send()` once a restart is
+  found. In that mode, when its stream ends with exit code 255 after the
+  command wrote stdout (Kata's status for a command whose VM stopped), the stream ends
+  as usual and every later operation fails as after a detected restart. The command
+  must not exit 255 itself once it has written.
+- `exec(user="root")` no longer needs `id` or `runuser` in the image. In a container
+  that is not root, `exec(user="0")` now fails as `exec(user="root")` does, with a
+  warning, rather than raising a `RuntimeError` that says the user does not exist.
+- `exec()`, `read_file()` and `write_file()` no longer find the programs they run
+  besides the caller's command through the image's `PATH`: `exec(user=...)` runs
+  `runuser` as `/sbin/runuser`, and `id`, `base64`, `timeout`, `head`, `mkdir`, `cat` (and
+  `printf`, where the shell has no builtin) come from `/usr/bin` or `/bin`, so images need
+  them there. The caller's command still runs with the container's `PATH`.
+- The task name and sample UUID reach the chart verbatim, as strings, whatever
+  characters they contain (a comma, `=`, a leading `{`, or a name such as `123`).
 
 ## 2026-10-09 0.14.0
 
