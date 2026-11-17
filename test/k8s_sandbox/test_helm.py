@@ -1453,7 +1453,7 @@ def _services(stdout: str) -> frozenset[str]:
             _manifest(_stateful_set("'null'")), {"null"}, id="quoted-null-label"
         ),
         # Helm reads a scalar tagged `!` as text.
-        pytest.param(_manifest(_stateful_set("! 1e3")), {"1e3"}, id="bang-label"),
+        pytest.param(_manifest(_stateful_set("! 012")), {"012"}, id="bang-label"),
         # A custom chart may merge its pod's labels in.
         pytest.param(
             _manifest(
