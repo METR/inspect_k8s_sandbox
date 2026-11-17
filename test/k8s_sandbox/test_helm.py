@@ -1423,7 +1423,7 @@ def _services(stdout: str) -> frozenset[str]:
             {"default"},
             id="strings-pyyaml-types",
         ),
-        # Helm reads a number too large for 64 bits or for a float as a string: a name.
+        # Helm reads a hex past 64 bits, or a number past a float, as a string: a name.
         pytest.param(
             _manifest(_stateful_set("1e400"), _stateful_set("0x" + "f" * 40)),
             {"1e400", "0x" + "f" * 40},

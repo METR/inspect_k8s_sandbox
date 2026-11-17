@@ -872,8 +872,8 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
 _CORE_SCHEMA = {
     "null": r"null|Null|NULL|~|",
     "bool": r"true|True|TRUE|false|False|FALSE",
-    "int": r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
-    "float": r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
+    "untagged-int": r"[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+",
+    "untagged-float": r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
     r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
     "merge": r"<<",
 }
@@ -881,12 +881,11 @@ _CORE_SCHEMA = {
 
 def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
     """A core schema integer; text past 64 bits, where Helm may write a string bare."""
-    text = loader.construct_scalar(node)
     try:
-        number = int(text, {"0o": 8, "0x": 16}.get(text[:2], 10))
+        number = int(node.value, {"0o": 8, "0x": 16}.get(node.value[:2], 10))
     except ValueError:  # more digits than Python reads
-        return text
-    return number if -(2**63) <= number < 2**64 else text
+        return node.value
+    return number if -(2**63) <= number < 2**64 else node.value
 
 
 def _core_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float | str:
@@ -907,8 +906,8 @@ class _ManifestLoader(yaml.SafeLoader):
     }
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        "tag:yaml.org,2002:int": _core_int,
-        "tag:yaml.org,2002:float": _core_float,
+        "tag:yaml.org,2002:untagged-int": _core_int,
+        "tag:yaml.org,2002:untagged-float": _core_float,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
