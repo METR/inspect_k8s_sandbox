@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -867,6 +868,58 @@ def _sandbox_pods(pods: Iterable[PodSnapshot]) -> Iterator[PodSnapshot]:
     )
 
 
+# The shape go-yaml takes for a float, once it has dropped every `_`.
+_GO_FLOAT = re.compile(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?")
+
+
+def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float | str:
+    """A number as Helm's reader, go-yaml, takes it; the text where that reads none."""
+    plain = node.value.replace("_", "")
+    try:  # Go's ParseInt with base 0, where a leading zero is octal
+        number = int(re.sub(r"^([-+]?)0(?=[0-7])", r"\g<1>0o", plain), 0)
+    except ValueError:  # no integer, or more digits than Python reads
+        number = 2**64
+    # A sign leaves 63 bits: past them Go reads an integer only as unsigned.
+    if -(2**63) <= number < (2**63 if plain[0] in "+-" else 2**64):
+        return number
+    value = float(plain) if _GO_FLOAT.fullmatch(plain) else math.inf
+    return node.value if math.isinf(value) else value
+
+
+# YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
+_SCALAR_TAGS = {
+    "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
+    "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
+    "tag:yaml.org,2002:float": r"[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
+    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*|\.[0-9]+([eE][-+]?[0-9]+)?",
+    "tag:yaml.org,2002:merge": r"<<",
+}
+
+
+class _ManifestLoader(yaml.SafeLoader):
+    """Helm's numbers, YAML 1.2's null and booleans: PyYAML's 1.1 types fail on `=`."""
+
+    yaml_implicit_resolvers = {
+        None: [
+            (tag, re.compile(f"(?:{pattern})$"))
+            for tag, pattern in _SCALAR_TAGS.items()
+        ]
+    }
+    # An untagged number's tag is its constructor: no manifest can write that as a tag.
+    yaml_constructors = {
+        **yaml.SafeLoader.yaml_constructors,
+        _helm_number: _helm_number,
+        "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
+    }
+
+    def compose_scalar_node(self, anchor: Any) -> yaml.ScalarNode:
+        event = self.peek_event()
+        # Helm reads a scalar tagged `!` as text, and still merges on a `! <<` key.
+        if event.tag == "!" and event.value != "<<":
+            event.tag = "tag:yaml.org,2002:str"
+        return super().compose_scalar_node(anchor)
+
+
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     """The manifest Helm rendered, as parsed documents.
 
@@ -875,8 +928,8 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     """
     try:
         manifest = json.loads(install_stdout)["manifest"]
-        # safe_load_all is lazy, so force the parse inside the try.
-        return list(yaml.safe_load_all(manifest))
+        # load_all is lazy, so force the parse inside the try.
+        return list(yaml.load_all(manifest, Loader=_ManifestLoader))
     except Exception as e:
         _raise_runtime_error(
             "Could not read the rendered manifest from Helm, so the sandboxes to wait "

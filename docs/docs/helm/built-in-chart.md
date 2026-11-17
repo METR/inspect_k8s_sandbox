@@ -602,7 +602,7 @@ additionalResources:
       Allow external ingress from all entities to the default service on port 2222.
     endpointSelector:
       matchLabels:
-        io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+        io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
         {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
         inspect/service: default
     ingress:
