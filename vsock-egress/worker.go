@@ -196,7 +196,7 @@ func (w *worker) dial() (net.Conn, error) {
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
-		if asked := w.asked.Load(); asked == nil || w.now().Sub(*asked) >= time.Second {
+		if w.now().Sub(*w.asked.Load()) >= time.Second {
 			w.addr.CompareAndSwap(addr, nil)
 		}
 		return nil, err
