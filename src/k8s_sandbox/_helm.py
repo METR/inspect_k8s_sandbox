@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -879,12 +880,20 @@ _CORE_SCHEMA = {
 
 
 def _core_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | str:
-    """A core schema integer, or its text where it has more digits than Python reads."""
+    """A core schema integer; text past 64 bits, where Helm may write a string bare."""
     text = loader.construct_scalar(node)
     try:
-        return int(text, {"0o": 8, "0x": 16}.get(text[:2], 10))
-    except ValueError:
+        number = int(text, {"0o": 8, "0x": 16}.get(text[:2], 10))
+    except ValueError:  # more digits than Python reads
         return text
+    return number if -(2**63) <= number < 2**64 else text
+
+
+def _core_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float | str:
+    """A core schema float; text where it overflows, which Helm reads as a string."""
+    number = loader.construct_yaml_float(node)
+    overflows = math.isinf(number) and "inf" not in node.value.lower()
+    return node.value if overflows else number
 
 
 class _ManifestLoader(yaml.SafeLoader):
@@ -899,6 +908,7 @@ class _ManifestLoader(yaml.SafeLoader):
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
         "tag:yaml.org,2002:int": _core_int,
+        "tag:yaml.org,2002:float": _core_float,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
