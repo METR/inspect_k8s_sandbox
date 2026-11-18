@@ -544,16 +544,14 @@ class Release:
         return {"pod_diagnostics": diagnostics} if diagnostics else {}
 
     def _list_release_pods(self, allow_stale: bool = False) -> list[PodSnapshot]:
-        """Its pods not being deleted. `allow_stale` reads the server's watch cache."""
-        pods = list_pods(
+        """The release's pods. `allow_stale` reads the API server's watch cache."""
+        return list_pods(
             k8s_client(self._context_name),
             self._namespace,
             label_selector=f"{_INSTANCE_LABEL}={self.release_name}",
             resource_version="0" if allow_stale else None,
             request_timeout=_LIST_PODS_READ_TIMEOUT,
         )
-        # One being deleted reports Ready until its containers stop, and is replaced.
-        return [pod for pod in pods if not pod.deleting]
 
     def _missing_services(self, pods: list[PodSnapshot]) -> frozenset[str]:
         """The declared sandboxes which no pod is yet serving."""
@@ -961,7 +959,7 @@ def _kubeconfig_context_args(context_name: str | None) -> list[str]:
 
 
 def _pod_ready(pod: PodSnapshot) -> bool:
-    """Helm's `isPodReady`, plus the completed-pod case Helm's own check gets wrong."""
+    """Helm's `isPodReady` less a pod being deleted, plus a pod that completed."""
     # A pod that ran to completion reports Ready=False with reason PodCompleted, so
     # Helm blocks on it until the timeout. The Ready condition rather than
     # containerStatuses[].ready, because it also accounts for readiness gates.
