@@ -173,6 +173,27 @@ func TestRecordThatOutlivedItsSandboxRaisesNoFault(t *testing.T) {
 	})
 }
 
+func TestAnyPodsNetworkNamespaceShowsTheLauncherThatItSeesThem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.netns = l.vms // it holds the namespace of a pod that names no proxy, as the launcher's own does, and none for the record below
+		os.WriteFile(filepath.Join(l.netns, "own"), nil, 0o600)
+		os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0","netns":"/var/run/netns/own"}`), 0o600)
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // it outlived its sandbox, as across a reboot
+		for range 2 {
+			if _, err := l.wanted(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Minute)
+		}
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing of a record that outlived its sandbox on a node whose namespaces the launcher sees", out.String())
+		}
+	})
+}
+
 func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
 	alone(t)
 	netns := podNetns(t)
@@ -295,10 +316,7 @@ func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		l.netns = l.vms // where the pod's network namespace is a file and bound to none, as a mount without the node's propagation shows it
-		if err := os.WriteFile(filepath.Join(l.netns, "net"), nil, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		l.netns = filepath.Join(l.vms, "none") // no namespace is seen: a record with no VM directory still raises no_worker
 		proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 		addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // its VM's directory follows its record

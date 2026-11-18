@@ -33,7 +33,8 @@ Each node needs:
   sandbox filled the socket buffers, so one sandbox can cost another its worker. That holds only while a thousandth
   of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
   resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
-  the node's memory.
+  the node's memory. Its pod is not on the host network, or a sandbox deleted before the launcher started can raise
+  `no_worker`.
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
