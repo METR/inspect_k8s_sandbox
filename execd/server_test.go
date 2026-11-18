@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 		syscall.Exec(os.Args[2], os.Args[2:], nil)
 		os.Exit(1) // not on into the tests, as the command
 	}
-	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect") {
+	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
 		main()
 		return
 	}
@@ -1330,6 +1330,107 @@ func borrowed() (ids []string) {
 func dumpable() bool {
 	d, _, _ := syscall.RawSyscall(syscall.SYS_PRCTL, 3, 0, 0) // PR_GET_DUMPABLE
 	return d != 0
+}
+
+func TestAKillReachesAnotherUsersCommandAndItsGroupThoughTheyCarryNoTag(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	prctl(prSetChildSubreaper, 1) // as execd: the command's child is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	open := t.TempDir() // where the user can run a copy of this binary: its own directory is root's alone
+	os.Chmod(open, 0o755)
+	os.Chmod(filepath.Dir(open), 0o755)
+	this, _ := os.Executable()
+	binary, _ := os.ReadFile(this)
+	leave := filepath.Join(open, "leave")
+	os.WriteFile(leave, binary, 0o755)
+	// Without CAP_KILL root's signal reaches neither, and with no tag no search finds them: each names what must end.
+	for id, argv := range [][]string{
+		{"env", "-i", "sh", "-c", "sleep 600 & echo $! $$; wait"}, // the command and a child in its group
+		{leave, "leave", "/bin/sleep", "600"},                     // the command, out of its own group
+	} {
+		req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, User: "65534", Tag: "none"})
+		s.dispatch(c, frame{kind: fStart, id: uint64(80 + id), payload: req})
+		printed := nextFrame(t, frames)
+		var pids []int
+		for _, field := range strings.Fields(string(printed.payload)) {
+			pid, _ := strconv.Atoi(field)
+			pids = append(pids, pid)
+		}
+		if printed.kind != fStdout || len(pids) == 0 || slices.Contains(pids, 0) { // or the kills below would be of this process's own group
+			t.Fatalf("the command printed %q, not its processes", printed.payload)
+		}
+		t.Cleanup(func() {
+			for _, pid := range pids {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+		})
+
+		s.dispatch(c, frame{kind: fKill, id: uint64(80 + id)})
+
+		for _, pid := range pids {
+			for deadline := time.Now().Add(30 * time.Second); syscall.Kill(pid, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("process %d of %q, run as another user, outlived its kill", pid, argv)
+				}
+			}
+		}
+		exitStatus(t, frames) // read before the next command's output
+	}
+	// The user's identity is the killing thread's for its two signals alone; the search's thread may hold it a while yet.
+	for deadline := time.Now().Add(30 * time.Second); len(borrowed()) > 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("threads kept the user's identity: %v", borrowed())
+		}
+	}
+}
+
+func TestAKillThatComesBeforeAnotherUsersCommandHasStartedReachesItThoughItCarriesNoTag(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root runs a command as another user")
+	}
+	open := t.TempDir() // where the user can write
+	os.Chmod(open, 0o777)
+	os.Chmod(filepath.Dir(open), 0o755)
+	cl := &call{id: 82, tag: "early"}
+	cl.room = sync.NewCond(&cl.mu)
+	pid := filepath.Join(open, "pid")
+	req := startRequest{Argv: []string{"env", "-i", "sh", "-c", `echo $$ >"$0"; exec sleep 600`, pid}, Env: map[string]string{}, User: "65534", Tag: "early"}
+
+	cl.kill()     // from another connection, while this one's START is still at work
+	cl.kmu.Lock() // and stays at work until the command runs as its user, whom root's signal does not reach without CAP_KILL
+	noted := sync.OnceFunc(cl.kmu.Unlock)
+	t.Cleanup(noted)
+	started := make(chan error, 1)
+	go func() { started <- cl.run(req) }()
+	var command int
+	for deadline := time.Now().Add(30 * time.Second); command == 0; time.Sleep(10 * time.Millisecond) {
+		written, _ := os.ReadFile(pid)
+		command, _ = strconv.Atoi(strings.TrimSpace(string(written)))
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ran")
+		}
+	}
+	t.Cleanup(func() { syscall.Kill(command, syscall.SIGKILL) })
+	noted()
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the START never returned")
+	}
+
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(command, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("command %d, run as another user with no tag, outlived a kill that came before it started", command)
+		}
+	}
 }
 
 func TestAKillReachesAChildThatLeftTheGroupAndDroppedTheTag(t *testing.T) {

@@ -478,6 +478,7 @@ func (cl *call) run(req startRequest) error {
 	cl.kmu.Unlock()
 	if killed { // while it started: nothing is reaped under this lock, so the id is its own
 		killTree(p.Pid)
+		killAs(p.Pid, as)
 	}
 	reaper.mu.Unlock()
 	if killed { // that holds for what it left running too
@@ -870,11 +871,25 @@ func (cl *call) stop(timeout bool) {
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
 		killTree(pid)
+		killAs(pid, as)
 	}
 	reaper.mu.Unlock()
 	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
 	}
+}
+
+// killAs sends another user's command and its group that user's own SIGKILL: root's reaches neither without CAP_KILL.
+func killAs(pid int, as *syscall.Credential) {
+	if as == nil {
+		return
+	}
+	runtime.LockOSThread() // the identity it takes is this thread's alone
+	defer runtime.UnlockOSThread()
+	setids(as.Uid, as.Gid)
+	syscall.Kill(pid, syscall.SIGKILL)
+	syscall.Kill(-pid, syscall.SIGKILL)
+	setids(uint32(os.Getuid()), uint32(os.Getgid()))
 }
 
 // stat is /proc/PID/stat after the name, which may hold spaces and parentheses: the state, the parent, and 20th the start time.
@@ -950,6 +965,11 @@ func (cl *call) end(as *syscall.Credential) {
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
 		go func() { searches <- search{cl.tag, as} }()
+		// gVisor lets them be read only with the user's real ids, which let the user signal their holder: a child holds them, not execd.
+		argv := []string{"/proc/self/exe", "search", fmt.Sprint(as.Uid), fmt.Sprint(as.Gid), strings.Trim(fmt.Sprint(as.Groups), "[]"), cl.tag}
+		if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}}); err == nil {
+			child.Release()
+		}
 	}
 }
 

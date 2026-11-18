@@ -32,6 +32,13 @@ func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
+	if len(os.Args) == 6 && os.Args[1] == "search" { // how the daemon kills what carries a tag as another user, with every id of theirs
+		if err := take(os.Args[2:5]); err != nil {
+			fail(err.Error())
+		}
+		killTagged(os.Args[5])
+		return
+	}
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket
 		connect(os.Args[2])
 	}
@@ -90,8 +97,8 @@ func cgroupLimit(root string) ([]byte, error) {
 	return os.ReadFile(root + "/memory/memory.limit_in_bytes")
 }
 
-// become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
-func become(cwd string, ids, argv []string) {
+// take gives this process a user's identity for good: their groups, gid and uid, each real, effective and saved.
+func take(ids []string) error {
 	var n []int
 	for _, id := range append([]string{ids[0], ids[1]}, strings.Fields(ids[2])...) {
 		i, err := strconv.Atoi(id)
@@ -107,6 +114,12 @@ func become(cwd string, ids, argv []string) {
 	if err == nil {
 		err = syscall.Setuid(n[0])
 	}
+	return err
+}
+
+// become takes a user's identity, enters cwd as them and execs argv, failing as a shell would.
+func become(cwd string, ids, argv []string) {
+	err := take(ids)
 	code := 126
 	if err == nil && cwd != "" {
 		if err = os.Chdir(cwd); err != nil {

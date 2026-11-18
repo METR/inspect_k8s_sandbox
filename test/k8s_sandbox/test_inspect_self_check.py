@@ -111,14 +111,15 @@ async def test_a_command_is_found_on_the_path_as_its_user(
     assert result.stdout == "nobody\n", result
 
 
+@pytest.mark.parametrize("service", ["default", "runc"])  # on gVisor, and on Linux
 async def test_a_kill_reaches_what_another_users_command_detached(
-    transport: str, sandboxes: dict[str, K8sSandboxEnvironment]
+    transport: str, sandboxes: dict[str, K8sSandboxEnvironment], service: str
 ) -> None:
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
-    root = sandboxes["runc"]
-    # setsid takes it out of the process group a kill signals.
-    detach = "setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' & wait"
+    root = sandboxes[service]
+    # Out of the group a kill signals and reparented: only the tag leads a kill to it.
+    detach = "(setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' &); sleep 600"
     command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))
 
     async def detached() -> str:

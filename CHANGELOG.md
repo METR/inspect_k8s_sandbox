@@ -52,12 +52,12 @@
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
   status 1 once that directory is gone. A timed-out `exec()` whose command is still
-  running gets SIGKILL, and so do the processes under it that execd may
-  signal: all where it has `CAP_KILL`, else its own user's. So do the
-  others it started, unless one has left its process group, or is one execd may not
-  signal, and has cleared its environment or made it unreadable to execd, runs as a
-  user that is neither execd's nor the command's where execd lacks `CAP_SYS_PTRACE`,
-  or on gVisor comes from a command run as another user;
+  running gets SIGKILL, and so does its process group, from execd and, where the
+  command runs as another user, from that user. So do the processes under it that
+  execd may signal: all where it has `CAP_KILL`, else its own user's. So do the
+  others it started, unless one has left its process group and has cleared its
+  environment or made it unreadable to execd, or runs as a user that is neither
+  execd's nor the command's where execd lacks `CAP_KILL` or `CAP_SYS_PTRACE`;
   those of a command that has ended are left running. A command that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()`,
   `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
