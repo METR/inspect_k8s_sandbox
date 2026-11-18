@@ -1079,8 +1079,16 @@ def _get_expected_services(docs: list[Any], release_name: str) -> frozenset[str]
     Named rather than counted, so that readiness is stated in the vocabulary
     `get_sandbox_pods()` hands over and no other pod of the release can satisfy it.
 
-    Raises RuntimeError if the chart declares no sandbox.
+    Raises RuntimeError if the chart declares no sandbox, or scales one to none.
     """
+    idle = [doc for doc in docs if _dig(doc, "spec", "replicas") == 0]
+    if scaled_to_none := sorted(_declared_services(idle)):
+        # Not left out: asked for it by name, Inspect hands over the one sandbox left.
+        _raise_runtime_error(
+            f"The rendered chart scales the sandbox {', '.join(scaled_to_none)} to "
+            "`replicas: 0`: no Pod would ever serve it.",
+            release=release_name,
+        )
     services = frozenset(_declared_services(docs))
     if not services:
         _raise_runtime_error(
@@ -1104,7 +1112,7 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             yield from _service_name(
                 _dig(doc, "spec", "jobTemplate", "spec", "template", "metadata")
             )
-        elif _dig(doc, "spec", "replicas") != 0:  # scaled to none, it makes no pod
+        else:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
 
 

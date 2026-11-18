@@ -1449,12 +1449,6 @@ def _services(stdout: str) -> frozenset[str]:
             {"a"},
             id="typed-list-wrapping-pods",
         ),
-        # A sandbox scaled to none has no pod to wait for.
-        pytest.param(
-            _manifest(_STATEFUL_SET, _stateful_set("victim", replicas=0)),
-            {"default"},
-            id="scaled-to-none",
-        ),
         # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
             _manifest(
@@ -1509,10 +1503,15 @@ def test_expected_services(stdout: str, expected: set[str]) -> None:
             _manifest("kind: ConfigMap\nmetadata: {name: c}\n"),
             id="declares-no-sandbox",
         ),
+        # No pod would ever serve it, and left out its name would reach `default`.
+        pytest.param(
+            _manifest(_stateful_set("victim", replicas=0), _STATEFUL_SET),
+            id="a-sandbox-scaled-to-none",
+        ),
     ],
 )
 def test_expected_services_fails_closed(stdout: str) -> None:
-    with pytest.raises(RuntimeError, match="manifest|declares no Pod"):
+    with pytest.raises(RuntimeError, match="manifest|declares no Pod|sandbox victim"):
         _services(stdout)
 
 
