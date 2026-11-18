@@ -1591,8 +1591,7 @@ func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "detached")
 	// Out of the command's group and no longer its child, only the tag leads a kill to it; signalled, it starts its successor and ends.
 	detached := `trap 'sleep 600 & echo $! > "$0.new"; exit' USR1; echo $$ > "$0.pid"; while :; do sleep 0.01; done`
-	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(setsid sh -c "$1" "$0" &); sleep 600`, base, detached}, Env: map[string]string{}, Tag: tag})
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(setsid sh -c "$1" "$0" &); sleep 600`, base, detached}, Env: map[string]string{}, Tag: "handoff"})
 	s.dispatch(c, frame{kind: fStart, id: 73, payload: req})
 	t.Cleanup(func() { s.dispatch(c, frame{kind: fKill, id: 73}) }) // whatever fails below
 	deadline := time.Now().Add(30 * time.Second)                    // for the whole test
@@ -1605,7 +1604,9 @@ func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
 		return pid
 	}
 	first, second := named(base+".pid"), 0
-	if first == 0 {
+	for ; first != 0 && !orphaned(first) && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	}
+	if first == 0 || !orphaned(first) {
 		t.Fatal("the command never detached its process")
 	}
 	var killing atomic.Bool // the hook is this kill's: a search an earlier test left running calls it too
@@ -1640,6 +1641,91 @@ func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("process %d, started by one the kill's search had listed and that ended before it was read, outlived the kill", second)
 		}
+	}
+}
+
+// orphaned says whether pid is this process's own child by now: until the one that started it has ended, a kill reaches it as one of the command's.
+func orphaned(pid int) bool {
+	f := stat(pid)
+	return len(f) > 1 && f[1] == strconv.Itoa(os.Getpid())
+}
+
+func TestAKillReachesAProcessWhoseEnvironmentWasNotYetInPlaceWhenFirstRead(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	// Out of the command's group and no longer its child, only the tag leads a kill to it.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(setsid sh -c 'echo $$; exec sleep 600' &); sleep 600`}, Env: map[string]string{}, Tag: "starting up"})
+	s.dispatch(c, frame{kind: fStart, id: 74, payload: req})
+	t.Cleanup(func() { s.dispatch(c, frame{kind: fKill, id: 74}) }) // whatever fails below
+	printed := nextFrame(t, frames)
+	detached, _ := strconv.Atoi(strings.TrimSpace(string(printed.payload)))
+	if printed.kind != fStdout || detached <= 0 { // or the kill below would be of this process's own group
+		t.Fatalf("the command printed %q, not the process it detached", printed.payload)
+	}
+	t.Cleanup(func() { syscall.Kill(detached, syscall.SIGKILL) })
+	deadline := time.Now().Add(30 * time.Second) // for the whole test
+	for ; !orphaned(detached); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the command never detached its process")
+		}
+	}
+	var shown atomic.Bool
+	starting := func(environ string) (*os.File, error) { // as the kernel shows a process whose execve is under way: no environment, then its own
+		if environ == "/proc/"+strconv.Itoa(detached)+"/environ" && !shown.Swap(true) {
+			return os.Open(os.DevNull)
+		}
+		return os.Open(environ)
+	}
+	openEnviron.Store(&starting)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+
+	s.dispatch(c, frame{kind: fKill, id: 74})
+
+	for ; syscall.Kill(detached, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, whose environment was not yet in place when the kill's search first read it, outlived the kill", detached)
+		}
+	}
+}
+
+func TestAKillsSearchDoesNotWaitForTheEnvironmentOfAProcessThatHasEnded(t *testing.T) {
+	keeper := exec.Command("sh", "-c", "sleep 0 & exec sleep 600") // the sleep the shell becomes reaps nothing: its child stays a zombie
+	if err := keeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { keeper.Process.Kill() })
+	zombie := 0
+	for deadline := time.Now().Add(30 * time.Second); zombie == 0; time.Sleep(time.Millisecond) {
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			pid, _ := strconv.Atoi(e.Name())
+			if f := stat(pid); len(f) > 1 && f[0] == "Z" && f[1] == strconv.Itoa(keeper.Process.Pid) {
+				zombie = pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the shell's child never ended")
+		}
+	}
+	var reads atomic.Int32
+	counted := func(environ string) (*os.File, error) { // as the kernels that open it show it: empty (this one may refuse the open)
+		if environ == "/proc/"+strconv.Itoa(zombie)+"/environ" {
+			reads.Add(1)
+			return os.Open(os.DevNull)
+		}
+		return os.Open(environ)
+	}
+	openEnviron.Store(&counted)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+
+	killTagged("no process carries it")
+
+	// It shows no environment and never will: read again in each of eight listings, it would cost every kill their wait.
+	if n := reads.Load(); n >= 8 {
+		t.Fatalf("the search read the environment of a process that has ended %d times", n)
 	}
 }
 
