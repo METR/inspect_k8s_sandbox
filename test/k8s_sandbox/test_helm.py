@@ -1347,9 +1347,8 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
         "apiVersion: apps/v1\nkind: StatefulSetList\n"
         "items: [{metadata: {name: helper}}]\n",
-        # Helm makes nothing of a template that rendered a comment alone,
-        "# no object\n",
-        # nor of a document whose `items` is null, whatever its kind.
+        "# a template that rendered this comment alone\n",
+        # Helm installs nothing for a document whose `items` is null.
         "kind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
     )
 

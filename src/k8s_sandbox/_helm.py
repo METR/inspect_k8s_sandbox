@@ -1002,7 +1002,6 @@ def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float 
 _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
     "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
-    "tag:yaml.org,2002:float": r"[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
     # After a leading `.` Helm takes a `_` only between two digits.
     _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*"
     r"|\.[0-9](_?[0-9])*([eE][-+]?[0-9](_?[0-9])*)?",
