@@ -136,6 +136,7 @@ func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
 		{"fe80::8b4:7ff:fe9c:1/64", "fe80::2", false}, // another machine on the link
 		{"2001:db8::5/126", "2001:db8::4", true},      // a routable subnet has one too
 		{"2001:db8::5/126", "2001:db8::8", false},     // the next subnet's is another machine's
+		{"2001:db8::5/128", "2001:db8::5", true},      // the pod's own, in no subnet
 		{"2001:db8::3/127", "2001:db8::2", false},     // the other end of a point-to-point link
 		{"192.0.2.9/24", "192.0.2.0", false},          // IPv4 has no such address
 	} {
