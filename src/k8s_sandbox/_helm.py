@@ -1109,7 +1109,7 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             yield from _service_name(
                 _dig(doc, "spec", "jobTemplate", "spec", "template", "metadata")
             )
-        else:
+        elif _dig(doc, "spec", "replicas") != 0:  # scaled to none, it makes no pod
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
 
 

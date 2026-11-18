@@ -1440,6 +1440,12 @@ def _services(stdout: str) -> frozenset[str]:
             {"a"},
             id="typed-list-wrapping-pods",
         ),
+        # A sandbox scaled to none has no pod to wait for.
+        pytest.param(
+            _manifest(_STATEFUL_SET, _stateful_set("victim", replicas=0)),
+            {"default"},
+            id="scaled-to-none",
+        ),
         # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
             _manifest(
