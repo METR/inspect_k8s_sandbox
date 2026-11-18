@@ -191,9 +191,9 @@ func fromThisPod(nc net.Conn) bool {
 	if remote.IP.To4() != nil { // what else the pod answers at, its anycast addresses, is IPv6's alone
 		return false
 	}
-	// A pod that forwards IPv6 also answers at its subnets' anycast addresses, as fe80::, which are no interface's; gVisor keeps no list of them.
+	// A pod that forwards IPv6 also answers at its subnets' anycast addresses, as fe80::, which net.InterfaceAddrs leaves out.
 	anycast, err := os.ReadFile(anycast6)
-	if err != nil && !errors.Is(err, os.ErrNotExist) { // can't tell, as where execd is out of descriptors: refuse
+	if err != nil && !errors.Is(err, os.ErrNotExist) { // gVisor has no such file; otherwise can't tell: refuse
 		return true
 	}
 	return strings.Contains(string(anycast), hex.EncodeToString(remote.IP)) // the kernel writes each as 32 hex digits

@@ -127,11 +127,10 @@ func TestAConnectionIsRefusedWhenTheInterfacesCannotBeListed(t *testing.T) {
 }
 
 func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
-	interfaceAddrs = func() ([]net.Addr, error) { return nil, nil } // the peers below are at no interface's address
-	t.Cleanup(func() { interfaceAddrs = net.InterfaceAddrs })
-	defer func(was string) { anycast6 = was }(anycast6)
+	was := anycast6
+	t.Cleanup(func() { anycast6 = was })
 	list := filepath.Join(t.TempDir(), "anycast6")
-	// The list of a pod that forwards IPv6, as its kernel writes it; the second line is one with a routable prefix as well.
+	// The list of a pod that forwards IPv6, as its kernel writes it.
 	if err := os.WriteFile(list, []byte("3    eth0            fe800000000000000000000000000000     1\n3    eth0            20010db8000000010000000000000000     1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -141,35 +140,15 @@ func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
 	}{
 		{list, "fe80::", true},
 		{list, "2001:db8:0:1::", true},
-		{list, "fe80::1", false},                              // another machine on the link
+		{list, "2001:db8:0:1::1", false},                      // another machine on the link
 		{filepath.Join(t.TempDir(), "none"), "fe80::", false}, // gVisor keeps no list, and its pods answer at no such address
+		{t.TempDir(), "2001:db8::1", true},                    // a directory stands for a list that execd cannot read
+		{t.TempDir(), "192.0.2.1", false},                     // IPv4 does not wait on the list
 	} {
 		anycast6 = peer.list
 		if fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}) != peer.refused {
-			t.Errorf("a connection from %s, with the pod's anycast addresses in %s: refused is %t, want %t", peer.from, filepath.Base(peer.list), !peer.refused, peer.refused)
+			t.Errorf("a connection from %s, with the pod's anycast addresses in %s: refused is %t, want %t", peer.from, peer.list, !peer.refused, peer.refused)
 		}
-	}
-}
-
-func TestAnIPv6ConnectionIsRefusedWhenThePodsAnycastAddressesCannotBeRead(t *testing.T) {
-	interfaceAddrs = func() ([]net.Addr, error) { return nil, nil } // the peers below are at no interface's address
-	t.Cleanup(func() { interfaceAddrs = net.InterfaceAddrs })
-	var limit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit) })
-	syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Max: limit.Max}) // out of descriptors, execd cannot open the list
-
-	overIPv6 := fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP("2001:db8::1")}})
-	overIPv4 := fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1")}})
-
-	syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit)
-	if !overIPv6 {
-		t.Error("a connection over IPv6 was admitted while execd could not read the pod's anycast addresses")
-	}
-	if overIPv4 {
-		t.Error("a connection over IPv4, where the pod has no anycast address, was refused for want of their list")
 	}
 }
 

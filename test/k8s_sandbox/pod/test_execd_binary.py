@@ -42,6 +42,27 @@ for host in sys.argv[2:]:
         print(host, "closed")
 """
 
+# Run in a container that forwards IPv6: the same, from its link's anycast address.
+ANYCAST_PROBE = """
+import socket, ssl, sys
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
+eth0 = socket.if_nametoindex("eth0")
+links = (line.split() for line in open("/proc/net/if_inet6"))
+own = next(f[0] for f in links if f[5] == "eth0" and f[0].startswith("fe80"))
+s = socket.socket(socket.AF_INET6)
+s.settimeout(30)
+s.setsockopt(socket.IPPROTO_IPV6, 78, 1)  # IPV6_FREEBIND: for an address it cannot list
+s.bind(("fe80::", 0, 0, eth0))
+own = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(own))
+s.connect((own, int(sys.argv[1]), 0, eth0))
+try:
+    context.wrap_socket(s)
+    print("served")
+except OSError:
+    print("closed")
+"""
+
 
 def docker(
     *args: str, stdin: str | None = None, timeout: float = 30
@@ -411,6 +432,27 @@ async def test_a_connection_from_the_sandbox_itself_is_closed(
     probe = await asyncio.to_thread(docker, "exec", sandbox.name, *dial)
 
     assert probe.stdout.split() == ["127.0.0.1", "closed", sandbox.ip, "closed"]
+
+
+async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
+    sandbox: Sandbox,
+) -> None:
+    """Regression: a sandbox that forwards IPv6 reached its own execd from fe80::."""
+    forwards = Sandbox(f"{sandbox.name}-forwards", "")
+    ipv6 = "com.docker.network.endpoint.sysctls=net.ipv6.conf.IFNAME.disable_ipv6=0"
+    network = ["--network", f"name=bridge,driver-opt={ipv6}"]
+    forwarding = ["--sysctl", "net.ipv6.conf.all.forwarding=1"]  # as a Nitro pod's
+    try:
+        run = ["run", "-d", "--name", forwards.name, *network, *forwarding]
+        started = docker(*run, sandbox.name, "sleep", "3600")
+        assert started.returncode == 0, started.stderr
+        await start_execd(forwards, False, "--port", str(PORT))
+        dial = ["python3", "-c", ANYCAST_PROBE, str(PORT)]
+        probe = await asyncio.to_thread(docker, "exec", forwards.name, *dial)
+    finally:
+        docker("rm", "-f", forwards.name)
+
+    assert (probe.stdout, probe.stderr) == ("closed\n", "")
 
 
 async def test_another_users_process_is_refused_at_execds_socket(
