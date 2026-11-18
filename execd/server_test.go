@@ -1861,7 +1861,7 @@ func TestAKillsSearchReadsAgainOnlyAProcessThatMayYetShowItsEnvironment(t *testi
 
 func TestAKillFindsATagThatEndsAnEnvironmentWithNoNul(t *testing.T) {
 	last, room := filepath.Join(t.TempDir(), "environ"), make([]byte, 4<<10)
-	if err := os.WriteFile(last, []byte("PAD=x\x00HAWK_NEXT_EXEC=last"), 0o600); err != nil { // as a process that wrote over the end of its own leaves it
+	if err := os.WriteFile(last, []byte("PAD=x\x00HAWK_NEXT_EXEC=last"), 0o600); err != nil { // as a process leaves its own once it has moved its end back (prctl's PR_SET_MM_MAP)
 		t.Fatal(err)
 	}
 
@@ -2555,7 +2555,7 @@ func TestACallExecdAbandonedStillSaysThatItsOwnTimeoutEndedIt(t *testing.T) {
 	timers[1]() // six minutes with no client
 	late, frames := recordedConn(t)
 
-	s.resume(late, frame{kind: fResume, id: 24, payload: []byte(`{"stdout":0,"stderr":0}`)})
+	go s.resume(late, frame{kind: fResume, id: 24, payload: []byte(`{"stdout":0,"stderr":0}`)}) // a RESUME that waits fails by the frames' wait
 
 	// Its client, back at last, is told what execd knows: "abandoned" would say that how it ended is not known.
 	if said := nextFrame(t, frames); said.kind != fResumed {
@@ -2603,13 +2603,25 @@ func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t 
 		}
 	}
 	beforeKill.Store(&held)
-	t.Cleanup(func() { beforeKill.Store(nil) })
+	release := sync.OnceFunc(func() { close(kill) })
+	t.Cleanup(func() { // whatever fails: the held kill has the reaper's lock, and the call waits for its exit
+		release()
+		select {
+		case exit <- syscall.WaitStatus(syscall.SIGKILL):
+		default:
+		}
+		beforeKill.Store(nil)
+	})
 	waits := make(chan struct{}, 1)
 	cl.mu.Lock()
 	cl.room.L = released{&cl.mu, waits}
 	cl.mu.Unlock()
 	go timers[0]() // its timeout
-	<-killing
+	select {
+	case <-killing:
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("the timeout's kill never began")
+	}
 	s.detach(first)
 	go timers[1]() // six minutes with no client: the kill that abandons it waits for the timeout's
 	for abandoned := false; !abandoned; time.Sleep(time.Millisecond) {
@@ -2634,7 +2646,7 @@ func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t 
 	case <-time.After(time.Until(deadline)):
 		t.Fatal("the RESUME neither waited nor was answered")
 	}
-	close(kill)
+	release()
 	select {
 	case f := <-frames:
 		// Neither kill has yet said which ended it, nor has its exit: "abandoned" would say that how it ended is not known.

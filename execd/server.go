@@ -1109,7 +1109,7 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
-// More than execve lets an environment hold (6 MiB).
+// More than execve lets an environment hold (6 MiB at most).
 const maxEnviron = 8 << 20
 
 // Tests open another file in an environment's place for the search of a tag, as the kernel shows none of a process whose execve is under way.
