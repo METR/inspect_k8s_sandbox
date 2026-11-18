@@ -7,6 +7,8 @@
 - Fix a sandbox being handed over on a Pod that is Ready but being deleted.
 - Fix an install waiting until its timeout for a sandbox whose controller has
   `replicas: 0`.
+- Fix an install failing with "Could not read the rendered manifest" when the chart
+  writes a number as `!!int 0X10` or `!!float 0x8`.
 - A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
   This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
 - A pod annotated

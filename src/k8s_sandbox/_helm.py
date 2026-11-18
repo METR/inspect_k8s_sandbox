@@ -998,15 +998,6 @@ def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float 
     return node.value if math.isinf(value) else value
 
 
-def _helm_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
-    """A scalar tagged `!!float`: Helm reads its number as untagged, so `010` is 8."""
-    number = _helm_number(loader, node)
-    # `.inf` and `.nan` are no number to `_helm_number`: PyYAML reads them as Helm does.
-    return (
-        loader.construct_yaml_float(node) if isinstance(number, str) else float(number)
-    )
-
-
 # YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
 _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
@@ -1032,7 +1023,9 @@ class _ManifestLoader(yaml.SafeLoader):
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
         _helm_number: _helm_number,
-        "tag:yaml.org,2002:float": _helm_float,
+        # Tagged `!!int` or `!!float` too, Helm reads a number as it reads any.
+        "tag:yaml.org,2002:int": _helm_number,
+        "tag:yaml.org,2002:float": _helm_number,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 

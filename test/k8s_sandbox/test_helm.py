@@ -1361,6 +1361,14 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
         pytest.param("010", list(range(2, 10)), id="leading-zero"),
         # Helm drops every `_` and reads the `0b` as binary.
         pytest.param("0b1__010", list(range(2, 12)), id="binary-underscores"),
+        # After a leading `.` Helm takes a `_` between digits: as text, ValueError.
+        pytest.param(".2_0e0_1", [2, 3], id="underscores-after-a-dot"),
+        # Helm takes a sign after `0b`: read as text, it raised ValueError.
+        pytest.param("0b+10", [2, 3], id="binary-with-a-sign"),
+        # Tagged, a number is read as untagged: as 10 here, two pods never came.
+        pytest.param("!!float 010", list(range(2, 10)), id="tagged-a-float"),
+        # PyYAML takes no `0X` under `!!int`: the manifest could not be read.
+        pytest.param("!!int 0X10", list(range(2, 18)), id="tagged-an-int"),
     ],
 )
 def test_a_stateful_sets_counts_read_as_numbers(
@@ -1373,7 +1381,8 @@ def test_a_stateful_sets_counts_read_as_numbers(
 
     spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
 
-    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == ordinals
+    count = int(spec["replicas"])  # as the reader of a StatefulSet's pods takes it
+    assert [spec["ordinals"]["start"] + n for n in range(count)] == ordinals
 
 
 def _services(stdout: str) -> frozenset[str]:
@@ -1643,30 +1652,6 @@ def _in_a_typed_list(manifest: str) -> str:
             [_helper_pod(1000000)],
             str,
             id="a-start-ordinal-written-as-a-float",
-        ),
-        # Helm reads this start as 1: read as text, it raised ValueError.
-        pytest.param(
-            "  ordinals: {start: .1_0e0_1}\n",
-            [],
-            [_helper_pod(1)],
-            str,
-            id="a-start-ordinal-with-underscores",
-        ),
-        # Helm reads a sign after `0b`, here 2 replicas: as text it raised ValueError.
-        pytest.param(
-            "  replicas: 0b+10\n",
-            [_helper_pod()],
-            [_helper_pod(), _helper_pod(1)],
-            str,
-            id="a-binary-count-with-a-sign",
-        ),
-        # Helm reads a leading zero as octal there too: read as 10, two pods never came.
-        pytest.param(
-            "  replicas: !!float 010\n",
-            [_helper_pod(n) for n in range(7)],
-            [_helper_pod(n) for n in range(8)],
-            str,
-            id="an-octal-count-tagged-a-float",
         ),
     ],
 )
