@@ -49,7 +49,9 @@ context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
 eth0 = socket.if_nametoindex("eth0")
 links = (line.split() for line in open("/proc/net/if_inet6"))
-own = bytes.fromhex(next(f[0] for f in links if f[0].startswith("fe80")))
+# Not one still tentative (0x40): a dial to it waits for seconds.
+ready = (f[0] for f in links if f[0].startswith("fe80") and not int(f[4], 16) & 0x40)
+own = bytes.fromhex(next(ready))
 s = socket.socket(socket.AF_INET6)
 s.setsockopt(socket.IPPROTO_IPV6, 78, 1)  # IPV6_FREEBIND: no bind to it otherwise
 s.bind(("fe80::", 0, 0, eth0))
@@ -441,7 +443,8 @@ async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
     network = ["--network", f"name=bridge,driver-opt={ipv6}"]
     forwarding = ["--sysctl", "net.ipv6.conf.all.forwarding=1"]
     try:
-        run = ["run", "-d", "--name", forwards.name, *network, *forwarding]
+        runc = ["--runtime", "runc"]  # the kernel's own stack, not gVisor's
+        run = ["run", "-d", *runc, "--name", forwards.name, *network, *forwarding]
         started = docker(*run, sandbox.name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         await start_execd(forwards, False, "--port", str(PORT))
