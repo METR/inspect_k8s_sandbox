@@ -1750,6 +1750,22 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	unheld(t, pipe, "which it had stopped reading and no process has open to write")
 }
 
+// answered has one call of this thread's return an errno from now on (0: nothing, with nothing done), as a seccomp profile can.
+func answered(call uintptr, answer syscall.Errno) syscall.Errno {
+	runtime.LockOSThread() // the filter is this thread's, which ends with its goroutine
+	filter := []syscall.SockFilter{
+		{Code: 0x20, K: 0},                        // the call's number
+		{Code: 0x15, Jf: 1, K: uint32(call)},      // another call: allowed
+		{Code: 0x06, K: 0x50000 | uint32(answer)}, // SECCOMP_RET_ERRNO
+		{Code: 0x06, K: 0x7fff0000},               // SECCOMP_RET_ALLOW
+	}
+	prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	const prSetNoNewPrivs, prSetSeccomp, seccompModeFilter = 38, 22, 2
+	prctl(prSetNoNewPrivs, 1) // without it a filter needs CAP_SYS_ADMIN
+	_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog)))
+	return errno
+}
+
 func TestAPipeIsLetGoWhereThePollIsRefusedOrCutShortEveryTime(t *testing.T) {
 	for _, poll := range []struct {
 		answer syscall.Errno // as a seccomp profile can answer ppoll: a refusal, and what a signal makes of the call
@@ -1767,17 +1783,7 @@ func TestAPipeIsLetGoWhereThePollIsRefusedOrCutShortEveryTime(t *testing.T) {
 			defer w.Close() // a writer that stays
 			let := make(chan syscall.Errno, 1)
 			go func() {
-				runtime.LockOSThread() // the filter is this thread's, which ends with this goroutine
-				filter := []syscall.SockFilter{
-					{Code: 0x20, K: 0},                             // the call's number
-					{Code: 0x15, Jf: 1, K: syscall.SYS_PPOLL},      // not ppoll: allowed
-					{Code: 0x06, K: 0x50000 | uint32(poll.answer)}, // SECCOMP_RET_ERRNO
-					{Code: 0x06, K: 0x7fff0000},                    // SECCOMP_RET_ALLOW
-				}
-				prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
-				const prSetNoNewPrivs, prSetSeccomp, seccompModeFilter = 38, 22, 2
-				prctl(prSetNoNewPrivs, 1) // without it a filter needs CAP_SYS_ADMIN
-				_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog)))
+				errno := answered(syscall.SYS_PPOLL, poll.answer)
 				if errno == 0 {
 					held <- struct{}{}
 					closeOnceUnheld(r)
@@ -2061,21 +2067,41 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 	if stopped[0] == 0 {
 		t.Fatal("the kill looked last at a command it had not seen stop: it can still end by itself before the kill")
 	}
-	s.dispatch(c, frame{kind: fStdin, id: 37, payload: []byte("\n")}) // on which it ends at once, if it still runs
-	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-		if strings.Contains(string(stat), ") T ") || strings.Contains(string(stat), ") Z ") {
-			break // stopped, or ended
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the command neither stopped nor ended")
-		}
-	}
+	s.dispatch(c, frame{kind: fStdin, id: 37, payload: []byte("\n")}) // on which it would end at once, if it still ran
 
 	letGo()
 
 	if status := exitStatus(t, frames); status["code"] != 137.0 {
 		t.Fatalf("EXIT %v: the command ended by itself after the kill's last look, and the kill went on to end what it left running", status)
+	}
+}
+
+func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: tag})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
+	killed := make(chan syscall.Errno, 1)
+	go func() {
+		errno := answered(syscall.SYS_WAITID, 0) // it returns, and has told nothing
+		if errno == 0 {
+			s.dispatch(c, frame{kind: fKill, id: 39}) // as its client's timeout sends; a command a debugger holds reports no stop either
+		}
+		killed <- errno
+	}()
+
+	select {
+	case errno := <-killed:
+		if errno != 0 {
+			t.Fatalf("seccomp: %v", errno)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill waits for ever to hear that its command has stopped, and holds the reaper's lock: no command starts or ends")
+	}
+	if status := exitStatus(t, frames); status["code"] != 137.0 {
+		t.Fatalf("EXIT %v: the kill did not go ahead", status)
 	}
 }
 

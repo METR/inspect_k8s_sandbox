@@ -774,7 +774,7 @@ class ExecdClient:
                 return ended
             if item[0] in (STDOUT, STDERR):
                 # shortcut: past HOLD an exit to come is lost; count on if one matters
-                if drained + len(item[1]) > call.hold:
+                if not call.exited and drained + len(item[1]) > call.hold:
                     break  # as RELEASE frees the call
                 drained += len(item[1])
                 ended.append(item)

@@ -91,8 +91,8 @@ type call struct {
 	// killed for want of a client, and kept so a RESUME can be told so
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
-	timedOut  bool // its timeout killed it: its exit says so, as the code alone can't
-	// its timeout found it running and signalled it
+	timedOut  bool // a timeout's kill went ahead on it: its exit says so, as the code alone can't
+	// a timeout's kill, execd's or its client's, went ahead on it, or will as it starts
 	timeoutKilled bool
 }
 
@@ -822,9 +822,11 @@ func (cl *call) stop(timeout bool) {
 	cl.timeoutKilled = cl.timeoutKilled || timeout && cl.status == nil // not started yet: the kill that meets it as it starts is this timeout's
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
+	refused := false // waitid, as a seccomp profile can: nothing then says the command has stopped, and a kill does not wait to hear it
 	seen := func(states int) bool {
 		var info [128]byte // a siginfo_t: waitid sets its first field for a child in one of the states, and leaves it unreaped
-		syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		refused = errno != 0
 		return info[0] != 0
 	}
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
@@ -836,7 +838,7 @@ func (cl *call) stop(timeout bool) {
 	if running {
 		hook(&beforeKill, false)
 		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
-			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED); wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
+			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED) && !refused; wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
 				time.Sleep(wait)
 			}
 		}

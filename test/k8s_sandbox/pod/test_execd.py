@@ -1512,8 +1512,7 @@ async def test_an_exit_that_came_before_its_connection_dropped_is_kept(
 
     async def exits_and_drops(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        clock.now += 2000  # past its timeout
-        w.write(frame(execd.STDOUT, call_id, b"done\n"))  # wakes us to that
+        w.write(frame(execd.STDOUT, call_id, b"done\n"))
         w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
         w.close()
 
@@ -1528,6 +1527,7 @@ async def test_an_exit_that_came_before_its_connection_dropped_is_kept(
             link = client._link
             assert link is not None
             await until(lambda: link.closed)  # the exit has come, then the drop
+            clock.now += 2000  # past its timeout
             return got + [chunk async for chunk in chunks]
 
     got = await asyncio.wait_for(taken(), 30)  # only bounds a hang
@@ -1583,6 +1583,57 @@ async def test_an_exit_that_comes_as_our_writes_wait_behind_a_stuck_one_is_kept(
     assert (result.returncode, result.stdout) == (3, "x" + last.decode())
 
 
+async def test_an_exit_queued_behind_more_output_than_we_hold_is_kept(
+    daemons: Daemons, clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: our kill's wait gave up past HOLD, its command's exit queued."""
+    monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its exit ends the wait
+    full = b"y" * execd.ACK_EVERY  # enough to ack
+    sent = asyncio.Event()
+    sent.set()
+
+    class Waits(Plain):
+        async def write(self, data: bytes) -> None:
+            await sent.wait()  # as behind another call's write
+            await super().write(data)
+
+    async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
+        r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
+        return Waits(r, w)
+
+    async def ends(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        clock.now += 2000  # past its timeout
+        w.write(frame(execd.STDOUT, call_id, b"x"))  # wakes us to that
+        while (await read_frame(r))[0] != execd.KILL:  # too late to end it
+            pass
+        for _ in range(3):
+            w.write(frame(execd.STDOUT, call_id, full))
+            while (await read_frame(r))[0] != execd.ACK:  # taken: the next may come
+                pass
+        sent.clear()
+        for kind in (execd.STDOUT, execd.STDERR):
+            for _ in range(4):  # all that execd sends of a stream unacked
+                w.write(frame(kind, call_id, full))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 3}'))
+        await r.read()
+
+    monkeypatch.setattr(execd, "_connect", connect)
+    await daemons.serve(ends)
+    client = daemons.client()
+    run = client.exec(["sh", "-c", "exit 3"], None, None, {}, None, 1000)
+    command = asyncio.ensure_future(run)
+    await until(
+        lambda: client._link is not None
+        and any(call.exited for call in client._link.calls.values())
+    )
+    sent.set()
+    result = await asyncio.wait_for(command, 30)  # only bounds a hang
+
+    got = (result.returncode, len(result.stdout), len(result.stderr))
+    assert got == (3, 1 + 7 * len(full), 4 * len(full))
+
+
 async def test_an_exit_behind_a_drop_its_call_heard_of_twice_is_kept(
     daemons: Daemons, clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1623,6 +1674,7 @@ async def test_an_exit_behind_a_drop_its_call_heard_of_twice_is_kept(
             await r.read()
             return
         _, call_id, _ = await read_frame(r)  # RESUME
+        w.write(frame(execd.RESUMED, call_id, b'{"stdin": 0, "eof": false, "put": 0}'))
         w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
         await r.read()
 
@@ -1674,13 +1726,13 @@ async def test_our_timer_follows_execds_own(
     no_timer_lag: float,
 ) -> None:
     """Regression: ours fired first, and killed a command with its timeout not up."""
-    # The lag we ship, as minutes: the stand-in has the test's budget to answer in it.
-    monkeypatch.setattr(execd, "TIMER_LAG", 60 * no_timer_lag)
+    # Any lag we ship, as a minute: the stand-in has the test's budget to answer in it.
+    monkeypatch.setattr(execd, "TIMER_LAG", 60.0 * (no_timer_lag > 0))
     got: list[int] = []
 
     async def still_runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        clock.now += 1030  # past its timeout by our clock: execd's began at its start
+        clock.now += 1030  # past its timeout, within our lag
         w.write(frame(execd.STDOUT, call_id, b"x" * execd.ACK_EVERY))  # we ack, or kill
         while execd.ACK not in got:
             got.append((await read_frame(r))[0])
