@@ -126,6 +126,12 @@ def waiting(link: execd.Link) -> bool:
     return bool(link._wlock._waiters)
 
 
+def reading(client: execd.ExecdClient) -> int:
+    """How many of its calls wait for a frame: their STARTs are written."""
+    calls = client._link.calls.values() if client._link else ()
+    return sum(bool(c.queue._getters) for c in calls)  # type: ignore[attr-defined]
+
+
 @pytest.fixture(autouse=True)
 def no_timer_lag(monkeypatch: pytest.MonkeyPatch) -> float:
     """Our timer fires at the timeout: no stand-in here has one of its own to follow."""
@@ -1694,7 +1700,7 @@ async def test_a_timed_out_call_whose_connection_went_silent_asks_execd_on_a_new
     argv = ["sh", "-c", "echo done; exit 3"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
     other = asyncio.ensure_future(client.exec(argv, None, None, {}, None, None))
-    await until(lambda: bool(client._link and len(client._link.calls) == 2))
+    await until(lambda: reading(client) == 2)
     clock.now += 2000  # past the first's timeout: its wait for execd's word begins
     await asyncio.wait_for(killed.wait(), 30)  # only bounds a hang
     asked, expired = clock.now, clock.expired
@@ -1739,7 +1745,7 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     link, opening = client._link, client._opening
     assert link is not None
     clock.now += 2000  # past our timer: the wait for execd's word begins
@@ -1777,7 +1783,7 @@ async def test_a_timed_out_call_keeps_a_connection_for_time_its_own_loop_was_hel
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     link, opening = client._link, client._opening
     assert link is not None
     clock.now += 2000  # past its timeout: the wait for execd's word begins
@@ -1830,7 +1836,7 @@ async def test_a_timed_out_call_leaves_a_connection_slow_to_answer_to_the_pods_c
     said = b"y\n" * (execd.ACK_EVERY // 2)  # enough to be acked
     argv = ["sh", "-c", f"sleep 8; yes | head -n {len(said) // 2}; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     clock.now += 2000  # past its timeout: the wait for execd's word begins
     await until(lambda: bool(killed))
     clock.now += execd.KILL_WAIT / 2  # half of it passes with not a frame
@@ -1873,7 +1879,7 @@ async def test_a_timed_out_call_asks_for_a_new_connection_once_while_its_own_is_
     await daemons.serve(answers_late)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait begins
     await until(lambda: bool(killed))
     clock.now += execd.KILL_WAIT / 2  # half of it passes with not a frame
@@ -1933,7 +1939,7 @@ async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     link = client._link
     assert link is not None
     (ours,) = link.calls.values()
@@ -2010,7 +2016,7 @@ async def test_a_timed_out_call_waits_for_execds_word_no_longer_than_for_its_kil
     await daemons.serve(at_our_timer)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait begins
     await asyncio.wait_for(killed.wait(), 30)  # only bounds a hang
     began = clock.now
@@ -2310,7 +2316,7 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
     await daemons.serve(knows_no_call)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: bool(client._link and client._link.calls))
+    await until(lambda: reading(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait finds the drop, then no execd
 
     # Its timeout passed first: the daemon's end is not what it reports.
@@ -2403,7 +2409,7 @@ async def test_a_connection_is_not_given_up_for_time_our_own_loop_was_held(
     await daemons.serve(answers)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: connections[0] == 1)
+    await until(lambda: reading(client) == 1)
     link = client._link
     assert link is not None
     ended = [0]
@@ -2450,7 +2456,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     await daemons.serve(falls_silent)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: connections[0] == 1)
+    await until(lambda: reading(client) == 1)
     link = client._link
     assert link is not None
     ended = [0]
@@ -4873,7 +4879,10 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
                     w.write(frame(execd.ERROR, call_id, b"unknown call"))
                 elif kind == execd.START:
                     w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                elif kind == execd.RELEASE:
+                    released.set()
 
+    released = asyncio.Event()
     server = await asyncio.start_server(runs, "127.0.0.1", 0, ssl=context)
     execs: list[Ended] = []
 
@@ -4889,6 +4898,8 @@ async def test_a_write_an_ended_exec_refuses_is_a_dropped_connection(
 
     client = execd.ExecdClient(start)
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
+    # Its last frame has left: the write the exec refuses is the next call's START.
+    await asyncio.wait_for(released.wait(), 30)
     execs[0].ended = True
 
     call = client.exec(["true"], None, None, {}, None, None)
