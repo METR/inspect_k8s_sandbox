@@ -791,7 +791,10 @@ class ExecdClient:
                         # The same daemon never got the START: nothing ran, so start it.
                         call.resuming = False
                         try:
-                            await link.send(START, call.id, start)
+                            again = link.send(START, call.id, start)
+                            await asyncio.wait_for(again, left())
+                        except asyncio.TimeoutError:  # out of time: nothing starts now
+                            raise
                         except OSError:  # dropped again: the next resume asks once more
                             call.queue.put_nowait(Dropped(link))
                             continue
@@ -860,10 +863,10 @@ class ExecdClient:
         link.send_last(call.id, KILL)  # not waited for: its exit can come first
         end = time.monotonic() + KILL_WAIT
         drained = 0
-        # An exit that has come is taken, with the output before it, at any time.
-        while call.exited or time.monotonic() < end:
+        # What has come is taken whatever the time: an exit, and execd's word of none.
+        while not call.queue.empty() or time.monotonic() < end:
             try:
-                wait = None if call.exited else end - time.monotonic()
+                wait = None if not call.queue.empty() else end - time.monotonic()
                 item = await _next(call.queue, wait)
             except asyncio.TimeoutError:
                 continue  # once more, for an exit that came as the time ran out
@@ -877,11 +880,13 @@ class ExecdClient:
                     link = await asyncio.wait_for(reopen, end - time.monotonic())
                     resume = self._resume(link, call)  # its write may wait its turn
                     await asyncio.wait_for(resume, end - time.monotonic())
+                except asyncio.TimeoutError:
+                    pass  # its write may be with execd all the same: an answer is read
                 except Exception:  # an execd we cannot reach: our timer's word stands
                     break
                 continue
             if item[0] == ERROR:  # execd has let the call go, or never had it
-                if item[1] == b"unknown call" and not (any(call.got) or call.stdin_put):
+                if item[1] == b"unknown call":
                     break  # nothing ran, in all its time
                 raise ExecdResultUnknownError(
                     f"execd: {item[1].decode(errors='replace')}", pod=link.daemon.ip
