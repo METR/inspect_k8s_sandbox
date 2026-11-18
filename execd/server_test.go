@@ -2529,7 +2529,7 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 
 	// The client sends the START of an "unknown call" again: right for 99, which never came; 23 would run twice.
 	for id, unknown := range map[uint64]bool{99: true, 23: false} {
-		s.resume(late, frame{kind: fResume, id: id, payload: []byte(`{"stdout":0,"stderr":0}`)})
+		go s.resume(late, frame{kind: fResume, id: id, payload: []byte(`{"stdout":0,"stderr":0}`)}) // one that waits fails the wait below
 		select {
 		case f := <-frames:
 			if f.kind != fError || (string(f.payload) == "unknown call") != unknown {
@@ -2605,12 +2605,15 @@ func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t 
 	beforeKill.Store(&held)
 	release := sync.OnceFunc(func() { close(kill) })
 	t.Cleanup(func() { // whatever fails: the held kill has the reaper's lock, and the call waits for its exit
+		beforeKill.Store(nil)
 		release()
+		reaper.mu.Lock() // a kill that had begun has kept the exit by now
+		kept := exit
+		reaper.mu.Unlock()
 		select {
-		case exit <- syscall.WaitStatus(syscall.SIGKILL):
+		case kept <- syscall.WaitStatus(syscall.SIGKILL):
 		default:
 		}
-		beforeKill.Store(nil)
 	})
 	waits := make(chan struct{}, 1)
 	cl.mu.Lock()

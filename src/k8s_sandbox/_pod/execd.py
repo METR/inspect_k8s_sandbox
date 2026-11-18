@@ -91,7 +91,7 @@ RECONNECT_FOR = 300.0
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
-KILL_WAIT = 10.0  # for a killed command's exit
+KILL_WAIT = 10.0  # for execd's word on a call our timer has passed: then we kill
 SPEAKS_WITHIN = 1.0  # a connection given up as silent, once execd answers another
 TIMER_LAG = 1.0  # ours follows execd's own, which counts from the command's start
 
@@ -595,10 +595,12 @@ class ExecdClient:
         self._failed: BaseException | None = None  # why the open under way last failed
         self._owed: dict[int, tuple[int, ...]] = {}  # a call's last frames, by its id
 
-    async def _open(self, deadline: float) -> Link:
+    async def _open(
+        self, deadline: float, since: float = float("inf"), until: float = float("inf")
+    ) -> Link:
+        """Open a connection; since and until: of a call asking for a silent one."""
         # A connection dropped soon after it opened waits as a failed attempt would.
-        began = time.monotonic()
-        recent = began - self._opened < PING_EVERY
+        recent = time.monotonic() - self._opened < PING_EVERY
         delay = self._backoff if recent else 0.0
         while True:
             # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
@@ -613,15 +615,18 @@ class ExecdClient:
                         raise _port_held() from e
                 daemon = self._daemon
                 pipe = await _connect(daemon, self._pace)
-                old, until = self._link, time.monotonic() + SPEAKS_WITHIN
+                old, turns = self._link, 100
                 # Still open, one that speaks now that execd has is kept: it was slow.
+                # Counted in our own turns, as the keepalive is: held, we read nothing.
+                turn = min(SPEAKS_WITHIN, (until - time.monotonic()) / 2) / turns
                 while old and not old.pipe._writer.transport.is_closing():
-                    if old._last_rx > began:
+                    if old._last_rx > since:
                         await pipe.close()
                         return old
-                    if time.monotonic() >= until:
+                    if not turns:
                         break
-                    await asyncio.sleep(0.01)
+                    turns -= 1
+                    await asyncio.sleep(turn)
                 link = Link(
                     pipe, daemon, self._strays, self._pace, self._owed, self._pod
                 )
@@ -684,19 +689,23 @@ class ExecdClient:
             if self._owed:
                 await link.send(PING, 0)
 
+    def _opens(self, wait: float, *asked: float) -> asyncio.Future[Link]:
+        """The open under way, begun here if none is."""
+        if self._opening is None or self._opening.done():
+            self._failed = None
+            opening = self._open(time.monotonic() + wait, *asked)
+            self._opening = asyncio.ensure_future(opening)
+            # Retrieved here, as no caller may still wait when it fails.
+            self._opening.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return self._opening
+
     async def _get(self, stale: Link | None = None) -> Link:
         await self.leave_replaced()  # its check may have been cancelled, or not be back
         link = self._link
         if link is not None and link is not stale and not link.closed:
             return link
-        if self._opening is None or self._opening.done():
-            wait = FIRST_OPEN_FOR if link is None else RECONNECT_FOR
-            self._failed = None
-            self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
-            # Retrieved here, as no caller may still wait when it fails.
-            self._opening.add_done_callback(lambda f: f.cancelled() or f.exception())
         # Shared: callers wait on one open; a new call gives up on a reopen sooner.
-        opening = self._opening
+        opening = self._opens(FIRST_OPEN_FOR if link is None else RECONNECT_FOR)
         new_call = stale is None and link is not None
         await asyncio.wait({opening}, timeout=FIRST_OPEN_FOR if new_call else None)
         if not opening.done():
@@ -767,8 +776,8 @@ class ExecdClient:
                         item = await _next(call.queue, left())
                     except asyncio.TimeoutError:
                         call.closed = True  # the cancel can be lost before Python 3.12
-                        sender.cancel()  # its write could hold the lock the KILL needs
-                        ended = await self._kill(link, call)
+                        sender.cancel()  # its write could hold the lock the PING needs
+                        ended = await self._verdict(link, call)
                         if not ended:
                             yield EXIT, None
                             return
@@ -783,7 +792,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         try:
                             link = await asyncio.wait_for(self._get(stale=link), left())
-                        except asyncio.TimeoutError:  # the kill's wait takes it up
+                        except asyncio.TimeoutError:  # the wait for execd's word has it
                             call.queue.put_nowait(item)
                             continue
                         self._resume(link, call)
@@ -829,7 +838,9 @@ class ExecdClient:
                         call.resuming = False
                         try:
                             again = link.send(START, call.id, start, late)
-                            await asyncio.wait_for(again, left())
+                            # Past it none is written, so its turn is not waited for.
+                            within = None if late is None else late - time.monotonic()
+                            await asyncio.wait_for(again, within)
                         except asyncio.TimeoutError:  # out of time: nothing starts now
                             raise
                         except OSError:  # dropped again: the next resume asks once more
@@ -861,7 +872,7 @@ class ExecdClient:
                 if not finished:  # left by its caller, or timed out
                     self._over(link, call.id, KILL, RELEASE)
             finally:
-                # The kill's wait may have taken it to another connection.
+                # The wait for execd's word may have taken it to another connection.
                 for held in (link, self._link):
                     if held is not None:
                         held.calls.pop(call.id, None)
@@ -901,11 +912,11 @@ class ExecdClient:
         task.add_done_callback(link._last.discard)
         log_warn("execd connection lost: resuming", pod=call.daemon.ip)
 
-    async def _kill(self, link: Link, call: Call) -> list[tuple[int, bytes]]:
-        """Kill the call; give its last output and its exit, if it ended by itself."""
+    async def _verdict(self, link: Link, call: Call) -> list[tuple[int, bytes]]:
+        """Wait for execd's word: the call's last output and its own exit, if any."""
         ended: list[tuple[int, bytes]] = []
-        # Not waited for: its exit can come first. execd answers the PING, then kills.
-        link.send_last(call.id, PING, KILL)
+        # No KILL: execd's own timeout ends it, counted from its start. Not waited for.
+        link.send_last(call.id, PING)
         asked = time.monotonic()
         end = asked + KILL_WAIT
         probe = asked + KILL_WAIT / 2  # when execd is asked anew, this one still silent
@@ -916,31 +927,24 @@ class ExecdClient:
                 wait = None if call.exited else min(probe, end) - time.monotonic()
                 item = await _next(call.queue, wait)
             except asyncio.TimeoutError:
-                over = time.monotonic() - probe
-                if over >= 1:  # our loop was held: what came meanwhile is not read yet
-                    probe += over + KILL_WAIT / 2
-                elif over >= 0:
-                    probe = end
-                    if link._last_rx < asked:  # silent since: asked over a new one
-                        call.queue.put_nowait(Dropped(link))
+                now = time.monotonic()
+                if now - probe >= 1:  # our loop was held: what came is not read yet
+                    probe = now + 1
+                elif now >= probe:
+                    probe = float("inf")  # asked once
+                    if link._last_rx < asked:
+                        # Silent since: one opened in its place closes it. Read on here.
+                        self._opens(RECONNECT_FOR, asked, end)
                 continue  # once more, for an exit that came as the time ran out
             if not isinstance(item, tuple):
                 if item.args != (link,):  # a connection the call has left since
                     continue
                 # Whether it timed out is execd's to say: asked again within this wait.
+                link.calls.pop(call.id, None)
                 try:
                     reopen = self._get(stale=link)
-                    new = await asyncio.wait_for(reopen, end - time.monotonic())
-                    if new is not link:  # else it answered after all: the wait goes on
-                        # Only now: one given up as silent may answer until then.
-                        link.calls.pop(call.id, None)
-                        link = new
-                        self._resume(link, call)
-                except asyncio.TimeoutError:
-                    continue  # the wait is over: an exit that came meanwhile is taken
-                except ConnectionError:  # no new one: this one, if open, may speak yet
-                    if link.closed:
-                        break
+                    link = await asyncio.wait_for(reopen, end - time.monotonic())
+                    self._resume(link, call)
                 except Exception:  # an execd we cannot reach: our timer's word stands
                     break
                 continue
@@ -1134,7 +1138,7 @@ async def _next(
     queue: asyncio.Queue[tuple[int, bytes] | Exception], timeout: float | None
 ) -> tuple[int, bytes] | Exception:
     """queue.get() within timeout; before 3.12 wait_for costs a loop turn per item."""
-    if timeout == 0:  # out of time: what is queued is the kill's wait's to take
+    if timeout == 0:  # out of time: what is queued, the wait for execd's word takes
         raise asyncio.TimeoutError
     if not queue.empty():
         return queue.get_nowait()
