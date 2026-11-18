@@ -134,16 +134,24 @@ func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
 	}{
 		{"fe80::8b4:7ff:fe9c:1/64", "fe80::", true},   // as a pod that forwards IPv6 answers there
 		{"fe80::8b4:7ff:fe9c:1/64", "fe80::2", false}, // another machine on the link
-		{"2001:db8::5/126", "2001:db8::4", true},      // a routable subnet has one too
-		{"2001:db8::5/126", "2001:db8::8", false},     // the next subnet's is another machine's
-		{"2001:db8::5/128", "2001:db8::5", true},      // the pod's own, in no subnet
+		{"2001:db8::7/126", "2001:db8::4", true},      // a routable subnet has one too
+		{"2001:db8::7/126", "2001:db8::8", false},     // the next subnet's is another machine's
+		{"2001:db8::7/126", "2001:db8:1::4", true},    // the subnet's own address, for the address listed first
+		{"2001:db8:1::6/126", "2001:db8:1::7", true},  // that address itself, the pod's own too
+		{"2001:db8::5/128", "2001:db8::6", false},     // another machine, where the pod's address is a /128
 		{"2001:db8::3/127", "2001:db8::2", false},     // the other end of a point-to-point link
 		{"192.0.2.9/24", "192.0.2.0", false},          // IPv4 has no such address
 	} {
 		ip, subnet, _ := net.ParseCIDR(peer.own)
-		interfaceAddrs = func() ([]net.Addr, error) { return []net.Addr{&net.IPNet{IP: ip, Mask: subnet.Mask}}, nil }
+		interfaceAddrs = func() ([]net.Addr, error) { // made anew each time, as a listing is: the pod's own address is dialled from below
+			other := &net.IPNet{IP: net.ParseIP("2001:db8:1::7"), Mask: net.CIDRMask(126, 128)} // another interface's, listed first: each address is looked at
+			return []net.Addr{other, &net.IPNet{IP: slices.Clone(ip), Mask: slices.Clone(subnet.Mask)}}, nil
+		}
 		if refused := fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}); refused != peer.refused {
 			t.Errorf("a connection from %s to a pod at %s: refused is %t, want %t", peer.from, peer.own, refused, peer.refused)
+		}
+		if !fromThisPod(remoteConn{addr: &net.TCPAddr{IP: ip}}) { // whatever its prefix
+			t.Errorf("a connection from a pod at %s to itself was admitted", peer.own)
 		}
 	}
 }
