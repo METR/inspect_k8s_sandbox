@@ -207,7 +207,8 @@ print(*said)
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
-contract=$(k -n "$LNS" exec "$(launcher)" -c launcher -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
+pod=$(launcher)
+contract=$(k -n "$LNS" exec "$pod" -c "$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}')" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
 case "$contract" in *"ok: "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
