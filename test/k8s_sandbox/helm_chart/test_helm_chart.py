@@ -854,10 +854,11 @@ def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
     # A name Helm reads as a number is another volume's: both checks read it.
     render("123", f"{no_card},{proxy}")
 
-    with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        render("coredns-config", no_card)
+    for annotations in (no_card, f"{no_card},{proxy}"):
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            render("coredns-config", annotations)
 
-    assert "mounts the volume coredns-config" in exc_info.value.stderr
+        assert "mounts the volume coredns-config" in exc_info.value.stderr
 
 
 def test_a_service_from_additional_resources_resolves_by_its_own_name(
