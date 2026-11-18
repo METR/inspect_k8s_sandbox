@@ -212,6 +212,27 @@ kill "$canary" 2> /dev/null; canary=
 case "$contract" in *"ok: "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
 
+say "6a. the sandbox's pod is deleted while its node's launcher runs: its worker and VM directory go, and the pod that follows gets a worker from that launcher"
+at() { peek "tr '\\0' ' ' < /proc/${1:-none}/cmdline" 2> /dev/null | sed -n 's|.* -vsock [^ ]*/\([0-9a-f]\{12\}\)/root/vm.vsock .*|\1|p'; } # a worker's VM directory
+by() { peek "awk '/^PPid/{print \$2}' /proc/${1:-none}/status" 2> /dev/null; } # and the process that started it: its launcher
+was=$(echo $(workers)); before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid}')
+# The StatefulSet makes the pod again under its name: Ready there says its forwarder has met a new worker.
+reborn() { local now; now=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}') && [ "${now% *}" != "$uid" ] && [ "${now#* }" = True ]; }
+dir_gone() { [ "$(peek "[ -e /vms/. ] && { [ -e /vms/$1 ] || echo gone; }")" = gone ]; } # not where the VM directories cannot be read at all
+moved() { # one new worker and no other: the node says `looked` after naming them all, as an answer cut short could hide the old one
+  seen=$(echo $(workers 'echo looked')); now=${seen%looked}; now=${now% }; new=$(at "$now")
+  [ "$seen" != "$now" ] && [ -n "$new" ] && [ "$new" != "$before" ]
+}
+if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
+  wait_for 120 dir_gone "$before" # the node can stop the old VM after the new pod is up: its directory goes then, and its worker at the launcher's next pass
+  # A launcher that ended instead would have taken every worker on the node with it, and its successor would start this one too.
+  wait_for 60 moved && vm=$new && dir_gone "$before" && [ "$(by "$now")" = "$from" ] \
+    && pass "worker $was and VM directory $before went with the pod; the pod that followed has worker $now and VM directory $vm, from the same launcher (pid $from)" \
+    || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was') at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
+else
+  fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
+fi
+
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
 old=$(launcher)
@@ -224,8 +245,7 @@ k -n "$LNS" delete pod "$old" --wait=false > /dev/null
 wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" || fail "the launcher $old is still there"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
-vm_gone() { [ "$(peek "[ -e /vms/$vm ] || echo gone")" = gone ]; }
-if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 vm_gone; then
+if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 dir_gone "$vm"; then
   back=$(k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o name) && [ -z "$back" ] \
     || fail "a launcher was on the node while the sandbox went, or the launchers were not listed: '$back' (does the DaemonSet tolerate the taint $TAINT?)"
 else
