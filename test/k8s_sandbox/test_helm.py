@@ -1638,6 +1638,30 @@ def _in_a_typed_list(manifest: str) -> str:
             str,
             id="a-start-ordinal-written-as-a-float",
         ),
+        # Helm reads this start as 1: read as text, it raised ValueError.
+        pytest.param(
+            "  ordinals: {start: .1_0e0_1}\n",
+            [],
+            [_helper_pod(1)],
+            str,
+            id="a-start-ordinal-with-underscores",
+        ),
+        # Helm reads a sign after `0b`, here 2 replicas: as text it raised ValueError.
+        pytest.param(
+            "  replicas: 0b+10\n",
+            [_helper_pod()],
+            [_helper_pod(), _helper_pod(1)],
+            str,
+            id="a-binary-count-with-a-sign",
+        ),
+        # Helm reads a leading zero as octal there too: read as 10, two pods never came.
+        pytest.param(
+            "  replicas: !!float 010\n",
+            [_helper_pod(n) for n in range(7)],
+            [_helper_pod(n) for n in range(8)],
+            str,
+            id="an-octal-count-tagged-a-float",
+        ),
     ],
 )
 async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(

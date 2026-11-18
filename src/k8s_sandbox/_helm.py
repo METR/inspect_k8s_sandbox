@@ -985,7 +985,8 @@ _GO_FLOAT = re.compile(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?")
 
 def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float | str:
     """A number as Helm's reader, go-yaml, takes it; the text where that reads none."""
-    plain = node.value.replace("_", "")
+    # go-yaml takes a sign after `0b`, which Python takes only before it.
+    plain = re.sub(r"^0b([-+])", r"\g<1>0b", node.value.replace("_", ""))
     try:  # Go's ParseInt with base 0, where a leading zero is octal
         number = int(re.sub(r"^([-+]?)0(?=[0-7])", r"\g<1>0o", plain), 0)
     except ValueError:  # no integer, or more digits than Python reads
@@ -997,12 +998,23 @@ def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float 
     return node.value if math.isinf(value) else value
 
 
+def _helm_float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> float:
+    """A scalar tagged `!!float`: Helm reads its number as untagged, so `010` is 8."""
+    number = _helm_number(loader, node)
+    # `.inf` and `.nan` are no number to `_helm_number`: PyYAML reads them as Helm does.
+    return (
+        loader.construct_yaml_float(node) if isinstance(number, str) else float(number)
+    )
+
+
 # YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
 _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
     "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
     "tag:yaml.org,2002:float": r"[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
-    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*|\.[0-9]+([eE][-+]?[0-9]+)?",
+    # After a leading `.` Helm takes a `_` only between two digits.
+    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*"
+    r"|\.[0-9](_?[0-9])*([eE][-+]?[0-9](_?[0-9])*)?",
     "tag:yaml.org,2002:merge": r"<<",
 }
 
@@ -1020,6 +1032,7 @@ class _ManifestLoader(yaml.SafeLoader):
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
         _helm_number: _helm_number,
+        "tag:yaml.org,2002:float": _helm_float,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
     }
 
