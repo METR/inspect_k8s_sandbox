@@ -1940,6 +1940,116 @@ func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *tes
 	}
 }
 
+func TestAKillThatFindsItsCommandRunningLeavesWhatItLeftRunningIfItEndsFirst(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	t.Cleanup(func() { killTagged("ends-first") })
+	// Once let go, it leaves a loop running that keeps putting a file back, and ends.
+	left := `read x; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Stdin: true, Tag: "ends-first"})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 36, payload: req})
+	cl := s.get(36)
+	cl.kmu.Lock()
+	pid := cl.pid
+	cl.kmu.Unlock()
+	found, kill, killed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hold := func(bool) { once.Do(func() { close(found); <-kill }) } // the kill waits here, holding the reaper's lock
+	beforeKill.Store(&hold)
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	letGo := sync.OnceFunc(func() { close(kill) }) // at a failure too: held, the kill keeps the reaper's lock from the tests that follow
+	t.Cleanup(letGo)
+	go func() { s.dispatch(c, frame{kind: fKill, id: 36}); close(killed) }() // as its client's timeout sends
+	select {
+	case <-found:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never found the command running")
+	}
+	s.dispatch(c, frame{kind: fStdin, id: 36, payload: []byte("\n")})
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") Z ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+
+	letGo()
+
+	select {
+	case <-killed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never returned")
+	}
+	if status := exitStatus(t, frames); status["code"] != 0.0 || status["timeout"] != nil {
+		t.Fatalf("EXIT %v, want the command's own status 0 and no timeout", status)
+	}
+	os.Remove(alive)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(alive); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("what the command left running was killed, and its exit says it ended by itself: its caller takes it all for done")
+		}
+	}
+}
+
+func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit 3"}, Env: map[string]string{}, Stdin: true, Tag: tag})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 37, payload: req})
+	cl := s.get(37)
+	cl.kmu.Lock()
+	pid := cl.pid
+	cl.kmu.Unlock()
+	found, kill := make(chan struct{}), make(chan struct{})
+	var stopped [128]byte       // a siginfo_t: waitid sets its first field for a child that has stopped
+	hold := func(looked bool) { // the kill waits here once it has looked again, holding the reaper's lock
+		if looked {
+			syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&stopped)), syscall.WSTOPPED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+			close(found)
+			<-kill
+		}
+	}
+	beforeKill.Store(&hold)
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	letGo := sync.OnceFunc(func() { close(kill) }) // at a failure too: held, the kill keeps the reaper's lock from the tests that follow
+	t.Cleanup(letGo)
+	go s.dispatch(c, frame{kind: fKill, id: 37}) // as its client's timeout sends
+	select {
+	case <-found:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never found the command running")
+	}
+	if stopped[0] == 0 {
+		t.Fatal("the kill looked last at a command it had not seen stop: it can still end by itself before the kill")
+	}
+	s.dispatch(c, frame{kind: fStdin, id: 37, payload: []byte("\n")}) // on which it ends at once, if it still runs
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") T ") || strings.Contains(string(stat), ") Z ") {
+			break // stopped, or ended
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command neither stopped nor ended")
+		}
+	}
+
+	letGo()
+
+	if status := exitStatus(t, frames); status["code"] != 137.0 {
+		t.Fatalf("EXIT %v: the command ended by itself after the kill's last look, and the kill went on to end what it left running", status)
+	}
+}
+
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	var timers []func()
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }

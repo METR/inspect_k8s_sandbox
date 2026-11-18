@@ -821,23 +821,35 @@ func (cl *call) stop(timeout bool) {
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
-	var ended [128]byte // a siginfo_t: waitid sets its first field for a child exited and not yet reaped
-	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+	seen := func(states int) bool {
+		var info [128]byte // a siginfo_t: waitid sets its first field for a child in one of the states, and leaves it unreaped
+		syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		return info[0] != 0
+	}
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
-	if pid <= 0 || ended[0] != 0 {
+	if pid <= 0 || seen(syscall.WEXITED) {
 		return
 	}
 	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own
 	running := reaper.waiting[pid] == status
 	if running {
+		hook(&beforeKill, false)
+		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
+			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED); wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
+				time.Sleep(wait)
+			}
+		}
+		running = !seen(syscall.WEXITED)
+	}
+	if running {
+		hook(&beforeKill, true)
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
-		hook(&beforeKill, false)
 		killTree(pid)
 	}
 	reaper.mu.Unlock()
-	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
+	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
 	}
 }
