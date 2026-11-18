@@ -23,7 +23,7 @@ import (
 const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
 
 // A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
-var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([1-9][0-9]{0,4})$`)
+var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([0-9]{1,5})$`)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
 type node struct {
@@ -278,8 +278,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		sb, err := l.sandbox(r)
 		gone := errors.Is(err, os.ErrNotExist)
 		l.had[r.ContainerID] = l.had[r.ContainerID] || !gone
-		// Of five digits, those past "65535" are no port.
-		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0] || (len(m[4]) == 5 && m[4] > "65535")) {
+		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0] || !isPort(m[4])) {
 			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port from 1 to 65535>", proxyAnnotation, sb.target)
 		}
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
@@ -303,6 +302,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		}
 	}
 	return wanted, nil
+}
+
+// isPort reports whether digits name a port a worker can dial: 1 to 65535.
+func isPort(digits string) bool {
+	port, err := strconv.ParseUint(digits, 10, 16)
+	return err == nil && port > 0
 }
 
 // fault writes why a sandbox has no worker once that has lasted faultAgain: a VM's directory follows its record, and is root's at first.

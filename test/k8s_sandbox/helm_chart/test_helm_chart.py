@@ -1076,7 +1076,7 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     chart_dir: pathlib.Path, proxy: str
 ) -> None:
-    # The policy is cut from the name and port; the launcher would take 0, 03128, 65536.
+    # The policy is cut from the name and port; the launcher would take 03128.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(
             chart_dir,
