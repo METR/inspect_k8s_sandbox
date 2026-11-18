@@ -1118,18 +1118,19 @@ func tagged(environ string, needle []byte) bool {
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
-	// Eight listings at most, until one finds none: what a process starts while a listing is read is in the next.
-	for pass, found := 0, true; found && pass < 8; pass++ {
-		found = false
+	read := map[int]bool{}
+	// Eight listings at most, until one holds no process not yet read: what a process starts while one is read is in the next.
+	for pass, more := 0, true; more && pass < 8; pass++ {
+		more = false
 		entries, _ := os.ReadDir("/proc")
 		hook(&afterListed, pass > 0)
 		for _, e := range entries {
 			pid, err := strconv.Atoi(e.Name())
-			if err != nil || pid == os.Getpid() {
+			if err != nil || pid == os.Getpid() || read[pid] {
 				continue
 			}
+			read[pid], more = true, true
 			if tagged("/proc/"+e.Name()+"/environ", needle) {
-				found = true
 				syscall.Kill(pid, syscall.SIGKILL)
 			}
 		}

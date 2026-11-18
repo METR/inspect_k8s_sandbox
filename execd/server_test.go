@@ -1583,19 +1583,21 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 }
 
 func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
-	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
+	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once it ends
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	c := testConn(t)
 	s.authenticated(c)
 	base := filepath.Join(t.TempDir(), "detached")
-	// Out of the command's group and no longer its child, only the tag leads a kill to it; signalled, it starts another process.
-	detached := `trap 'sleep 600 & echo $! > "$0.new"' USR1; echo $$ > "$0.pid"; while :; do sleep 0.01; done`
+	// Out of the command's group and no longer its child, only the tag leads a kill to it; signalled, it starts its successor and ends.
+	detached := `trap 'sleep 600 & echo $! > "$0.new"; exit' USR1; echo $$ > "$0.pid"; while :; do sleep 0.01; done`
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(setsid sh -c "$1" "$0" &); sleep 600`, base, detached}, Env: map[string]string{}, Tag: tag})
 	s.dispatch(c, frame{kind: fStart, id: 73, payload: req})
-	named := func(file string) (pid int) { // the process a file names, once the file is written
-		for deadline := time.Now().Add(30 * time.Second); pid == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	t.Cleanup(func() { s.dispatch(c, frame{kind: fKill, id: 73}) }) // whatever fails below
+	deadline := time.Now().Add(30 * time.Second)                    // for the whole test
+	named := func(file string) (pid int) {                          // the process a file names, once the file is written
+		for ; pid == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
 			if data, _ := os.ReadFile(file); bytes.HasSuffix(data, []byte("\n")) {
 				pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
 			}
@@ -1606,12 +1608,17 @@ func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
 	if first == 0 {
 		t.Fatal("the command never detached its process")
 	}
+	var killing atomic.Bool // the hook is this kill's: a search an earlier test left running calls it too
 	var once sync.Once
-	listed := func(bool) { // the search's first listing holds the detached process, and not what it starts now
-		once.Do(func() {
-			syscall.Kill(first, syscall.SIGUSR1)
-			second = named(base + ".new")
-		})
+	listed := func(bool) { // the search's first listing holds the detached process, which is gone before it is read, and not its successor
+		if killing.Load() {
+			once.Do(func() {
+				syscall.Kill(first, syscall.SIGUSR1)
+				second = named(base + ".new")
+				for ; syscall.Kill(first, 0) != syscall.ESRCH && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+				}
+			})
+		}
 	}
 	afterListed.Store(&listed)
 	t.Cleanup(func() {
@@ -1623,14 +1630,15 @@ func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
 		}
 	})
 
+	killing.Store(true)
 	s.dispatch(c, frame{kind: fKill, id: 73})
 
 	if second == 0 {
 		t.Fatal("the detached process started nothing as the kill searched")
 	}
-	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(second, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+	for ; syscall.Kill(second, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
-			t.Fatalf("process %d, started as the kill's search had listed the processes, outlived the kill", second)
+			t.Fatalf("process %d, started by one the kill's search had listed and that ended before it was read, outlived the kill", second)
 		}
 	}
 }
