@@ -222,7 +222,7 @@ func (s *server) dispatch(c *conn, f frame) {
 		}
 	case fKill:
 		if cl := s.get(f.id); cl != nil {
-			cl.kill()
+			cl.stop(true) // as a timeout's: the client that sends it at its own timeout reads the exit
 		}
 	case fResume:
 		s.resume(c, f)
@@ -487,8 +487,12 @@ func (cl *call) run(req startRequest) error {
 					cl.output(i, buf[:n])
 				}
 				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
-					go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
-					return
+					select {
+					case held <- struct{}{}:
+						go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
+						return
+					default: // no place left: closed, and that write fails
+					}
 				}
 				if err != nil {
 					r.Close()
@@ -514,7 +518,7 @@ func (cl *call) run(req startRequest) error {
 		byTimeout := cl.timeoutKilled
 		cl.kmu.Unlock()
 		cl.mu.Lock()
-		cl.timedOut = byTimeout && ws.Signal() == syscall.SIGKILL
+		cl.timedOut = byTimeout
 		cl.mu.Unlock()
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
@@ -560,9 +564,18 @@ func (cl *call) run(req startRequest) error {
 // leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node where execd's user has too many pipes.
 const leftOutput = 1 << 20
 
-// closeOnceUnheld closes the pipe when no process holds its other end. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
+// held has a place for each pipe kept open for what a command left running: half of execd's descriptors, so that its calls and connections have the rest.
+var held = func() chan struct{} {
+	var files syscall.Rlimit
+	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) != nil {
+		files.Cur = 0 // a limit execd cannot read: it keeps no pipe
+	}
+	return make(chan struct{}, files.Cur/2)
+}()
+
+// closeOnceUnheld closes the pipe when no process holds its other end, and gives back its place. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
 func closeOnceUnheld(r *os.File) {
-	defer r.Close()
+	defer func() { r.Close(); <-held }()
 	r.SetReadDeadline(time.Time{})
 	var dropped [512]byte // on this goroutine's stack: io.Discard would keep 8 KiB of heap for as long as a quiet process holds the pipe
 	for left := leftOutput; left > 0; {
@@ -577,9 +590,12 @@ func closeOnceUnheld(r *os.File) {
 				fd              int32
 				events, revents int16
 			}{fd: int32(fd)}
-			syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
-			hook(&afterTaken, false)
-			return p.revents != 0
+			errno := syscall.EINTR
+			for asked := 0; errno == syscall.EINTR && asked < 100; asked++ { // a signal cut the poll short: asked again, but not for ever where every answer is that
+				_, _, errno = syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
+				hook(&afterTaken, false)
+			}
+			return p.revents != 0 || errno != 0 // refused, as a seccomp profile can, a poll would never see the writers go
 		})
 	}
 }
@@ -799,29 +815,42 @@ func signalLine(ws syscall.WaitStatus) string {
 // kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
-// stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
+// stop is kill; a timeout's, execd's or its client's, notes that the command was running, so only then does the exit say "timed out".
 func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
+	cl.timeoutKilled = cl.timeoutKilled || timeout && cl.status == nil // not started yet: the kill that meets it as it starts is this timeout's
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
-	var ended [128]byte // a siginfo_t: waitid sets its first field for a child exited and not yet reaped
-	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+	seen := func(states int) bool {
+		var info [128]byte // a siginfo_t: waitid sets its first field for a child in one of the states, and leaves it unreaped
+		syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		return info[0] != 0
+	}
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
-	if pid <= 0 || ended[0] != 0 {
+	if pid <= 0 || seen(syscall.WEXITED) {
 		return
 	}
 	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own
 	running := reaper.waiting[pid] == status
 	if running {
+		hook(&beforeKill, false)
+		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
+			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED); wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
+				time.Sleep(wait)
+			}
+		}
+		running = !seen(syscall.WEXITED)
+	}
+	if running {
+		hook(&beforeKill, true)
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
-		hook(&beforeKill, false)
 		killTree(pid)
 	}
 	reaper.mu.Unlock()
-	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
+	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
 	}
 }

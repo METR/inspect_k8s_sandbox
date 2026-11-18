@@ -503,6 +503,21 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	}
 }
 
+func TestACommandItsClientsKillEndedSaysSoInItsExit(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 10, payload: req})
+
+	s.dispatch(c, frame{kind: fKill, id: 10})
+
+	if status := exitStatus(t, frames); status["timeout"] != true {
+		t.Fatalf("EXIT %v: the client, whose timeout sent the kill, can't tell it from the command's own exit", status)
+	}
+}
+
 func TestTheLineForACommandASignalEndedIsDashs(t *testing.T) {
 	const core = 0x80 // a wait status's mark of a core dump
 	for status, want := range map[syscall.WaitStatus]string{
@@ -1476,7 +1491,7 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
-	cl.kill()     // from another connection, while this one's START is still at work
+	cl.stop(true) // its client's, from another connection, while this one's START is still at work
 	cl.kmu.Lock() // and stays at work: the command has ended before the START notes its id
 	noted := sync.OnceFunc(cl.kmu.Unlock)
 	t.Cleanup(noted)
@@ -1513,6 +1528,20 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 			if time.Now().After(deadline) {
 				t.Fatalf("process %d, which the command left running, outlived a kill that came before it started", left)
 			}
+		}
+	}
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		cl.mu.Lock()
+		exited, timedOut := cl.exited, cl.timedOut
+		cl.mu.Unlock()
+		if exited && !timedOut {
+			t.Fatal("its exit does not say timed out: its client takes the command for done, with what it left running killed")
+		}
+		if exited {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command's exit never came")
 		}
 	}
 }
@@ -1721,6 +1750,58 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	unheld(t, pipe, "which it had stopped reading and no process has open to write")
 }
 
+func TestAPipeIsLetGoWhereThePollIsRefusedOrCutShortEveryTime(t *testing.T) {
+	for _, poll := range []struct {
+		answer syscall.Errno // as a seccomp profile can answer ppoll: a refusal, and what a signal makes of the call
+		again  bool
+	}{{syscall.EPERM, false}, {syscall.EINTR, true}} {
+		t.Run(poll.answer.Error(), func(t *testing.T) {
+			var polls atomic.Int32
+			note := func(bool) { polls.Add(1) }
+			afterTaken.Store(&note)
+			t.Cleanup(func() { afterTaken.Store(nil) })
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close() // a writer that stays
+			let := make(chan syscall.Errno, 1)
+			go func() {
+				runtime.LockOSThread() // the filter is this thread's, which ends with this goroutine
+				filter := []syscall.SockFilter{
+					{Code: 0x20, K: 0},                             // the call's number
+					{Code: 0x15, Jf: 1, K: syscall.SYS_PPOLL},      // not ppoll: allowed
+					{Code: 0x06, K: 0x50000 | uint32(poll.answer)}, // SECCOMP_RET_ERRNO
+					{Code: 0x06, K: 0x7fff0000},                    // SECCOMP_RET_ALLOW
+				}
+				prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+				const prSetNoNewPrivs, prSetSeccomp, seccompModeFilter = 38, 22, 2
+				prctl(prSetNoNewPrivs, 1) // without it a filter needs CAP_SYS_ADMIN
+				_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog)))
+				if errno == 0 {
+					held <- struct{}{}
+					closeOnceUnheld(r)
+				}
+				let <- errno
+			}()
+
+			go w.Write(make([]byte, leftOutput)) // what execd takes of it: it then polls
+
+			select {
+			case errno := <-let:
+				if errno != 0 {
+					t.Fatalf("seccomp: %v", errno)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("execd waits on a pipe whose poll never says that its writers have gone: it holds the pipe, and a goroutine, for as long as the pod")
+			}
+			if got := polls.Load(); got > 1 != poll.again {
+				t.Fatalf("execd polled %d times: a refusal is final, and a poll a signal cut short is asked again", got)
+			}
+		})
+	}
+}
+
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
@@ -1885,6 +1966,116 @@ func TestAKillOfACommandThatEndedAndIsNotYetReapedLeavesWhatItLeftRunning(t *tes
 		if time.Now().After(deadline) {
 			t.Fatal("what the command left running was killed after it ended")
 		}
+	}
+}
+
+func TestAKillThatFindsItsCommandRunningLeavesWhatItLeftRunningIfItEndsFirst(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	t.Cleanup(func() { killTagged("ends-first") })
+	// Once let go, it leaves a loop running that keeps putting a file back, and ends.
+	left := `read x; (while :; do : >"$0"; sleep 0.01; done) >/dev/null 2>&1 &`
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, alive}, Env: map[string]string{}, Stdin: true, Tag: "ends-first"})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 36, payload: req})
+	cl := s.get(36)
+	cl.kmu.Lock()
+	pid := cl.pid
+	cl.kmu.Unlock()
+	found, kill, killed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hold := func(bool) { once.Do(func() { close(found); <-kill }) } // the kill waits here, holding the reaper's lock
+	beforeKill.Store(&hold)
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	letGo := sync.OnceFunc(func() { close(kill) }) // at a failure too: held, the kill keeps the reaper's lock from the tests that follow
+	t.Cleanup(letGo)
+	go func() { s.dispatch(c, frame{kind: fKill, id: 36}); close(killed) }() // as its client's timeout sends
+	select {
+	case <-found:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never found the command running")
+	}
+	s.dispatch(c, frame{kind: fStdin, id: 36, payload: []byte("\n")})
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") Z ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never ended")
+		}
+	}
+
+	letGo()
+
+	select {
+	case <-killed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never returned")
+	}
+	if status := exitStatus(t, frames); status["code"] != 0.0 || status["timeout"] != nil {
+		t.Fatalf("EXIT %v, want the command's own status 0 and no timeout", status)
+	}
+	os.Remove(alive)
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(alive); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("what the command left running was killed, and its exit says it ended by itself: its caller takes it all for done")
+		}
+	}
+}
+
+func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit 3"}, Env: map[string]string{}, Stdin: true, Tag: tag})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 37, payload: req})
+	cl := s.get(37)
+	cl.kmu.Lock()
+	pid := cl.pid
+	cl.kmu.Unlock()
+	found, kill := make(chan struct{}), make(chan struct{})
+	var stopped [128]byte       // a siginfo_t: waitid sets its first field for a child that has stopped
+	hold := func(looked bool) { // the kill waits here once it has looked again, holding the reaper's lock
+		if looked {
+			syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&stopped)), syscall.WSTOPPED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+			close(found)
+			<-kill
+		}
+	}
+	beforeKill.Store(&hold)
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	letGo := sync.OnceFunc(func() { close(kill) }) // at a failure too: held, the kill keeps the reaper's lock from the tests that follow
+	t.Cleanup(letGo)
+	go s.dispatch(c, frame{kind: fKill, id: 37}) // as its client's timeout sends
+	select {
+	case <-found:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the kill never found the command running")
+	}
+	if stopped[0] == 0 {
+		t.Fatal("the kill looked last at a command it had not seen stop: it can still end by itself before the kill")
+	}
+	s.dispatch(c, frame{kind: fStdin, id: 37, payload: []byte("\n")}) // on which it ends at once, if it still runs
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if strings.Contains(string(stat), ") T ") || strings.Contains(string(stat), ") Z ") {
+			break // stopped, or ended
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command neither stopped nor ended")
+		}
+	}
+
+	letGo()
+
+	if status := exitStatus(t, frames); status["code"] != 137.0 {
+		t.Fatalf("EXIT %v: the command ended by itself after the kill's last look, and the kill went on to end what it left running", status)
 	}
 }
 
