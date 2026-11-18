@@ -728,6 +728,9 @@ class ExecdClient:
                 while True:
                     try:
                         item = await _next(call.queue, left())
+                        if isinstance(item, Dropped) and left() == 0:
+                            call.queue.put_nowait(item)  # the kill's wait takes it up
+                            raise asyncio.TimeoutError
                     except asyncio.TimeoutError:
                         call.closed = True  # the cancel can be lost before Python 3.12
                         sender.cancel()  # its write could hold the lock the KILL needs
@@ -745,19 +748,7 @@ class ExecdClient:
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
                         link = await asyncio.wait_for(self._get(stale=link), left())
-                        if link.daemon is not call.daemon:
-                            raise ExecdStoppedError(
-                                "execd stopped while it ran the command",
-                                pod=call.daemon.ip,
-                            )
-                        link.calls[call.id] = call
-                        at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
-                        call.resuming = True  # before the RESUMED can arrive
-                        try:
-                            await link.send(RESUME, call.id, at.encode())
-                        except OSError:  # dropped again before it left: once more
-                            call.queue.put_nowait(Dropped(link))
-                        log_warn("execd connection lost: resuming", pod=call.daemon.ip)
+                        await self._resume(link, call)
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item
@@ -829,7 +820,10 @@ class ExecdClient:
                 if not finished:  # left by its caller, or timed out
                     self._over(link, call.id, KILL, RELEASE)
             finally:
-                link.calls.pop(call.id, None)
+                # The kill's wait may have taken it to another connection.
+                for held in (link, self._link):
+                    if held is not None:
+                        held.calls.pop(call.id, None)
 
     async def _upload(
         self, link: Link, call: Call, stdin: bytes | None, offset: int
@@ -843,6 +837,21 @@ class ExecdClient:
                 call.stdin_sent = max(call.stdin_sent, min(i + CHUNK, len(stdin)))
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
+
+    async def _resume(self, link: Link, call: Call) -> None:
+        """Ask execd, over a new connection, to send the call on from what we have."""
+        if link.daemon is not call.daemon:
+            raise ExecdStoppedError(
+                "execd stopped while it ran the command", pod=call.daemon.ip
+            )
+        link.calls[call.id] = call
+        at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
+        call.resuming = True  # before the RESUMED can arrive
+        try:
+            await link.send(RESUME, call.id, at.encode())
+        except OSError:  # dropped again before it left: once more
+            call.queue.put_nowait(Dropped(link))
+        log_warn("execd connection lost: resuming", pod=call.daemon.ip)
 
     async def _kill(self, link: Link, call: Call) -> list[tuple[int, bytes]]:
         """Kill the call; give its last output and its exit, if it ended by itself."""
@@ -860,7 +869,15 @@ class ExecdClient:
             if not isinstance(item, tuple):
                 if item.args != (link,):  # a connection the call has left since
                     continue
-                break  # a dropped connection
+                # Whether it timed out is execd's to say: asked again within this wait.
+                link.calls.pop(call.id, None)
+                try:
+                    reopen = self._get(stale=link)
+                    link = await asyncio.wait_for(reopen, end - time.monotonic())
+                    await self._resume(link, call)
+                except Exception:  # an execd we cannot reach: our timer's word stands
+                    break
+                continue
             if item[0] == EXIT:  # execd marks the exit of a command a kill ended
                 if json.loads(item[1]).get("timeout"):
                     break
