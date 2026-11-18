@@ -230,7 +230,7 @@ func TestExecdEndsWhereAThreadCannotTakeItsIdentityBack(t *testing.T) {
 		ran, _ := child.Output() // its exit status may go to the tests' reaper
 
 		if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "could not take execd's identity back") {
-			t.Errorf("refused its %s, execd said %q, then %q (%v): the thread would do execd's other work as another", half, said.String(), ran, ctx.Err())
+			t.Fatalf("refused its %s, execd said %q, then %q (%v): the thread would do execd's other work as another", half, said.String(), ran, ctx.Err())
 		}
 	}
 }

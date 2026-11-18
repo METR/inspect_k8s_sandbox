@@ -365,13 +365,19 @@ func (s *server) resume(c *conn, f frame) {
 	}
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	for cl.abandoned && !cl.gone { // the kill that abandons it is under way: whether a timeout's got there first is known once it is done
+		cl.room.Wait()
+	}
 	s.mu.Lock()
 	replaced := s.current != nil && s.current != c // the call is the new connection's to resume
 	s.mu.Unlock()
 	if replaced {
 		return
 	}
-	if cl.abandoned && !cl.timedOut { // one its own timeout ended still says so: that takes none of the output let go
+	cl.kmu.Lock()
+	byTimeout := cl.timeoutKilled // the kill's own word: its exit may not have said so yet
+	cl.kmu.Unlock()
+	if cl.abandoned && !byTimeout { // one its own timeout ended still says so: that takes none of the output let go
 		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
 	}
@@ -1109,20 +1115,25 @@ const maxEnviron = 8 << 20
 // Tests open another file in an environment's place for the search of a tag, as the kernel shows none of a process whose execve is under way.
 var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
 
-// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
-func tagged(open func(string) (*os.File, error), environ string, needle []byte) (is, none bool) {
+// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all; it reads into room, and leaves a larger one where an environment filled it.
+func tagged(open func(string) (*os.File, error), environ string, needle []byte, room *[]byte) (is, none bool) {
 	// In one read: an execve between two lets the environment go, and the second ends the file short of its tag.
-	for size := 4 << 10; ; size = min(4*size, maxEnviron) {
+	for {
 		f, err := open(environ)
 		if err != nil {
 			return false, false
 		}
-		data := make([]byte, size+1)
-		n, _ := f.Read(data[:size])
+		data := *room
+		n, _ := f.Read(data)
 		f.Close()
-		if n < size || size == maxEnviron { // a read it fills may not hold it all: a process can make its own look any size
-			return bytes.Contains(append(data[:n], 0), needle), n == 0
+		// A read it fills may not hold it all: a process can make its own look any size.
+		whole := n < len(data) || len(data) == maxEnviron
+		// The last variable of a whole one may lack its NUL.
+		is = bytes.Contains(data[:n], needle) || whole && bytes.HasSuffix(data[:n], needle[:len(needle)-1])
+		if is || whole { // a tag it shows is enough: the next open may fail
+			return is, n == 0
 		}
+		*room = make([]byte, min(4*len(data), maxEnviron)) // kept for the search's later reads: each open more is one an execve can empty
 	}
 }
 
@@ -1133,7 +1144,7 @@ func killTagged(tag string) {
 	if stand := openEnviron.Load(); stand != nil {
 		open = func(environ string) (*os.File, error) { return (*stand)(tag, environ) }
 	}
-	read := map[int]bool{}
+	read, room := map[int]bool{}, make([]byte, 4<<10)
 	// Eight listings at most, until one holds no process not yet read: what a process starts while one is read is in the next.
 	for pass, more, starting := 0, true, false; more && pass < 8; pass++ {
 		if starting {
@@ -1147,7 +1158,7 @@ func killTagged(tag string) {
 				continue
 			}
 			more = true
-			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle)
+			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle, &room)
 			if none {
 				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
 					starting = true

@@ -1744,6 +1744,63 @@ func TestAKillReachesAProcessWhoseEnvironmentIsGoneAfterItsFirstRead(t *testing.
 	}
 }
 
+func TestAKillReachesAProcessWhoseTagIsPastTheFirstReadOfAnEnvironmentThatOpensNoThirdTime(t *testing.T) {
+	detached, kill, deadline := detach(t, 76, "second read")
+	environment := filepath.Join(t.TempDir(), "environ") // more than the first read takes, its tag past that, and more than the second takes after it
+	pad := bytes.Repeat([]byte("PAD=x\x00"), 1000)
+	if err := os.WriteFile(environment, append(append(pad, "HAWK_NEXT_EXEC=second read\x00"...), bytes.Repeat(pad, 4)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opens := 0
+	twice := func(tag, environ string) (*os.File, error) { // as of a process that makes its environment unreadable while the search reads it
+		if tag != "second read" || environ != "/proc/"+strconv.Itoa(detached)+"/environ" {
+			return os.Open(environ)
+		}
+		if opens++; opens > 2 {
+			return nil, syscall.EACCES
+		}
+		return os.Open(environment)
+	}
+	openEnviron.Store(&twice)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+
+	kill()
+
+	for ; syscall.Kill(detached, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, whose tag the search's second read of its environment held, outlived the kill", detached)
+		}
+	}
+}
+
+func TestAKillReadsALargeEnvironmentInOneReadOnceItHasMadeRoomForIt(t *testing.T) {
+	detached, kill, deadline := detach(t, 77, "kept room")
+	environment := filepath.Join(t.TempDir(), "environ") // more than the first read takes, its tag at its end
+	if err := os.WriteFile(environment, append(bytes.Repeat([]byte("PAD=x\x00"), 1000), "HAWK_NEXT_EXEC=kept room\x00"...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opens := 0
+	emptied := func(tag, environ string) (*os.File, error) { // as of a process that execs itself in a loop: every second read finds its environment gone
+		if tag != "kept room" || environ != "/proc/"+strconv.Itoa(detached)+"/environ" {
+			return os.Open(environ)
+		}
+		if opens++; opens%2 == 0 {
+			return os.Open(os.DevNull)
+		}
+		return os.Open(environment)
+	}
+	openEnviron.Store(&emptied)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+
+	kill()
+
+	for ; syscall.Kill(detached, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, whose environment took two reads at first and was gone at every second one, outlived the kill", detached)
+		}
+	}
+}
+
 func TestAKillsSearchReadsAgainOnlyAProcessThatMayYetShowItsEnvironment(t *testing.T) {
 	keeper := exec.Command("sh", "-c", "sleep 0 & exec sleep 600") // the sleep the shell becomes reaps nothing: its child stays a zombie
 	bare := exec.Command("sleep", "600")
@@ -1802,6 +1859,17 @@ func TestAKillsSearchReadsAgainOnlyAProcessThatMayYetShowItsEnvironment(t *testi
 	}
 }
 
+func TestAKillFindsATagThatEndsAnEnvironmentWithNoNul(t *testing.T) {
+	last, room := filepath.Join(t.TempDir(), "environ"), make([]byte, 4<<10)
+	if err := os.WriteFile(last, []byte("PAD=x\x00HAWK_NEXT_EXEC=last"), 0o600); err != nil { // as a process that wrote over the end of its own leaves it
+		t.Fatal(err)
+	}
+
+	if is, _ := tagged(os.Open, last, []byte("HAWK_NEXT_EXEC=last\x00"), &room); !is {
+		t.Fatal("a tag that ends an environment with no NUL after it was not found")
+	}
+}
+
 func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	huge := filepath.Join(t.TempDir(), "environ")
 	os.WriteFile(huge, nil, 0o644)
@@ -1809,7 +1877,8 @@ func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
 
-	tagged(os.Open, huge, []byte("HAWK_NEXT_EXEC=huge\x00"))
+	room := make([]byte, 4<<10)
+	tagged(os.Open, huge, []byte("HAWK_NEXT_EXEC=huge\x00"), &room)
 
 	runtime.ReadMemStats(&after)
 	if took := (after.TotalAlloc - before.TotalAlloc) >> 20; took > 64 {
@@ -2489,8 +2558,95 @@ func TestACallExecdAbandonedStillSaysThatItsOwnTimeoutEndedIt(t *testing.T) {
 	s.resume(late, frame{kind: fResume, id: 24, payload: []byte(`{"stdout":0,"stderr":0}`)})
 
 	// Its client, back at last, is told what execd knows: "abandoned" would say that how it ended is not known.
-	if said := awaited(t, frames, fExit, time.Now().Add(30*time.Second)); !bytes.Contains(said.payload, []byte(`"timeout":true`)) {
-		t.Fatalf("a RESUME of a call that execd's timeout ended, and execd then abandoned, got the exit %s", said.payload)
+	if said := nextFrame(t, frames); said.kind != fResumed {
+		t.Fatalf("a RESUME of a call that execd's timeout ended, and execd then abandoned, got a frame of kind %d: %s", said.kind, said.payload)
+	}
+	if said := nextFrame(t, frames); said.kind != fExit || !bytes.Contains(said.payload, []byte(`"timeout":true`)) {
+		t.Fatalf("a RESUME of a call that execd's timeout ended, and execd then abandoned, got a frame of kind %d: %s", said.kind, said.payload)
+	}
+}
+
+// released tells a test that a goroutine has let go of a call's lock to wait on its condition.
+type released struct {
+	sync.Locker
+	waits chan<- struct{}
+}
+
+func (r released) Unlock() {
+	r.Locker.Unlock()
+	select {
+	case r.waits <- struct{}{}:
+	default:
+	}
+}
+
+func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t *testing.T) {
+	var timers []func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "both", Timeout: 60})
+	first := testConn(t)
+	s.start(first, frame{kind: fStart, id: 25, payload: req})
+	cl, deadline := s.get(25), time.Now().Add(30*time.Second)
+	var exit chan syscall.WaitStatus
+	killing, kill := make(chan struct{}), make(chan struct{})
+	held := func(committed bool) { // the timeout's kill waits as it is about to go ahead, and the command's exit is kept from the call
+		if committed && exit == nil {
+			cl.kmu.Lock()
+			pid := cl.pid
+			cl.kmu.Unlock()
+			exit = reaper.waiting[pid]
+			delete(reaper.waiting, pid)
+			close(killing)
+			<-kill
+		}
+	}
+	beforeKill.Store(&held)
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	waits := make(chan struct{}, 1)
+	cl.mu.Lock()
+	cl.room.L = released{&cl.mu, waits}
+	cl.mu.Unlock()
+	go timers[0]() // its timeout
+	<-killing
+	s.detach(first)
+	go timers[1]() // six minutes with no client: the kill that abandons it waits for the timeout's
+	for abandoned := false; !abandoned; time.Sleep(time.Millisecond) {
+		cl.mu.Lock()
+		abandoned = cl.abandoned
+		cl.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("the call was never abandoned")
+		}
+	}
+	late, frames := recordedConn(t)
+	answered := make(chan struct{})
+
+	go func() {
+		s.resume(late, frame{kind: fResume, id: 25, payload: []byte(`{"stdout":0,"stderr":0}`)})
+		close(answered)
+	}()
+
+	select {
+	case <-waits: // for the kill that abandons it
+	case <-answered: // at once: the frames show what
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("the RESUME neither waited nor was answered")
+	}
+	close(kill)
+	select {
+	case f := <-frames:
+		// Neither kill has yet said which ended it, nor has its exit: "abandoned" would say that how it ended is not known.
+		if f.kind != fResumed {
+			t.Fatalf("a RESUME of a call that its timeout was killing as execd abandoned it got a frame of kind %d: %s", f.kind, f.payload)
+		}
+	case <-time.After(time.Until(deadline)):
+		t.Fatal("the RESUME got no answer")
+	}
+	exit <- syscall.WaitStatus(syscall.SIGKILL) // as the reaper gives it
+	if said := awaited(t, frames, fExit, deadline); !bytes.Contains(said.payload, []byte(`"timeout":true`)) {
+		t.Fatalf("the call that its timeout killed as execd abandoned it got the exit %s", said.payload)
 	}
 }
 
