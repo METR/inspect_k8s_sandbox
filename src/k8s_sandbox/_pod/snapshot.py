@@ -59,12 +59,14 @@ class PodSnapshot:
     phase: str | None = None
     """``status.phase``: Pending, Running, Succeeded, Failed or Unknown."""
     ready: bool = False
-    """``status.conditions[type=Ready]`` is True and the pod is not being deleted."""
+    """``status.conditions[type=Ready]`` is True, which is what Helm's wait checks."""
     ip: str | None = None
     """``status.podIP``."""
     annotations: dict[str, str] = field(default_factory=dict)
     shares_pids: bool = False
     """``spec.shareProcessNamespace`` or ``spec.hostPID``."""
+    deleting: bool = False
+    """``metadata.deletionTimestamp`` is set: its controller counts it no longer."""
 
     def status_for(self, container_name: str) -> ContainerStatus | None:
         if self.container_statuses is None:
@@ -170,13 +172,13 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
         container_names=tuple(c["name"] for c in spec.get("containers") or []),
         container_statuses=container_statuses,
         phase=status.get("phase"),
-        ready=not metadata.get("deletionTimestamp")
-        and any(
+        ready=any(
             c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         ),
         ip=status.get("podIP"),
         annotations=metadata.get("annotations") or {},
         shares_pids=bool(spec.get("shareProcessNamespace") or spec.get("hostPID")),
+        deleting=bool(metadata.get("deletionTimestamp")),
     )
 
 

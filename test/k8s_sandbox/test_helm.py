@@ -2049,6 +2049,22 @@ async def test_install_takes_the_pod_count_from_helm_and_waits_off_the_subproces
     _mock_release_pods.assert_called()
 
 
+async def test_a_pod_being_deleted_is_neither_waited_for_nor_handed_over(
+    _mock_release_pods: MagicMock,
+) -> None:
+    # It reports Ready until its containers stop, beside the pod that replaces it.
+    going = dataclasses.replace(_pod(name="going"), deleting=True)
+    _mock_release_pods.return_value = [_pod(name="next"), going]
+    release = Release(__file__, None, ValuesSource.none(), None)
+
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        _helm_installed(mock_run)
+        await release.install()
+    sandboxes = await release.get_sandbox_pods()
+
+    assert sandboxes["default"].info.name == "next"
+
+
 @pytest.mark.parametrize(
     "phase",
     [pytest.param("Succeeded", id="completed"), pytest.param("Failed", id="evicted")],

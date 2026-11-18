@@ -4,7 +4,7 @@
 
 - Fix a chart being refused as declaring no sandbox when it renders its sandbox inside a
   typed list such as a `StatefulSetList`.
-- Fix a sandbox being handed over on a Pod that is Ready but being deleted.
+- Fix a sandbox being handed over on a Pod that is being deleted.
 - Fix an install waiting until its timeout for a sandbox whose controller has
   `replicas: 0`.
 - Fix an install failing with "Could not read the rendered manifest" when the chart
