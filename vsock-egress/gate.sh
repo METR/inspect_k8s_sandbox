@@ -95,8 +95,7 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
-# A worker that ended and was not reaped has no command line: each of $ended that still has a process entry is named with its state.
-workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; for p in '"${ended:-}"'; do awk "/^State/{print \"$p:\" \$2}" /proc/$p/status; done 2>/dev/null; '"${1:-true}" | tr '\n' ' '; }
+workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; '"${1:-true}" | tr '\n' ' '; }
 # The node says `looked` after naming every worker: an answer cut short does not.
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
@@ -223,11 +222,10 @@ was=$(echo $(workers)); before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS"
 # The StatefulSet makes the pod again under its name: Ready there says its forwarder has met a new worker.
 reborn() { local now; now=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}') && [ "${now% *}" != "$uid" ] && [ "${now#* }" = True ]; }
 dir_gone() { [ "$(peek "[ -e /vms/. ] && { [ -e /vms/$1 ] || echo gone; }")" = gone ]; } # not where the VM directories cannot be read at all
-moved() { # one new worker and no other: the node says `looked` after naming them all, as an answer cut short could hide the old one
-  seen=$(echo $(workers 'echo looked')); now=${seen%looked}; now=${now% }; new=$(at "$now")
+moved() { # one new worker and no other, nor the old one unreaped, which has a process entry and no command line: the node says `looked` after naming them all, as an answer cut short could hide the old one
+  seen=$(echo $(workers "awk '/^State/{print \"$was:\" \$2}' /proc/$was/status 2>/dev/null; echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
   [ "$seen" != "$now" ] && [ -n "$new" ] && [ "$new" != "$before" ]
 }
-ended=$was
 if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
   wait_for 120 dir_gone "$before" # the node can stop the old VM after the new pod is up: its directory goes then, and its worker at the launcher's next pass
   # A launcher that ended instead would have taken every worker on the node with it, and its successor would start this one too.
@@ -247,11 +245,9 @@ owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
   || { fail "the pod '$old' is not one of DaemonSet $LAUNCHERS: it is left alone"; exit 1; }
 # The taint keeps the DaemonSet from putting a launcher back on the node before the sandbox has gone.
 k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the node was not tainted $TAINT"; exit 1; }
-# A pod can leave the API before its node has stopped it: that the launcher's process has gone is the node's own word.
-lpid=$(by "${now:-}"); down() { [ "$(peek "[ -e /proc/${lpid:-self} ] || echo down")" = down ]; }
-k -n "$LNS" delete pod "$old" --wait=false > /dev/null
-wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 60 down \
-  || fail "the launcher $old is still there, or its process '$lpid' was not seen to end on the node"
+# With no grace period a pod leaves the API before its node has stopped it: --now gives the launcher one second, whatever its DaemonSet sets.
+k -n "$LNS" delete pod "$old" --now --wait=false > /dev/null
+wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" || fail "the launcher $old is still there"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 && kept="pod $REL-peek" || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
 if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 dir_gone "$vm"; then
@@ -261,10 +257,10 @@ else
   fail "the sandbox pod, or its VM directory $vm, is still there"
 fi
 k taint node "$node" "$TAINT-" > /dev/null && tainted= || fail "the taint $TAINT was not taken off $node"
-# Running is also the phase of a launcher that keeps ending: this one is Ready and has not restarted, now and ten seconds on.
-steady() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status} {.status.containerStatuses[*].restartCount}{"\n"}{end}' | grep -v "^$old " | grep -E ' True( 0)+$'; }
-stays() { local first; first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
-wait_for 120 stays && pass "a new launcher runs on the node, Ready and not restarted in 10 s: $(launcher) (the old one was $old)" \
+# Running is also the phase of a launcher that keeps ending: this one has been Ready since one moment, with no restart, now and ten seconds on.
+steady() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {range .status.conditions[?(@.type=="Ready")]}{.status} {.lastTransitionTime}{end} {.status.containerStatuses[*].restartCount}{"\n"}{end}' | grep -v "^$old " | grep -E ' True [^ ]+( 0)+$'; }
+stays() { first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
+wait_for 120 stays && pass "a new launcher runs on the node, Ready with no restart for 10 s: ${first%% *} (the old one was $old)" \
   || fail "no new launcher stays up on $node: $(k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" 2>&1 | tr '\n' '|')"
 # The node names each worker and the VM directory it finds, then says `looked`: an exec that fails, or is cut short, does not.
 left() { echo $(workers "[ -e /vms/$vm ] && echo /vms/$vm; [ -e /vms/. ] && echo looked"); }
