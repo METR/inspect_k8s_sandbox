@@ -836,25 +836,22 @@ def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
     chart_dir: pathlib.Path,
 ) -> None:
     # As Hawk makes a pod with no network device: it names its egress proxy too.
-    no_card = (
-        r"annotations.sandbox\.amazonaws\.com/network-isolated=true,"
-        f"services.default.podAnnotations.{_EGRESS_PROXY}"
-    )
+    proxy = f"services.default.podAnnotations.{_EGRESS_PROXY}"
+    no_card = rf"annotations.sandbox\.amazonaws\.com/network-isolated=true,{proxy}"
 
-    def render(mount: str, annotation: str | None) -> None:
+    def render(mount: str, annotations: str) -> None:
         _run_helm_template(
             chart_dir,
             set_str="egressForwarderImage=vsock-egress:1,"
-            "services.default.volumes[0]=123:/data,"
             "services.default.initContainers[0].name=setup,"
             "services.default.initContainers[0].image=busybox,"
             f"services.default.initContainers[0].volumeMounts[0].name={mount},"
             "services.default.initContainers[0].volumeMounts[0].mountPath=/mnt",
-            set_string=annotation,
+            set_string=annotations,
         )
 
-    render("coredns-config", None)  # with a network card the pod has the volume
-    render("123", no_card)  # a name Helm reads as a number is another volume's
+    render("coredns-config", proxy)  # with a network card the pod has the volume
+    render("123", no_card)  # a name Helm reads as a number
 
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         render("coredns-config", no_card)

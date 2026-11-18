@@ -79,6 +79,7 @@ func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 		"a Service of another namespace":  {"eth0", map[string]string{proxyAnnotation: "proxy.other.svc.cluster.local:3128"}, vmUID, false},
 		"no proxy":                        {"eth0", map[string]string{"other": "annotation"}, vmUID, false},
 		"more than a name and a port":     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128 -rate=1"}, vmUID, false},
+		"a port with a leading zero":      {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:03128"}, vmUID, true},
 		"a port of 0":                     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:0"}, vmUID, false},
 		"the last port":                   {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65535"}, vmUID, true},
 		"a port past the last":            {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65536"}, vmUID, false},
