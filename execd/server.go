@@ -590,9 +590,12 @@ func closeOnceUnheld(r *os.File) {
 				fd              int32
 				events, revents int16
 			}{fd: int32(fd)}
-			syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
-			hook(&afterTaken, false)
-			return p.revents != 0
+			errno := syscall.EINTR
+			for asked := 0; errno == syscall.EINTR && asked < 100; asked++ { // a signal cut the poll short: asked again, but not for ever where every answer is that
+				_, _, errno = syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
+				hook(&afterTaken, false)
+			}
+			return p.revents != 0 || errno != 0 // refused, as a seccomp profile can, a poll would never see the writers go
 		})
 	}
 }

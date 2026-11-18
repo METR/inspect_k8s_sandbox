@@ -1721,6 +1721,58 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	unheld(t, pipe, "which it had stopped reading and no process has open to write")
 }
 
+func TestAPipeIsLetGoWhereThePollIsRefusedOrCutShortEveryTime(t *testing.T) {
+	for _, poll := range []struct {
+		answer syscall.Errno // as a seccomp profile can answer ppoll: a refusal, and what a signal makes of the call
+		again  bool
+	}{{syscall.EPERM, false}, {syscall.EINTR, true}} {
+		t.Run(poll.answer.Error(), func(t *testing.T) {
+			var polls atomic.Int32
+			note := func(bool) { polls.Add(1) }
+			afterTaken.Store(&note)
+			t.Cleanup(func() { afterTaken.Store(nil) })
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close() // a writer that stays
+			let := make(chan syscall.Errno, 1)
+			go func() {
+				runtime.LockOSThread() // the filter is this thread's, which ends with this goroutine
+				filter := []syscall.SockFilter{
+					{Code: 0x20, K: 0},                             // the call's number
+					{Code: 0x15, Jf: 1, K: syscall.SYS_PPOLL},      // not ppoll: allowed
+					{Code: 0x06, K: 0x50000 | uint32(poll.answer)}, // SECCOMP_RET_ERRNO
+					{Code: 0x06, K: 0x7fff0000},                    // SECCOMP_RET_ALLOW
+				}
+				prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+				const prSetNoNewPrivs, prSetSeccomp, seccompModeFilter = 38, 22, 2
+				prctl(prSetNoNewPrivs, 1) // without it a filter needs CAP_SYS_ADMIN
+				_, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog)))
+				if errno == 0 {
+					held <- struct{}{}
+					closeOnceUnheld(r)
+				}
+				let <- errno
+			}()
+
+			go w.Write(make([]byte, leftOutput)) // what execd takes of it: it then polls
+
+			select {
+			case errno := <-let:
+				if errno != 0 {
+					t.Fatalf("seccomp: %v", errno)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("execd waits on a pipe whose poll never says that its writers have gone: it holds the pipe, and a goroutine, for as long as the pod")
+			}
+			if got := polls.Load(); got > 1 != poll.again {
+				t.Fatalf("execd polled %d times: a refusal is final, and a poll a signal cut short is asked again", got)
+			}
+		})
+	}
+}
+
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
