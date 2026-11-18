@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix a chart being refused as declaring no sandbox when it renders its sandbox inside a
+  typed list such as a `StatefulSetList`.
 - A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
   This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
 - A pod annotated

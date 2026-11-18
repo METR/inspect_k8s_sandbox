@@ -1032,7 +1032,7 @@ class _ManifestLoader(yaml.SafeLoader):
 
 
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
-    """The manifest Helm rendered, as parsed documents.
+    """The objects of the manifest Helm rendered, as parsed documents.
 
     Raises RuntimeError if Helm's output cannot be read: treating that as "nothing to
     wait for" is how a release comes to be handed over before its pods exist.
@@ -1040,7 +1040,7 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     try:
         manifest = json.loads(install_stdout)["manifest"]
         # load_all is lazy, so force the parse inside the try.
-        return list(yaml.load_all(manifest, Loader=_ManifestLoader))
+        return list(_objects(yaml.load_all(manifest, Loader=_ManifestLoader)))
     except Exception as e:
         _raise_runtime_error(
             "Could not read the rendered manifest from Helm, so the sandboxes to wait "
@@ -1048,6 +1048,21 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
             release=release_name,
             from_exception=e,
         )
+
+
+def _objects(docs: Iterable[Any]) -> Iterator[Any]:
+    """Each object Helm installs: a document with `items` is a list of them."""
+    for doc in docs:
+        if not isinstance(doc, dict) or "items" not in doc:
+            yield doc
+            continue
+        # As Kubernetes decodes a list: an item that names neither takes both from it.
+        typed = {
+            "apiVersion": doc.get("apiVersion"),
+            "kind": doc["kind"].removesuffix("List"),
+        }
+        for item in doc["items"] or []:
+            yield item if item.get("kind") or item.get("apiVersion") else item | typed
 
 
 def _get_expected_services(docs: list[Any], release_name: str) -> frozenset[str]:
@@ -1077,8 +1092,6 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
         kind = _dig(doc, "kind")
         if kind == "Pod":
             yield from _service_name(_dig(doc, "metadata"))
-        elif kind == "List":
-            yield from _declared_services(_dig(doc, "items") or [])
         elif kind == "CronJob":
             yield from _service_name(
                 _dig(doc, "spec", "jobTemplate", "spec", "template", "metadata")
@@ -1092,22 +1105,9 @@ def _stateful_set_pods(
 ) -> Iterator[str]:
     """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
-        kind = _dig(doc, "kind")
-        if isinstance(kind, str) and kind.endswith("List"):
-            # Helm installs an item that names neither as its list's kind and version.
-            items = [
-                item
-                | {
-                    "apiVersion": item.get("apiVersion") or _dig(doc, "apiVersion"),
-                    "kind": item.get("kind") or kind.removesuffix("List"),
-                }
-                for item in _dig(doc, "items") or []
-                if isinstance(item, dict)
-            ]
-            yield from _stateful_set_pods(items, release_name, namespace)
         # The poll lists by this label in this namespace: no other pod is ever seen.
-        elif (
-            kind == "StatefulSet"
+        if (
+            _dig(doc, "kind") == "StatefulSet"
             # Another group's StatefulSet names its pods by rules of its own.
             and _dig(doc, "apiVersion") == "apps/v1"
             and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
@@ -1124,9 +1124,6 @@ def _stateful_set_pods(
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:
     """Every name a rendered manifest gives an object, whatever its kind."""
     for doc in docs:
-        if _dig(doc, "kind") == "List":
-            yield from _declared_object_names(_dig(doc, "items") or [])
-            continue
         name = _dig(doc, "metadata", "name")
         if name is not None:
             yield str(name)

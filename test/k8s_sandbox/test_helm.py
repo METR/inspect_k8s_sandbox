@@ -1345,11 +1345,12 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
         "kind: ConfigMap\nmetadata: {name: cm}\n",
         _stateful_set("default"),
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
+        "kind: StatefulSetList\nitems: [{metadata: {name: helper}}]\n",
     )
 
     names = frozenset(_declared_object_names(_rendered_docs(stdout, "abcdefgh")))
 
-    assert names == {"cm", "default", "svc"}
+    assert names == {"cm", "default", "svc", "helper"}
 
 
 @pytest.mark.parametrize(
@@ -1428,6 +1429,16 @@ def _services(stdout: str) -> frozenset[str]:
             ),
             {"a", "b"},
             id="list-wrapping-pods",
+        ),
+        # Helm installs an item that names no kind as the kind its list names.
+        pytest.param(
+            _manifest(
+                "kind: PodList\nitems: ["
+                + _list_item("a").replace("kind: Pod, ", "")
+                + "]"
+            ),
+            {"a"},
+            id="typed-list-wrapping-pods",
         ),
         # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
