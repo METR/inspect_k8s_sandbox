@@ -16,7 +16,7 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
                inspect-k8s-sandbox/gate:NoSchedule while the sandbox is deleted
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
-  KEEP=1       leave the release installed when a step fails: the gate then ends before step 7, which uninstalls it
+  KEEP=1       leave the release installed when a step fails: the gate then ends before it deletes anything more
 It needs helm, kubectl, python3 and RBAC to patch nodes, and leaves nothing behind: one helm release, and one pod
 with the node's process list and a read-only mount of its VM directories. A run killed in step 7 leaves the taint,
 and no launcher comes to NODE until `kubectl taint node NODE inspect-k8s-sandbox/gate-`. Exit 0: every step passed.
@@ -37,13 +37,13 @@ SANDBOX=agent-env-$REL-default-0
 k() { kubectl --context "$CONTEXT" --request-timeout=60s "$@"; }
 h() { HELM_DRIVER=configmap helm --kube-context "$CONTEXT" --namespace "$NS" "$@"; }
 failed=0
-kept="helm release $REL and pod $REL-peek"
 say() { echo "== $(date -u +%T) $*"; }
 pass() { echo "   PASS  $*"; }
 fail() { echo "   FAIL  $*"; failed=1; }
 in_sandbox() { k -n "$NS" exec "$SANDBOX" -c default -- "$@"; }
 peek() { k -n "$NS" exec "$REL-peek" -- sh -c "$1"; }
 launcher() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node,status.phase=Running" -o jsonpath='{.items[0].metadata.name}'; }
+keep() { [ "$failed" = 0 ] || [ "${KEEP:-}" != 1 ] || { echo; echo "GATE FAILED $(date -u +%FT%TZ) on $NODE: with KEEP=1 it ends before $*"; exit 1; }; }
 wait_for() { # wait_for SECONDS COMMAND...: until the command succeeds
   local end=$(( $(date +%s) + $1 )); shift
   until "$@" > /dev/null 2>&1; do [ "$(date +%s)" -lt "$end" ] || return 1; sleep 2; done
@@ -51,7 +51,7 @@ wait_for() { # wait_for SECONDS COMMAND...: until the command succeeds
 cleanup() {
   [ -n "${canary:-}" ] && kill "$canary" 2> /dev/null
   [ -n "${tainted:-}" ] && k taint node "$node" "$TAINT-" > /dev/null 2>&1
-  [ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && { echo "   kept: $kept in $NS"; return; }
+  [ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && { echo "   kept: what is left of helm release $REL and pod $REL-peek in $NS"; return; }
   h uninstall "$REL" --ignore-not-found --wait --timeout 120s > /dev/null 2>&1
   k -n "$NS" delete pod "$REL-peek" --ignore-not-found --wait=false > /dev/null 2>&1
 }
@@ -215,6 +215,7 @@ kill "$canary" 2> /dev/null; canary=
 case "$contract" in *"ok: "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
 
+keep "step 6a deletes the sandbox's pod"
 say "6a. the sandbox's pod is deleted while its node's launcher runs: its worker and VM directory go, and the pod that follows gets a worker from that launcher"
 at() { peek "tr '\\0' ' ' < /proc/${1:-none}/cmdline" 2> /dev/null | sed -n 's|.* -vsock [^ ]*/\([0-9a-f]\{12\}\)/root/vm.vsock .*|\1|p'; } # a worker's VM directory
 by() { peek "awk '/^PPid/{print \$2}' /proc/${1:-none}/status" 2> /dev/null; } # and the process that started it: its launcher
@@ -236,7 +237,7 @@ else
   fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
 fi
 
-[ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && exit 1 # before step 7 deletes the launcher and uninstalls the release
+keep "step 7 deletes the launcher and uninstalls the release"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
 old=$(launcher)
@@ -248,7 +249,8 @@ k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the
 # With no grace period a pod leaves the API before its node has stopped it: --now gives the launcher one second, whatever its DaemonSet sets.
 k -n "$LNS" delete pod "$old" --now --wait=false > /dev/null
 wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" || fail "the launcher $old is still there"
-h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 && kept="pod $REL-peek" || fail "helm uninstall"
+keep "the release is uninstalled"
+h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
 if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 dir_gone "$vm"; then
   back=$(k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o name) && [ -z "$back" ] \
