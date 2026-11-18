@@ -206,17 +206,9 @@ def test_a_pod_being_deleted_is_not_ready():
     assert snapshot.ready is False
 
 
-def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
-    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
-    events = [
-        {"type": "ADDED", "object": _pod_body(uid="p")},
-        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
-        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
-    ]
-    asked: list[str] = []
-
+def _watch(events: list[dict], asked: list[str]) -> list[PodSnapshot]:
     class Watched(http.server.BaseHTTPRequestHandler):
-        """An API server that answers a watch with three events and ends it."""
+        """An API server that answers a watch with the events and ends it."""
 
         def do_GET(self) -> None:
             asked.append(self.path)
@@ -237,13 +229,35 @@ def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
                 )
             )
         )
-        pods = list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
+        return list(watch_pods(api, "ns", label_selector="app", timeout_seconds=1))
+
+
+def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
+    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    events = [
+        {"type": "ADDED", "object": _pod_body(uid="p")},
+        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
+        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
+    ]
+    asked: list[str] = []
+
+    pods = _watch(events, asked)
 
     assert [pod.ready for pod in pods] == [False, True]
     target = urllib.parse.urlsplit(asked[0])
     asks = urllib.parse.parse_qs(target.query)
     assert target.path == "/api/v1/namespaces/ns/pods"
     assert (asks["labelSelector"], asks["resourceVersion"]) == (["app"], ["0"])
+
+
+def test_watch_pods_raises_the_error_a_watch_ends_with():
+    # A watch that has expired says so in its stream: the request itself was answered.
+    gone = {"kind": "Status", "code": 410, "reason": "Expired", "message": "too old"}
+
+    with pytest.raises(kubernetes.client.ApiException, match="Expired") as e:
+        _watch([{"type": "ERROR", "object": gone}], [])
+
+    assert e.value.status == 410
 
 
 @pytest.mark.parametrize(

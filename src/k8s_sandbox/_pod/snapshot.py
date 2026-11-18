@@ -136,13 +136,12 @@ def watch_pods(
 ) -> Iterator[PodSnapshot]:
     """Each pod as it is and then as it changes, until the server ends the watch."""
     for event in watch.Watch().stream(
-        api.list_namespaced_pod,
-        namespace,
+        # The client reads the model to build from a docstring, and this call has none.
+        lambda **asks: api.list_namespaced_pod(namespace, **asks),
         label_selector=label_selector,
         resource_version="0",
         timeout_seconds=timeout_seconds,
         _request_timeout=(5, timeout_seconds + 30),
-        deserialize=False,  # as list_pods does: see the module's docstring
     ):
         if event["type"] in ("ADDED", "MODIFIED"):
             yield _parse_pod(event["object"])
