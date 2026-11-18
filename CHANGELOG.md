@@ -5,9 +5,9 @@
 - Fix a chart being refused as declaring no sandbox when it renders its sandbox inside a
   typed list such as a `StatefulSetList`.
 - Fix a sandbox being handed over on a Pod that is being deleted.
-- **BREAKING CHANGE**: Fail the install as soon as Helm returns when every controller of
-  a sandbox is rendered with `replicas: 0`, where it waited until the timeout for a Pod.
-  Render each sandbox with at least one replica.
+- **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
+  declared only by controllers at `replicas: 0`, where it waited until the timeout for a
+  Pod. Render each sandbox with at least one replica.
 - Fix an install failing with "Could not read the rendered manifest" when the chart
   writes a number as `!!int 0X10` or `!!float 0x8`.
 - A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.

@@ -85,12 +85,12 @@ own labels, or a workload's `spec.template` labels.
 
 Two consequences worth knowing:
 
-* A chart that declares no `inspect/service` Pod, or a sandbox with every controller at
-  `replicas: 0`, fails the install. If your Pods are created indirectly, by an operator
+* A chart that declares no `inspect/service` Pod fails the install rather than starting
+  an eval with no sandbox. If your Pods are created indirectly, by an operator
   reconciling a custom resource for instance, put the label on a Pod the chart itself
   renders, or use a [Helm post-install
   hook](https://helm.sh/docs/topics/charts_hooks/) which waits for a condition to be
-  met.
+  met. A sandbox declared only by controllers at `replicas: 0` fails the install too.
 * Pods the chart creates that are *not* sandboxes — a sidecar, a DaemonSet, a hook —
   still have to be Ready before the eval starts, but they cannot stand in for a
   sandbox. Neither can a Pod that has run to completion, since nothing can be exec'd
