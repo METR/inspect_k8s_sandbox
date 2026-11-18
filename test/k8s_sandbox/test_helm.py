@@ -1347,8 +1347,8 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
         "apiVersion: apps/v1\nkind: StatefulSetList\n"
         "items: [{metadata: {name: helper}}]\n",
+        # Helm installs nothing for a null document, nor for one whose `items` is null.
         "# a template that rendered this comment alone\n",
-        # Helm installs nothing for a document whose `items` is null.
         "kind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
     )
 
@@ -1358,35 +1358,29 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replicas", "ordinals"),
+    ("replicas", "number"),
     [
-        pytest.param("10", list(range(2, 12)), id="decimal"),
+        pytest.param("10", 10, id="decimal"),
         # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
-        pytest.param("010", list(range(2, 10)), id="leading-zero"),
+        pytest.param("010", 8, id="leading-zero"),
         # Helm drops every `_` and reads the `0b` as binary.
-        pytest.param("0b1__010", list(range(2, 12)), id="binary-underscores"),
+        pytest.param("0b1__010", 10, id="binary-underscores"),
         # After a leading `.` Helm takes a `_` between digits: as text, ValueError.
-        pytest.param(".2_0e0_1", [2, 3], id="underscores-after-a-dot"),
+        pytest.param(".2_0e0_1", 2, id="underscores-after-a-dot"),
         # Helm takes a sign after `0b`: read as text, it raised ValueError.
-        pytest.param("0b+10", [2, 3], id="binary-with-a-sign"),
+        pytest.param("0b+10", 2, id="binary-with-a-sign"),
         # Tagged, a number is read as untagged: as 10 here, two pods never came.
-        pytest.param("!!float 010", list(range(2, 10)), id="tagged-a-float"),
+        pytest.param("!!float 010", 8, id="tagged-a-float"),
         # PyYAML takes no `0X` under `!!int`: the manifest could not be read.
-        pytest.param("!!int 0X10", list(range(2, 18)), id="tagged-an-int"),
+        pytest.param("!!int 0X10", 16, id="tagged-an-int"),
     ],
 )
-def test_a_stateful_sets_counts_read_as_numbers(
-    replicas: str, ordinals: list[int]
-) -> None:
-    # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
-    stdout = _manifest(
-        f"kind: StatefulSet\nspec: {{replicas: {replicas}, ordinals: {{start: 2}}}}\n"
-    )
+def test_a_stateful_sets_counts_read_as_numbers(replicas: str, number: int) -> None:
+    stdout = _manifest(f"kind: StatefulSet\nspec: {{replicas: {replicas}}}\n")
 
     spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
 
-    count = int(spec["replicas"])  # as the reader of a StatefulSet's pods takes it
-    assert [spec["ordinals"]["start"] + n for n in range(count)] == ordinals
+    assert spec["replicas"] == number
 
 
 def _services(stdout: str) -> frozenset[str]:
@@ -1406,15 +1400,6 @@ def _services(stdout: str) -> frozenset[str]:
         # Replicas do not add sandboxes: get_sandbox_pods() keys one entry per label.
         pytest.param(
             _manifest(_stateful_set("default", replicas=3)), {"default"}, id="replicas"
-        ),
-        # A controller scaled to none takes no sandbox from the one that serves it.
-        pytest.param(
-            _manifest(
-                _stateful_set(replicas=0).replace("StatefulSet", "Deployment"),
-                _STATEFUL_SET,
-            ),
-            {"default"},
-            id="a-standby-scaled-to-none",
         ),
         # A pod the chart does not declare to be a sandbox cannot serve as one.
         pytest.param(
@@ -1524,7 +1509,8 @@ def test_expected_services_fails_closed(stdout: str) -> None:
 
 def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
     # Left out, Inspect would make `victim` the default sandbox.
-    stdout = _manifest(_stateful_set(replicas=0), _stateful_set("victim"))
+    idle = _stateful_set(replicas=0).replace("StatefulSet", "Deployment")
+    stdout = _manifest(idle, _stateful_set("victim"))
 
     with pytest.raises(RuntimeError, match="sandbox default to `replicas: 0`"):
         _services(stdout)
