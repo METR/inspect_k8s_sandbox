@@ -445,12 +445,13 @@ async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
         started = docker(*run, sandbox.name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         await start_execd(forwards, False, "--port", str(PORT))
-        await forwards.until("grep -q 'eth0 *fe80' /proc/net/anycast6")  # answers there
+        await forwards.until("grep -q 'eth0 *fe800* ' /proc/net/anycast6")
+
         probe = docker("exec", forwards.name, "python3", "-c", ANYCAST_PROBE, str(PORT))
     finally:
         docker("rm", "-f", forwards.name)
 
-    assert (probe.stdout, probe.stderr) == ("closed\n", "")
+    assert (probe.returncode, probe.stdout) == (0, "closed\n"), probe.stderr
 
 
 async def test_another_users_process_is_refused_at_execds_socket(

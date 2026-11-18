@@ -140,8 +140,8 @@ func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
 	} {
 		ip, subnet, _ := net.ParseCIDR(peer.own)
 		interfaceAddrs = func() ([]net.Addr, error) { return []net.Addr{&net.IPNet{IP: ip, Mask: subnet.Mask}}, nil }
-		if fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}) != peer.refused {
-			t.Errorf("a connection from %s to a pod at %s: refused is %t, want %t", peer.from, peer.own, !peer.refused, peer.refused)
+		if refused := fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}); refused != peer.refused {
+			t.Errorf("a connection from %s to a pod at %s: refused is %t, want %t", peer.from, peer.own, refused, peer.refused)
 		}
 	}
 }
