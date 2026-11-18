@@ -229,7 +229,7 @@ def _watch(events: list[dict], asked: list[str]) -> list[PodSnapshot]:
                 )
             )
         )
-        return list(watch_pods(api, "ns", label_selector="app", timeout_seconds=1))
+        return list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
 
 
 def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
@@ -248,10 +248,11 @@ def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
     asks = urllib.parse.parse_qs(target.query)
     assert target.path == "/api/v1/namespaces/ns/pods"
     assert (asks["labelSelector"], asks["resourceVersion"]) == (["app"], ["0"])
+    assert asks["watch"] == ["True"]  # or the call would list the pods once
 
 
 def test_watch_pods_raises_the_error_a_watch_ends_with():
-    # A watch that has expired says so in its stream: the request itself was answered.
+    # Told not to deserialize, the client raised KeyError('raw_object') for this event.
     gone = {"kind": "Status", "code": 410, "reason": "Expired", "message": "too old"}
 
     with pytest.raises(kubernetes.client.ApiException, match="Expired") as e:
