@@ -245,8 +245,11 @@ owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
   || { fail "the pod '$old' is not one of DaemonSet $LAUNCHERS: it is left alone"; exit 1; }
 # The taint keeps the DaemonSet from putting a launcher back on the node before the sandbox has gone.
 k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the node was not tainted $TAINT"; exit 1; }
+# A pod can leave the API before its node has stopped it: that the launcher's process has gone is the node's own word.
+lpid=$(by "${now:-}"); down() { [ "$(peek "[ -e /proc/${lpid:-self} ] || echo down")" = down ]; }
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
-wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" || fail "the launcher $old is still there"
+wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 60 down \
+  || fail "the launcher $old is still there, or its process '$lpid' was not seen to end on the node"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
 if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 dir_gone "$vm"; then
@@ -256,8 +259,11 @@ else
   fail "the sandbox pod, or its VM directory $vm, is still there"
 fi
 k taint node "$node" "$TAINT-" > /dev/null && tainted= || fail "the taint $TAINT was not taken off $node"
-wait_for 120 sh -c "[ -n \"\$(kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pods -l '$selector' --field-selector 'spec.nodeName=$node,status.phase=Running' -o name | grep -v '$old')\" ]" \
-  && pass "a new launcher runs on the node: $(launcher) (the old one was $old)" || fail "no new launcher on $node"
+# Running is also the phase of a launcher that keeps ending: this one is Ready and has not restarted, now and ten seconds on.
+steady() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status} {.status.containerStatuses[*].restartCount}{"\n"}{end}' | grep -v "^$old " | grep -E ' True( 0)+$'; }
+stays() { local first; first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
+wait_for 120 stays && pass "a new launcher runs on the node, Ready and not restarted in 10 s: $(launcher) (the old one was $old)" \
+  || fail "no new launcher stays up on $node: $(k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" 2>&1 | tr '\n' '|')"
 # The node names each worker and the VM directory it finds, then says `looked`: an exec that fails, or is cut short, does not.
 left() { echo $(workers "[ -e /vms/$vm ] && echo /vms/$vm; [ -e /vms/. ] && echo looked"); }
 gone() { found=$(left); [ "$found" = looked ]; }
