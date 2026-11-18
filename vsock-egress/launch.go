@@ -239,7 +239,7 @@ type launcher struct {
 const faultAgain = time.Minute
 
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, started: map[string]bool{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, had: map[string]bool{}, started: map[string]bool{}}
 }
 
 func launch(args []string) error {
@@ -264,12 +264,6 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	if l.had == nil { // its first pass: a record with no directory is then a sandbox deleted before this launcher started
-		l.had = map[string]bool{}
-		for _, r := range records {
-			l.had[r.ContainerID] = true
-		}
-	}
 	wanted, present, vms := map[string]sandbox{}, map[string]bool{}, map[uint32]int{}
 	for _, r := range records {
 		if sb, err := l.sandbox(r); err == nil {
@@ -290,10 +284,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
 		}
+		_, bound := os.Stat(sb.netns)
 		switch {
 		case err == nil:
 			wanted[r.ContainerID] = sb
 		case gone && l.had[r.ContainerID]: // its sandbox is being deleted: the directory goes before the record does
+		case gone && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
 		default:
 			l.fault(r.ContainerID, sb.pod, err)
 		}

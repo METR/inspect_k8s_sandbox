@@ -125,9 +125,6 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 			synctest.Test(t, func(t *testing.T) {
 				out := capture(t)
 				l := fakeNode(t)
-				if _, err := l.wanted(); err != nil { // the launcher was there before the sandbox
-					t.Fatal(err)
-				}
 				proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 				vm := filepath.Join(l.vms, id("a")[:12])
@@ -157,7 +154,7 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 	}
 }
 
-func TestLauncherThatStartsAfterASandboxWentRaisesNoFaultForIt(t *testing.T) {
+func TestRecordThatOutlivedItsSandboxRaisesNoFault(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
@@ -167,10 +164,11 @@ func TestLauncherThatStartsAfterASandboxWentRaisesNoFaultForIt(t *testing.T) {
 			if _, err := l.wanted(); err != nil {
 				t.Fatal(err)
 			}
+			l.netns = l.vms // its network namespace goes after this launcher's first pass: that directory holds none of the record's name
 			time.Sleep(time.Minute)
 		}
 		if out.String() != "" {
-			t.Fatalf("the log is %q: want nothing of a sandbox that had gone before the launcher started", out.String())
+			t.Fatalf("the log is %q: want nothing of a sandbox that has gone and left its record", out.String())
 		}
 	})
 }
@@ -297,10 +295,10 @@ func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		if _, err := l.wanted(); err != nil { // the launcher was there before the sandbox
+		l.netns = l.vms // where the pod's network namespace is a file and bound to none, as a mount without the node's propagation shows it
+		if err := os.WriteFile(filepath.Join(l.netns, "net"), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		l.netns = filepath.Join(l.vms, "none") // where no pod's network namespace is bound
 		proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 		addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // its VM's directory follows its record
