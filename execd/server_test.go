@@ -503,6 +503,22 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	}
 }
 
+func TestACommandKilledAtItsTimeoutLeavesNoLineForItsSignal(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag, Timeout: 0.05})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+
+	s.dispatch(c, frame{kind: fStart, id: 9, payload: req})
+
+	for f := nextFrame(t, frames); f.kind != fExit; f = nextFrame(t, frames) {
+		if f.kind == fStderr {
+			t.Fatalf("stderr %q: the line counts against its caller's output limit, where the command's own output was within it", f.payload)
+		}
+	}
+}
+
 func TestACommandItsClientsKillEndedSaysSoInItsExit(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching

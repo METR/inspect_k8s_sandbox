@@ -549,7 +549,7 @@ func (cl *call) run(req startRequest) error {
 		done := make(chan struct{})
 		go func() {
 			drained.Wait()
-			if said := signalLine(ws); said != "" { // after the command's own stderr, as a shell's line is
+			if said := signalLine(ws); said != "" && !byTimeout { // after the command's own stderr, as a shell's line is; none for a timeout's kill: its caller is told of the timeout
 				cl.output(1, []byte(said))
 			}
 			close(done)

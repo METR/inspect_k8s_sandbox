@@ -1585,7 +1585,7 @@ async def test_an_exit_that_comes_as_our_writes_wait_behind_a_stuck_one_is_kept(
     assert (result.returncode, result.stdout) == (3, "x" + last.decode())
 
 
-async def test_an_exit_queued_behind_more_output_than_we_hold_is_kept(
+async def test_an_exit_that_follows_more_output_than_we_hold_is_kept(
     daemons: Daemons, clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: our kill's wait gave up past HOLD, its command's exit queued."""
@@ -1615,7 +1615,7 @@ async def test_an_exit_queued_behind_more_output_than_we_hold_is_kept(
                 pass
         sent.clear()
         for kind in (execd.STDOUT, execd.STDERR):
-            for _ in range(4):  # all that execd sends of a stream unacked
+            for _ in range(4):  # within what execd sends of a stream unacked
                 w.write(frame(kind, call_id, full))
         w.write(frame(execd.EXIT, call_id, b'{"code": 3}'))
         await r.read()
