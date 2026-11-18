@@ -240,8 +240,9 @@ fi
 keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
-# A launcher that started again since 6a is another process: the one seen to go must still be the worker's parent.
-[ -n "${from:-}" ] && [ "$(by "${now:-}")" = "$from" ] || fail "the launcher's process '${from:-}' is not the parent of the pod's worker '${now:-}' before the delete"
+# The node names each launcher's process, then says `looked`: the worker's parent is one before the delete, and none is left once the launcher is down.
+launchers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^[^ ]*vsock-egress launch" && echo ${p#/proc/}; done; echo looked' | tr '\n' ' '; }
+case " $(launchers)" in *" ${from:-none} "*looked*) ;; *) fail "the node does not name the parent of the pod's worker, '${from:-}', among its launcher processes before the delete" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
 owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
@@ -250,10 +251,10 @@ owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
 # The taint keeps the DaemonSet from putting a launcher back on the node before the sandbox has gone.
 k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the node was not tainted $TAINT"; exit 1; }
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
-# A pod can leave the API before its node has stopped it: that the launcher's process has gone is the node's own word.
-down() { [ "$(peek "[ -e /proc/$from ] || echo down")" = down ]; }
-wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && [ -n "${from:-}" ] && wait_for 30 down \
-  || fail "the launcher $old is still there, or its process '${from:-}' was not seen to end"
+# A pod can leave the API before its node has stopped it: that no launcher's process is left is the node's own word.
+down() { [ "$(launchers)" = "looked " ]; }
+wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 30 down \
+  || fail "the launcher $old is still there, or the node still names a launcher's process: '$(launchers)'"
 keep "the release is uninstalled"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
