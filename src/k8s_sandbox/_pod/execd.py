@@ -1,4 +1,4 @@
-"""Commands and file transfer over TLS to execd in the sandbox, never exec stdin."""
+"""Commands and file transfer over TLS to execd in the sandbox."""
 
 from __future__ import annotations
 
@@ -43,8 +43,10 @@ from k8s_sandbox._pod.read import read_command
 logger = logging.getLogger(__name__)
 
 ANNOTATION = "inspect-k8s-sandbox/execd"
+TRANSPORTS = ("true", "stdio")  # its values: execd's port, or one exec's stdio
 EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
 EXECD_PORT = 14601  # below every runtime's ephemeral ports: gVisor's start at 16000
+EXECD_SOCKET = "inspect-k8s-sandbox-execd"  # abstract: where a pod has no network card
 
 AUTH, START, STDIN, KILL, RESUME, RELEASE, PING, ACK = 1, 2, 3, 4, 5, 6, 7, 8
 OK, STDOUT, STDERR, EXIT, PONG, ERROR, RESUMED, STDIN_ACK = (
@@ -79,6 +81,9 @@ RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 SLICE = RAW_READ // 3 + 1  # to TLS at once: 8 KiB slowed bulk reads, 64 held the loop
 PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
+# shortcut for aws/containers-roadmap#2913: drop the gap and the cap with its fix
+MESSAGE_GAP = 0.001
+MESSAGE_SIZE = 64 << 10
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -97,6 +102,8 @@ class Daemon:
     fingerprint: str
     key: bytes = field(repr=False)
     pod: str = ""  # the pod's UID
+    # Opens an exec joined to the daemon's socket, for a pod with no network card.
+    stdio: Callable[[], Awaitable[ByteStream]] | None = None
 
 
 class Dropped(Exception):
@@ -113,7 +120,8 @@ class DaemonRunning(Exception):
 
 def _port_held() -> RuntimeError:
     return RuntimeError(
-        f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
+        f"execd's TCP port {EXECD_PORT} or socket in the sandbox is held by a process "
+        "other than execd"
     )
 
 
@@ -126,8 +134,8 @@ class _Pipe:
 
     def __init__(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader | _Stdio,
+        writer: asyncio.StreamWriter | _Stdio,
         context: ssl.SSLContext,
         pace: Pace,
     ) -> None:
@@ -212,6 +220,78 @@ class _Pipe:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
+_closing: set[asyncio.Future[None]] = set()  # held until their execs have closed
+
+
+class _Stdio:
+    """An exec's stdio, as the reader, writer and transport _Pipe has of TCP."""
+
+    def __init__(self, stdio: ByteStream) -> None:
+        self._stdio = stdio
+        self._out = bytearray()
+        self._written, self._taken = asyncio.Event(), asyncio.Event()
+        self._closed = False
+        self.transport = self
+        self._sender = asyncio.ensure_future(self._send())
+
+    async def read(self, n: int) -> bytes:
+        try:
+            return await self._stdio.receive(n)
+        except (
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ):
+            return b""  # as a socket reads its end
+
+    def write(self, data: bytes) -> None:
+        self._out += data
+        self._written.set()
+
+    async def drain(self) -> None:
+        while len(self._out) > RAW_READ and not self._closed:
+            self._taken.clear()
+            await self._taken.wait()
+        if self._closed:
+            raise ConnectionResetError("the exec that reaches execd ended")
+
+    async def _send(self) -> None:
+        """A message at a time: what is written meanwhile goes in the next ones."""
+        try:
+            while True:
+                await self._written.wait()
+                self._written.clear()
+                while self._out:
+                    data = bytes(self._out[:MESSAGE_SIZE])
+                    del self._out[:MESSAGE_SIZE]
+                    self._taken.set()
+                    await self._stdio.send(data)
+                    # A timer takes a busy loop up to three turns a message: yield once.
+                    due = time.monotonic() + MESSAGE_GAP
+                    await asyncio.sleep(0)
+                    if (left := due - time.monotonic()) > 0:
+                        await asyncio.sleep(left)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            self.abort()  # the reader sees the end, as of a port reset under a write
+
+    def pause_reading(self) -> None:
+        """Nothing to pause: an exec is read only when read() asks."""
+
+    resume_reading = pause_reading
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._sender.cancel()
+            self._taken.set()
+            closing = asyncio.ensure_future(self._stdio.aclose())
+            _closing.add(closing)
+            closing.add_done_callback(_closing.discard)
+
+
 async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     # The certificate is self-signed: it is trusted by its fingerprint, below.
@@ -221,8 +301,15 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     # One group: a stand-in can't pick a 150 ms one. Python 3.10 can't set X25519.
     context.set_ecdh_curve("prime256v1")
 
+    # Before the timeout: its exec waits its turn among the pod's operations.
+    stdio = None if daemon.stdio is None else _Stdio(await daemon.stdio())
+
     async def handshake() -> _Pipe:
-        reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        reader, writer = (
+            (stdio, stdio)
+            if stdio
+            else await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        )
         pipe = _Pipe(reader, writer, context, pace)
         try:
             await pipe.handshake()

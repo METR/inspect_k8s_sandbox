@@ -26,6 +26,11 @@ data:
           {{- end }}
         {{- end }}
 
+        {{- range .Values.additionalResourceDnsRecords }}
+        # {{ . }}, a Service that additionalResources adds
+        rewrite name exact {{ template "agentEnv.fullname" $ -}}-{{ . }} {{ template "agentEnv.fullname" $ -}}-{{ . }}.{{ $.Release.Namespace }}.svc.cluster.local
+        {{- end }}
+
         # Forward all queries to the Kubernetes cluster DNS server.
         forward . {{ if .Values.corednsUpstream }}{{ join " " .Values.corednsUpstream }}{{ else }}/etc/resolv.conf{{ end }} {
             # Bound memory use when an untrusted workload floods the local resolver.

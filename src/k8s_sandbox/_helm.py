@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import itertools
 import json
 import logging
 import math
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -38,12 +40,14 @@ from k8s_sandbox._logger import (
 )
 from k8s_sandbox._pod import Pod
 from k8s_sandbox._pod.execd import ANNOTATION as EXECD_ANNOTATION
-from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods
+from k8s_sandbox._pod.execd import TRANSPORTS as EXECD_TRANSPORTS
+from k8s_sandbox._pod.snapshot import PodSnapshot, list_pods, watch_pods
 
 DEFAULT_CHART = Path(__file__).parent / "resources" / "helm" / "agent-env"
 DEFAULT_TIMEOUT = 600  # 10 minutes
 MAX_INSTALL_ATTEMPTS = 3
 _READINESS_POLL_INTERVAL = 2  # seconds; the cadence `helm install --wait` used
+_READY_WATCH_SECONDS = 300  # after which the server ends a watch and it starts again
 # Without one, the client can wait on a stalled socket indefinitely.
 _LIST_PODS_READ_TIMEOUT = (5, 30)  # (connect, read) seconds
 INSTALL_RETRY_DELAY_SECONDS = 5
@@ -64,9 +68,17 @@ HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
 # read it by the same rule, so a release cannot pass readiness while a sandbox the
 # caller is about to ask for is missing.
 _SERVICE_LABEL = "inspect/service"
+# The label a release's pods are listed by.
+_INSTANCE_LABEL = "app.kubernetes.io/instance"
+_ReadyWaits = dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]]
+# Each namespace with a watch running: its waiting releases' loops and wake-up events.
+_ready_waits: dict[tuple[str | None, str], _ReadyWaits] = {}
+_ready_waits_lock = threading.Lock()
 # A pod in one of these has stopped for good. Its controller may already have made a
 # replacement, so both can carry the same sandbox label at once.
 _TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
+# Kubernetes is designed for 150,000 pods in a cluster: the client names no more.
+_MOST_PODS = 150_000
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +268,8 @@ class Release:
         self._extra_values = dict(extra_values) if extra_values else {}
         # The sandboxes the rendered chart declares; set by _install().
         self._expected_services: frozenset[str] = frozenset()
+        # The pods the rendered chart's StatefulSets make; set by _install().
+        self._expected_pods: frozenset[str] = frozenset()
         # The names of everything the chart rendered; set by _install(). A sandbox
         # whose controller cannot create a pod is only explained by an event on that
         # controller, which carries no pod name to be found by.
@@ -377,9 +391,9 @@ class Release:
         sandboxes = dict()
         for pod in _sandbox_pods(pods):
             default_container_name = pod.container_names[0]
-            execd = pod.annotations.get(EXECD_ANNOTATION) == "true"
+            execd = pod.annotations.get(EXECD_ANNOTATION)
             if (
-                execd
+                execd in EXECD_TRANSPORTS
                 and pod.shares_pids
                 and self.restarted_container_behavior == "raise"
             ):
@@ -458,6 +472,16 @@ class Release:
             await self._raise_install_error(result)
         docs = _rendered_docs(result.stdout, self.release_name)
         self._expected_services = _get_expected_services(docs, self.release_name)
+        pods = _stateful_set_pods(docs, self.release_name, self._namespace)
+        # No further: a name for every replica asked for can take all of memory.
+        names = list(itertools.islice(pods, _MOST_PODS + 1))
+        if len(names) > _MOST_PODS:
+            _raise_runtime_error(
+                f"The release's StatefulSets ask for more than {_MOST_PODS} pods, the "
+                "most the client waits for by name.",
+                release=self.release_name,
+            )
+        self._expected_pods = frozenset(names)
         self._object_names = frozenset(_declared_object_names(docs))
 
     async def _raise_install_error(self, result: ExecResult[str]) -> NoReturn:
@@ -524,7 +548,7 @@ class Release:
         return list_pods(
             k8s_client(self._context_name),
             self._namespace,
-            label_selector=f"app.kubernetes.io/instance={self.release_name}",
+            label_selector=f"{_INSTANCE_LABEL}={self.release_name}",
             resource_version="0" if allow_stale else None,
             request_timeout=_LIST_PODS_READ_TIMEOUT,
         )
@@ -535,12 +559,23 @@ class Release:
             pod.labels[_SERVICE_LABEL] for pod in _sandbox_pods(pods) if pod.ready
         }
 
+    def _missing_pods(self, pods: list[PodSnapshot]) -> frozenset[str]:
+        """The pods of the chart's StatefulSets which are not yet there and Ready."""
+        # A pod its controller has yet to create is in no list to be judged.
+        return self._expected_pods - {
+            pod.name for pod in pods if pod.phase != "Failed" and pod.ready
+        }
+
     def _is_ready(self, pods: list[PodSnapshot]) -> bool:
         """Whether `pods` means the release is ready to be handed to a caller."""
         # A terminally failed pod is replaced by its controller; a bare one that
         # cannot be replaced just leaves its sandbox missing until the deadline.
         live = [pod for pod in pods if pod.phase != "Failed"]
-        return not self._missing_services(pods) and all(map(_pod_ready, live))
+        return (
+            not self._missing_services(pods)
+            and all(map(_pod_ready, live))
+            and not self._missing_pods(pods)
+        )
 
     async def _wait_until_ready(self, deadline: float) -> list[PodSnapshot]:
         """Wait for the release's pods to report Ready.
@@ -551,33 +586,54 @@ class Release:
         saw_a_pod = False
         poll_error: Exception | None = None
         missing: frozenset[str] = self._expected_services
-        while True:
-            try:
-                pods = await asyncio.to_thread(self._list_release_pods, True)
-                saw_a_pod = saw_a_pod or bool(pods)
-                missing = self._missing_services(pods)
-                # The cache can lag reality in either direction, so confirm against a
-                # consistent read and hand those same pods on: nothing may change
-                # between the verdict and the sandbox the caller gets. One read per
-                # install, not per poll.
-                if self._is_ready(pods):
-                    confirmed = await asyncio.to_thread(self._list_release_pods)
-                    if self._is_ready(confirmed):
-                        return confirmed
-            except Exception as e:
-                # A blip must not fail an install. Keep the error: a persistent one
-                # (a missing RBAC rule, say) is not a capacity problem and must not
-                # be reported as one.
-                log_debug("Readiness poll failed; will retry.", error=e)
-                poll_error = e
-            else:
-                poll_error = None
-            if time.monotonic() >= deadline:
-                await self._raise_not_ready_error(saw_a_pod, poll_error, missing)
-            await asyncio.sleep(_READINESS_POLL_INTERVAL)
+        absent: frozenset[str] = self._expected_pods
+        fresh = False
+        with _woken_when_ready(
+            self._context_name, self._namespace, self.release_name
+        ) as woken:
+            while True:
+                try:
+                    # The cache may lag the watch that woke this read.
+                    pods = await asyncio.to_thread(self._list_release_pods, not fresh)
+                    saw_a_pod = saw_a_pod or bool(pods)
+                    missing = self._missing_services(pods)
+                    absent = self._missing_pods(pods)
+                    # The cache can lag reality in either direction, so confirm against
+                    # a consistent read and hand those same pods on: nothing may change
+                    # between the verdict and the sandbox the caller gets. One read
+                    # per install, not per poll.
+                    if self._is_ready(pods):
+                        if not fresh:
+                            pods = await asyncio.to_thread(self._list_release_pods)
+                        if self._is_ready(pods):
+                            return pods
+                except Exception as e:
+                    # A blip must not fail an install. Keep the error: a persistent
+                    # one (a missing RBAC rule, say) is not a capacity problem and must
+                    # not be reported as one.
+                    log_debug("Readiness poll failed; will retry.", error=e)
+                    poll_error = e
+                else:
+                    poll_error = None
+                if time.monotonic() >= deadline:
+                    await self._raise_not_ready_error(
+                        saw_a_pod, poll_error, missing, absent
+                    )
+                # Woken by a Ready pod; wait_for or a cancel scope can swallow a cancel.
+                wake = asyncio.ensure_future(woken.wait())
+                try:
+                    await asyncio.wait({wake}, timeout=_READINESS_POLL_INTERVAL)
+                finally:
+                    wake.cancel()
+                fresh = woken.is_set()
+                woken.clear()
 
     async def _raise_not_ready_error(
-        self, saw_a_pod: bool, poll_error: Exception | None, missing: frozenset[str]
+        self,
+        saw_a_pod: bool,
+        poll_error: Exception | None,
+        missing: frozenset[str],
+        absent: frozenset[str],
     ) -> NoReturn:
         extra = await self._pod_diagnostics()
         budget = f"{_get_timeout()}s"
@@ -606,6 +662,8 @@ class Release:
         extra["missing_sandboxes" if missing else "declared_sandboxes"] = ", ".join(
             sorted(missing or self._expected_services)
         )
+        if absent:
+            extra["missing_pods"] = ", ".join(sorted(absent))
         _raise_runtime_error(
             f"Helm release did not become ready within {budget}. Please see the docs "
             f"for why this might occur: {HELM_RELEASE_NOT_READY_URL}. Also consider "
@@ -761,6 +819,59 @@ def _get_uninstall_timeout() -> int:
     # Separate from INSPECT_HELM_TIMEOUT, which is legitimately set to hours: an
     # uninstall holds an uninstall permit and, on the error path, a sandbox slot.
     return _get_positive_environ_int(INSPECT_HELM_UNINSTALL_TIMEOUT, DEFAULT_TIMEOUT)
+
+
+@contextmanager
+def _woken_when_ready(
+    context_name: str | None, namespace: str, release_name: str
+) -> Generator[asyncio.Event, None, None]:
+    """An event set when the namespace's watch sees one of the release's pods Ready."""
+    key, woken = (context_name, namespace), asyncio.Event()
+    with _ready_waits_lock:
+        waits = _ready_waits.get(key)
+        if waits is None:
+            waits = {}
+            try:
+                threading.Thread(
+                    target=_watch_ready, args=(*key, waits), daemon=True
+                ).start()
+            except RuntimeError:
+                # Unregistered: this release polls unwoken, and the next asks again.
+                log_trace("No thread for the readiness watch.", release=release_name)
+            else:
+                _ready_waits[key] = waits
+        waits[release_name] = (asyncio.get_running_loop(), woken)
+    try:
+        yield woken
+    finally:
+        with _ready_waits_lock:
+            del waits[release_name]
+
+
+def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -> None:
+    """Wake a namespace's waiting releases as their pods turn Ready, while any waits."""
+    while True:
+        with _ready_waits_lock:
+            if not waits:
+                del _ready_waits[context_name, namespace]
+                return
+        try:
+            for pod in watch_pods(
+                k8s_client(context_name),
+                namespace,
+                label_selector=_INSTANCE_LABEL,
+                timeout_seconds=_READY_WATCH_SECONDS,
+            ):
+                if _pod_ready(pod):
+                    with _ready_waits_lock:
+                        wait = waits.get(pod.labels[_INSTANCE_LABEL])
+                    if wait is not None:
+                        with suppress(RuntimeError):  # its loop has closed
+                            wait[0].call_soon_threadsafe(wait[1].set)
+        except Exception as e:
+            # Without the watch a release is still polled.
+            log_debug("Readiness watch failed; will retry.", error=e)
+        time.sleep(1)
 
 
 def _install_semaphore() -> AsyncContextManager[object]:
@@ -974,6 +1085,40 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
             )
         else:
             yield from _service_name(_dig(doc, "spec", "template", "metadata"))
+
+
+def _stateful_set_pods(
+    docs: Iterable[Any], release_name: str, namespace: str
+) -> Iterator[str]:
+    """The name of each pod of the release that a manifest's StatefulSets make."""
+    for doc in docs:
+        kind = _dig(doc, "kind")
+        if isinstance(kind, str) and kind.endswith("List"):
+            # Helm installs an item that names neither as its list's kind and version.
+            items = [
+                item
+                | {
+                    "apiVersion": item.get("apiVersion") or _dig(doc, "apiVersion"),
+                    "kind": item.get("kind") or kind.removesuffix("List"),
+                }
+                for item in _dig(doc, "items") or []
+                if isinstance(item, dict)
+            ]
+            yield from _stateful_set_pods(items, release_name, namespace)
+        # The poll lists by this label in this namespace: no other pod is ever seen.
+        elif (
+            kind == "StatefulSet"
+            # Another group's StatefulSet names its pods by rules of its own.
+            and _dig(doc, "apiVersion") == "apps/v1"
+            and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
+            == release_name
+            and (_dig(doc, "metadata", "namespace") or namespace) == namespace
+        ):
+            replicas = _dig(doc, "spec", "replicas")
+            # Helm installs a whole number written as a float (`3.0`, `1e+06`).
+            start = int(_dig(doc, "spec", "ordinals", "start") or 0)
+            for ordinal in range(1 if replicas is None else int(replicas)):
+                yield f"{_dig(doc, 'metadata', 'name')}-{start + ordinal}"
 
 
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:

@@ -42,8 +42,20 @@ spec:
       {{- range $key, $value := $service.podAnnotations }}
       {{- $_ := set $podAnnotations $key $value }}
       {{- end }}
+      {{- $egressProxy := include "agentEnv.egressProxy" (dict "root" $ "service" $service) }}
+      {{- if $egressProxy }}
+      {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
+      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
+      {{- range .volumeMounts }}
+      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
       annotations:
         {{- include "agentEnv.toYaml" $podAnnotations | nindent 8 }}
+      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
+      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -66,8 +78,21 @@ spec:
         nameservers:
           - 127.0.0.1
       {{- end }}
+      {{- if and $noCard (include "shouldCreateDnsRecord" $service) }}
+      {{- /* No sidecar answers there, so the service's names lead to the pod itself. */}}
+      {{- $names := concat (list $name (printf "%s-%s" (include "agentEnv.fullname" $) $name)) ($service.additionalDnsRecords | default list) }}
+      {{- /* The kubelet writes them as one line of /etc/hosts, and musl reads no more than 510 bytes of a line. */}}
+      {{- $line := join "\t" (prepend $names "127.0.0.1") }}
+      {{- if gt (len $line) 510 }}{{ fail (printf "services.%s.additionalDnsRecords: in a pod with no network device its names are one line of /etc/hosts, here %d bytes, and musl resolves no name past byte 510 of a line" $name (len $line)) }}{{ end }}
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+            {{- range $names }}
+            - {{ . | quote }}
+            {{- end }}
+      {{- end }}
 
-      {{- if $service.initContainers }}
+      {{- if or $service.initContainers $egressProxy }}
       {{- /* A mount that names no volume of the Pod means the colon-separated volume of that name. */}}
       {{- $generated := dict }}
       {{- $volumeNames := empty $.Values.corednsUpstream | ternary (list "coredns-config" "resolv-conf") (list "coredns-config") }}
@@ -83,6 +108,34 @@ spec:
         {{- $_ := unset $generated . }}
       {{- end }}
       initContainers:
+      {{- if $egressProxy }}
+        {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
+        - name: egress-forwarder
+          image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
+          command: ["/vsock-egress", "forward", "-key", "/key/key"]
+          restartPolicy: Always
+          {{- /* The next container starts once the forwarder listens. An exec: no probe reaches a port of a pod with no network device. */}}
+          startupProbe:
+            exec:
+              command: ["/vsock-egress", "ready", "-key", "/key/key"]
+            periodSeconds: 1
+            failureThreshold: 30
+          volumeMounts:
+            - name: egress-forwarder-key
+              mountPath: /key
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            {{- /* The runtime's default profile refuses the one thing the forwarder needs, socket(AF_VSOCK). */}}
+            seccompProfile:
+              type: Localhost
+              localhostProfile: profiles/vsock-egress.json
+      {{- end }}
       {{- range $service.initContainers }}
         - name: {{ .name | quote }}
           image: {{ .image | quote }}
@@ -197,6 +250,7 @@ spec:
         securityContext:
           {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
+      {{- if not $noCard }}
       - name: coredns
         image: {{ quote $.Values.corednsImage }}
         command:
@@ -232,6 +286,7 @@ spec:
           - name: coredns-config
             mountPath: /etc/coredns
             readOnly: true
+      {{- end }}
       {{- with $.Values.extraContainers }}
         {{- include "agentEnv.toYaml" . | nindent 6 }}
       {{- end }}
@@ -244,9 +299,11 @@ spec:
         {{- include "agentEnv.toYaml" . | nindent 8 }}
       {{- end }}
       volumes:
+      {{- if not $noCard }}
         - name: coredns-config
           configMap:
             name: {{ template "agentEnv.fullname" $ -}}-coredns-configmap
+      {{- end }}
       {{- if not $.Values.corednsUpstream }}
         - name: resolv-conf
           configMap:
@@ -262,6 +319,13 @@ spec:
         {{- else }}
         -  {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
+      {{- end }}
+      {{- if $egressProxy }}
+        {{- /* Mounted by the forwarder alone: its key outlives a restart of it, and no other container reads it. */}}
+        - name: egress-forwarder-key
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
       {{- end }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:

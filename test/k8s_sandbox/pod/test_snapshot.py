@@ -1,6 +1,10 @@
+import http.server
 import json
+import threading
+import urllib.parse
 from unittest.mock import MagicMock
 
+import kubernetes.client
 import pytest
 
 from k8s_sandbox._pod.snapshot import (
@@ -9,6 +13,7 @@ from k8s_sandbox._pod.snapshot import (
     _parse_pod,
     list_pods,
     read_pod,
+    watch_pods,
 )
 
 
@@ -188,6 +193,46 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     pod = list_pods(api, "ns", label_selector="app=x")[0]
 
     assert (pod.ready, pod.phase) == expected
+
+
+def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
+    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    events = [
+        {"type": "ADDED", "object": _pod_body(uid="p")},
+        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
+        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
+    ]
+    asked: list[str] = []
+
+    class Watched(http.server.BaseHTTPRequestHandler):
+        """An API server that answers a watch with three events and ends it."""
+
+        def do_GET(self) -> None:
+            asked.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write("".join(json.dumps(e) + "\n" for e in events).encode())
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with http.server.HTTPServer(("127.0.0.1", 0), Watched) as server:
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        # The real client, which turns each event into a model unless told not to.
+        api = kubernetes.client.CoreV1Api(
+            kubernetes.client.ApiClient(
+                kubernetes.client.Configuration(
+                    host="http://127.0.0.1:%d" % server.server_port
+                )
+            )
+        )
+        pods = list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
+
+    assert [pod.ready for pod in pods] == [False, True]
+    target = urllib.parse.urlsplit(asked[0])
+    asks = urllib.parse.parse_qs(target.query)
+    assert target.path == "/api/v1/namespaces/ns/pods"
+    assert (asks["labelSelector"], asks["resourceVersion"]) == (["app"], ["0"])
 
 
 @pytest.mark.parametrize(
