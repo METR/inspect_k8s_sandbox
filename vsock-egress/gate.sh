@@ -16,7 +16,7 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
                inspect-k8s-sandbox/gate:NoSchedule while the sandbox is deleted
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
-  KEEP=1       leave the release installed when a step fails
+  KEEP=1       leave the release installed when a step fails: the gate then ends before step 7, which uninstalls it
 It needs helm, kubectl, python3 and RBAC to patch nodes, and leaves nothing behind: one helm release, and one pod
 with the node's process list and a read-only mount of its VM directories. A run killed in step 7 leaves the taint,
 and no launcher comes to NODE until `kubectl taint node NODE inspect-k8s-sandbox/gate-`. Exit 0: every step passed.
@@ -37,6 +37,7 @@ SANDBOX=agent-env-$REL-default-0
 k() { kubectl --context "$CONTEXT" --request-timeout=60s "$@"; }
 h() { HELM_DRIVER=configmap helm --kube-context "$CONTEXT" --namespace "$NS" "$@"; }
 failed=0
+kept="helm release $REL and pod $REL-peek"
 say() { echo "== $(date -u +%T) $*"; }
 pass() { echo "   PASS  $*"; }
 fail() { echo "   FAIL  $*"; failed=1; }
@@ -50,7 +51,7 @@ wait_for() { # wait_for SECONDS COMMAND...: until the command succeeds
 cleanup() {
   [ -n "${canary:-}" ] && kill "$canary" 2> /dev/null
   [ -n "${tainted:-}" ] && k taint node "$node" "$TAINT-" > /dev/null 2>&1
-  [ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && { echo "   kept: helm release $REL and pod $REL-peek in $NS"; return; }
+  [ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && { echo "   kept: $kept in $NS"; return; }
   h uninstall "$REL" --ignore-not-found --wait --timeout 120s > /dev/null 2>&1
   k -n "$NS" delete pod "$REL-peek" --ignore-not-found --wait=false > /dev/null 2>&1
 }
@@ -237,6 +238,7 @@ else
   fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
 fi
 
+[ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && exit 1 # before step 7 deletes the launcher and uninstalls the release
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
 old=$(launcher)
@@ -250,7 +252,7 @@ lpid=$(by "${now:-}"); down() { [ "$(peek "[ -e /proc/${lpid:-self} ] || echo do
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
 wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 60 down \
   || fail "the launcher $old is still there, or its process '$lpid' was not seen to end on the node"
-h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
+h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 && kept="pod $REL-peek" || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
 if wait_for 120 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$NS' get pod '$SANDBOX' 2>&1 | grep -q '(NotFound)'" && wait_for 120 dir_gone "$vm"; then
   back=$(k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o name) && [ -z "$back" ] \
