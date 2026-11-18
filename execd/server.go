@@ -66,8 +66,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone, and afterListed each time a kill's search has listed the processes.
-var afterRead, afterDrainCheck, beforeKill, afterTaken, afterListed atomic.Pointer[func(late bool)]
+// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone.
+var afterRead, afterDrainCheck, beforeKill, afterTaken atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -890,6 +890,9 @@ func killAs(pid int, as *syscall.Credential) {
 	syscall.Kill(pid, syscall.SIGKILL)
 	syscall.Kill(-pid, syscall.SIGKILL)
 	setids(uint32(os.Getuid()), uint32(os.Getgid()))
+	if os.Geteuid() != os.Getuid() || os.Getegid() != os.Getgid() { // unlocked so, the thread would do execd's own work as that user
+		fail("a thread could not take execd's identity back")
+	}
 }
 
 // stat is /proc/PID/stat after the name, which may hold spaces and parentheses: the state, the parent, and 20th the start time.
@@ -1104,15 +1107,11 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 // More than execve lets an environment hold (6 MiB).
 const maxEnviron = 8 << 20
 
-// Tests open another file in an environment's place, as the kernel shows none of a process whose execve is under way.
-var openEnviron atomic.Pointer[func(string) (*os.File, error)]
+// Tests open another file in an environment's place for the search of a tag, as the kernel shows none of a process whose execve is under way.
+var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
 
-// tagged says whether the environment a /proc/PID/environ file shows holds needle, and whether it shows none at all.
-func tagged(environ string, needle []byte) (is, none bool) {
-	open := os.Open
-	if stand := openEnviron.Load(); stand != nil {
-		open = *stand
-	}
+// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
+func tagged(open func(string) (*os.File, error), environ string, needle []byte) (is, none bool) {
 	f, err := open(environ)
 	if err != nil {
 		return false, false
@@ -1125,20 +1124,25 @@ func tagged(environ string, needle []byte) (is, none bool) {
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
+	open := os.Open
+	if stand := openEnviron.Load(); stand != nil {
+		open = func(environ string) (*os.File, error) { return (*stand)(tag, environ) }
+	}
 	read := map[int]bool{}
 	// Eight listings at most, until one holds no process not yet read: what a process starts while one is read is in the next.
-	for pass, more := 0, true; more && pass < 8; pass++ {
-		more = false
+	for pass, more, starting := 0, true, false; more && pass < 8; pass++ {
+		if starting {
+			time.Sleep(time.Millisecond) // an execve takes about a tenth of that
+		}
+		more, starting = false, false
 		entries, _ := os.ReadDir("/proc")
-		hook(&afterListed, false)
-		starting := false
 		for _, e := range entries {
 			pid, err := strconv.Atoi(e.Name())
 			if err != nil || pid == os.Getpid() || read[pid] {
 				continue
 			}
 			more = true
-			is, none := tagged("/proc/"+e.Name()+"/environ", needle)
+			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle)
 			if none {
 				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
 					starting = true
@@ -1149,9 +1153,6 @@ func killTagged(tag string) {
 			if is {
 				syscall.Kill(pid, syscall.SIGKILL)
 			}
-		}
-		if starting {
-			time.Sleep(time.Millisecond) // an execve takes about a tenth of that
 		}
 	}
 }

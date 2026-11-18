@@ -118,8 +118,9 @@ async def test_a_kill_reaches_what_another_users_command_detached(
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
     root = sandboxes[service]
-    # Out of the group a kill signals and reparented: only the tag leads a kill to it.
-    detach = "(setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' &); sleep 600"
+    # Out of the group a kill signals, its parent gone: only the tag leads a kill to it.
+    orphan = "while kill -0 $PPID 2>/dev/null; do :; done; echo $$ > /tmp/detached"
+    detach = f"(setsid sh -c '{orphan}; kill -STOP $$' &); sleep 600"
     command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))
 
     async def detached() -> str:
@@ -127,12 +128,17 @@ async def test_a_kill_reaches_what_another_users_command_detached(
             await asyncio.sleep(0.1)
         return pid.strip()
 
-    pid = await asyncio.wait_for(detached(), 30)
-    command.cancel()
-
     async def gone() -> None:
         while (await root.exec(["test", "-e", f"/proc/{pid}"])).success:
             await asyncio.sleep(0.1)
 
-    # Without CAP_SYS_PTRACE root can't read the user's environment for the call's tag.
-    await asyncio.wait_for(gone(), 30)
+    try:
+        pid = await asyncio.wait_for(detached(), 30)
+        command.cancel()
+
+        # Without CAP_SYS_PTRACE root can't read the user's environment for its tag.
+        await asyncio.wait_for(gone(), 30)
+    finally:
+        command.cancel()
+        left = "kill -9 $(cat /tmp/detached); rm -f /tmp/detached"
+        await root.exec(["sh", "-c", left])
