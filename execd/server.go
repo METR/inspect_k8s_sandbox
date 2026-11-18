@@ -64,8 +64,6 @@ var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, and 
 
 var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
 
-var anycast6 = "/proc/self/net/anycast6" // tests name a file of their own
-
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
@@ -184,19 +182,16 @@ func fromThisPod(nc net.Conn) bool {
 		return true
 	}
 	for _, a := range addrs {
-		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(remote.IP) {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		// A pod that forwards IPv6 also answers at each subnet's router anycast address, the subnet's own, as fe80::; a /127 has none.
+		if ones, bits := n.Mask.Size(); n.IP.Equal(remote.IP) || bits == 128 && ones < 127 && n.IP.Mask(n.Mask).Equal(remote.IP) {
 			return true
 		}
 	}
-	if remote.IP.To4() != nil { // what else the pod answers at, its anycast addresses, is IPv6's alone
-		return false
-	}
-	// A pod that forwards IPv6 also answers at its subnets' anycast addresses, as fe80::, which net.InterfaceAddrs leaves out.
-	anycast, err := os.ReadFile(anycast6)
-	if err != nil && !errors.Is(err, os.ErrNotExist) { // gVisor has no such file; otherwise can't tell: refuse
-		return true
-	}
-	return strings.Contains(string(anycast), hex.EncodeToString(remote.IP)) // the kernel writes each as 32 hex digits
+	return false
 }
 
 func (s *server) handle(c *conn) {

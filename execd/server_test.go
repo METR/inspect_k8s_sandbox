@@ -127,27 +127,23 @@ func TestAConnectionIsRefusedWhenTheInterfacesCannotBeListed(t *testing.T) {
 }
 
 func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
-	was := anycast6
-	t.Cleanup(func() { anycast6 = was })
-	list := filepath.Join(t.TempDir(), "anycast6")
-	// The list of a pod that forwards IPv6, as its kernel writes it.
-	if err := os.WriteFile(list, []byte("3    eth0            fe800000000000000000000000000000     1\n3    eth0            20010db8000000010000000000000000     1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { interfaceAddrs = net.InterfaceAddrs })
 	for _, peer := range []struct {
-		list, from string
-		refused    bool
+		own, from string // an address of the pod's in its subnet, and the peer's
+		refused   bool
 	}{
-		{list, "fe80::", true},
-		{list, "2001:db8:0:1::", true},
-		{list, "2001:db8:0:1::1", false},                      // another machine on the link
-		{filepath.Join(t.TempDir(), "none"), "fe80::", false}, // gVisor keeps no list, and its pods answer at no such address
-		{t.TempDir(), "2001:db8::1", true},                    // a directory stands for a list that execd cannot read
-		{t.TempDir(), "192.0.2.1", false},                     // IPv4 does not wait on the list
+		{"fe80::8b4:7ff:fe9c:1/64", "fe80::", true},   // as a pod that forwards IPv6 answers there
+		{"fe80::8b4:7ff:fe9c:1/64", "fe80::2", false}, // another machine on the link
+		{"2001:db8::1/127", "2001:db8::", false},      // the other end of a point-to-point link
+		{"192.0.2.9/24", "192.0.2.0", false},          // IPv4 has no such address
 	} {
-		anycast6 = peer.list
+		ip, subnet, err := net.ParseCIDR(peer.own)
+		if err != nil {
+			t.Fatal(err)
+		}
+		interfaceAddrs = func() ([]net.Addr, error) { return []net.Addr{&net.IPNet{IP: ip, Mask: subnet.Mask}}, nil }
 		if fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}) != peer.refused {
-			t.Errorf("a connection from %s, with the pod's anycast addresses in %s: refused is %t, want %t", peer.from, peer.list, !peer.refused, peer.refused)
+			t.Errorf("a connection from %s to a pod at %s: refused is %t, want %t", peer.from, peer.own, !peer.refused, peer.refused)
 		}
 	}
 }

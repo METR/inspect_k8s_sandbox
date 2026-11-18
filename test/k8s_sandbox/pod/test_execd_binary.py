@@ -52,7 +52,7 @@ links = (line.split() for line in open("/proc/net/if_inet6"))
 own = next(f[0] for f in links if f[5] == "eth0" and f[0].startswith("fe80"))
 s = socket.socket(socket.AF_INET6)
 s.settimeout(30)
-s.setsockopt(socket.IPPROTO_IPV6, 78, 1)  # IPV6_FREEBIND: for an address it cannot list
+s.setsockopt(socket.IPPROTO_IPV6, 78, 1)  # IPV6_FREEBIND: no bind to it otherwise
 s.bind(("fe80::", 0, 0, eth0))
 own = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(own))
 s.connect((own, int(sys.argv[1]), 0, eth0))
@@ -447,6 +447,7 @@ async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
         started = docker(*run, sandbox.name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         await start_execd(forwards, False, "--port", str(PORT))
+        await forwards.until("grep -q fe80 /proc/net/anycast6")  # it answers there
         dial = ["python3", "-c", ANYCAST_PROBE, str(PORT)]
         probe = await asyncio.to_thread(docker, "exec", forwards.name, *dial)
     finally:
