@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Once a process has converted one Docker Compose file to Helm values, each further
+  conversion takes about 60 to 100 ms less.
 - A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
   This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
 - A pod annotated
