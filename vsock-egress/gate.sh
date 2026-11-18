@@ -246,9 +246,11 @@ owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
   || { fail "the pod '$old' is not one of DaemonSet $LAUNCHERS: it is left alone"; exit 1; }
 # The taint keeps the DaemonSet from putting a launcher back on the node before the sandbox has gone.
 k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the node was not tainted $TAINT"; exit 1; }
-# With no grace period a pod leaves the API before its node has stopped it: --now gives the launcher one second, whatever its DaemonSet sets.
-k -n "$LNS" delete pod "$old" --now --wait=false > /dev/null
-wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" || fail "the launcher $old is still there"
+k -n "$LNS" delete pod "$old" --wait=false > /dev/null
+# A pod can leave the API before its node has stopped it: that the launcher's process has gone is the node's own word.
+down() { [ -z "${from:-}" ] || [ "$(peek "[ -e /proc/$from ] || echo down")" = down ]; }
+wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 60 down \
+  || fail "the launcher $old is still there, or its process '${from:-}' still runs"
 keep "the release is uninstalled"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
