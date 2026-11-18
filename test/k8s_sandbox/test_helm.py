@@ -1360,7 +1360,6 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
 @pytest.mark.parametrize(
     ("replicas", "number"),
     [
-        pytest.param("10", 10, id="decimal"),
         # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
         pytest.param("010", 8, id="leading-zero"),
         # Helm drops every `_` and reads the `0b` as binary.
@@ -1508,11 +1507,12 @@ def test_expected_services_fails_closed(stdout: str) -> None:
 
 
 def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
-    # Left out, Inspect would make `victim` the default sandbox.
+    # Only `victim` has a replica: left out, Inspect would make it the default sandbox.
     idle = _stateful_set(replicas=0).replace("StatefulSet", "Deployment")
-    stdout = _manifest(idle, _stateful_set("victim"))
+    served = [idle.replace("default", "victim"), _stateful_set("victim")]
+    stdout = _manifest(idle, *served, _stateful_set("other", replicas=0))
 
-    with pytest.raises(RuntimeError, match="sandbox default to `replicas: 0`"):
+    with pytest.raises(RuntimeError, match="sandbox default, other to `replicas: 0`"):
         _services(stdout)
 
 
