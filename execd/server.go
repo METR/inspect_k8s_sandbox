@@ -66,8 +66,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone.
-var afterRead, afterDrainCheck, beforeKill, afterTaken atomic.Pointer[func(late bool)]
+// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone, and afterListed each time a kill's search has listed the processes.
+var afterRead, afterDrainCheck, beforeKill, afterTaken, afterListed atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -1098,14 +1098,20 @@ func tagged(environ string, needle []byte) bool {
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		if tagged("/proc/"+e.Name()+"/environ", needle) {
-			syscall.Kill(pid, syscall.SIGKILL)
+	// Eight listings at most, until one finds none: what a process starts while a listing is read is in the next.
+	for pass, found := 0, true; found && pass < 8; pass++ {
+		found = false
+		entries, _ := os.ReadDir("/proc")
+		hook(&afterListed, pass > 0)
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == os.Getpid() {
+				continue
+			}
+			if tagged("/proc/"+e.Name()+"/environ", needle) {
+				found = true
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 }

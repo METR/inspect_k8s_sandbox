@@ -1481,6 +1481,59 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 	}
 }
 
+func TestAKillReachesWhatIsStartedWhileItSearchesByTag(t *testing.T) {
+	prctl(prSetChildSubreaper, 1) // as execd: what the command detached is reaped here once killed
+	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c := testConn(t)
+	s.authenticated(c)
+	base := filepath.Join(t.TempDir(), "detached")
+	// Out of the command's group and no longer its child, only the tag leads a kill to it; signalled, it starts another process.
+	detached := `trap 'sleep 600 & echo $! > "$0.new"' USR1; echo $$ > "$0.pid"; while :; do sleep 0.01; done`
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(setsid sh -c "$1" "$0" &); sleep 600`, base, detached}, Env: map[string]string{}, Tag: tag})
+	s.dispatch(c, frame{kind: fStart, id: 73, payload: req})
+	named := func(file string) (pid int) { // the process a file names, once the file is written
+		for deadline := time.Now().Add(30 * time.Second); pid == 0 && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			if data, _ := os.ReadFile(file); bytes.HasSuffix(data, []byte("\n")) {
+				pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+			}
+		}
+		return pid
+	}
+	first, second := named(base+".pid"), 0
+	if first == 0 {
+		t.Fatal("the command never detached its process")
+	}
+	var once sync.Once
+	listed := func(bool) { // the search's first listing holds the detached process, and not what it starts now
+		once.Do(func() {
+			syscall.Kill(first, syscall.SIGUSR1)
+			second = named(base + ".new")
+		})
+	}
+	afterListed.Store(&listed)
+	t.Cleanup(func() {
+		afterListed.Store(nil)
+		for _, pid := range []int{first, second} {
+			if pid > 0 {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+
+	s.dispatch(c, frame{kind: fKill, id: 73})
+
+	if second == 0 {
+		t.Fatal("the detached process started nothing as the kill searched")
+	}
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(second, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d, started as the kill's search had listed the processes, outlived the kill", second)
+		}
+	}
+}
+
 func TestAKillReadsNoMoreOfAnEnvironmentThanOneCanHold(t *testing.T) {
 	huge := filepath.Join(t.TempDir(), "environ")
 	os.WriteFile(huge, nil, 0o644)
