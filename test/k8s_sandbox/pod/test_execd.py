@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 import types
-import typing
 import urllib.parse
 
 import anyio
@@ -70,11 +69,13 @@ class Daemons:
         self.unstarted.append(daemon)
         return server
 
-    def client(self) -> execd.ExecdClient:
+    def client(
+        self, pod: collections.abc.Callable[[], str] = lambda: ""
+    ) -> execd.ExecdClient:
         async def start(replace: bool) -> execd.Daemon:
             return self.unstarted.pop(0)
 
-        return execd.ExecdClient(start)
+        return execd.ExecdClient(start, pod)
 
 
 class Plain(execd._Pipe):
@@ -82,6 +83,7 @@ class Plain(execd._Pipe):
 
     def __init__(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         self._reader, self._writer = r, w
+        self.starts = 0  # the STARTs written to it
 
     async def readexactly(self, n: int) -> bytes:
         try:
@@ -90,6 +92,7 @@ class Plain(execd._Pipe):
             raise ConnectionResetError("execd closed the connection") from None
 
     async def write(self, data: bytes) -> None:
+        self.starts += data[0] == execd.START
         self._writer.write(data)
         await self._writer.drain()
 
@@ -126,10 +129,10 @@ def waiting(link: execd.Link) -> bool:
     return bool(link._wlock._waiters)
 
 
-def reading(client: execd.ExecdClient) -> int:
-    """How many of its calls wait for a frame: their STARTs are written."""
-    calls = client._link.calls.values() if client._link else ()
-    return sum(bool(c.queue._getters) for c in calls)  # type: ignore[attr-defined]
+def starts_written(client: execd.ExecdClient) -> int:
+    """How many STARTs its connection has written: a call's time runs from its own."""
+    pipe = client._link.pipe if client._link else None
+    return pipe.starts if isinstance(pipe, Plain) else 0
 
 
 @pytest.fixture(autouse=True)
@@ -1134,15 +1137,25 @@ async def test_a_call_left_once_its_connection_is_replaced_is_killed_on_the_new_
 @pytest.mark.parametrize(
     ("verdict", "taken"),
     [
-        # execd killed it at its timeout: timed out, as our own timer said
-        (b'{"code": 137, "timeout": true}', [(execd.EXIT, None)]),
+        # execd killed it at its timeout: the exit it marked, a timeout to exec()
+        (
+            b'{"code": 137, "timeout": true}',
+            [(execd.PING, None), (execd.EXIT, {"code": 137, "timeout": True})],
+        ),
         # it had ended by itself: its result, though our timer had passed
-        (b'{"code": 0}', [(execd.STDOUT, b"done\n"), (execd.EXIT, {"code": 0})]),
+        (
+            b'{"code": 0}',
+            [(execd.PING, None), (execd.STDOUT, b"done\n"), (execd.EXIT, {"code": 0})],
+        ),
     ],
     ids=["killed", "ended"],
 )
 async def test_a_call_timed_out_as_its_connection_drops_asks_execd_on_the_next(
-    tls_daemon: TlsDaemon, verdict: bytes, taken: list[tuple[int, object]]
+    tls_daemon: TlsDaemon,
+    clock: types.SimpleNamespace,
+    timers: None,
+    verdict: bytes,
+    taken: list[tuple[int, object]],
 ) -> None:
     """Regression: it took its own timer's word; and once, never sent its RELEASE."""
     got: list[tuple[int, int]] = []
@@ -1177,16 +1190,19 @@ async def test_a_call_timed_out_as_its_connection_drops_asks_execd_on_the_next(
 
     client = await tls_daemon(drops_the_first_at_our_timer)
     argv = ["sleep", "9"] if b"timeout" in verdict else ["echo", "done"]
-    run = client.run(argv, env={}, cwd=None, user=None, stdin=None, timeout=0.01)
+    run = client.run(argv, env={}, cwd=None, user=None, stdin=None, timeout=9)
 
     async def items() -> list[tuple[int, object]]:
         return [item async for item in run]
 
-    assert await asyncio.wait_for(items(), 30) == taken
+    taking = asyncio.ensure_future(items())
+    await until(lambda: bool(starts))  # its START is written: its time runs from there
+    clock.now += 2000  # past our timer
+    assert await asyncio.wait_for(taking, 30) == taken
     await asyncio.wait_for(client.exec(["true"], None, None, {}, None, None), 30)
 
-    last = [execd.KILL, execd.RELEASE] if b"timeout" in verdict else [execd.RELEASE]
-    assert got[: 1 + len(last)] == [(k, starts[0]) for k in [execd.RESUME, *last]]
+    # No KILL: either way execd has said that it ended.
+    assert [k for k, i in got if i == starts[0]] == [execd.RESUME, execd.RELEASE]
     assert client._link is not None and not client._link.calls
 
 
@@ -1484,32 +1500,6 @@ async def test_a_timed_out_call_frees_what_execd_holds(
     await asyncio.wait_for(released.wait(), 30)
 
 
-async def test_a_timed_out_call_takes_no_more_than_its_hold(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(execd, "KILL_WAIT", 3600.0)  # only its hold ends the wait
-    acked = 0
-
-    async def sends_while_acked(
-        r: asyncio.StreamReader, w: asyncio.StreamWriter
-    ) -> None:
-        nonlocal acked
-        _, call_id, _ = await read_frame(r)  # START
-        more = frame(execd.STDOUT, call_id, b"x" * (execd.CHUNK * 3 // 2))
-        while True:
-            kind, _, payload = await read_frame(r)
-            if kind == execd.ACK:
-                acked = max(acked, sum(json.loads(payload).values()))
-            if kind in (execd.PING, execd.ACK):  # never exits; sends again when acked
-                w.write(more)
-
-    await daemons.serve(sends_while_acked)
-    with pytest.raises(TimeoutError, match="Command timed out"):
-        call = daemons.client().exec(["yes"], None, None, {}, None, 1)
-        await asyncio.wait_for(call, 30)  # only bounds a hang
-    assert 0 < acked <= 10 << 20
-
-
 @pytest.mark.parametrize("again", [False, True], ids=["its first", "sent again"])
 async def test_a_start_whose_turn_comes_once_its_calls_time_is_up_is_not_written(
     daemons: Daemons, clock: types.SimpleNamespace, again: bool
@@ -1560,7 +1550,7 @@ async def test_a_start_whose_turn_comes_once_its_calls_time_is_up_is_not_written
 async def test_a_command_has_its_whole_timeout_from_when_its_start_is_written(
     daemons: Daemons, clock: types.SimpleNamespace, timers: None, again: bool
 ) -> None:
-    """Regression: our timer ran from the call, and killed one execd still gave time."""
+    """Regression: our timer ran from the call, and passed with execd's own not up."""
     connections = [0]
     got: list[int] = []
     asked, answer, ends = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -1629,15 +1619,15 @@ async def test_a_start_that_waited_and_was_lost_is_not_sent_again_past_its_calls
             if kind == execd.START:  # it runs, and ends
                 w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
 
-    class Late(asyncio.Lock):
-        """A turn that comes as the call's time ends, before a wait runs out."""
+    late = False
 
-        async def acquire(self) -> typing.Literal[True]:
-            clock.now = max(clock.now, 12.0)  # within that timer
-            return await super().acquire()
+    def pod() -> str:  # asked as a START's turn comes: no wait has run out by then
+        if late:
+            clock.now = max(clock.now, 12.0)  # past the call's time, within that timer
+        return ""
 
     await daemons.serve(never_had)
-    client = daemons.client()
+    client = daemons.client(pod)
     link = await client._get()
     await link._wlock.acquire()  # as another call's write has the turn
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, 9))
@@ -1648,7 +1638,7 @@ async def test_a_start_that_waited_and_was_lost_is_not_sent_again_past_its_calls
     again = client._link
     assert again is not None
     if turn == "late":  # asked for in the call's time
-        again._wlock = Late()
+        late = True
     else:  # nor is its turn to be written waited for
         await again._wlock.acquire()
         clock.now += 4  # past the call's time, within that timer
@@ -1683,6 +1673,8 @@ async def test_a_timed_out_call_whose_connection_went_silent_asks_execd_on_a_new
 
     async def goes_silent(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         connections[0] += 1
+        if connections[0] == 2:  # the new one takes that long to answer
+            clock.now += 0.1
         while True:
             kind, call_id, _ = await read_frame(r)
             if connections[0] == 1:  # it takes what is sent, and answers nothing
@@ -1700,14 +1692,14 @@ async def test_a_timed_out_call_whose_connection_went_silent_asks_execd_on_a_new
     argv = ["sh", "-c", "echo done; exit 3"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
     other = asyncio.ensure_future(client.exec(argv, None, None, {}, None, None))
-    await until(lambda: reading(client) == 2)
+    await until(lambda: starts_written(client) == 2)
     clock.now += 2000  # past the first's timeout: its wait for execd's word begins
     await asyncio.wait_for(killed.wait(), 30)  # only bounds a hang
-    asked, expired = clock.now, clock.expired
+    asked, expired, opening = clock.now, clock.expired, client._opening
     if how == "our loop held":  # well past the half: looked at again a second on
         clock.now += execd.KILL_WAIT / 2 + 1.5
         await until(lambda: clock.expired > expired)
-        assert not dialled.is_set()
+        assert client._opening is opening  # none asked for: what came may be unread
         clock.now += 1
     else:  # half of it passes with not a frame, and a timer's own lateness
         clock.now += execd.KILL_WAIT / 2 + 0.5
@@ -1729,7 +1721,7 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     """Regression: our timer's KILL ended a command execd had started late."""
     connections = [0]
     got: list[int] = []
-    ended = asyncio.Event()
+    asked: list[tuple[asyncio.StreamWriter, int]] = []
 
     async def started_late(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         connections[0] += 1
@@ -1737,15 +1729,16 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
             kind, call_id, _ = await read_frame(r)
             got.append(kind)
             if kind == execd.PING:  # it answers: by its own count there is time
+                asked.append((w, call_id))
                 w.write(frame(execd.PONG, call_id))
-                await ended.wait()
-                w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))
+            elif kind == execd.KILL:  # as execd ends a command it is told to kill
+                w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
 
     await daemons.serve(started_late)
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     link, opening = client._link, client._opening
     assert link is not None
     clock.now += 2000  # past our timer: the wait for execd's word begins
@@ -1754,11 +1747,51 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     clock.now += execd.KILL_WAIT / 2  # half of it passes
     await until(lambda: clock.expired > expired)
     assert client._opening is opening  # it answered: no other is asked for
-    ended.set()  # the command ends by itself
+    w, call_id = asked[0]
+    w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))  # the command ends by itself
 
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
     await until(lambda: execd.RELEASE in got)  # the call's last frame
-    assert (result.returncode, connections[0], execd.KILL in got) == (7, 1, False)
+    assert (result.returncode, connections[0]) == (7, 1)
+
+
+@pytest.mark.parametrize("dropped", [False, True], ids=["its own", "a new one"])
+async def test_a_command_execd_still_gives_time_has_its_stdin_past_our_timer(
+    daemons: Daemons, clock: types.SimpleNamespace, timers: None, dropped: bool
+) -> None:
+    """Regression: our timer stopped the upload: the command got no more stdin."""
+    connections, took = [0], [0]
+    got: list[int] = []
+
+    async def reads_on(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        connections[0] += 1
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            got.append(kind)
+            if kind == execd.STDIN and payload:
+                took[0] += len(payload)
+            elif kind == execd.STDIN:  # its end: the command has it all, and ends
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            elif kind == execd.PING and dropped and connections[0] == 1:
+                w.transport.abort()
+                return
+            elif kind == execd.PING:  # our timer's: by its own count it reads on
+                w.write(frame(execd.STDIN_ACK, call_id, b'{"stdin": %d}' % took[0]))
+            elif kind == execd.RESUME:
+                have = b'{"stdin": %d, "eof": false, "put": %d}' % (took[0], took[0])
+                w.write(frame(execd.RESUMED, call_id, have))
+
+    await daemons.serve(reads_on)
+    client = daemons.client()
+    stdin = b"x" * (execd.STDIN_WINDOW + execd.CHUNK)
+    call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 9))
+    await until(lambda: took[0] == execd.STDIN_WINDOW)  # the rest waits for room
+    clock.now += 2000  # past our timer
+
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+    await until(lambda: execd.RELEASE in got)  # the call's last frame
+    assert (result.returncode, took[0], execd.KILL in got) == (0, len(stdin), False)
+    assert connections[0] == 1 + dropped
 
 
 async def test_a_timed_out_call_keeps_a_connection_for_time_its_own_loop_was_held(
@@ -1783,7 +1816,7 @@ async def test_a_timed_out_call_keeps_a_connection_for_time_its_own_loop_was_hel
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     link, opening = client._link, client._opening
     assert link is not None
     clock.now += 2000  # past its timeout: the wait for execd's word begins
@@ -1836,7 +1869,7 @@ async def test_a_timed_out_call_leaves_a_connection_slow_to_answer_to_the_pods_c
     said = b"y\n" * (execd.ACK_EVERY // 2)  # enough to be acked
     argv = ["sh", "-c", f"sleep 8; yes | head -n {len(said) // 2}; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     clock.now += 2000  # past its timeout: the wait for execd's word begins
     await until(lambda: bool(killed))
     clock.now += execd.KILL_WAIT / 2  # half of it passes with not a frame
@@ -1879,7 +1912,7 @@ async def test_a_timed_out_call_asks_for_a_new_connection_once_while_its_own_is_
     await daemons.serve(answers_late)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait begins
     await until(lambda: bool(killed))
     clock.now += execd.KILL_WAIT / 2  # half of it passes with not a frame
@@ -1893,7 +1926,9 @@ async def test_a_timed_out_call_asks_for_a_new_connection_once_while_its_own_is_
     assert opened[0] == 2
 
 
-@pytest.mark.parametrize("how", ["answers first", "answers then", "answers and drops"])
+@pytest.mark.parametrize(
+    "how", ["answers first", "answers then", "answers in time", "answers and drops"]
+)
 async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_open(
     daemons: Daemons,
     clock: types.SimpleNamespace,
@@ -1906,6 +1941,7 @@ async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_
     opened, connections = [0], [0]
     got: list[int] = []
     killed: list[tuple[asyncio.StreamWriter, int]] = []
+    pipes: list[Plain] = []
     reached = asyncio.Event()
 
     async def connect(daemon: execd.Daemon, pace: execd.Pace) -> execd._Pipe:
@@ -1916,10 +1952,19 @@ async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_
         r, w = await asyncio.open_connection("127.0.0.1", daemons.ports[daemon])
         if second and how == "answers then":  # a moment after, our loop held meanwhile
             asyncio.get_running_loop().call_soon(late)
-        return Plain(r, w)
+        if second and how == "answers in time":
+            asyncio.ensure_future(in_time())
+        pipes.append(Plain(r, w))
+        return pipes[-1]
 
     def late() -> None:
         clock.now += 1.5
+        killed[0][0].write(frame(execd.EXIT, killed[0][1], b'{"code": 7}'))
+
+    async def in_time() -> None:  # half a second on, by the turns it is given to speak
+        at = clock.now + 0.5
+        while clock.now < at and not pipes[0]._writer.transport.is_closing():
+            await asyncio.sleep(0)
         killed[0][0].write(frame(execd.EXIT, killed[0][1], b'{"code": 7}'))
 
     async def answers_late(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -1939,7 +1984,7 @@ async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_
     client = daemons.client()
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     link = client._link
     assert link is not None
     (ours,) = link.calls.values()
@@ -1964,12 +2009,14 @@ async def test_a_connection_that_answers_as_another_is_reached_is_kept_if_it_is_
     assert (result.returncode, result.stdout) == (7, "so far" if drops else "")
     # Kept, the first is not asked to resume a call it has; dropped, the second is.
     assert (connections[0], opened[0], got.count(execd.RESUME)) == (1 + drops, 2, drops)
+    assert pipes[1]._writer.transport.is_closing() is not drops  # let go, if not used
 
 
 @pytest.mark.parametrize(
-    ("reopening", "resuming", "dropped"),  # how long each is held, in kill's waits
-    [(2.0, 0.0, True), (0.0, 2.0, True), (0.6, 0.0, False)],
-    ids=["connection", "resume", "silent"],
+    # In kill's waits: how long each is held, and when the connection drops, if it does.
+    ("reopening", "resuming", "drops"),
+    [(2.0, 0.0, 0.0), (0.0, 2.0, 0.0), (0.6, 0.0, None), (0.5, 0.0, 0.8)],
+    ids=["connection", "resume", "silent", "dropped late"],
 )
 async def test_a_timed_out_call_waits_for_execds_word_no_longer_than_for_its_kill(
     daemons: Daemons,
@@ -1978,11 +2025,11 @@ async def test_a_timed_out_call_waits_for_execds_word_no_longer_than_for_its_kil
     monkeypatch: pytest.MonkeyPatch,
     reopening: float,
     resuming: float,
-    dropped: bool,
+    drops: float | None,
 ) -> None:
     """Regression: over a new connection the wait for execd had no end of its own."""
     opened, resumes, asked = [0], asyncio.Event(), asyncio.Event()
-    killed = asyncio.Event()
+    killed, drop = asyncio.Event(), asyncio.Event()
 
     async def held(waits: float) -> None:  # until the clock has moved on by so many
         over = clock.now + waits * execd.KILL_WAIT
@@ -2008,20 +2055,21 @@ async def test_a_timed_out_call_waits_for_execds_word_no_longer_than_for_its_kil
         while (await read_frame(r))[0] != execd.PING:
             pass
         killed.set()
-        if dropped:
-            w.transport.abort()
-        await r.read()  # else silent: at half the wait we give it up ourselves
+        if drops is None:
+            await r.read()  # silent: at half the wait we give it up ourselves
+        await drop.wait()
+        w.transport.abort()
 
     monkeypatch.setattr(execd, "_connect", connect)
     await daemons.serve(at_our_timer)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait begins
     await asyncio.wait_for(killed.wait(), 30)  # only bounds a hang
     began = clock.now
-    if not dropped:
-        clock.now = began + 0.5 * execd.KILL_WAIT
+    clock.now = began + (0.5 if drops is None else drops) * execd.KILL_WAIT
+    drop.set()
     await until(lambda: opened[0] == 2)
     if resuming:
         clock.now = began + reopening * execd.KILL_WAIT  # the connection is back
@@ -2160,7 +2208,8 @@ async def test_an_exit_that_came_before_its_connection_dropped_is_kept(
 
     got = await asyncio.wait_for(taken(), 30)  # only bounds a hang
 
-    assert got == [(execd.STDOUT, b"done\n"), (execd.EXIT, {"code": 137})]
+    late = (execd.PING, None)  # our timer had passed
+    assert got == [(execd.STDOUT, b"done\n"), late, (execd.EXIT, {"code": 137})]
 
 
 async def test_a_command_that_ended_after_its_connection_dropped_keeps_its_result(
@@ -2193,16 +2242,16 @@ async def test_a_command_that_ended_after_its_connection_dropped_keeps_its_resul
     assert (result.returncode, result.stdout) == (0, "done\n")
 
 
-@pytest.mark.parametrize("eager", [False, True])
-async def test_a_command_whose_connection_reopens_past_our_timer_keeps_its_result(
+@pytest.mark.parametrize("back", [True, False], ids=["in it", "never: eager tasks"])
+async def test_a_call_out_of_time_as_its_connection_reopens_has_our_wait_for_execd(
     daemons: Daemons,
     clock: types.SimpleNamespace,
     timers: None,
     monkeypatch: pytest.MonkeyPatch,
-    eager: bool,
+    back: bool,
 ) -> None:
-    """Regression: our timer passed as the connection reopened: execd went unasked."""
-    if eager:  # Textual's tasks, under Inspect's full display: the call asked on and on
+    """Regression: execd went unasked; under eager tasks the call asked on and on."""
+    if not back:  # Textual's tasks, under Inspect's full display
         if sys.version_info < (3, 12):
             pytest.skip("tasks start at once from Python 3.12 on")
         asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)
@@ -2237,12 +2286,16 @@ async def test_a_command_whose_connection_reopens_past_our_timer_keeps_its_resul
     argv = ["sh", "-c", "sleep 0.5; echo done"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 1))
     await until(lambda: bool(client._link and client._link.calls))
-    assert client._link is not None
-    (ours,) = client._link.calls.values()
     dropped.set()
     await until(lambda: connections[0] == 2)  # the drop is read in the call's time
+    expired = clock.expired
     clock.now += 2000  # which ends with the connection not back
-    await until(lambda: ours.closed)
+    await until(lambda: clock.expired > expired)
+    if not back:
+        clock.now += execd.KILL_WAIT  # nor is it back in our wait for execd's word
+        with pytest.raises(TimeoutError, match="Command timed out"):
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+        return
     reopen.set()
 
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
@@ -2316,7 +2369,7 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
     await daemons.serve(knows_no_call)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["sleep", "9"], None, None, {}, None, 9))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     clock.now += 2000  # past its timeout: the kill's wait finds the drop, then no execd
 
     # Its timeout passed first: the daemon's end is not what it reports.
@@ -2409,7 +2462,7 @@ async def test_a_connection_is_not_given_up_for_time_our_own_loop_was_held(
     await daemons.serve(answers)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     link = client._link
     assert link is not None
     ended = [0]
@@ -2456,7 +2509,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     await daemons.serve(falls_silent)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: reading(client) == 1)
+    await until(lambda: starts_written(client) == 1)
     link = client._link
     assert link is not None
     ended = [0]
@@ -2672,6 +2725,51 @@ async def test_a_killed_commands_last_output_does_not_count_against_its_limit(
         await asyncio.wait_for(call, 30)  # only bounds a hang
 
 
+@pytest.mark.parametrize("ends", [False, True], ids=["no word", "its own exit"])
+async def test_a_command_that_writes_on_past_our_timer_has_its_limit_and_our_wait(
+    daemons: Daemons, clock: types.SimpleNamespace, timers: None, ends: bool
+) -> None:
+    """Only this fails where a command that writes on past our timer has no bound."""
+    limit = execd.limits.MAX_EXEC_OUTPUT_SIZE
+    more = b"x" * execd.ACK_EVERY  # each of them is acked
+    over = 2 * (limit // len(more) + 1)  # frames: more than is kept of either stream
+    got: list[int] = []
+    sent: list[int] = []
+
+    async def writes_on(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        while True:
+            kind, _, _ = await read_frame(r)
+            got.append(kind)
+            if kind not in (execd.PING, execd.ACK):
+                continue
+            if ends and len(sent) >= over:
+                w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+                continue
+            # To both streams in turn, as each is taken; three at first, so some wait.
+            for _ in range(3 if kind == execd.PING else 1):
+                sent.append(execd.STDOUT + len(sent) % 2)
+                w.write(frame(sent[-1], call_id, more))
+
+    await daemons.serve(writes_on)
+    client = daemons.client()
+    call = asyncio.ensure_future(client.exec(["yes"], None, None, {}, None, 9))
+    await until(lambda: starts_written(client) == 1)
+    clock.now += 2000  # past our timer: it writes on, by execd's leave for all we know
+    if ends:  # too much output, as before our timer, and no more of it kept
+        with pytest.raises(inspect_ai.util.OutputLimitExceededError) as too_much:
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+        assert len(too_much.value.truncated_output or "") == 2 * limit
+        return
+    await until(lambda: len(sent) > over)
+    clock.now += execd.KILL_WAIT  # our wait for execd's word ends
+
+    with pytest.raises(TimeoutError, match="Command timed out"):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+    await until(lambda: execd.RELEASE in got)  # the call's last frame
+    assert execd.KILL in got
+
+
 async def test_our_timer_follows_execds_own(
     daemons: Daemons,
     clock: types.SimpleNamespace,
@@ -2686,8 +2784,8 @@ async def test_our_timer_follows_execds_own(
     async def still_runs(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
         clock.now += 1030  # past its timeout, within our lag
-        w.write(frame(execd.STDOUT, call_id, b"x" * execd.ACK_EVERY))  # we ack, or kill
-        while execd.ACK not in got:
+        w.write(frame(execd.STDOUT, call_id, b"x" * execd.ACK_EVERY))  # we ack, or ask
+        while not {execd.ACK, execd.PING} & set(got):
             got.append((await read_frame(r))[0])
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         while execd.RELEASE not in got:
@@ -2698,7 +2796,8 @@ async def test_our_timer_follows_execds_own(
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
     await until(lambda: execd.RELEASE in got)
 
-    assert (result.returncode, execd.KILL in got) == (0, False)
+    # No PING: our timer had not passed.
+    assert (result.returncode, execd.PING in got) == (0, False)
 
 
 async def test_a_reconnect_waits_only_for_what_is_left_of_the_timeout(
@@ -2955,17 +3054,21 @@ async def test_closing_a_stream_ends_a_send_waiting_for_room(daemons: Daemons) -
 
 async def test_a_send_cancelled_partway_ends_the_stream(daemons: Daemons) -> None:
     """Regression: the part it had sent stayed, and the next item followed it."""
+    took = [0]
 
     async def never_acks_stdin(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         while True:
-            await read_frame(r)
+            kind, _, payload = await read_frame(r)
+            if kind == execd.STDIN:
+                took[0] += len(payload)
 
     await daemons.serve(never_acks_stdin)
     stream = await daemons.client().open_stream(["cat"], None)
     send = asyncio.create_task(stream.send(b"x" * (2 * execd.STDIN_WINDOW)))
-    await until(lambda: stream._sent >= execd.STDIN_WINDOW)  # it waits for room
+    # All of it written: it waits for room, and no write of it ends as it is cancelled.
+    await until(lambda: took[0] >= execd.STDIN_WINDOW)
 
     send.cancel()
 
@@ -3333,34 +3436,22 @@ async def test_a_call_cancelled_as_it_exits_is_released(daemons: Daemons) -> Non
     assert execd.KILL not in got  # it exited: a KILL would end what it left running
 
 
-@pytest.mark.parametrize("left", ["cancelled", "timed out"])
 async def test_a_call_left_as_its_upload_writes_sends_no_more_stdin(
-    tls_daemon: TlsDaemon, monkeypatch: pytest.MonkeyPatch, left: str
+    tls_daemon: TlsDaemon,
 ) -> None:
     """Regression: before Python 3.12 the upload's cancel was lost, and it sent on."""
     got: list[int] = []
-    late = 0.0  # seconds the client's clock is put on
 
     async def leaves(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal late
         _, first, _ = await read_frame(r)  # the command that opens the connection
         w.write(frame(execd.EXIT, first, b'{"code": 0}'))
         while True:
             kind, call_id, _ = await read_frame(r)
             if call_id not in (first, 0):  # the call's own frames
                 got.append(kind)
-            if kind == execd.STDIN and left == "cancelled":
+            if kind == execd.STDIN:
                 call.cancel()
-            elif kind == execd.START and left == "timed out":
-                late = 60.0  # its timeout passes, and output wakes it to that
-                w.write(frame(execd.STDOUT, call_id, b"x"))
-            elif kind == execd.PING and call_id:  # our timer's: execd's has ended it
-                w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
 
-    clock = types.SimpleNamespace(
-        monotonic=lambda: time.monotonic() + late, thread_time=time.thread_time
-    )
-    monkeypatch.setattr(execd, "time", clock)
     client = await tls_daemon(leaves)
     opens = client.exec(["true"], None, None, {}, None, None)
     await asyncio.wait_for(opens, 30)  # only bounds a hang
@@ -3372,11 +3463,10 @@ async def test_a_call_left_as_its_upload_writes_sends_no_more_stdin(
     call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 60))
     await until(lambda: execd.RELEASE in got)
 
-    left_at = min(got.index(k) for k in (execd.PING, execd.KILL) if k in got)
-    assert execd.STDIN not in got[left_at:]
+    assert execd.STDIN not in got[got.index(execd.KILL) :]
     done, _ = await asyncio.wait({call}, timeout=30)  # only bounds a hang
     assert done, "the call never ended"
-    with pytest.raises(asyncio.CancelledError if left == "cancelled" else TimeoutError):
+    with pytest.raises(asyncio.CancelledError):
         call.result()
 
 
@@ -4279,26 +4369,27 @@ async def test_a_port_held_at_the_first_start_says_so() -> None:
 
 
 async def test_stray_frames_are_counted_per_ping_interval(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch
+    daemons: Daemons, clock: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(execd, "MAX_STRAY", 100)
-    monkeypatch.setattr(execd, "PING_EVERY", 0.01)
+    more = asyncio.Event()
 
-    async def pongs_across_pings(
+    async def pongs_across_intervals(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.PONG, 0) * execd.MAX_STRAY)
-        for _ in range(2):  # the count restarts with each interval
-            while (await read_frame(r))[0] != execd.PING:
-                pass
-        w.write(frame(execd.PONG, 0) * execd.MAX_STRAY)
-        w.write(frame(execd.STDOUT, call_id, b"still here"))
+        for said in (b"here", b"still here"):  # the count restarts with each interval
+            w.write(frame(execd.PONG, 0) * execd.MAX_STRAY)
+            w.write(frame(execd.STDOUT, call_id, said))  # read once they are counted
+            await more.wait()
         await r.read()
 
-    await daemons.serve(pongs_across_pings)
+    await daemons.serve(pongs_across_intervals)
     stream = await daemons.client().open_stream(["cat"], None)
 
+    assert await asyncio.wait_for(stream.receive(), 30) == b"here"
+    clock.now += 2 * execd.PING_EVERY
+    more.set()
     assert await asyncio.wait_for(stream.receive(), 30) == b"still here"
 
 
