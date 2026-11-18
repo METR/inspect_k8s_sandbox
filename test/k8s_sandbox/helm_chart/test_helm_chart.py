@@ -832,6 +832,31 @@ def test_a_pod_with_no_network_card_keeps_its_names_within_the_line_musl_reads(
     assert "here 511 bytes" in exc_info.value.stderr
 
 
+@pytest.mark.parametrize(
+    "container",
+    ["services.default", "services.default.initContainers[0]", "extraContainers[0]"],
+)
+def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
+    chart_dir: pathlib.Path, container: str
+) -> None:
+    def render(annotation: str | None) -> None:
+        _run_helm_template(
+            chart_dir,
+            set_str="services.default.initContainers[0].name=setup,"
+            "services.default.initContainers[0].image=busybox,"
+            "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+            f"{container}.volumeMounts[0].name=coredns-config,"
+            f"{container}.volumeMounts[0].mountPath=/etc/coredns",
+            set_string=annotation,
+        )
+
+    render(None)  # with a network card the pod has the volume
+    # Without one it has not, and the API server refused the StatefulSet.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        render(r"annotations.sandbox\.amazonaws\.com/network-isolated=true")
+    assert "no network device" in exc_info.value.stderr
+
+
 def test_a_service_from_additional_resources_resolves_by_its_own_name(
     chart_dir: pathlib.Path,
 ) -> None:
