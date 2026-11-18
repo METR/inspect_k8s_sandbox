@@ -503,6 +503,21 @@ func TestACommandKilledAtItsTimeoutSaysSoInItsExit(t *testing.T) {
 	}
 }
 
+func TestACommandItsClientsKillEndedSaysSoInItsExit(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "60"}, Env: map[string]string{}, Tag: tag})
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	s.dispatch(c, frame{kind: fStart, id: 10, payload: req})
+
+	s.dispatch(c, frame{kind: fKill, id: 10})
+
+	if status := exitStatus(t, frames); status["timeout"] != true {
+		t.Fatalf("EXIT %v: the client, whose timeout sent the kill, can't tell it from the command's own exit", status)
+	}
+}
+
 func TestTheLineForACommandASignalEndedIsDashs(t *testing.T) {
 	const core = 0x80 // a wait status's mark of a core dump
 	for status, want := range map[syscall.WaitStatus]string{
@@ -1476,7 +1491,7 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
-	cl.kill()     // from another connection, while this one's START is still at work
+	cl.stop(true) // its client's, from another connection, while this one's START is still at work
 	cl.kmu.Lock() // and stays at work: the command has ended before the START notes its id
 	noted := sync.OnceFunc(cl.kmu.Unlock)
 	t.Cleanup(noted)
@@ -1513,6 +1528,20 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 			if time.Now().After(deadline) {
 				t.Fatalf("process %d, which the command left running, outlived a kill that came before it started", left)
 			}
+		}
+	}
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		cl.mu.Lock()
+		exited, timedOut := cl.exited, cl.timedOut
+		cl.mu.Unlock()
+		if exited && !timedOut {
+			t.Fatal("its exit does not say timed out: its client takes the command for done, with what it left running killed")
+		}
+		if exited {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command's exit never came")
 		}
 	}
 }

@@ -87,6 +87,7 @@ RECONNECT_FOR = 300.0
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
 KILL_WAIT = 10.0  # for a killed command's exit
+TIMER_LAG = 1.0  # ours follows execd's own, which counts from the command's start
 
 
 @dataclass(frozen=True)
@@ -382,9 +383,6 @@ class Link:
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
                 c = self.calls.get(call_id)
-                if kind == EXIT and c is not None:
-                    c.exited = True
-                    c.stdin_room.set()  # a send waiting for room sees the exit
                 put = json.loads(payload)["stdin"] if kind == STDIN_ACK else 0
                 if kind == PONG and self._pinged:  # execd read what its PING followed
                     for released in self._pinged.pop(0):
@@ -422,6 +420,9 @@ class Link:
                         c.got[kind - STDOUT] += n
                     if kind == RESUMED:
                         c.resuming = False
+                    if kind == EXIT:  # as it is queued: who sees it set finds the exit
+                        c.exited = True
+                        c.stdin_room.set()  # a send waiting for room sees the exit
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
@@ -586,7 +587,7 @@ class ExecdClient:
         stdin: bytes | None,
         timeout: float | None,
     ) -> AsyncGenerator[tuple[int, Any], None]:
-        """Yield (STDOUT|STDERR, bytes), then (EXIT, status), None at our timeout."""
+        """Yield (STDOUT|STDERR, bytes), then (EXIT, status): None if we time it out."""
         tag = os.urandom(8).hex()
         request: dict[str, Any] = {
             "argv": argv,
@@ -610,7 +611,7 @@ class ExecdClient:
                     link = await asyncio.wait_for(self._get(), end - time.monotonic())
             except asyncio.TimeoutError:  # a peer that answers no PING is not execd
                 raise ConnectionError("execd has not confirmed its calls") from None
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout + TIMER_LAG
 
         def left() -> float | None:  # of the command's timeout
             return None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -636,14 +637,13 @@ class ExecdClient:
                     except asyncio.TimeoutError:
                         call.closed = True  # the cancel can be lost before Python 3.12
                         sender.cancel()  # its write could hold the lock the KILL needs
-                        try:
-                            await asyncio.wait_for(
-                                self._kill(link, call), KILL_WAIT + 1
-                            )
-                        except asyncio.TimeoutError:  # a write the peer never reads
-                            await link.close()
-                        yield EXIT, None
-                        return
+                        ended = await self._kill(link, call)
+                        if not ended:
+                            yield EXIT, None
+                            return
+                        item = ended.pop()  # its own exit: it ended before a kill came
+                        for kind, payload in ended:
+                            yield kind, payload
                     if isinstance(item, Dropped):
                         if item.args != (link,):  # a connection the call has left since
                             continue
@@ -671,7 +671,7 @@ class ExecdClient:
                         yield kind, payload
                         await _taken(link, call, kind, len(payload), left())
                     elif kind == EXIT:
-                        finished = True  # no KILL: it would end what it left running
+                        finished = True  # no KILL: it has ended
                         self._over(link, call.id, RELEASE)
                         status = json.loads(payload)
                         code, why = status.get("code"), status.get("error", "")
@@ -750,24 +750,37 @@ class ExecdClient:
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
-    async def _kill(self, link: Link, call: Call) -> None:
-        """Kill the call's processes and wait briefly for its exit."""
-        try:
-            await link.send(KILL, call.id)
-            end = time.monotonic() + KILL_WAIT
-            drained = 0
-            while time.monotonic() < end:
-                item = await _next(call.queue, end - time.monotonic())
-                if not isinstance(item, tuple) or item[0] == EXIT:
-                    break  # its exit, or a dropped connection
-                # acks let execd finish; past HOLD give up, as RELEASE frees the call
-                if item[0] in (STDOUT, STDERR):
-                    if drained + len(item[1]) > call.hold:
-                        break
-                    drained += len(item[1])
-                    await _taken(link, call, item[0], len(item[1]))
-        except (OSError, asyncio.TimeoutError):
-            pass
+    async def _kill(self, link: Link, call: Call) -> list[tuple[int, bytes]]:
+        """Kill the call; give its last output and its exit, if it ended by itself."""
+        ended: list[tuple[int, bytes]] = []
+        link.send_last(call.id, KILL)  # not waited for: its exit can come first
+        end = time.monotonic() + KILL_WAIT
+        drained = 0
+        # An exit that has come is taken, with the output before it, at any time.
+        while call.exited or time.monotonic() < end:
+            try:
+                wait = None if call.exited else end - time.monotonic()
+                item = await _next(call.queue, wait)
+            except asyncio.TimeoutError:
+                continue  # once more, for an exit that came as the time ran out
+            if not isinstance(item, tuple):
+                if item.args != (link,):  # a connection the call has left since
+                    continue
+                break  # a dropped connection
+            if item[0] == EXIT:  # execd marks the exit of a command a kill ended
+                if json.loads(item[1]).get("timeout"):
+                    break
+                ended.append(item)
+                return ended
+            if item[0] in (STDOUT, STDERR):
+                # shortcut: past HOLD an exit to come is lost; count on if one matters
+                if drained + len(item[1]) > call.hold:
+                    break  # as RELEASE frees the call
+                drained += len(item[1])
+                ended.append(item)
+                within = end - time.monotonic()  # acks let execd finish
+                await _taken(link, call, item[0], len(item[1]), within)
+        return []
 
     async def exec(
         self,

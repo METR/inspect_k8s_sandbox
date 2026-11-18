@@ -222,7 +222,7 @@ func (s *server) dispatch(c *conn, f frame) {
 		}
 	case fKill:
 		if cl := s.get(f.id); cl != nil {
-			cl.kill()
+			cl.stop(true) // as a timeout's: the client that sends it at its own timeout reads the exit
 		}
 	case fResume:
 		s.resume(c, f)
@@ -518,7 +518,7 @@ func (cl *call) run(req startRequest) error {
 		byTimeout := cl.timeoutKilled
 		cl.kmu.Unlock()
 		cl.mu.Lock()
-		cl.timedOut = byTimeout && ws.Signal() == syscall.SIGKILL
+		cl.timedOut = byTimeout
 		cl.mu.Unlock()
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
@@ -815,10 +815,11 @@ func signalLine(ws syscall.WaitStatus) string {
 // kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
-// stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
+// stop is kill; a timeout's, execd's or its client's, notes that the command was running, so only then does the exit say "timed out".
 func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
+	cl.timeoutKilled = cl.timeoutKilled || timeout && cl.status == nil // not started yet: the kill that meets it as it starts is this timeout's
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
 	seen := func(states int) bool {
