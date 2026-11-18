@@ -240,6 +240,47 @@ async def test_a_command_for_another_user_does_not_run_with_groups_it_cannot_tak
     assert (result.returncode, result.stdout) == (126, "")
 
 
+async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: in a Kata guest, with 1,024, the 506th such command failed."""
+    name = f"{sandbox.name}-nofile"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    run = ["run", "-d", "--name", name, "--ulimit", "nofile=64:64", sandbox.name]
+    gate = f"/tmp/{uuid.uuid4().hex}"
+    # A process that holds its command's stdout and stderr until it is let go.
+    held = 'until [ -e "$0" ]; do sleep 0.05; done; echo >>"$0.gone"'
+    # One that then writes to the stdout it kept, and says how the write ended.
+    late = 'trap "" PIPE; until [ -e "$0.go" ]; do sleep 0.05; done; echo late'
+    late += '; echo $? >"$0.wrote"'
+
+    async def leave(script: str) -> int:
+        argv = ["sh", "-c", f"({script}) &", gate]
+        ran = client.exec(argv, None, None, {}, None, None)
+        return (await asyncio.wait_for(ran, 30)).returncode  # only bounds a hang
+
+    try:
+        assert docker(*run, "sleep", "3600").returncode == 0
+        monkeypatch.setattr(sandbox, "name", name)
+        ip = docker("inspect", "-f", address, name).stdout.strip()
+        monkeypatch.setattr(relay, "ip", ip)
+        for _ in range(32):  # 64 pipes, were all kept: every descriptor execd has
+            assert await leave(held) == 0
+        sandbox.sh(f"touch {gate}")
+        await sandbox.until(f'[ "$(wc -l <{gate}.gone)" = 32 ]')
+        assert await leave(late) == 0
+        sandbox.sh(f"touch {gate}.go")
+        await sandbox.until(f"test -s {gate}.wrote")
+        wrote = sandbox.sh(f"cat {gate}.wrote").stdout
+    finally:
+        docker("rm", "-f", name)
+
+    assert wrote == "0\n"  # the places of the pipes execd let go went to new ones
+
+
 async def test_an_id_no_uid_holds_is_not_narrowed_to_one(
     sandbox: Sandbox, client: execd.ExecdClient
 ) -> None:

@@ -487,8 +487,12 @@ func (cl *call) run(req startRequest) error {
 					cl.output(i, buf[:n])
 				}
 				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
-					go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
-					return
+					select {
+					case held <- struct{}{}:
+						go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
+						return
+					default: // no place left: closed, and that write fails
+					}
 				}
 				if err != nil {
 					r.Close()
@@ -560,9 +564,18 @@ func (cl *call) run(req startRequest) error {
 // leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node where execd's user has too many pipes.
 const leftOutput = 1 << 20
 
-// closeOnceUnheld closes the pipe when no process holds its other end. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
+// held has a place for each pipe kept open for what a command left running: half of execd's descriptors, so that its calls and connections have the rest.
+var held = func() chan struct{} {
+	var files syscall.Rlimit
+	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) != nil {
+		files.Cur = 0 // a limit execd cannot read: it keeps no pipe
+	}
+	return make(chan struct{}, files.Cur/2)
+}()
+
+// closeOnceUnheld closes the pipe when no process holds its other end, and gives back its place. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
 func closeOnceUnheld(r *os.File) {
-	defer r.Close()
+	defer func() { r.Close(); <-held }()
 	r.SetReadDeadline(time.Time{})
 	var dropped [512]byte // on this goroutine's stack: io.Discard would keep 8 KiB of heap for as long as a quiet process holds the pipe
 	for left := leftOutput; left > 0; {
