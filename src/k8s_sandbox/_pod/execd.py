@@ -728,9 +728,6 @@ class ExecdClient:
                 while True:
                     try:
                         item = await _next(call.queue, left())
-                        if isinstance(item, Dropped) and left() == 0:
-                            call.queue.put_nowait(item)  # the kill's wait takes it up
-                            raise asyncio.TimeoutError
                     except asyncio.TimeoutError:
                         call.closed = True  # the cancel can be lost before Python 3.12
                         sender.cancel()  # its write could hold the lock the KILL needs
@@ -747,7 +744,11 @@ class ExecdClient:
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
-                        link = await asyncio.wait_for(self._get(stale=link), left())
+                        try:
+                            link = await asyncio.wait_for(self._get(stale=link), left())
+                        except asyncio.TimeoutError:  # the kill's wait takes it up
+                            call.queue.put_nowait(item)
+                            continue
                         await self._resume(link, call)
                         continue
                     assert isinstance(item, tuple)
@@ -874,10 +875,17 @@ class ExecdClient:
                 try:
                     reopen = self._get(stale=link)
                     link = await asyncio.wait_for(reopen, end - time.monotonic())
-                    await self._resume(link, call)
+                    resume = self._resume(link, call)  # its write may wait its turn
+                    await asyncio.wait_for(resume, end - time.monotonic())
                 except Exception:  # an execd we cannot reach: our timer's word stands
                     break
                 continue
+            if item[0] == ERROR:  # execd has let the call go, or never had it
+                if item[1] == b"unknown call" and not (any(call.got) or call.stdin_put):
+                    break  # nothing ran, in all its time
+                raise ExecdResultUnknownError(
+                    f"execd: {item[1].decode(errors='replace')}", pod=link.daemon.ip
+                )
             if item[0] == EXIT:  # execd marks the exit of a command a kill ended
                 if json.loads(item[1]).get("timeout"):
                     break
