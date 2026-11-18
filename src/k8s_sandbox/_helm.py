@@ -1003,7 +1003,7 @@ _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
     "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
     # After a leading `.` Helm takes a `_` only between two digits.
-    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*"
+    "tag:yaml.org,2002:int": r"[-+0-9][-+.0-9A-Za-z_]*"
     r"|\.[0-9](_?[0-9])*([eE][-+]?[0-9](_?[0-9])*)?",
     "tag:yaml.org,2002:merge": r"<<",
 }
@@ -1018,11 +1018,9 @@ class _ManifestLoader(yaml.SafeLoader):
             for tag, pattern in _SCALAR_TAGS.items()
         ]
     }
-    # An untagged number's tag is its constructor: no manifest can write that as a tag.
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        _helm_number: _helm_number,
-        # Tagged `!!int` or `!!float` too, Helm reads a number as it reads any.
+        # Tagged `!!int`, `!!float` or neither, Helm reads a number one way.
         "tag:yaml.org,2002:int": _helm_number,
         "tag:yaml.org,2002:float": _helm_number,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
