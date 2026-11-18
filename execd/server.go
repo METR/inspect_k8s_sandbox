@@ -371,7 +371,7 @@ func (s *server) resume(c *conn, f frame) {
 	if replaced {
 		return
 	}
-	if cl.abandoned {
+	if cl.abandoned && !cl.timedOut { // one its own timeout ended still says so: that takes none of the output let go
 		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
 	}

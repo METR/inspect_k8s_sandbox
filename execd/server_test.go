@@ -2472,6 +2472,28 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	}
 }
 
+func TestACallExecdAbandonedStillSaysThatItsOwnTimeoutEndedIt(t *testing.T) {
+	var timers []func()
+	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
+	t.Cleanup(func() { afterFunc = time.AfterFunc })
+	s, _ := newServer(strings.Repeat("00", 32))
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "outlives", Timeout: 60})
+	first := testConn(t)
+	s.start(first, frame{kind: fStart, id: 24, payload: req})
+	timers[0]() // its timeout
+	exitCode(t, s.get(24))
+	s.detach(first)
+	timers[1]() // six minutes with no client
+	late, frames := recordedConn(t)
+
+	s.resume(late, frame{kind: fResume, id: 24, payload: []byte(`{"stdout":0,"stderr":0}`)})
+
+	// Its client, back at last, is told what execd knows: "abandoned" would say that how it ended is not known.
+	if said := awaited(t, frames, fExit, time.Now().Add(30*time.Second)); !bytes.Contains(said.payload, []byte(`"timeout":true`)) {
+		t.Fatalf("a RESUME of a call that execd's timeout ended, and execd then abandoned, got the exit %s", said.payload)
+	}
+}
+
 func TestAnExitDeliversTheOutputBehindAReadNotYetCounted(t *testing.T) {
 	var armed atomic.Bool
 	taken, count := make(chan struct{}), make(chan struct{})
