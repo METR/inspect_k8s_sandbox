@@ -195,6 +195,15 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     assert (pod.ready, pod.phase) == expected
 
 
+def test_a_pod_being_deleted_is_not_ready():
+    # Until its containers stop, a deleted pod still reports Ready.
+    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    body = _pod_body() | ready
+    body["metadata"]["deletionTimestamp"] = "2026-11-18T00:00:00Z"
+
+    assert _parse_pod(body).ready is False
+
+
 def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
     ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
     events = [
