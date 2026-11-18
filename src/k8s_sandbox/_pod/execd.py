@@ -146,6 +146,7 @@ class _Pipe:
         self.tls = context.wrap_bio(self._in, self._out)
         self._pace = pace
         self._plain = bytearray()
+        self._ended = False  # execd's close_notify is read: no more follows
         self._rest = b""  # TCP bytes a pass left undecrypted
         self._small_at = float("-inf")  # when the next small read may start
         self._transport = cast(asyncio.Transport, writer.transport)  # TCP: it reads too
@@ -171,6 +172,8 @@ class _Pipe:
 
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
+            if self._ended:  # only now: the frames read with its end are execd's last
+                raise ConnectionResetError("execd ended the TLS session")
             raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
             for i in range(0, len(raw), SLICE):
@@ -179,7 +182,8 @@ class _Pipe:
                     while True:
                         chunk = self.tls.read(RAW_READ)  # a record at a time
                         if not chunk:
-                            raise ConnectionResetError("execd ended the TLS session")
+                            self._ended = True
+                            break
                         self._plain += chunk
                 if i + SLICE < len(raw) and time.thread_time() - began > PASS_CPU:
                     self._rest = raw[i + SLICE :]
@@ -519,9 +523,12 @@ class Link:
             await self.close()
 
     async def _ping(self) -> None:
+        # Intervals with no frame, not seconds: while our own loop is held, none passes.
+        quiet, last = 0, self._last_rx
         while not self.closed:
             await asyncio.sleep(PING_EVERY)
-            if time.monotonic() - self._last_rx > DEAD_AFTER:
+            quiet, last = (quiet + 1 if self._last_rx == last else 0), self._last_rx
+            if quiet * PING_EVERY >= DEAD_AFTER:
                 await self.close()
                 return
             try:
