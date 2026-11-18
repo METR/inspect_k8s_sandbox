@@ -57,7 +57,7 @@ s.connect((socket.inet_ntop(socket.AF_INET6, own), int(sys.argv[1]), 0, eth0))
 try:
     context.wrap_socket(s)
     print("served")
-except (ssl.SSLEOFError, ConnectionResetError, BrokenPipeError):
+except (ssl.SSLEOFError, ConnectionResetError):
     print("closed")
 """
 
@@ -445,10 +445,8 @@ async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
         started = docker(*run, sandbox.name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         await start_execd(forwards, False, "--port", str(PORT))
-        listed = "eth0 *fe800000000000000000000000000000 "  # it answers there
-        await forwards.until(f"grep -q '{listed}' /proc/net/anycast6")
-        dial = ["python3", "-c", ANYCAST_PROBE, str(PORT)]
-        probe = await asyncio.to_thread(docker, "exec", forwards.name, *dial)
+        await forwards.until("grep -q 'eth0 *fe80' /proc/net/anycast6")  # answers there
+        probe = docker("exec", forwards.name, "python3", "-c", ANYCAST_PROBE, str(PORT))
     finally:
         docker("rm", "-f", forwards.name)
 
