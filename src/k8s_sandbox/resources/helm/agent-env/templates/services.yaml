@@ -45,25 +45,19 @@ spec:
       {{- $egressProxy := include "agentEnv.egressProxy" (dict "root" $ "service" $service) }}
       {{- if $egressProxy }}
       {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
-      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- end }}
+      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
+      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
       {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
       {{- range .volumeMounts }}
-      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
-      {{- end }}
+      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- if and $egressProxy (eq (toString .name) "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- /* The DNS sidecar's volume is not there where no sidecar runs: the API server would refuse the StatefulSet. */}}
+      {{- if and $noCard (eq (toString .name) "coredns-config") }}{{ fail (printf "a container of services.%s mounts the volume coredns-config: that is the DNS sidecar's, and a pod with no network device runs none" $name) }}{{ end }}
       {{- end }}
       {{- end }}
       annotations:
         {{- include "agentEnv.toYaml" $podAnnotations | nindent 8 }}
-      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
-      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
-      {{- if $noCard }}
-      {{- /* Such a pod has no DNS sidecar, so no such volume: the API server would refuse its StatefulSet. */}}
-      {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
-      {{- range .volumeMounts }}
-      {{- if eq .name "coredns-config" }}{{ fail (printf "a container of services.%s mounts the volume coredns-config, the DNS sidecar's, which a pod with no network device does not have" $name) }}{{ end }}
-      {{- end }}
-      {{- end }}
-      {{- end }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
