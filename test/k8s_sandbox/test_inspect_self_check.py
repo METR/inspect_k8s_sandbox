@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 from typing import AsyncGenerator
 
 import pytest
@@ -34,16 +35,21 @@ _NONSTRICT_XFAILS = {
 }
 
 
-@pytest.fixture(scope="module", params=["exec", "execd"])
+@pytest.fixture(scope="module", params=["exec", "execd", "execd-stdio"])
 def transport(request: pytest.FixtureRequest) -> str:
     return request.param
 
 
 @pytest_asyncio.fixture(scope="module")
 async def sandboxes(
-    transport: str,
+    transport: str, tmp_path_factory: pytest.TempPathFactory
 ) -> AsyncGenerator[dict[str, K8sSandboxEnvironment], None]:
     values = "values.yaml" if transport == "exec" else "execd-values.yaml"
+    if transport == "execd-stdio":  # the same pods, reached as one with no network card
+        on_tcp = (pathlib.Path(__file__).parent / "resources" / values).read_text()
+        stdio = tmp_path_factory.mktemp("values") / values
+        stdio.write_text(on_tcp.replace('/execd: "true"', '/execd: "stdio"'))
+        values = str(stdio)
     async with install_sandbox_environments(__file__, values) as envs:
         yield envs
 
@@ -75,7 +81,8 @@ async def test_annotation_picks_transport(
     # execd starts a command itself; Kubernetes exec starts it from a shell.
     result = await sandbox_env.exec(["sh", "-c", "cat /proc/$PPID/cmdline"])
     assert result.success, result.stderr
-    assert ("execd" in result.stdout) == (transport == "execd"), result.stdout
+    assert ("execd" in result.stdout) == (transport != "exec"), result.stdout
+    assert ("--socket" in result.stdout) == (transport == "execd-stdio"), result.stdout
 
 
 async def test_a_script_with_no_interpreter_line_runs(
@@ -104,14 +111,16 @@ async def test_a_command_is_found_on_the_path_as_its_user(
     assert result.stdout == "nobody\n", result
 
 
+@pytest.mark.parametrize("service", ["default", "runc"])  # on gVisor, and on Linux
 async def test_a_kill_reaches_what_another_users_command_detached(
-    transport: str, sandboxes: dict[str, K8sSandboxEnvironment]
+    transport: str, sandboxes: dict[str, K8sSandboxEnvironment], service: str
 ) -> None:
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
-    root = sandboxes["runc"]
-    # setsid takes it out of the process group a kill signals.
-    detach = "setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' & wait"
+    root = sandboxes[service]
+    # Out of the group a kill signals, its parent gone: only the tag leads a kill to it.
+    orphan = "while kill -0 $PPID 2>/dev/null; do :; done; echo $$ > /tmp/detached"
+    detach = f"(setsid sh -c '{orphan}; kill -STOP $$' &); sleep 600"
     command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))
 
     async def detached() -> str:
@@ -119,12 +128,18 @@ async def test_a_kill_reaches_what_another_users_command_detached(
             await asyncio.sleep(0.1)
         return pid.strip()
 
-    pid = await asyncio.wait_for(detached(), 30)
-    command.cancel()
-
     async def gone() -> None:
         while (await root.exec(["test", "-e", f"/proc/{pid}"])).success:
             await asyncio.sleep(0.1)
 
-    # Without CAP_SYS_PTRACE root can't read the user's environment for the call's tag.
-    await asyncio.wait_for(gone(), 30)
+    left = "kill -9 $(cat /tmp/detached); "  # what a failed run leaves
+    try:
+        pid = await asyncio.wait_for(detached(), 30)
+        command.cancel()
+
+        # Without CAP_SYS_PTRACE root can't read the user's environment for its tag.
+        await asyncio.wait_for(gone(), 30)
+        left = ""
+    finally:
+        command.cancel()
+        await root.exec(["sh", "-c", left + "rm -f /tmp/detached"])

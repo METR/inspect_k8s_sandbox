@@ -72,6 +72,9 @@
         "pattern": "^[a-z0-9](?:[-a-z0-9.]{0,53}[a-z0-9])?$"
       }
     },
+    "egressForwarderImage": {
+      "type": "string"
+    },
     "corednsImage": {
       "type": "string"
     },
@@ -304,6 +307,14 @@
           "object",
           "string"
         ]
+      }
+    },
+    "additionalResourceDnsRecords": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Interpolated into the CoreDNS Corefile, so the pattern is a security control: one DNS label.",
+        "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
       }
     },
     "annotations": {

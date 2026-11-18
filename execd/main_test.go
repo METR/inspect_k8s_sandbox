@@ -75,6 +75,56 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	}
 }
 
+func TestConnectWaitsWhileItsOutputIsNotRead(t *testing.T) {
+	const unread = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	name := "execd-test-" + strconv.Itoa(os.Getpid())
+	daemon, err := net.Listen("unix", "@"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	bridge := exec.CommandContext(ctx, os.Args[0], "connect", name)
+	stdin, _ := bridge.StdinPipe() // open until the test ends: connect ends when its stdin does
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	bridge.Stdout = w
+	if err := bridge.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	defer bridge.Wait() // its exit status may go to the tests' reaper
+	defer stdin.Close()
+	daemon.(*net.UnixListener).SetDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	c, err := daemon.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ran := func() time.Duration { // the bridge's user and system time so far, which /proc counts in hundredths of a second
+		stat, err := os.ReadFile("/proc/" + strconv.Itoa(bridge.Process.Pid) + "/stat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:])) // after the name, which may hold spaces
+		user, _ := strconv.Atoi(f[11])
+		system, _ := strconv.Atoi(f[12])
+		return time.Duration(user+system) * 10 * time.Millisecond
+	}
+	started := ran()                // it has connected: what it took to start does not count
+	go c.Write(make([]byte, 1<<20)) // more than the exec's stdout holds
+
+	time.Sleep(unread)
+
+	if spent := ran() - started; spent > unread/10 {
+		t.Fatalf("connect ran for %v of the %v its output went unread: want it to wait", spent, unread)
+	}
+}
+
 // firstProcess runs execd as a pod's first process that reaps nothing would.
 func firstProcess(argv []string) {
 	prctl(prSetChildSubreaper, 1)
@@ -114,15 +164,22 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	}
 }
 
-// refused runs execd where the kernel refuses PR_SET_DUMPABLE, as a seccomp profile can, and says so if execd then ran on.
+// refused runs execd where the kernel refuses PR_SET_DUMPABLE, or a thread its way back to root, as a seccomp profile can, and says so if execd then ran on.
 func refused(at string) {
 	if at != "ran on" {
 		runtime.LockOSThread() // the filter is this thread's, and an exec keeps it
+		// What is refused: prctl's first argument, the option; or the second of setresuid or setresgid, root as the effective id.
+		call, argument, value := uint32(syscall.SYS_PRCTL), uint32(16), uint32(prSetDumpable)
+		if at == "user back" {
+			call, argument, value = syscall.SYS_SETRESUID, 24, 0
+		} else if at == "group back" {
+			call, argument, value = syscall.SYS_SETRESGID, 24, 0
+		}
 		filter := []syscall.SockFilter{
 			{Code: 0x20, K: 0},                               // the call's number
-			{Code: 0x15, Jf: 3, K: syscall.SYS_PRCTL},        // not prctl: allowed
-			{Code: 0x20, K: 16},                              // its first argument
-			{Code: 0x15, Jf: 1, K: prSetDumpable},            // another option: allowed
+			{Code: 0x15, Jf: 3, K: call},                     // another call: allowed
+			{Code: 0x20, K: argument},                        // its argument
+			{Code: 0x15, Jf: 1, K: value},                    // another value: allowed
 			{Code: 0x06, K: 0x50000 | uint32(syscall.EPERM)}, // SECCOMP_RET_ERRNO
 			{Code: 0x06, K: 0x7fff0000},                      // SECCOMP_RET_ALLOW
 		}
@@ -134,6 +191,9 @@ func refused(at string) {
 		}
 		if at == "start" { // init() runs again, under the filter
 			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ran on"}, os.Environ())
+		}
+		if strings.HasSuffix(at, " back") { // of no process: only the user's identity is taken, and given back
+			killAs(1<<30, &syscall.Credential{Uid: 65534, Gid: 65534})
 		}
 		setids(uint32(os.Getuid()), uint32(os.Getgid()))
 	}
@@ -152,6 +212,25 @@ func TestExecdEndsWhereItCannotBeMadeNonDumpable(t *testing.T) {
 
 		if len(ran) > 0 || !strings.Contains(said.String(), "prctl(PR_SET_DUMPABLE): operation not permitted") {
 			t.Errorf("at its %s execd said %q, then %q: its user could read its memory", at, said.String(), ran)
+		}
+	}
+}
+
+func TestExecdEndsWhereAThreadCannotTakeItsIdentityBack(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("only root takes another user's identity")
+	}
+	for _, half := range []string{"user back", "group back"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "refused", half)
+		var said strings.Builder
+		child.Stderr = &said
+
+		ran, _ := child.Output() // its exit status may go to the tests' reaper
+
+		if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "could not take execd's identity back") {
+			t.Errorf("refused its %s, execd said %q, then %q (%v): the thread would do execd's other work as another", half, said.String(), ran, ctx.Err())
 		}
 	}
 }

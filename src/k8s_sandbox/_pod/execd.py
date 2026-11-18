@@ -1,4 +1,4 @@
-"""Commands and file transfer over TLS to execd in the sandbox, never exec stdin."""
+"""Commands and file transfer over TLS to execd in the sandbox."""
 
 from __future__ import annotations
 
@@ -43,8 +43,10 @@ from k8s_sandbox._pod.read import read_command
 logger = logging.getLogger(__name__)
 
 ANNOTATION = "inspect-k8s-sandbox/execd"
+TRANSPORTS = ("true", "stdio")  # its values: execd's port, or one exec's stdio
 EXECD_PATH = "/execd/execd"  # directly under /: root can't rename a mountpoint there
 EXECD_PORT = 14601  # below every runtime's ephemeral ports: gVisor's start at 16000
+EXECD_SOCKET = "inspect-k8s-sandbox-execd"  # abstract: where a pod has no network card
 
 AUTH, START, STDIN, KILL, RESUME, RELEASE, PING, ACK = 1, 2, 3, 4, 5, 6, 7, 8
 OK, STDOUT, STDERR, EXIT, PONG, ERROR, RESUMED, STDIN_ACK = (
@@ -79,6 +81,9 @@ RAW_READ = 64 << 10  # TCP bytes decrypted between pace checks
 SLICE = RAW_READ // 3 + 1  # to TLS at once: 8 KiB slowed bulk reads, 64 held the loop
 PASS_CPU = 0.002  # CPU seconds after which a pass leaves the rest of them to the next
 SMALL_READS = 8  # a read short of RAW_READ spends one of these; one comes back each ms
+# shortcut for aws/containers-roadmap#2913: drop the gap and the cap with its fix
+MESSAGE_GAP = 0.001
+MESSAGE_SIZE = 64 << 10
 STDIN_WINDOW = 8 << 20  # unwritten stdin in flight, so execd's queue stays small
 PING_EVERY = 15.0
 DEAD_AFTER = 45.0  # no frame at all for this long means the connection is gone
@@ -98,6 +103,8 @@ class Daemon:
     fingerprint: str
     key: bytes = field(repr=False)
     pod: str = ""  # the pod's UID
+    # Opens an exec joined to the daemon's socket, for a pod with no network card.
+    stdio: Callable[[], Awaitable[ByteStream]] | None = None
 
 
 class Dropped(Exception):
@@ -114,7 +121,8 @@ class DaemonRunning(Exception):
 
 def _port_held() -> RuntimeError:
     return RuntimeError(
-        f"TCP port {EXECD_PORT} in the sandbox is held by a process other than execd"
+        f"execd's TCP port {EXECD_PORT} or socket in the sandbox is held by a process "
+        "other than execd"
     )
 
 
@@ -127,8 +135,8 @@ class _Pipe:
 
     def __init__(
         self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader | _Stdio,
+        writer: asyncio.StreamWriter | _Stdio,
         context: ssl.SSLContext,
         pace: Pace,
     ) -> None:
@@ -138,6 +146,7 @@ class _Pipe:
         self.tls = context.wrap_bio(self._in, self._out)
         self._pace = pace
         self._plain = bytearray()
+        self._ended = False  # execd's close_notify is read: no more follows
         self._rest = b""  # TCP bytes a pass left undecrypted
         self._small_at = float("-inf")  # when the next small read may start
         self._transport = cast(asyncio.Transport, writer.transport)  # TCP: it reads too
@@ -163,6 +172,8 @@ class _Pipe:
 
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
+            if self._ended:  # only now: the frames read with its end are execd's last
+                raise ConnectionResetError("execd ended the TLS session")
             raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
             for i in range(0, len(raw), SLICE):
@@ -171,7 +182,8 @@ class _Pipe:
                     while True:
                         chunk = self.tls.read(RAW_READ)  # a record at a time
                         if not chunk:
-                            raise ConnectionResetError("execd ended the TLS session")
+                            self._ended = True
+                            break
                         self._plain += chunk
                 if i + SLICE < len(raw) and time.thread_time() - began > PASS_CPU:
                     self._rest = raw[i + SLICE :]
@@ -213,6 +225,78 @@ class _Pipe:
         self._writer.transport.abort()  # a peer that stopped reading can't hold it open
 
 
+_closing: set[asyncio.Future[None]] = set()  # held until their execs have closed
+
+
+class _Stdio:
+    """An exec's stdio, as the reader, writer and transport _Pipe has of TCP."""
+
+    def __init__(self, stdio: ByteStream) -> None:
+        self._stdio = stdio
+        self._out = bytearray()
+        self._written, self._taken = asyncio.Event(), asyncio.Event()
+        self._closed = False
+        self.transport = self
+        self._sender = asyncio.ensure_future(self._send())
+
+    async def read(self, n: int) -> bytes:
+        try:
+            return await self._stdio.receive(n)
+        except (
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ):
+            return b""  # as a socket reads its end
+
+    def write(self, data: bytes) -> None:
+        self._out += data
+        self._written.set()
+
+    async def drain(self) -> None:
+        while len(self._out) > RAW_READ and not self._closed:
+            self._taken.clear()
+            await self._taken.wait()
+        if self._closed:
+            raise ConnectionResetError("the exec that reaches execd ended")
+
+    async def _send(self) -> None:
+        """A message at a time: what is written meanwhile goes in the next ones."""
+        try:
+            while True:
+                await self._written.wait()
+                self._written.clear()
+                while self._out:
+                    data = bytes(self._out[:MESSAGE_SIZE])
+                    del self._out[:MESSAGE_SIZE]
+                    self._taken.set()
+                    await self._stdio.send(data)
+                    # A timer takes a busy loop up to three turns a message: yield once.
+                    due = time.monotonic() + MESSAGE_GAP
+                    await asyncio.sleep(0)
+                    if (left := due - time.monotonic()) > 0:
+                        await asyncio.sleep(left)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            self.abort()  # the reader sees the end, as of a port reset under a write
+
+    def pause_reading(self) -> None:
+        """Nothing to pause: an exec is read only when read() asks."""
+
+    resume_reading = pause_reading
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._sender.cancel()
+            self._taken.set()
+            closing = asyncio.ensure_future(self._stdio.aclose())
+            _closing.add(closing)
+            closing.add_done_callback(_closing.discard)
+
+
 async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     # The certificate is self-signed: it is trusted by its fingerprint, below.
@@ -222,8 +306,15 @@ async def _connect(daemon: Daemon, pace: Pace) -> _Pipe:
     # One group: a stand-in can't pick a 150 ms one. Python 3.10 can't set X25519.
     context.set_ecdh_curve("prime256v1")
 
+    # Before the timeout: its exec waits its turn among the pod's operations.
+    stdio = None if daemon.stdio is None else _Stdio(await daemon.stdio())
+
     async def handshake() -> _Pipe:
-        reader, writer = await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        reader, writer = (
+            (stdio, stdio)
+            if stdio
+            else await asyncio.open_connection(daemon.ip, EXECD_PORT)
+        )
         pipe = _Pipe(reader, writer, context, pace)
         try:
             await pipe.handshake()
@@ -432,9 +523,12 @@ class Link:
             await self.close()
 
     async def _ping(self) -> None:
+        # Intervals with no frame, not seconds: while our own loop is held, none passes.
+        quiet, last = 0, self._last_rx
         while not self.closed:
             await asyncio.sleep(PING_EVERY)
-            if time.monotonic() - self._last_rx > DEAD_AFTER:
+            quiet, last = (quiet + 1 if self._last_rx == last else 0), self._last_rx
+            if quiet * PING_EVERY >= DEAD_AFTER:
                 await self.close()
                 return
             try:
@@ -650,20 +744,12 @@ class ExecdClient:
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
-                        link = await asyncio.wait_for(self._get(stale=link), left())
-                        if link.daemon is not call.daemon:
-                            raise ExecdStoppedError(
-                                "execd stopped while it ran the command",
-                                pod=call.daemon.ip,
-                            )
-                        link.calls[call.id] = call
-                        at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
-                        call.resuming = True  # before the RESUMED can arrive
                         try:
-                            await link.send(RESUME, call.id, at.encode())
-                        except OSError:  # dropped again before it left: once more
-                            call.queue.put_nowait(Dropped(link))
-                        log_warn("execd connection lost: resuming", pod=call.daemon.ip)
+                            link = await asyncio.wait_for(self._get(stale=link), left())
+                        except asyncio.TimeoutError:  # the kill's wait takes it up
+                            call.queue.put_nowait(item)
+                            continue
+                        await self._resume(link, call)
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item
@@ -705,7 +791,10 @@ class ExecdClient:
                         # The same daemon never got the START: nothing ran, so start it.
                         call.resuming = False
                         try:
-                            await link.send(START, call.id, start)
+                            again = link.send(START, call.id, start)
+                            await asyncio.wait_for(again, left())
+                        except asyncio.TimeoutError:  # out of time: nothing starts now
+                            raise
                         except OSError:  # dropped again: the next resume asks once more
                             call.queue.put_nowait(Dropped(link))
                             continue
@@ -735,7 +824,10 @@ class ExecdClient:
                 if not finished:  # left by its caller, or timed out
                     self._over(link, call.id, KILL, RELEASE)
             finally:
-                link.calls.pop(call.id, None)
+                # The kill's wait may have taken it to another connection.
+                for held in (link, self._link):
+                    if held is not None:
+                        held.calls.pop(call.id, None)
 
     async def _upload(
         self, link: Link, call: Call, stdin: bytes | None, offset: int
@@ -750,23 +842,55 @@ class ExecdClient:
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
+    async def _resume(self, link: Link, call: Call) -> None:
+        """Ask execd, over a new connection, to send the call on from what we have."""
+        if link.daemon is not call.daemon:
+            raise ExecdStoppedError(
+                "execd stopped while it ran the command", pod=call.daemon.ip
+            )
+        link.calls[call.id] = call
+        at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
+        call.resuming = True  # before the RESUMED can arrive
+        try:
+            await link.send(RESUME, call.id, at.encode())
+        except OSError:  # dropped again before it left: once more
+            call.queue.put_nowait(Dropped(link))
+        log_warn("execd connection lost: resuming", pod=call.daemon.ip)
+
     async def _kill(self, link: Link, call: Call) -> list[tuple[int, bytes]]:
         """Kill the call; give its last output and its exit, if it ended by itself."""
         ended: list[tuple[int, bytes]] = []
         link.send_last(call.id, KILL)  # not waited for: its exit can come first
         end = time.monotonic() + KILL_WAIT
         drained = 0
-        # An exit that has come is taken, with the output before it, at any time.
-        while call.exited or time.monotonic() < end:
+        # What has come is taken whatever the time: an exit, and execd's word of none.
+        while not call.queue.empty() or time.monotonic() < end:
             try:
-                wait = None if call.exited else end - time.monotonic()
+                wait = None if not call.queue.empty() else end - time.monotonic()
                 item = await _next(call.queue, wait)
             except asyncio.TimeoutError:
                 continue  # once more, for an exit that came as the time ran out
             if not isinstance(item, tuple):
                 if item.args != (link,):  # a connection the call has left since
                     continue
-                break  # a dropped connection
+                # Whether it timed out is execd's to say: asked again within this wait.
+                link.calls.pop(call.id, None)
+                try:
+                    reopen = self._get(stale=link)
+                    link = await asyncio.wait_for(reopen, end - time.monotonic())
+                    resume = self._resume(link, call)  # its write may wait its turn
+                    await asyncio.wait_for(resume, end - time.monotonic())
+                except asyncio.TimeoutError:
+                    pass  # its write may be with execd all the same: an answer is read
+                except Exception:  # an execd we cannot reach: our timer's word stands
+                    break
+                continue
+            if item[0] == ERROR:  # execd has let the call go, or never had it
+                if item[1] == b"unknown call":
+                    break  # nothing ran, in all its time
+                raise ExecdResultUnknownError(
+                    f"execd: {item[1].decode(errors='replace')}", pod=link.daemon.ip
+                )
             if item[0] == EXIT:  # execd marks the exit of a command a kill ended
                 if json.loads(item[1]).get("timeout"):
                     break
@@ -774,7 +898,7 @@ class ExecdClient:
                 return ended
             if item[0] in (STDOUT, STDERR):
                 # shortcut: past HOLD an exit to come is lost; count on if one matters
-                if drained + len(item[1]) > call.hold:
+                if not call.exited and drained + len(item[1]) > call.hold:
                     break  # as RELEASE frees the call
                 drained += len(item[1])
                 ended.append(item)

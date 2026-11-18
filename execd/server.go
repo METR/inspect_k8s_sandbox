@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -23,6 +22,26 @@ import (
 	"time"
 	"unsafe"
 )
+
+// fromAnotherUser says whether a Unix socket's peer runs as a user other than execd's, who could hold every unauthenticated slot.
+func fromAnotherUser(nc net.Conn) bool {
+	if secured, ok := nc.(interface{ NetConn() net.Conn }); ok {
+		nc = secured.NetConn()
+	}
+	local, ok := nc.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	uid := -1
+	if raw, err := local.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			if peer, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED); err == nil {
+				uid = int(peer.Uid)
+			}
+		})
+	}
+	return uid != os.Geteuid()
+}
 
 // server owns every process; a call outlives its connection, so a client can resume it.
 type server struct {
@@ -91,8 +110,8 @@ type call struct {
 	// killed for want of a client, and kept so a RESUME can be told so
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
-	timedOut  bool // its timeout killed it: its exit says so, as the code alone can't
-	// its timeout found it running and signalled it
+	timedOut  bool // a timeout's kill went ahead on it: its exit says so, as the code alone can't
+	// a timeout's kill, execd's or its client's, went ahead on it, or will as it starts
 	timeoutKilled bool
 }
 
@@ -138,7 +157,7 @@ func (s *server) serve(l net.Listener) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if fromThisPod(nc) { // the client dials from another pod: here, only the sandbox would
+		if fromThisPod(nc) || fromAnotherUser(nc) { // the client dials from another pod, or through an exec as execd's user
 			nc.Close()
 			continue
 		}
@@ -352,7 +371,7 @@ func (s *server) resume(c *conn, f frame) {
 	if replaced {
 		return
 	}
-	if cl.abandoned {
+	if cl.abandoned && !cl.timedOut { // one its own timeout ended still says so: that takes none of the output let go
 		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
 	}
@@ -458,6 +477,7 @@ func (cl *call) run(req startRequest) error {
 	cl.kmu.Unlock()
 	if killed { // while it started: nothing is reaped under this lock, so the id is its own
 		killTree(p.Pid)
+		killAs(p.Pid, as)
 	}
 	reaper.mu.Unlock()
 	if killed { // that holds for what it left running too
@@ -529,7 +549,7 @@ func (cl *call) run(req startRequest) error {
 		done := make(chan struct{})
 		go func() {
 			drained.Wait()
-			if said := signalLine(ws); said != "" { // after the command's own stderr, as a shell's line is
+			if said := signalLine(ws); said != "" && !byTimeout { // after the command's own stderr, as a shell's line is; none for a timeout's kill: its caller is told of the timeout
 				cl.output(1, []byte(said))
 			}
 			close(done)
@@ -822,9 +842,11 @@ func (cl *call) stop(timeout bool) {
 	cl.timeoutKilled = cl.timeoutKilled || timeout && cl.status == nil // not started yet: the kill that meets it as it starts is this timeout's
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
+	refused := false // waitid, as a seccomp profile can: nothing then says the command has stopped, and a kill does not wait to hear it
 	seen := func(states int) bool {
 		var info [128]byte // a siginfo_t: waitid sets its first field for a child in one of the states, and leaves it unreaped
-		syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		refused = errno != 0
 		return info[0] != 0
 	}
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
@@ -836,7 +858,7 @@ func (cl *call) stop(timeout bool) {
 	if running {
 		hook(&beforeKill, false)
 		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
-			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED); wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
+			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED) && !refused; wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
 				time.Sleep(wait)
 			}
 		}
@@ -848,10 +870,27 @@ func (cl *call) stop(timeout bool) {
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
 		killTree(pid)
+		killAs(pid, as)
 	}
 	reaper.mu.Unlock()
 	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
+	}
+}
+
+// killAs sends another user's command and its group that user's own SIGKILL: root's reaches neither without CAP_KILL.
+func killAs(pid int, as *syscall.Credential) {
+	if as == nil {
+		return
+	}
+	runtime.LockOSThread() // the identity it takes is this thread's alone
+	defer runtime.UnlockOSThread()
+	setids(as.Uid, as.Gid)
+	syscall.Kill(pid, syscall.SIGKILL)
+	syscall.Kill(-pid, syscall.SIGKILL)
+	setids(uint32(os.Getuid()), uint32(os.Getgid()))
+	if os.Geteuid() != os.Getuid() || os.Getegid() != os.Getgid() { // unlocked so, the thread would do execd's own work as that user
+		fail("a thread could not take execd's identity back")
 	}
 }
 
@@ -928,6 +967,11 @@ func (cl *call) end(as *syscall.Credential) {
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
 		go func() { searches <- search{cl.tag, as} }()
+		// gVisor lets them be read only with the user's real ids, which let the user signal their holder: a child holds them, not execd.
+		argv := []string{"/proc/self/exe", "search", fmt.Sprint(as.Uid), fmt.Sprint(as.Gid), strings.Trim(fmt.Sprint(as.Groups), "[]"), cl.tag}
+		if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}}); err == nil {
+			child.Release()
+		}
 	}
 }
 
@@ -1062,28 +1106,58 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 // More than execve lets an environment hold (6 MiB).
 const maxEnviron = 8 << 20
 
-// tagged says whether the environment a /proc/PID/environ file shows holds needle.
-func tagged(environ string, needle []byte) bool {
-	f, err := os.Open(environ)
-	if err != nil {
-		return false
+// Tests open another file in an environment's place for the search of a tag, as the kernel shows none of a process whose execve is under way.
+var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
+
+// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
+func tagged(open func(string) (*os.File, error), environ string, needle []byte) (is, none bool) {
+	// In one read: an execve between two lets the environment go, and the second ends the file short of its tag.
+	for size := 4 << 10; ; size = min(4*size, maxEnviron) {
+		f, err := open(environ)
+		if err != nil {
+			return false, false
+		}
+		data := make([]byte, size+1)
+		n, _ := f.Read(data[:size])
+		f.Close()
+		if n < size || size == maxEnviron { // a read it fills may not hold it all: a process can make its own look any size
+			return bytes.Contains(append(data[:n], 0), needle), n == 0
+		}
 	}
-	defer f.Close()
-	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
-	return bytes.Contains(append(data, 0), needle)
 }
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
+	open := os.Open
+	if stand := openEnviron.Load(); stand != nil {
+		open = func(environ string) (*os.File, error) { return (*stand)(tag, environ) }
+	}
+	read := map[int]bool{}
+	// Eight listings at most, until one holds no process not yet read: what a process starts while one is read is in the next.
+	for pass, more, starting := 0, true, false; more && pass < 8; pass++ {
+		if starting {
+			time.Sleep(time.Millisecond) // an execve takes about a tenth of that
 		}
-		if tagged("/proc/"+e.Name()+"/environ", needle) {
-			syscall.Kill(pid, syscall.SIGKILL)
+		more, starting = false, false
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == os.Getpid() || read[pid] {
+				continue
+			}
+			more = true
+			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle)
+			if none {
+				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
+					starting = true
+					continue
+				}
+			}
+			read[pid] = true
+			if is {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 }

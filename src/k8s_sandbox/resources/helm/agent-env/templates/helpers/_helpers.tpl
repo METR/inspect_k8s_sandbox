@@ -60,6 +60,22 @@ app.kubernetes.io/name: {{ include "agentEnv.name" . | quote }}
 app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 
+{{/* The egress proxy a service's pod names, or nothing: takes a dict of root ($) and service. */}}
+{{- define "agentEnv.egressProxy" -}}
+{{- $key := "inspect-k8s-sandbox/egress-proxy" -}}
+{{- $own := default (dict) .service.podAnnotations -}}
+{{- with get (ternary $own (default (dict) .root.Values.annotations) (hasKey $own $key)) $key -}}
+{{- /* A template here can name a Service of this release, whose name no values file knows. */ -}}
+{{- $proxy := tpl . $.root -}}
+{{- /* What the node's launcher takes, and a port a network policy can carry: Cilium reads port 0 as every port. */ -}}
+{{- $form := printf "^[a-z0-9]([-a-z0-9]*[a-z0-9])?[.]%s[.]svc[.]cluster[.]local[.]?:[1-9][0-9]{0,4}$" $.root.Release.Namespace -}}
+{{- if or (not (regexMatch $form $proxy)) (gt (atoi (regexFind "[0-9]+$" $proxy)) 65535) -}}
+{{- fail (printf "the annotation %s is %q, not <service>.%s.svc.cluster.local:<port>, with a port from 1 to 65535: vsock-egress joins a pod only to a Service of its own namespace" $key $proxy $.root.Release.Namespace) -}}
+{{- end -}}
+{{- $proxy -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Whether to create a ClusterIP type Service (which implies a DNS record) for a service
 */}}

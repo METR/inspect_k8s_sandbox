@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
+  This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
+- A pod annotated
+  `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
+  (a template there can name a Service of the release) gets an HTTP proxy at
+  `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
+  Sandbox with no network device. The Service's pods must carry the release's
+  `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that
+  port; those that `additionalResources` adds need policies of their own (see
+  `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
+  grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
+  sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
+  yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
+  `no_proxy` for a server on the sandbox's own loopback, and the new
+  `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
+  seccomp profiles (see `vsock-egress/README.md`): on a node with no launcher such a pod
+  does not start.
+- Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
+  `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
+  environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
+- Wait for the Pods of every `apps/v1` StatefulSet of the release, in its namespace,
+  whose Pod template carries the release's `app.kubernetes.io/instance` label, including
+  those from `additionalResources`, before handing over a sandbox.
 - Fix a sandbox failing to start when a value such as a `command` argument is exactly
   `=` or `<<`, or a date or time that does not exist such as `2023-02-29`.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
@@ -29,12 +52,12 @@
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
   status 1 once that directory is gone. A timed-out `exec()` whose command is still
-  running gets SIGKILL, and so do the processes under it that execd may
-  signal: all where it has `CAP_KILL`, else its own user's. So do the
-  others it started, unless one has left its process group, or is one execd may not
-  signal, and has cleared its environment or made it unreadable to execd, runs as a
-  user that is neither execd's nor the command's where execd lacks `CAP_SYS_PTRACE`,
-  or on gVisor comes from a command run as another user;
+  running gets SIGKILL, and so does its process group. So do the processes under it
+  that execd may signal: all where it has `CAP_KILL`, else its own user's. So do the
+  others it started that execd finds: not one that has left its process group and has
+  cleared its environment or made it unreadable to execd, nor one that runs as a user
+  that is neither execd's nor the command's where execd lacks `CAP_KILL` or
+  `CAP_SYS_PTRACE`, and perhaps not one started while execd looks;
   those of a command that has ended are left running. A command that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()`,
   `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
@@ -49,6 +72,13 @@
   command that leaves its stdin unread, most of it kept for minutes after the command
   ends. With `restarted_container_behavior="raise"`, a pod that sets
   `shareProcessNamespace` or `hostPID` is refused: the sample fails to start.
+- Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
+- A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
+  sidecar. A service with a DNS record finds itself there under its own name and its
+  `additionalDnsRecords` through `/etc/hosts`, at `127.0.0.1`. The install fails for a
+  record that is no lower-case DNS name (upper case, `_`, `*`, a trailing dot), and
+  where that line of `/etc/hosts`, the address and every name with a tab between, is
+  longer than the 510 bytes musl reads of one.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default
