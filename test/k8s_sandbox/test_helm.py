@@ -40,7 +40,6 @@ from k8s_sandbox._helm import (
     StaticValuesSource,
     ValuesSource,
     _declared_object_names,
-    _get_expected_services,
     _get_helm_major_version,
     _get_timeout,
     _get_uninstall_timeout,
@@ -1353,8 +1352,32 @@ def test_declared_object_names_covers_every_kind_including_nested_lists() -> Non
     assert names == {"cm", "default", "svc"}
 
 
+@pytest.mark.parametrize(
+    ("replicas", "ordinals"),
+    [
+        pytest.param("10", list(range(2, 12)), id="decimal"),
+        # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
+        pytest.param("010", list(range(2, 10)), id="leading-zero"),
+        # Helm drops every `_` and reads the `0b` as binary.
+        pytest.param("0b1__010", list(range(2, 12)), id="binary-underscores"),
+    ],
+)
+def test_a_stateful_sets_counts_read_as_numbers(
+    replicas: str, ordinals: list[int]
+) -> None:
+    # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
+    stdout = _manifest(
+        f"kind: StatefulSet\nspec: {{replicas: {replicas}, ordinals: {{start: 2}}}}\n"
+    )
+
+    spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
+
+    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == ordinals
+
+
 def _services(stdout: str) -> frozenset[str]:
-    return _get_expected_services(_rendered_docs(stdout, "abcdefgh"), "abcdefgh")
+    docs = _helm._rendered_docs(stdout, "abcdefgh")
+    return _helm._get_expected_services(docs, "abcdefgh")
 
 
 @pytest.mark.parametrize(
@@ -1405,6 +1428,42 @@ def _services(stdout: str) -> frozenset[str]:
             ),
             {"a", "b"},
             id="list-wrapping-pods",
+        ),
+        # Helm writes each of these strings bare, and PyYAML's own loader builds none.
+        pytest.param(
+            _manifest(
+                _STATEFUL_SET
+                + "    spec: {containers: [{args: [=, <<, 0000-00-00, 0x_, "
+                + "9" * 4301
+                + "]}]}\n"
+            ),
+            {"default"},
+            id="strings-pyyaml-types",
+        ),
+        # Helm reads a hex past 64 bits, or a number past a float, as a string: a name.
+        pytest.param(
+            _manifest(_stateful_set("1e400"), _stateful_set(hex(2**64))),
+            {"1e400", hex(2**64)},
+            id="numbers-too-large",
+        ),
+        # A bare null is no name; quoted, `null` is a name like any other.
+        pytest.param(
+            _manifest(_stateful_set("null"), _stateful_set("nullable")),
+            {"nullable"},
+            id="null-label",
+        ),
+        pytest.param(
+            _manifest(_stateful_set("'null'")), {"null"}, id="quoted-null-label"
+        ),
+        # Helm reads a scalar tagged `!` as text.
+        pytest.param(_manifest(_stateful_set("! 012")), {"012"}, id="bang-label"),
+        # A custom chart may merge its pod's labels in.
+        pytest.param(
+            _manifest(
+                f"kind: Pod\nmetadata: {{labels: {{<<: {{{_SERVICE_LABEL}: a}}}}}}"
+            ),
+            {"a"},
+            id="merged-labels",
         ),
     ],
 )
@@ -1489,9 +1548,9 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
 
 
 def _helper(release: Release, spec: str = "") -> str:
-    labels = f"{{app.kubernetes.io/instance: {release.release_name}}}"
+    labels = f'{{app.kubernetes.io/instance: "{release.release_name}"}}'
     return (
-        "kind: StatefulSet\nmetadata: {name: helper}\n"
+        "apiVersion: apps/v1\nkind: StatefulSet\nmetadata: {name: helper}\n"
         f"spec:\n{spec}  template: {{metadata: {{labels: {labels}}}}}\n"
     )
 
@@ -1501,7 +1560,15 @@ def _helper_pod(ordinal: int = 0, **status: Any) -> PodSnapshot:
 
 
 def _in_a_list(manifest: str) -> str:
-    return "kind: List\nitems:\n  - " + manifest.replace("\n", "\n    ")
+    items = manifest.replace("\n", "\n    ")
+    return "apiVersion: v1\nkind: List\nitems:\n  - " + items
+
+
+def _in_a_typed_list(manifest: str) -> str:
+    items = _in_a_list(
+        manifest.removeprefix("apiVersion: apps/v1\nkind: StatefulSet\n")
+    )
+    return items.replace("v1\nkind: List", "apps/v1\nkind: StatefulSetList")
 
 
 @pytest.mark.parametrize(
@@ -1509,6 +1576,8 @@ def _in_a_list(manifest: str) -> str:
     [
         pytest.param("", [], [_helper_pod()], str, id="a-pod-that-is-no-sandbox"),
         pytest.param("", [], [_helper_pod()], _in_a_list, id="in-a-list"),
+        # Helm installs the items of a StatefulSetList, which name no kind themselves.
+        pytest.param("", [], [_helper_pod()], _in_a_typed_list, id="in-a-typed-list"),
         # Helm installs a manifest whose namespace is empty into the release's.
         pytest.param(
             "",
@@ -1542,6 +1611,22 @@ def _in_a_list(manifest: str) -> str:
         pytest.param(
             "  ordinals: {start: 3}\n", [], [_helper_pod(3)], str, id="a-start-ordinal"
         ),
+        # Helm installs this as 3 replicas: read as written, it raised TypeError.
+        pytest.param(
+            "  replicas: 3.0\n",
+            [_helper_pod(n) for n in range(2)],
+            [_helper_pod(n) for n in range(3)],
+            str,
+            id="a-count-written-as-a-float",
+        ),
+        # Helm renders a start of 1000000 from values so: it named `helper-1000000.0`.
+        pytest.param(
+            "  ordinals: {start: 1e+06}\n",
+            [],
+            [_helper_pod(1000000)],
+            str,
+            id="a-start-ordinal-written-as-a-float",
+        ),
     ],
 )
 async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_to_make(
@@ -1567,8 +1652,15 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_a_stateful_set_has_yet_t
         ),
         # The poll lists pods by the release's label, so this one's would never be seen.
         pytest.param(
-            lambda release: "kind: StatefulSet\nmetadata: {name: helper}\n",
+            lambda release: _helper(release).replace(release.release_name, "another"),
             id="not-labelled-as-the-release",
+        ),
+        # OpenKruise's StatefulSet can skip ordinals: its pods are not these names.
+        pytest.param(
+            lambda release: _helper(release).replace(
+                "apps/v1", "apps.kruise.io/v1beta1"
+            ),
+            id="of-another-api-group",
         ),
         pytest.param(
             lambda release: _helper(release).replace(
@@ -1587,6 +1679,19 @@ async def test_wait_until_ready_does_not_wait_for_a_pod_it_will_never_see(
         await release._install(None, time.monotonic() + 60, upgrade=False)
 
     await _wait(release, [[_pod()]] * 2, monkeypatch)
+
+
+async def test_install_refuses_more_pods_than_the_client_will_name() -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    many = _helper(release, "  replicas: 100000\n")
+    other = many.replace("{name: helper}", "{name: other}")
+    # Reading this count raises: past the bound the client must read no further.
+    unread = _helper(release, "  replicas: unread\n")
+    with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+        # Two StatefulSets: the names of both together are what take the memory.
+        _helm_installed(mock_run, _STATEFUL_SET, many, other, unread)
+        with pytest.raises(RuntimeError, match="ask for more than"):
+            await release._install(None, time.monotonic() + 60, upgrade=False)
 
 
 async def test_wait_until_ready_keeps_waiting_while_no_pods_exist(
@@ -1686,6 +1791,85 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
     finally:
         over.set()
         wait.cancel()
+
+
+async def test_wait_until_ready_ends_for_a_cancel_that_comes_with_a_wake(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "cancelled-as-woken"  # where no other test's watch runs
+    _mock_release_pods.return_value = [_pod(ready=False)]
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    async def at_once(function: Callable[..., Any], *args: Any) -> Any:
+        return function(*args)
+
+    # With no thread for its read, the wait's first step ends where it waits for a wake.
+    monkeypatch.setattr(asyncio, "to_thread", at_once)
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        await asyncio.sleep(0)
+        waits = _helm._ready_waits[release._context_name, release._namespace]
+        waits[release.release_name][1].set()
+        wait.cancel()  # in the same turn of the loop as the wake
+        await asyncio.wait({wait}, timeout=5)
+        assert wait.cancelled()
+    finally:
+        wait.cancel()
+
+
+async def test_wait_until_ready_ends_for_a_cancel_that_comes_as_its_poll_falls_due(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "cancelled-at-a-poll"  # where no other test's watch runs
+    _mock_release_pods.return_value = [_pod(ready=False)]
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 0.01)
+    loop = asyncio.get_running_loop()
+    call_at = loop.call_at
+
+    def call_at_then_cancel(
+        when: float, callback: Callable[..., object], *args: Any, **kwargs: Any
+    ) -> asyncio.TimerHandle:
+        def due(*args: Any) -> None:
+            callback(*args)
+            wait.cancel()  # in the same turn of the loop as the timer
+
+        # The only timer the wait sets is its poll's.
+        timed = due if asyncio.current_task() is wait else callback
+        return call_at(when, timed, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_at", call_at_then_cancel)
+
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        await asyncio.wait({wait}, timeout=5)
+        assert wait.cancelled()
+    finally:
+        wait.cancel()
+
+
+async def test_wait_until_ready_polls_where_no_watch_thread_can_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = "no-thread"  # where no other test's watch runs
+    start = threading.Thread.start
+
+    def no_watch(thread: threading.Thread) -> None:
+        if getattr(thread, "_target", None) is _helm._watch_ready:
+            raise RuntimeError("can't start new thread")
+        start(thread)  # the threads that read the pods still start
+
+    monkeypatch.setattr(threading.Thread, "start", no_watch)
+
+    await _wait(release, [[], [_pod()], [_pod()]], monkeypatch)
+
+    # Or no later release there would start a watch: each would wait out its poll.
+    assert (release._context_name, release._namespace) not in _helm._ready_waits
 
 
 async def test_wait_until_ready_retries_a_transient_api_error(

@@ -154,6 +154,76 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 	}
 }
 
+func TestRecordThatOutlivedItsSandboxRaisesNoFault(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // deleted under the launcher before this one: its record can stay
+		for range 3 {
+			if _, err := l.wanted(); err != nil {
+				t.Fatal(err)
+			}
+			l.netns = l.vms // its network namespace goes after this launcher's first pass: that directory holds none of the record's name
+			time.Sleep(time.Minute)
+		}
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing of a sandbox that has gone and left its record", out.String())
+		}
+	})
+}
+
+func TestWorkerThatEndsAfterEachStartIsAFaultOnceItLasts(t *testing.T) {
+	alone(t)
+	netns := podNetns(t)
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.reap, l.netns = budget, filepath.Join(l.vms, "none")
+		l.retry = time.Millisecond // the pass that ends a worker starts no other: the test's clock stands still while a process runs
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+5)
+		t.Cleanup(func() {
+			for _, w := range l.workers {
+				w.end(budget)
+			}
+		})
+		pass := func() {
+			if err := l.pass(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pass() // no worker yet: its first start fails, where no network namespace is bound for its pod
+		time.Sleep(62 * time.Second)
+		l.netns = netns // bound now: the minute before a first worker is no part of that worker's
+		var said []int
+		for _, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
+			time.Sleep(wait)
+			pass() // starts a worker
+			started := l.tried[id("a")]
+			// As one that has run for just under a minute, which the test's clock cannot show.
+			l.tried[id("a")] = started.Add(-59 * time.Second)
+			pass() // finds it running
+			l.tried[id("a")] = started
+			w := l.workers[id("a")]
+			if w == nil || w.exited() {
+				t.Fatal("no worker runs for a sandbox that names a proxy")
+			}
+			if err := syscall.Kill(w.cmd.Process.Pid, syscall.SIGKILL); err != nil { // as the kernel does, and it writes nothing
+				t.Fatal(err)
+			}
+			<-w.done
+			pass() // finds it ended
+			said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: its worker ended"))
+			other := addSandbox(t, l, id("b"), "eth0", nil, vmUID+5)
+			pass() // another VM of its uid for a pass: the sandbox leaves and returns, and its next worker is no first one
+			os.Remove(other)
+		}
+		if !slices.Equal(said, []int{0, 0, 1, 1, 2}) {
+			t.Fatalf("lines after each pass %v, in %q: want none for a minute, then one each minute", said, out.String())
+		}
+	})
+}
+
 func TestWorkerThatCannotBeEndedIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
@@ -209,12 +279,14 @@ func TestFaultAfterAWorkerRanGetsAMinuteOfItsOwn(t *testing.T) {
 			time.Sleep(31 * time.Second)
 		}
 		pass() // no worker can start
-		l.workers[id("a")] = &child{done: make(chan struct{})}
-		pass() // one runs
+		l.workers[id("a")], l.tried[id("a")] = &child{done: make(chan struct{})}, time.Now()
+		for range 3 { // one runs, for longer than a minute
+			pass()
+		}
 		delete(l.workers, id("a"))
 		pass() // and is gone: none can start again
 		if out.String() != "" {
-			t.Fatalf("the log is %q: want nothing 31 s after a worker that ran was lost", out.String())
+			t.Fatalf("the log is %q: want nothing 31 s after a worker that ran for a minute was lost", out.String())
 		}
 	})
 }
@@ -223,10 +295,18 @@ func TestWorkerThatCannotStartIsAFaultOnceItLasts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
-		l.netns = filepath.Join(l.vms, "none") // where no pod's network namespace is bound
-		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		l.netns = l.vms // where the pod's network namespace is a file and bound to none, as a mount without the node's propagation shows it
+		if err := os.WriteFile(filepath.Join(l.netns, "net"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
+		addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // its VM's directory follows its record
 		var said []int
-		for range 25 { // a pass every retry, for two minutes
+		for i := range 25 { // a pass every retry, for two minutes
+			if i == 6 { // after 30 s: the minute it has had no worker goes on through its first start
+				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
+			}
 			if err := l.pass(); err != nil {
 				t.Fatal(err)
 			}
@@ -263,8 +343,9 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 		var profile struct {
 			DefaultAction string `json:"defaultAction"`
 			Syscalls      []struct {
-				Names  []string `json:"names"`
-				Action string   `json:"action"`
+				Names  []string          `json:"names"`
+				Action string            `json:"action"`
+				Args   []json.RawMessage `json:"args"`
 			} `json:"syscalls"`
 		}
 		b, err := os.ReadFile(file)
@@ -282,6 +363,10 @@ func TestProfilesRefuseWhatWasCutFromTheNodesDefault(t *testing.T) {
 			for _, name := range rule.Names {
 				if rule.Action == "SCMP_ACT_ALLOW" && slices.Contains(refused, name) {
 					t.Errorf("%s allows %s", file, name)
+				}
+				// The forwarder's rules test the command, to refuse the Nitro Secure Module's: gate.sh asks a node what they refuse.
+				if name == "ioctl" && len(rule.Args) == 0 && !strings.HasSuffix(file, "-launcher.json") {
+					t.Errorf("%s allows every ioctl", file)
 				}
 			}
 		}

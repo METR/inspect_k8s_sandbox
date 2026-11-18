@@ -232,13 +232,14 @@ type launcher struct {
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]time.Time // when each sandbox without a worker was first seen so, or last in the log
 	had      map[string]bool      // sandboxes whose VM directory has been there
+	started  map[string]bool      // sandboxes that have had a worker
 }
 
 // faultAgain is how long a fault lasts before its first line, and between lines.
 const faultAgain = time.Minute
 
 func newLauncher() *launcher {
-	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, had: map[string]bool{}}
+	return &launcher{retry: 5 * time.Second, reap: time.Second, workers: map[string]*child{}, tried: map[string]time.Time{}, reported: map[string]time.Time{}, had: map[string]bool{}, started: map[string]bool{}}
 }
 
 func launch(args []string) error {
@@ -283,10 +284,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
 		}
+		_, bound := os.Stat(sb.netns)
 		switch {
 		case err == nil:
 			wanted[r.ContainerID] = sb
 		case gone && l.had[r.ContainerID]: // its sandbox is being deleted: the directory goes before the record does
+		case gone && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
 		default:
 			l.fault(r.ContainerID, sb.pod, err)
 		}
@@ -295,6 +298,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		if !present[id] {
 			delete(l.had, id)
 			delete(l.reported, id)
+			delete(l.started, id)
 		}
 	}
 	return wanted, nil
@@ -318,7 +322,10 @@ func (l *launcher) pass() error {
 	}
 	deadline := time.Now().Add(l.reap)
 	for id, w := range l.workers {
-		if _, ok := wanted[id]; !ok || w.exited() {
+		if sb, ok := wanted[id]; !ok || w.exited() {
+			if ok { // its sandbox has none now, and no start failed: one that ends after each start is this fault alone
+				l.fault(id, sb.pod, errors.New("its worker ended"))
+			}
 			if err := w.end(time.Until(deadline)); err != nil { // kept: the next pass ends it again, and no new worker runs as its uid meanwhile
 				if w.unended.IsZero() { // a pass out of time ends it on the next: only one that is faultAgain late is a fault
 					w.unended = time.Now()
@@ -329,7 +336,7 @@ func (l *launcher) pass() error {
 				continue
 			}
 			delete(l.workers, id)
-		} else {
+		} else if time.Since(l.tried[id]) >= faultAgain { // not sooner: one that is killed after each start would never be a fault
 			delete(l.reported, id) // it serves its sandbox: a later fault gets a minute of its own
 		}
 	}
@@ -353,8 +360,13 @@ func (l *launcher) pass() error {
 			l.fault(id, sb.pod, err)
 			continue
 		}
+		if !l.started[id] { // what kept it from its first worker is over: one that ends gets a minute of its own
+			l.started[id] = true
+			delete(l.reported, id)
+		}
 		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)
 		l.workers[id] = w
+		held[sb.uid] = true // wanted counts a uid's VMs, then reads each again: one whose directory came between is a second of this uid
 	}
 	return nil
 }

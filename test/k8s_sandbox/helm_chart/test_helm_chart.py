@@ -567,11 +567,7 @@ def test_quotes_bare_scalar_fields(chart_dir: Path, test_resources_dir: Path) ->
     # A `": ` in a domain would close hand-written quotes or, bare, start a mapping.
     domain = 'a": b.org'
     assert {"matchPattern": domain} in _values_at(egress, "dns")[0]
-    shared = next(rule for rule in egress if _values_at(rule, "serverNames"))
-    assert {"matchPattern": domain} in shared["toFQDNs"]
-    assert domain in _values_at(shared, "serverNames")[0]
-    assert {"host": '(?i)^a": b[.]org(:[0-9]+)?$'} in _values_at(shared, "http")[0]
-    assert [{"matchPattern": domain}] in _values_at(egress, "toFQDNs")
+    assert domain in _values_at(egress, "serverNames")[0]
 
 
 @pytest.mark.parametrize(
@@ -802,19 +798,38 @@ def test_a_pod_with_no_network_card_has_no_coredns_sidecar(
     assert "hostAliases" not in pod_spec  # its service asked for no DNS record
 
 
-def test_a_pod_with_no_network_card_finds_itself_under_its_own_names(
+def test_a_pod_with_no_network_card_finds_itself_under_its_names(
     chart_dir: pathlib.Path,
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
-        # Records the sidecar answers and the API server refuses as a pod's aliases.
-        set_str=r"services.default.additionalDnsRecords={Site.test,my_db,site.test.}",
+        # Unquoted, `no` would be no name.
+        set_str="services.default.additionalDnsRecords={site.test,no}",
         set_string=r"annotations.sandbox\.amazonaws\.com/network-isolated=true",
     )
 
     pod_spec = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
-    names = ["default", "agent-env-my-release-default"]
+    names = ["default", "agent-env-my-release-default", "site.test", "no"]
     assert pod_spec["hostAliases"] == [{"ip": "127.0.0.1", "hostnames": names}]
+
+
+def test_a_pod_with_no_network_card_keeps_its_names_within_the_line_musl_reads(
+    chart_dir: pathlib.Path,
+) -> None:
+    # The line is 127.0.0.1, the service's two names and the records, a tab between.
+    def render(last: int) -> None:
+        name = ("a" * 63 + ".") * 4  # labels as long as DNS allows
+        records = f"{{{name[:253]},{name[:last]}}}"
+        _run_helm_template(
+            chart_dir,
+            set_str=f"services.default.additionalDnsRecords={records}",
+            set_string=r"annotations.sandbox\.amazonaws\.com/network-isolated=true",
+        )
+
+    render(209)  # 510 bytes
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        render(210)
+    assert "here 511 bytes" in exc_info.value.stderr
 
 
 def test_a_service_from_additional_resources_resolves_by_its_own_name(

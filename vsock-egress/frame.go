@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -19,18 +21,20 @@ var (
 )
 
 // join carries one TCP connection over a vsock connection as frames: Firecracker passes no half-close on, so each direction ends with an empty frame.
-func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
+func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer, stall time.Duration) {
 	var running sync.WaitGroup
+	var shut atomic.Bool // this side has closed its writes to tcp
 	sent, received, gone := make(chan error, 1), make(chan error, 1), make(chan struct{})
 	running.Add(2)
 	go func() {
 		defer running.Done()
-		sent <- toFrames(vsock, tcp, pace)
+		sent <- toFrames(vsock, unreset{tcp, &shut}, pace)
 	}()
 	go func() {
 		defer running.Done()
-		err := fromFrames(tcp, vsock, pace)
+		err := fromFrames(bounded{tcp, stall}, vsock, pace)
 		if err == nil {
+			shut.Store(true)
 			err = tcp.CloseWrite()
 		}
 		received <- err
@@ -61,6 +65,47 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer) {
 	tcp.Close()
 	vsock.Close()
 	running.Wait()
+}
+
+// bounded gives each write to its connection wait at most: a peer that takes nothing would else keep both of a stream's pumps waiting on it after the stream's other end had gone.
+type bounded struct {
+	*net.TCPConn
+	wait time.Duration
+}
+
+func (b bounded) Write(p []byte) (int, error) {
+	if b.wait > 0 {
+		b.SetWriteDeadline(time.Now().Add(b.wait))
+	}
+	return b.TCPConn.Write(p)
+}
+
+// unreset reads the end of a connection its peer reset as the error it is: the kernel gives a reset to one waiting call alone, and where a write takes it the read sees an end.
+type unreset struct {
+	*net.TCPConn
+	shut *atomic.Bool // this side has ended its writes: none waits then, and a clean end leaves the connection closed too
+}
+
+func (u unreset) Read(p []byte) (int, error) {
+	n, err := u.TCPConn.Read(p)
+	if err == io.EOF {
+		// Refused once the connection is closed, as a reset leaves it; asked before shut is read, so this side's own end cannot come between.
+		if closed := u.CloseRead(); closed != nil && !u.shut.Load() && !u.endedFirst() {
+			err = closed
+		}
+	}
+	return n, err
+}
+
+// endedFirst says whether a reset came after the peer had ended its side, which leaves the reply whole: the kernel then holds EPIPE for the socket, and ECONNRESET for a reset alone.
+func (u unreset) endedFirst() (ended bool) {
+	if raw, err := u.SyscallConn(); err == nil {
+		raw.Control(func(fd uintptr) {
+			held, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_ERROR)
+			ended = err == nil && held == int(syscall.EPIPE)
+		})
+	}
+	return ended
 }
 
 // toFrames copies src to dst as frames, each a 4-byte length and that many bytes, then an empty frame.

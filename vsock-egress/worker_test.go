@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -299,6 +300,30 @@ func TestWorkerRefusesToRunAsRoot(t *testing.T) {
 	}
 }
 
+func TestWorkerIsWhatTheKernelEndsFirstWhenMemoryIsOut(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a worker does not run as root")
+	}
+	vsock := filepath.Join(t.TempDir(), "vm.vsock")
+	worker := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", vsock, "-target", "proxy.ns.svc.cluster.local:3128")
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Wait()
+	defer worker.Process.Kill()
+	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) { // it serves once its socket is there
+		if _, err := os.Stat(fmt.Sprintf("%s_%d", vsock, streamPort)); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatal("the worker did not come to listen")
+		}
+	}
+	score, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", worker.Process.Pid))
+	if err != nil || strings.TrimSpace(string(score)) != "1000" {
+		t.Fatalf("its oom_score_adj is %q, %v: want 1000, or the kernel ends the launcher, and with it every worker", score, err)
+	}
+}
+
 func TestWorkerThatEndsWithAnErrorSaysSoInTheWordAnAlarmReads(t *testing.T) {
 	out, err := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", filepath.Join(t.TempDir(), "none", "vm.vsock")).CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "ns/pod: work_failed: ") {
@@ -447,39 +472,60 @@ func TestProxyIsLookedUpAgainAfterADialFails(t *testing.T) {
 	}
 }
 
-func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
-	var lookups, clock atomic.Int64
+func TestStreamEndedBeforeItsProxyCouldBeDialledIsNoFailure(t *testing.T) {
+	out := capture(t)
 	key := newKey()
-	target, _ := proxy(t)
-	_, port, _ := net.SplitHostPort(target)
-	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
-	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
-	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
-		lookups.Add(1)
-		return []netip.Addr{netip.MustParseAddr("127.0.0.2")}, nil // where nothing listens
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "127.0.0.2:9", 0) // where nothing listens
+	guest, node := net.Pipe()
+	go func() { // as the forwarder's startup probe does, before the pod's proxy is there
+		guest.Write(key)
+		guest.Close()
+	}()
+	w.unkeyed <- struct{}{}
+	w.stream(node)
+	w.report()
+	if out.String() != "" {
+		t.Fatalf("the log is %q: want nothing for a stream its guest had ended", out.String())
 	}
-	dial := serve(t, w)
-	stream := func() {
-		c := dial()
-		c.Write(key)
-		select {
-		case <-closed(c):
-		case <-time.After(budget):
-			t.Fatal("a stream was not closed while its proxy was down")
-		}
-	}
+}
 
-	for range 5 {
-		stream()
-	}
-	if n := lookups.Load(); n != 1 {
-		t.Fatalf("5 streams within a second looked the proxy up %d times: want once", n)
-	}
-	clock.Add(1)
-	stream() // its failed dial gives the address up
-	stream()
-	if n := lookups.Load(); n != 2 {
-		t.Fatalf("streams a second later brought the lookups to %d: want 2", n)
+func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
+	for name, unresolved := range map[string]error{"nothing listens at its address": nil, "its name does not resolve": errors.New("no such host")} {
+		t.Run(name, func(t *testing.T) {
+			var lookups, clock atomic.Int64
+			key := newKey()
+			target, _ := proxy(t)
+			_, port, _ := net.SplitHostPort(target)
+			w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), net.JoinHostPort("proxy.test", port), 0)
+			w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+			w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+				lookups.Add(1)
+				return []netip.Addr{netip.MustParseAddr("127.0.0.2")}, unresolved // where nothing listens
+			}
+			dial := serve(t, w)
+			stream := func() {
+				c := dial()
+				c.Write(key)
+				select {
+				case <-closed(c):
+				case <-time.After(budget):
+					t.Fatal("a stream was not closed while its proxy was down")
+				}
+			}
+
+			for range 5 {
+				stream()
+			}
+			if n := lookups.Load(); n != 1 {
+				t.Fatalf("5 streams within a second looked the proxy up %d times: want once", n)
+			}
+			clock.Add(1)
+			stream() // its failed dial gives the address up, or it asks again
+			stream()
+			if n := lookups.Load(); n != 2 {
+				t.Fatalf("streams a second later brought the lookups to %d: want 2", n)
+			}
+		})
 	}
 }
 
@@ -547,6 +593,32 @@ func TestProxySocketIsCappedEachWay(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestStreamWhoseProxyTakesNothingIsCutShort(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	if w.stall <= 0 {
+		t.Fatal("a worker gives a write to its proxy no bound")
+	}
+	w.stall = 100 * time.Millisecond
+	c := serve(t, w)()
+	c.Write(key)
+	up := within(t, accepted, "stream at the proxy")
+	up.SetReadDeadline(time.Now().Add(budget))
+	for range 4 { // while the proxy takes what it is sent, an upload may last longer than the wait
+		c.Write(frame("part"))
+		if _, err := io.ReadFull(up, make([]byte, len("part"))); err != nil {
+			t.Fatalf("the proxy read no more of an upload it was taking: %v", err)
+		}
+		time.Sleep(w.stall / 2)
+	}
+	go toFrames(c, zeros{}, nil) // the proxy reads no more: this upload stops once every buffer on the way to it is full
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if reply, err := io.ReadAll(c); errors.Is(err, os.ErrDeadlineExceeded) || len(reply) != 0 {
+		t.Fatalf("the guest read %q, %v: want the stream ended, and with no frame, as one cut short", reply, err)
+	}
 }
 
 func TestStreamPastTheCapIsRefused(t *testing.T) {

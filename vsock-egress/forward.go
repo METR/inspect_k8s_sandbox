@@ -62,7 +62,24 @@ func ready(args []string) error {
 	fs := flag.NewFlagSet("ready", flag.ExitOnError)
 	keyFile := fs.String("key", "", "where the forwarder keeps its key")
 	fs.Parse(args)
-	_, err := os.Stat(*keyFile + readySuffix)
+	return newForwarder(hostCID, streamPort).ready(*keyFile)
+}
+
+// ready passes once the forwarder listens and its worker does: with no worker for its VM, Firecracker resets the connection.
+func (f *forwarder) ready(keyFile string) error {
+	if _, err := os.Stat(keyFile + readySuffix); err != nil {
+		return err
+	}
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
+		return err
+	}
+	c, err := f.connect(f.host, f.port)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, err = c.Write(key) // a stream that opens with the key and ends: every worker takes that
 	return err
 }
 
@@ -144,7 +161,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		up.Close()
 		return
 	}
-	join(up, c, nil)
+	join(up, c, nil, 0)
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.

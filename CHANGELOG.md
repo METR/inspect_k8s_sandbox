@@ -8,19 +8,25 @@
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at
   `127.0.0.1:3128` that reaches only that Service of its own namespace, for an AWS Nitro
-  Sandbox with no network device. Such a pod gets none of the release's other egress
+  Sandbox with no network device. The Service's pods must carry the release's
+  `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that
+  port; those that `additionalResources` adds need policies of their own (see
+  `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
   grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
   sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
   yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
   `no_proxy` for a server on the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
-  seccomp profiles: see `vsock-egress/README.md`.
+  seccomp profiles (see `vsock-egress/README.md`): on a node with no launcher such a pod
+  does not start.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
-- Wait for the Pods of every StatefulSet of the release whose Pod template
-  carries the release's `app.kubernetes.io/instance` label, including those from
-  `additionalResources`, before handing over a sandbox.
+- Wait for the Pods of every `apps/v1` StatefulSet of the release, in its namespace,
+  whose Pod template carries the release's `app.kubernetes.io/instance` label, including
+  those from `additionalResources`, before handing over a sandbox.
+- Fix a sandbox failing to start when a value such as a `command` argument is exactly
+  `=` or `<<`, or a date or time that does not exist such as `2023-02-29`.
 - A service or namespace named `no` or `123`, or a generated release name that reads as
   a number, no longer fails the install, and a label key such as `no` or `on` is no
   longer applied as `false` or `true`.
@@ -68,8 +74,11 @@
   `shareProcessNamespace` or `hostPID` is refused: the sample fails to start.
 - Add `inspect-k8s-sandbox/execd: "stdio"` for pods with no network device.
 - A pod annotated `sandbox.amazonaws.com/network-isolated: "true"` gets no CoreDNS
-  sidecar. A service with a DNS record finds itself there under its own name through
-  `/etc/hosts`, at `127.0.0.1`; its `additionalDnsRecords` do not resolve.
+  sidecar. A service with a DNS record finds itself there under its own name and its
+  `additionalDnsRecords` through `/etc/hosts`, at `127.0.0.1`. The install fails for a
+  record that is no lower-case DNS name (upper case, `_`, `*`, a trailing dot), and
+  where that line of `/etc/hosts`, the address and every name with a tab between, is
+  longer than the 510 bytes musl reads of one.
 - Init containers take `env` and `volumeMounts`, so one can write a file into a volume
   the service's container then reads.
 - Fix orphaned processes exhausting PID slots in sandboxes using the default

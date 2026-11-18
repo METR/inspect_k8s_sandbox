@@ -65,7 +65,7 @@ func connect(name string) {
 		fail(err.Error())
 	}
 	go func() { io.Copy(c, os.Stdin); os.Exit(0) }()
-	io.Copy(os.Stdout, c)
+	io.Copy(struct{ io.Writer }{os.Stdout}, c) // not os.Stdout's ReadFrom: it splices, and while the exec's stdout is full it retries without waiting
 	os.Exit(0)
 }
 

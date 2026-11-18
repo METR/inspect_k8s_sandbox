@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -66,5 +67,17 @@ func TestProbeNamesTheAssumptionThatBroke(t *testing.T) {
 				t.Fatalf("the error is %d bytes long: the probe kept all that the guest sent", len(err.Error()))
 			}
 		})
+	}
+}
+
+func TestProbePassesACanaryThatStartsAfterIt(t *testing.T) {
+	var bound atomic.Bool
+	vsock := firecrackerThat(t, func(port uint32) (string, bool) { return "canary\n", port == canaryPort && bound.Load() })
+	time.AfterFunc(100*time.Millisecond, func() { // gate.sh starts the canary as it starts the check: it binds its port, then dials
+		bound.Store(true)
+		canaryDials(t, vsock, "bind: ok\n")
+	})
+	if err := probeVM(vsock, budget); err != nil {
+		t.Fatalf("a canary that started after the check did: %v", err)
 	}
 }

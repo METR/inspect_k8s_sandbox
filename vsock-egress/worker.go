@@ -26,15 +26,17 @@ type worker struct {
 	slots   chan struct{} // one for each open stream
 	unkeyed chan struct{} // one for each connection whose key has not been checked yet
 	keyWait time.Duration // how long a connection has to show its key
+	stall   time.Duration // how long the proxy may leave a write to it waiting
 
 	mu      sync.Mutex
 	key     []byte // the forwarder's
 	fetched time.Time
 	now     func() time.Time
 
-	addr   atomic.Pointer[string] // the target's address, once looked up
-	asked  atomic.Int64           // when that was, in nanoseconds since 1970
-	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	addr       atomic.Pointer[string]    // the target's address, once looked up
+	asked      atomic.Pointer[time.Time] // when that was: a Time, whose monotonic reading no step of the node's clock moves
+	unresolved atomic.Pointer[failedLookup]
+	lookup     func(ctx context.Context, network, host string) ([]netip.Addr, error)
 
 	accepts *pacer       // new streams a second
 	refused atomic.Int64 // streams turned away since the last report: without the key, or past the cap
@@ -48,11 +50,23 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
+// failedLookup is the target's last lookup that failed, and when: for a second after, streams fail as it did.
+type failedLookup struct {
+	err error
+	at  time.Time
+}
+
+// endedWait is how long a stream whose dial failed is given to show that the guest had already ended it.
+const endedWait = 10 * time.Millisecond
+
+// stallWait ends a stream whose proxy has stopped reading: it would hold its slot, and the forwarder's, for as long as the proxy kept the connection.
+const stallWait = 5 * time.Minute
+
 // proxyBuffer caps a stream's socket to the proxy each way, and the kernel accounts twice it, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, target string, rate int) *worker {
-	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait,
+	return &worker{vsock: vsock, target: target, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait, stall: stallWait,
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -88,6 +102,10 @@ func work(args []string) error {
 	runtime.GOMAXPROCS(1)
 	if os.Geteuid() == 0 {
 		return errors.New("a worker runs as its VM's uid, never as root")
+	}
+	// Out of memory, the kernel then ends a worker before the launcher, whose end would end every worker: the README says when.
+	if err := os.WriteFile("/proc/self/oom_score_adj", []byte("1000"), 0); err != nil {
+		return err
 	}
 	path := fmt.Sprintf("%s_%d", *vsock, streamPort) // where Firecracker takes the guest's connection to (host, streamPort)
 	os.Remove(path)                                  // an earlier worker's
@@ -143,36 +161,46 @@ func (w *worker) stream(c net.Conn) {
 	c.SetReadDeadline(time.Time{})
 	t, err := w.dial()
 	if err != nil {
+		// The forwarder's startup probe ends its stream at once: one that came before the proxy is no stream that failed.
+		c.SetReadDeadline(time.Now().Add(endedWait))
+		if _, ended := c.Read(make([]byte, 1)); ended == io.EOF {
+			return
+		}
 		if w.failed.Add(1) == 1 { // the first of each report says why
 			log.Printf("proxy_unreached: %v", err)
 		}
 		return
 	}
-	join(c, t.(*net.TCPConn), w.pace)
+	join(c, t.(*net.TCPConn), w.pace, w.stall)
 }
 
-// dial connects to the pod's proxy. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and a proxy that is down must not cost a lookup a stream.
+// dial connects to the pod's proxy. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a proxy that is down nor a name that does not resolve may cost a lookup a stream.
 func (w *worker) dial() (net.Conn, error) {
 	addr := w.addr.Load()
-	if addr == nil { // under no lock: a lookup that hangs holds up its own stream alone
+	if addr == nil { // under no lock: streams that ask during a lookup share it, each for dialWait at most
 		host, port, err := net.SplitHostPort(w.target)
 		if err != nil {
 			return nil, err
+		}
+		if last := w.unresolved.Load(); last != nil && w.now().Sub(last.at) < time.Second {
+			return nil, last.err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), dialWait)
 		ips, err := w.lookup(ctx, "ip4", host)
 		cancel()
 		if err != nil {
+			w.unresolved.Store(&failedLookup{err, w.now()})
 			return nil, err
 		}
 		found := net.JoinHostPort(ips[0].String(), port)
 		addr = &found
-		w.asked.Store(w.now().UnixNano())
+		asked := w.now()
+		w.asked.Store(&asked)
 		w.addr.CompareAndSwap(nil, addr) // an answer that came meanwhile is the newer one
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
-		if w.now().UnixNano()-w.asked.Load() >= int64(time.Second) {
+		if w.now().Sub(*w.asked.Load()) >= time.Second {
 			w.addr.CompareAndSwap(addr, nil)
 		}
 		return nil, err

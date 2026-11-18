@@ -79,12 +79,17 @@ spec:
           - 127.0.0.1
       {{- end }}
       {{- if and $noCard (include "shouldCreateDnsRecord" $service) }}
-      {{- /* No sidecar answers there, so the service's own names lead to the pod itself. */}}
+      {{- /* No sidecar answers there, so the service's names lead to the pod itself. */}}
+      {{- $names := concat (list $name (printf "%s-%s" (include "agentEnv.fullname" $) $name)) ($service.additionalDnsRecords | default list) }}
+      {{- /* The kubelet writes them as one line of /etc/hosts, and musl reads no more than 510 bytes of a line. */}}
+      {{- $line := join "\t" (prepend $names "127.0.0.1") }}
+      {{- if gt (len $line) 510 }}{{ fail (printf "services.%s.additionalDnsRecords: in a pod with no network device its names are one line of /etc/hosts, here %d bytes, and musl resolves no name past byte 510 of a line" $name (len $line)) }}{{ end }}
       hostAliases:
         - ip: "127.0.0.1"
           hostnames:
-            - {{ $name | quote }}
-            - {{ printf "%s-%s" (include "agentEnv.fullname" $) $name | quote }}
+            {{- range $names }}
+            - {{ . | quote }}
+            {{- end }}
       {{- end }}
 
       {{- if or $service.initContainers $egressProxy }}
