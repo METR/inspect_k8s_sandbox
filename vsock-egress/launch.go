@@ -304,7 +304,6 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	return wanted, nil
 }
 
-// isPort reports whether digits name a port a worker can dial: 1 to 65535.
 func isPort(digits string) bool {
 	port, err := strconv.ParseUint(digits, 10, 16)
 	return err == nil && port > 0
