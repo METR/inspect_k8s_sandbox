@@ -49,17 +49,15 @@ context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
 eth0 = socket.if_nametoindex("eth0")
 links = (line.split() for line in open("/proc/net/if_inet6"))
-own = next(f[0] for f in links if f[5] == "eth0" and f[0].startswith("fe80"))
+own = bytes.fromhex(next(f[0] for f in links if f[0].startswith("fe80")))
 s = socket.socket(socket.AF_INET6)
-s.settimeout(30)
 s.setsockopt(socket.IPPROTO_IPV6, 78, 1)  # IPV6_FREEBIND: no bind to it otherwise
 s.bind(("fe80::", 0, 0, eth0))
-own = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(own))
-s.connect((own, int(sys.argv[1]), 0, eth0))
+s.connect((socket.inet_ntop(socket.AF_INET6, own), int(sys.argv[1]), 0, eth0))
 try:
     context.wrap_socket(s)
     print("served")
-except OSError:
+except (ssl.SSLEOFError, ConnectionResetError, BrokenPipeError):
     print("closed")
 """
 
@@ -441,13 +439,14 @@ async def test_a_connection_from_an_anycast_address_of_the_sandboxs_is_closed(
     forwards = Sandbox(f"{sandbox.name}-forwards", "")
     ipv6 = "com.docker.network.endpoint.sysctls=net.ipv6.conf.IFNAME.disable_ipv6=0"
     network = ["--network", f"name=bridge,driver-opt={ipv6}"]
-    forwarding = ["--sysctl", "net.ipv6.conf.all.forwarding=1"]  # as a Nitro pod's
+    forwarding = ["--sysctl", "net.ipv6.conf.all.forwarding=1"]
     try:
         run = ["run", "-d", "--name", forwards.name, *network, *forwarding]
         started = docker(*run, sandbox.name, "sleep", "3600")
         assert started.returncode == 0, started.stderr
         await start_execd(forwards, False, "--port", str(PORT))
-        await forwards.until("grep -q fe80 /proc/net/anycast6")  # it answers there
+        listed = "eth0 *fe800000000000000000000000000000 "  # it answers there
+        await forwards.until(f"grep -q '{listed}' /proc/net/anycast6")
         dial = ["python3", "-c", ANYCAST_PROBE, str(PORT)]
         probe = await asyncio.to_thread(docker, "exec", forwards.name, *dial)
     finally:

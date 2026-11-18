@@ -134,13 +134,11 @@ func TestAConnectionFromAnAnycastAddressOfThePodsIsRefused(t *testing.T) {
 	}{
 		{"fe80::8b4:7ff:fe9c:1/64", "fe80::", true},   // as a pod that forwards IPv6 answers there
 		{"fe80::8b4:7ff:fe9c:1/64", "fe80::2", false}, // another machine on the link
-		{"2001:db8::1/127", "2001:db8::", false},      // the other end of a point-to-point link
+		{"2001:db8::5/126", "2001:db8::4", true},      // a routable subnet has one too
+		{"2001:db8::3/127", "2001:db8::2", false},     // the other end of a point-to-point link
 		{"192.0.2.9/24", "192.0.2.0", false},          // IPv4 has no such address
 	} {
-		ip, subnet, err := net.ParseCIDR(peer.own)
-		if err != nil {
-			t.Fatal(err)
-		}
+		ip, subnet, _ := net.ParseCIDR(peer.own)
 		interfaceAddrs = func() ([]net.Addr, error) { return []net.Addr{&net.IPNet{IP: ip, Mask: subnet.Mask}}, nil }
 		if fromThisPod(remoteConn{addr: &net.TCPAddr{IP: net.ParseIP(peer.from)}}) != peer.refused {
 			t.Errorf("a connection from %s to a pod at %s: refused is %t, want %t", peer.from, peer.own, !peer.refused, peer.refused)
