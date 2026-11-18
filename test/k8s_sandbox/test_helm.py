@@ -1408,6 +1408,15 @@ def _services(stdout: str) -> frozenset[str]:
         pytest.param(
             _manifest(_stateful_set("default", replicas=3)), {"default"}, id="replicas"
         ),
+        # A controller scaled to none takes no sandbox from the one that serves it.
+        pytest.param(
+            _manifest(
+                _stateful_set(replicas=0).replace("StatefulSet", "Deployment"),
+                _STATEFUL_SET,
+            ),
+            {"default"},
+            id="a-standby-scaled-to-none",
+        ),
         # A pod the chart does not declare to be a sandbox cannot serve as one.
         pytest.param(
             _manifest(_STATEFUL_SET, "kind: DaemonSet\nspec:\n  template:\n    {}\n"),
@@ -1507,15 +1516,18 @@ def test_expected_services(stdout: str, expected: set[str]) -> None:
             _manifest("kind: ConfigMap\nmetadata: {name: c}\n"),
             id="declares-no-sandbox",
         ),
-        # No pod would ever serve it, and left out its name would reach `default`.
-        pytest.param(
-            _manifest(_stateful_set("victim", replicas=0), _STATEFUL_SET),
-            id="a-sandbox-scaled-to-none",
-        ),
     ],
 )
 def test_expected_services_fails_closed(stdout: str) -> None:
-    with pytest.raises(RuntimeError, match="manifest|declares no Pod|sandbox victim"):
+    with pytest.raises(RuntimeError, match="manifest|declares no Pod"):
+        _services(stdout)
+
+
+def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
+    # Left out, Inspect would make `victim` the default sandbox.
+    stdout = _manifest(_stateful_set(replicas=0), _stateful_set("victim"))
+
+    with pytest.raises(RuntimeError, match="sandbox default to `replicas: 0`"):
         _services(stdout)
 
 

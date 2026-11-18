@@ -85,7 +85,7 @@ own labels, or a workload's `spec.template` labels.
 
 Two consequences worth knowing:
 
-* A chart that declares no `inspect/service` Pod, or scales a sandbox's controller to
+* A chart that declares no `inspect/service` Pod, or a sandbox with every controller at
   `replicas: 0`, fails the install. If your Pods are created indirectly, by an operator
   reconciling a custom resource for instance, put the label on a Pod the chart itself
   renders, or use a [Helm post-install
