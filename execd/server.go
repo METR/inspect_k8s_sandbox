@@ -1104,15 +1104,22 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 // More than execve lets an environment hold (6 MiB).
 const maxEnviron = 8 << 20
 
-// tagged says whether the environment a /proc/PID/environ file shows holds needle.
-func tagged(environ string, needle []byte) bool {
-	f, err := os.Open(environ)
+// Tests open another file in an environment's place, as the kernel shows none of a process whose execve is under way.
+var openEnviron atomic.Pointer[func(string) (*os.File, error)]
+
+// tagged says whether the environment a /proc/PID/environ file shows holds needle, and whether it shows none at all.
+func tagged(environ string, needle []byte) (is, none bool) {
+	open := os.Open
+	if stand := openEnviron.Load(); stand != nil {
+		open = *stand
+	}
+	f, err := open(environ)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer f.Close()
 	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
-	return bytes.Contains(append(data, 0), needle)
+	return bytes.Contains(append(data, 0), needle), len(data) == 0
 }
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
@@ -1123,16 +1130,28 @@ func killTagged(tag string) {
 	for pass, more := 0, true; more && pass < 8; pass++ {
 		more = false
 		entries, _ := os.ReadDir("/proc")
-		hook(&afterListed, pass > 0)
+		hook(&afterListed, false)
+		starting := false
 		for _, e := range entries {
 			pid, err := strconv.Atoi(e.Name())
 			if err != nil || pid == os.Getpid() || read[pid] {
 				continue
 			}
-			read[pid], more = true, true
-			if tagged("/proc/"+e.Name()+"/environ", needle) {
+			more = true
+			is, none := tagged("/proc/"+e.Name()+"/environ", needle)
+			if none {
+				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
+					starting = true
+					continue
+				}
+			}
+			read[pid] = true
+			if is {
 				syscall.Kill(pid, syscall.SIGKILL)
 			}
+		}
+		if starting {
+			time.Sleep(time.Millisecond) // an execve takes about a tenth of that
 		}
 	}
 }
