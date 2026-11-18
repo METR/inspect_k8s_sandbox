@@ -168,10 +168,12 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 func refused(at string) {
 	if at != "ran on" {
 		runtime.LockOSThread() // the filter is this thread's, and an exec keeps it
-		// What is refused: prctl's first argument, the option; or setresuid's second, root as the effective id.
+		// What is refused: prctl's first argument, the option; or the second of setresuid or setresgid, root as the effective id.
 		call, argument, value := uint32(syscall.SYS_PRCTL), uint32(16), uint32(prSetDumpable)
-		if at == "way back" {
+		if at == "user back" {
 			call, argument, value = syscall.SYS_SETRESUID, 24, 0
+		} else if at == "group back" {
+			call, argument, value = syscall.SYS_SETRESGID, 24, 0
 		}
 		filter := []syscall.SockFilter{
 			{Code: 0x20, K: 0},                               // the call's number
@@ -190,7 +192,7 @@ func refused(at string) {
 		if at == "start" { // init() runs again, under the filter
 			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ran on"}, os.Environ())
 		}
-		if at == "way back" { // of no process: only the user's identity is taken, and given back
+		if strings.HasSuffix(at, " back") { // of no process: only the user's identity is taken, and given back
 			killAs(1<<30, &syscall.Credential{Uid: 65534, Gid: 65534})
 		}
 		setids(uint32(os.Getuid()), uint32(os.Getgid()))
@@ -218,15 +220,17 @@ func TestExecdEndsWhereAThreadCannotTakeItsIdentityBack(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("only root takes another user's identity")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
-	defer cancel()
-	child := exec.CommandContext(ctx, os.Args[0], "refused", "way back")
-	var said strings.Builder
-	child.Stderr = &said
+	for _, half := range []string{"user back", "group back"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "refused", half)
+		var said strings.Builder
+		child.Stderr = &said
 
-	ran, _ := child.Output() // its exit status may go to the tests' reaper
+		ran, _ := child.Output() // its exit status may go to the tests' reaper
 
-	if len(ran) > 0 || !strings.Contains(said.String(), "could not take execd's identity back") {
-		t.Errorf("execd said %q, then %q: the thread would do execd's other work as another user", said.String(), ran)
+		if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "could not take execd's identity back") {
+			t.Errorf("refused its %s, execd said %q, then %q (%v): the thread would do execd's other work as another", half, said.String(), ran, ctx.Err())
+		}
 	}
 }

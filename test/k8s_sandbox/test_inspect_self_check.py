@@ -132,13 +132,14 @@ async def test_a_kill_reaches_what_another_users_command_detached(
         while (await root.exec(["test", "-e", f"/proc/{pid}"])).success:
             await asyncio.sleep(0.1)
 
+    left = "kill -9 $(cat /tmp/detached); "  # what a failed run leaves
     try:
         pid = await asyncio.wait_for(detached(), 30)
         command.cancel()
 
         # Without CAP_SYS_PTRACE root can't read the user's environment for its tag.
         await asyncio.wait_for(gone(), 30)
+        left = ""
     finally:
         command.cancel()
-        left = "kill -9 $(cat /tmp/detached); rm -f /tmp/detached"
-        await root.exec(["sh", "-c", left])
+        await root.exec(["sh", "-c", left + "rm -f /tmp/detached"])

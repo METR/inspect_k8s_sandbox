@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -1112,13 +1111,19 @@ var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
 
 // tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
 func tagged(open func(string) (*os.File, error), environ string, needle []byte) (is, none bool) {
-	f, err := open(environ)
-	if err != nil {
-		return false, false
+	// In one read: an execve between two lets the environment go, and the second ends the file short of its tag.
+	for size := 4 << 10; ; size = min(4*size, maxEnviron) {
+		f, err := open(environ)
+		if err != nil {
+			return false, false
+		}
+		data := make([]byte, size+1)
+		n, _ := f.Read(data[:size])
+		f.Close()
+		if n < size || size == maxEnviron { // a read it fills may not hold it all: a process can make its own look any size
+			return bytes.Contains(append(data[:n], 0), needle), n == 0
+		}
 	}
-	defer f.Close()
-	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
-	return bytes.Contains(append(data, 0), needle), len(data) == 0
 }
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
