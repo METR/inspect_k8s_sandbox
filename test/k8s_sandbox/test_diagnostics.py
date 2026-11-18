@@ -1,3 +1,4 @@
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from kubernetes.client import (  # type: ignore
@@ -214,6 +215,17 @@ def test_ignores_events_for_objects_outside_the_release() -> None:
         )
 
     assert summary is None
+
+
+def test_names_a_pod_that_is_being_deleted() -> None:
+    # It holds the readiness wait while each of its containers still reads healthy.
+    going = V1ObjectMeta(name="rel-default", deletion_timestamp=datetime(2026, 11, 18))
+    pod = V1Pod(metadata=going, status=V1PodStatus(phase="Running"))
+
+    with _patch_client([pod]):
+        summary = describe_release_pods(None, "default", "rel")
+
+    assert summary == "pod 'rel-default': being deleted"
 
 
 def test_returns_none_and_does_not_raise_when_api_call_fails() -> None:
