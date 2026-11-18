@@ -1338,14 +1338,19 @@ def test_pod_ready(pod: PodSnapshot, expected: bool) -> None:
     assert _pod_ready(pod) is expected
 
 
-def test_declared_object_names_covers_every_kind_including_nested_lists() -> None:
+def test_declared_object_names_covers_every_kind_including_lists() -> None:
     # These are what a Warning event on a non-pod object is matched against, so a kind
     # missed here is a failure the diagnostics cannot explain.
     stdout = _manifest(
         "kind: ConfigMap\nmetadata: {name: cm}\n",
         _stateful_set("default"),
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
-        "kind: StatefulSetList\nitems: [{metadata: {name: helper}}]\n",
+        "apiVersion: apps/v1\nkind: StatefulSetList\n"
+        "items: [{metadata: {name: helper}}]\n",
+        # Helm makes nothing of a template that rendered a comment alone,
+        "# no object\n",
+        # nor of a document whose `items` is null, whatever its kind.
+        "kind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
     )
 
     names = frozenset(_declared_object_names(_rendered_docs(stdout, "abcdefgh")))
@@ -1442,9 +1447,8 @@ def _services(stdout: str) -> frozenset[str]:
         # Helm installs an item that names no kind as the kind its list names.
         pytest.param(
             _manifest(
-                "kind: PodList\nitems: ["
-                + _list_item("a").replace("kind: Pod, ", "")
-                + "]"
+                "apiVersion: v1\nkind: PodList\n"
+                f"items: [{{metadata: {{labels: {{{_SERVICE_LABEL}: a}}}}}}]"
             ),
             {"a"},
             id="typed-list-wrapping-pods",
