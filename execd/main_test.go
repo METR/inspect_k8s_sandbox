@@ -75,6 +75,56 @@ func TestTheFirstExecPrintsItsDaemonsFingerprintAndReturns(t *testing.T) {
 	}
 }
 
+func TestConnectWaitsWhileItsOutputIsNotRead(t *testing.T) {
+	const unread = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	name := "execd-test-" + strconv.Itoa(os.Getpid())
+	daemon, err := net.Listen("unix", "@"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	bridge := exec.CommandContext(ctx, os.Args[0], "connect", name)
+	stdin, _ := bridge.StdinPipe() // open until the test ends: connect ends when its stdin does
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	bridge.Stdout = w
+	if err := bridge.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	defer bridge.Wait() // its exit status may go to the tests' reaper
+	defer stdin.Close()
+	daemon.(*net.UnixListener).SetDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	c, err := daemon.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ran := func() time.Duration { // the bridge's user and system time so far, which /proc counts in hundredths of a second
+		stat, err := os.ReadFile("/proc/" + strconv.Itoa(bridge.Process.Pid) + "/stat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:])) // after the name, which may hold spaces
+		user, _ := strconv.Atoi(f[11])
+		system, _ := strconv.Atoi(f[12])
+		return time.Duration(user+system) * 10 * time.Millisecond
+	}
+	started := ran()                // it has connected: what it took to start does not count
+	go c.Write(make([]byte, 1<<20)) // more than the exec's stdout holds
+
+	time.Sleep(unread)
+
+	if spent := ran() - started; spent > unread/10 {
+		t.Fatalf("connect ran for %v of the %v its output went unread: want it to wait", spent, unread)
+	}
+}
+
 // firstProcess runs execd as a pod's first process that reaps nothing would.
 func firstProcess(argv []string) {
 	prctl(prSetChildSubreaper, 1)

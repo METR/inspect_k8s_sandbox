@@ -7,11 +7,20 @@
 {{- range $svcName, $svc := .Values.services }}
 {{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
+{{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
 {{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
 {{- end }}
 {{- else -}}
+{{- /* A pod that names an egress proxy takes the last policy of this file in place of sandbox-egress. */}}
+{{- $egressProxies := dict }}
+{{- range $svcName, $svc := .Values.services }}
+{{- with include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}
+{{- if $svc.networkIsolated }}{{ fail (printf "services.%s.networkIsolated denies the pod all egress, so it could not reach the egress proxy it names: unset one of the two" $svcName) }}{{ end }}
+{{- $_ := set $egressProxies $svcName . }}
+{{- end }}
+{{- end -}}
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -34,6 +43,12 @@ spec:
     matchLabels:
       io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
       {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+    {{- with keys $egressProxies | sortAlpha }}
+    matchExpressions:
+      - key: inspect/service
+        operator: NotIn
+        values: {{ toJson . }}
+    {{- end }}
   egress:
     - toEndpoints:
       - matchLabels:
@@ -276,5 +291,48 @@ spec:
     - toEntities:
         - all
 {{- end }}
+{{- end }}
+{{- range $svcName, $proxy := $egressProxies }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ template "agentEnv.fullname" $ }}-svc-{{ $svcName }}-egress-proxy
+  annotations:
+    {{- include "agentEnv.toYaml" $.Values.annotations | nindent 4 }}
+  labels:
+    {{- include "agentEnv.toYaml" $.Values.labels | nindent 4 }}
+spec:
+  description: |
+    Service "{{ $svcName }}" names an egress proxy: its pod reaches only that name's
+    DNS record and the proxy's port on the pods of this sandbox.
+  endpointSelector:
+    matchLabels:
+      io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
+      {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
+      inspect/service: {{ $svcName | quote }}
+  egress:
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: kube-system
+          k8s-app: kube-dns
+      - matchLabels:
+          io.kubernetes.pod.namespace: kube-system
+          k8s-app: node-local-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
+          {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
+      toPorts:
+        - ports:
+            - port: {{ regexFind "[0-9]+$" $proxy | quote }}
+              protocol: TCP
 {{- end }}
 {{- end }}

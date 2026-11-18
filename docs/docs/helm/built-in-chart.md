@@ -248,7 +248,9 @@ services:
 
 Records are interpolated into the CoreDNS configuration, so they are restricted to
 letters, digits and `_ - .` (e.g. `_dmarc.example.com` is fine). Anything containing
-whitespace or other characters is rejected when the chart is installed.
+whitespace or other characters is rejected when the chart is installed. For a pod
+annotated `sandbox.amazonaws.com/network-isolated: "true"` each record must be a
+lower-case DNS name: `_dmarc.example.com` fails the install there.
 
 To achieve this, whilst maintaining support for deploying multiple instances of the same
 chart in a given namespace, a CoreDNS "sidecar" container is deployed in each service
@@ -584,6 +586,10 @@ additionalResources:
       password: my-password
 ```
 
+A Service named `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the
+agent environment as `$AGENT_ENV-<name>` once `additionalResourceDnsRecords` lists
+`<name>`.
+
 For more complex resources which are not valid standalone YAML, you can use a string
 block. The following example creates a Cilium Network Policy which allows ingress from
 all entities to the default service on port 2222.
@@ -602,7 +608,7 @@ additionalResources:
       Allow external ingress from all entities to the default service on port 2222.
     endpointSelector:
       matchLabels:
-        io.kubernetes.pod.namespace: {{ $.Release.Namespace }}
+        io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
         {{- include "agentEnv.selectorLabels" $ | nindent 6 }}
         inspect/service: default
     ingress:

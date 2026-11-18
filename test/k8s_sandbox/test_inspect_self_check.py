@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 from typing import AsyncGenerator
 
 import pytest
@@ -34,16 +35,21 @@ _NONSTRICT_XFAILS = {
 }
 
 
-@pytest.fixture(scope="module", params=["exec", "execd"])
+@pytest.fixture(scope="module", params=["exec", "execd", "execd-stdio"])
 def transport(request: pytest.FixtureRequest) -> str:
     return request.param
 
 
 @pytest_asyncio.fixture(scope="module")
 async def sandboxes(
-    transport: str,
+    transport: str, tmp_path_factory: pytest.TempPathFactory
 ) -> AsyncGenerator[dict[str, K8sSandboxEnvironment], None]:
     values = "values.yaml" if transport == "exec" else "execd-values.yaml"
+    if transport == "execd-stdio":  # the same pods, reached as one with no network card
+        on_tcp = (pathlib.Path(__file__).parent / "resources" / values).read_text()
+        stdio = tmp_path_factory.mktemp("values") / values
+        stdio.write_text(on_tcp.replace('/execd: "true"', '/execd: "stdio"'))
+        values = str(stdio)
     async with install_sandbox_environments(__file__, values) as envs:
         yield envs
 
@@ -75,7 +81,8 @@ async def test_annotation_picks_transport(
     # execd starts a command itself; Kubernetes exec starts it from a shell.
     result = await sandbox_env.exec(["sh", "-c", "cat /proc/$PPID/cmdline"])
     assert result.success, result.stderr
-    assert ("execd" in result.stdout) == (transport == "execd"), result.stdout
+    assert ("execd" in result.stdout) == (transport != "exec"), result.stdout
+    assert ("--socket" in result.stdout) == (transport == "execd-stdio"), result.stdout
 
 
 async def test_a_script_with_no_interpreter_line_runs(

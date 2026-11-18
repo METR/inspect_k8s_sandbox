@@ -39,6 +39,10 @@ networkPolicy:
 # CoreDNS containers, e.g. a relay a runtime needs in the pod. Each carries its own
 # `securityContext`: none of the service's hardening applies to it.
 extraContainers: []
+# -- The vsock-egress image (built from `vsock-egress/`), required once a pod carries
+# the annotation `inspect-k8s-sandbox/egress-proxy`.
+# @default -- Empty
+egressForwarderImage: ""
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []
 # - name: "gcr-json-key"
@@ -116,7 +120,9 @@ services:
     # agent environment (e.g. example.com). If one or more records are provided,
     # `dnsRecord` is automatically set to true. Records may contain letters, digits and
     # `_ - .`; whitespace and other characters are rejected at install time because
-    # these are interpolated into the CoreDNS Corefile.
+    # these are interpolated into the CoreDNS Corefile. For a pod annotated
+    # `sandbox.amazonaws.com/network-isolated: "true"` each must be a lower-case DNS
+    # name: `_dmarc.example.com` fails the install there.
     additionalDnsRecords: []
     # -- Deprecated. All ports of services with a DNS record are accessible (though not
     # necessarily open) to other services within the agent environment. If one or more
@@ -204,6 +210,9 @@ volumes: {}
 # passed through the Helm template engine. String values are passed through the
 # template engine then converted to YAML.
 additionalResources: []
+# -- Names of Services that `additionalResources` adds as `<fullname>-<name>`: each
+# resolves from within the agent environment as `$AGENT_ENV-<name>`.
+additionalResourceDnsRecords: []
 # -- A dict of annotations to apply to resources within the agent environment.
 annotations: {}
   # inspectTaskName: "task-name"

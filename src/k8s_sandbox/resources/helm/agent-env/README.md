@@ -6,6 +6,7 @@
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| additionalResourceDnsRecords | list | `[]` | Names of Services that `additionalResources` adds as `<fullname>-<name>`: each resolves from within the agent environment as `$AGENT_ENV-<name>`. |
 | additionalResources | list | `[]` | A list of additional resources to deploy within the agent environment. They're passed through the Helm template engine. String values are passed through the template engine then converted to YAML. |
 | allowCIDR | list | Empty list (no additional CIDR ranges compared to default policies) | A list of CIDR ranges (e.g. 1.1.1.1/32) that pods within the agent environment are allowed to access. |
 | allowDomains | list | Empty list (no internet access) | Domains the agent environment may reach. Egress is restricted to ports 80/443 and the request identity must match an entry (TLS SNI on 443, HTTP Host on 80). Use allowDomainsPorts to open other ports. Wildcard entries require Cilium >= 1.18. |
@@ -18,6 +19,7 @@
 | corednsReadyPort | int | `18181` | Port, on the pod IP, of the CoreDNS sidecar's startup probe endpoint. Change it if a service in the pod listens on this port. |
 | corednsSecurityContext | object | Non-root 65532, read-only root filesystem, RuntimeDefault seccomp, no privilege escalation, and no capability other than `NET_BIND_SERVICE` | Security context for the coredns container. Override only if a custom `corednsImage` cannot run under the hardened default. |
 | corednsUpstream | list | Empty list (forward to the node's cluster DNS via the kubelet's resolv.conf) | DNS servers (IP addresses) the CoreDNS sidecar forwards to, e.g. the cluster DNS Service IP. Set it for a runtime that cannot mount a single file over `/etc/resolv.conf` with `subPath`: the pod then uses `dnsPolicy: None` with the sidecar as its only nameserver. Init containers run before the sidecar starts, so in that mode they cannot resolve names. |
+| egressForwarderImage | string | Empty | The vsock-egress image (built from `vsock-egress/`), required once a pod carries the annotation `inspect-k8s-sandbox/egress-proxy`. |
 | extraContainers | list | `[]` | Containers added, as written, to every service's pod beside the service and CoreDNS containers, e.g. a relay a runtime needs in the pod. Each carries its own `securityContext`: none of the service's hardening applies to it. |
 | global | object | set by inspect | The name of the agent environment, only overwrite in cases where e.g. name lengths are causing failures. |
 | imagePullSecrets | list | `[]` | References to pre-existing secrets that contain registry credentials. |
@@ -29,7 +31,7 @@
 | serviceAccountName | string | `nil` | Service account name for sandbox pods. The account must already exist unless `serviceAccountCreate` is enabled. |
 | services | object | see [values.yaml](./values.yaml) | A collection of services to deploy within the agent environment. A service can connect to another service using DNS, e.g. `http://nginx:80`. |
 | services.default | object | see [values.yaml](./values.yaml) | The default service, this is required for the agent environment to function. |
-| services.default.additionalDnsRecords | list | `[]` | A list of additional domains which will resolve to this service from within the agent environment (e.g. example.com). If one or more records are provided, `dnsRecord` is automatically set to true. Records may contain letters, digits and `_ - .`; whitespace and other characters are rejected at install time because these are interpolated into the CoreDNS Corefile. |
+| services.default.additionalDnsRecords | list | `[]` | A list of additional domains which will resolve to this service from within the agent environment (e.g. example.com). If one or more records are provided, `dnsRecord` is automatically set to true. Records may contain letters, digits and `_ - .`; whitespace and other characters are rejected at install time because these are interpolated into the CoreDNS Corefile. For a pod annotated `sandbox.amazonaws.com/network-isolated: "true"` each must be a lower-case DNS name: `_dmarc.example.com` fails the install there. |
 | services.default.args | list | `[]` | The container's entrypoint arguments. |
 | services.default.command | list | `["sh","-c","trap '' HUP INT QUIT TERM; while true; do sleep 3600 & wait; done"]` | The container's entrypoint command. The default idle loop reaps orphaned processes and requires sh and sleep in the image. |
 | services.default.dnsRecord | bool | false | Whether to create a DNS record which will resolve to this service from within the agent environment, using the service name as the domain (e.g. default). |

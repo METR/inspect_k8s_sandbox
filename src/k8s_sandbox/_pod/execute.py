@@ -160,14 +160,14 @@ class ExecuteOperation(PodOperation):
         return result
 
     def open_stdio(
-        self, cmd: list[str], user: str | None
+        self, cmd: list[str], user: str | None, stderr: bool = True
     ) -> tuple[ExitStack, WSClient]:
         """Start `cmd` as `user`, switched to as exec() does, joined to a websocket."""
         stack = ExitStack()
         # No resize keepalive: its events can stall the stdin (see _send_keepalive).
         ws_client = stack.enter_context(
             self._interactive_shell(
-                _shell_command(user, command=cmd), send_keepalive=False
+                _shell_command(user, command=cmd), send_keepalive=False, stderr=stderr
             )
         )
         return stack, ws_client
@@ -217,13 +217,13 @@ class ExecuteOperation(PodOperation):
 
     @contextmanager
     def _interactive_shell(
-        self, command: list[str], send_keepalive: bool = True
+        self, command: list[str], send_keepalive: bool = True, stderr: bool = True
     ) -> Generator[WSClient, None, None]:
         # ExecutableNotFoundError here: no /bin/sh, or no runuser a probe had found.
         yield from self.create_websocket_client_for_exec(
             send_keepalive,
             command=command,
-            stderr=True,
+            stderr=stderr,
             stdin=True,
             stdout=True,
             # Leave stdout and stderr as binary. Has no effect on stdin.
@@ -528,6 +528,16 @@ class PodStdio(ByteStream):
                 await self._turn()
         # Also for a reply that came while this waited.
         self._drop_if_restarted()
+        # Frames already here come with it, within the turn: each cost a pass alone.
+        while self._unyielded < _STEPS_PER_TURN and len(self._stdout) < max_bytes:
+            try:
+                self._take(self._ws.sock.recv_frame())
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                break
+            except (OSError, websocket.WebSocketException) as e:
+                self._end(e)
+                break
+            self._unyielded += 1
         data = bytes(self._stdout[:max_bytes])
         del self._stdout[:max_bytes]
         return data
@@ -573,6 +583,7 @@ class PodStdio(ByteStream):
             self._status = bytes(data)
             if self._stopped is not None and self._wrote and _is_255(self._status):
                 self._stopped()
+                self._restarted = None  # its own restart: the stream ends as usual
             self._end(None)
 
     async def send(self, item: bytes) -> None:
