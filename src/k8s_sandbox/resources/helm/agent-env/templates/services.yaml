@@ -48,11 +48,16 @@ spec:
       {{- end }}
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
       {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
+      {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}
+      {{- range $service.volumes }}
+      {{- if not (kindIs "string" .) }}{{ if not (kindIs "string" (required (printf "services.%s has a volume with no name" $name) .name)) }}{{ fail (printf "services.%s has a volume named %v: quote the name" $name .name) }}{{ end }}{{ end }}
+      {{- end }}
       {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
       {{- range .volumeMounts }}
+      {{- if not (kindIs "string" (required (printf "a container of services.%s mounts a volume with no name" $name) .name)) }}{{ fail (printf "a container of services.%s mounts a volume named %v: quote the name" $name .name) }}{{ end }}
       {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
-      {{- if and $egressProxy (eq (toString .name) "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
-      {{- if and $noCard (eq (toString .name) "coredns-config") }}{{ fail (printf "a container of services.%s mounts the volume coredns-config: that is the DNS sidecar's, and a pod with no network device runs none" $name) }}{{ end }}
+      {{- if and $egressProxy (eq .name "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- if and $noCard (eq .name "coredns-config") }}{{ fail (printf "a container of services.%s mounts the volume coredns-config: that is the DNS sidecar's, and a pod with no network device runs none" $name) }}{{ end }}
       {{- end }}
       {{- end }}
       annotations:
@@ -102,7 +107,7 @@ spec:
           {{- $volumeName := (split ":" .)._0 }}
           {{- $_ := set $generated $volumeName (printf "%s-%s" (include "agentEnv.fullname" $) $volumeName) }}
         {{- else }}
-          {{- $volumeNames = append $volumeNames (toString .name) }}
+          {{- $volumeNames = append $volumeNames .name }}
         {{- end }}
       {{- end }}
       {{- range concat $volumeNames (values $generated) }}
@@ -168,7 +173,7 @@ spec:
           {{- with .volumeMounts }}
           volumeMounts:
           {{- range . }}
-            - {{- include "agentEnv.toYaml" (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
+            - {{- include "agentEnv.toYaml" (set (deepCopy .) "name" (get $generated .name | default .name)) | nindent 14 }}
           {{- end }}
           {{- end }}
           {{- if .resources }}

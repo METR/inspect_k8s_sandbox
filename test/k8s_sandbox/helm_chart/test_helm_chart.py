@@ -832,35 +832,6 @@ def test_a_pod_with_no_network_card_keeps_its_names_within_the_line_musl_reads(
     assert "here 511 bytes" in exc_info.value.stderr
 
 
-def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
-    chart_dir: pathlib.Path,
-) -> None:
-    proxy = f"services.default.podAnnotations.{_EGRESS_PROXY}"
-    no_card = r"annotations.sandbox\.amazonaws\.com/network-isolated=true"
-
-    def render(mount: str, annotations: str) -> None:
-        _run_helm_template(
-            chart_dir,
-            set_str="egressForwarderImage=vsock-egress:1,"
-            "services.default.volumes[0]=123:/data,"
-            "services.default.initContainers[0].name=setup,"
-            "services.default.initContainers[0].image=busybox,"
-            f"services.default.initContainers[0].volumeMounts[0].name={mount},"
-            "services.default.initContainers[0].volumeMounts[0].mountPath=/mnt",
-            set_string=annotations,
-        )
-
-    render("coredns-config", proxy)  # with a network card the pod has the volume
-    # A name Helm reads as a number is another volume's: both checks read it.
-    render("123", f"{no_card},{proxy}")
-
-    for annotations in (no_card, f"{no_card},{proxy}"):
-        with pytest.raises(subprocess.CalledProcessError) as exc_info:
-            render("coredns-config", annotations)
-
-        assert "mounts the volume coredns-config" in exc_info.value.stderr
-
-
 def test_a_service_from_additional_resources_resolves_by_its_own_name(
     chart_dir: pathlib.Path,
 ) -> None:
@@ -1091,6 +1062,22 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
 
 
+def _render_mount(
+    chart_dir: pathlib.Path, container: str, mount: str, *annotations: str
+) -> list[dict[str, Any]]:
+    its = "services.default.podAnnotations."
+    return _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,"
+        "services.default.initContainers[0].name=setup,"
+        "services.default.initContainers[0].image=busybox,"
+        "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+        f"{container}.volumeMounts[0].name={mount},"
+        f"{container}.volumeMounts[0].mountPath=/mnt",
+        set_string=",".join(its + annotation for annotation in annotations),
+    )
+
+
 @pytest.mark.parametrize(
     "container",
     ["services.default", "services.default.initContainers[0]", "extraContainers[0]"],
@@ -1100,17 +1087,58 @@ def test_no_other_container_can_mount_the_egress_forwarders_key(
 ) -> None:
     # Whoever reads the key can open streams to the node as the forwarder.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _run_helm_template(
-            chart_dir,
-            set_str="egressForwarderImage=vsock-egress:1,"
-            "services.default.initContainers[0].name=setup,"
-            "services.default.initContainers[0].image=busybox,"
-            "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
-            f"{container}.volumeMounts[0].name=egress-forwarder-key,"
-            f"{container}.volumeMounts[0].mountPath=/key",
-            set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
-        )
+        _render_mount(chart_dir, container, "egress-forwarder-key", _EGRESS_PROXY)
     assert "egress-forwarder-key" in exc_info.value.stderr
+
+
+_NO_CARD = r"sandbox\.amazonaws\.com/network-isolated=true"
+
+
+@pytest.mark.parametrize(
+    ("container", "annotations"),
+    [
+        pytest.param("services.default", [_NO_CARD], id="its-own"),
+        pytest.param(
+            "services.default.initContainers[0]",
+            [_NO_CARD, _EGRESS_PROXY],
+            id="init-in-a-pod-that-names-a-proxy",
+        ),
+    ],
+)
+def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
+    chart_dir: pathlib.Path, container: str, annotations: list[str]
+) -> None:
+    # No DNS sidecar, so no such volume: the API server refused the mount mid-install.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _render_mount(chart_dir, container, "coredns-config", *annotations)
+
+    refusal = "services.default mounts the volume coredns-config"
+    assert refusal in exc_info.value.stderr
+
+
+@pytest.mark.parametrize(
+    ("named", "refusal"),
+    [
+        pytest.param("volumeMounts[0].name=123", "mounts a volume named 123: quote"),
+        # Before any name is compared: in a pod that names a proxy main failed there.
+        pytest.param(
+            f"podAnnotations.{_EGRESS_PROXY},egressForwarderImage=vsock-egress:1,"
+            "services.default.volumeMounts[0].name=123",
+            "mounts a volume named 123: quote",
+        ),
+        pytest.param("volumeMounts[0].mountPath=/mnt", "mounts a volume with no name"),
+        pytest.param("volumes[0].name=123", "has a volume named 123: quote the name"),
+        pytest.param("volumes[0].emptyDir.medium=Memory", "has a volume with no name"),
+    ],
+)
+def test_a_volume_or_a_mount_whose_name_is_no_text_is_refused(
+    chart_dir: pathlib.Path, named: str, refusal: str
+) -> None:
+    # Kubernetes takes neither for a name: the API server refused it mid-install.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_str=f"services.default.{named}")
+
+    assert f"services.default {refusal}" in exc_info.value.stderr
 
 
 def test_an_isolated_service_cannot_name_an_egress_proxy(
