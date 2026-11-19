@@ -327,11 +327,11 @@ async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
         for _ in range(left):
             assert await leave(held) == 0
         # With all but 24 of 64 kept, four of these ran; with all but 18 of 32, one.
-        sleeps = (
-            client.exec(["sleep", "1"], None, None, {}, None, None)
-            for _ in range(beside)
-        )
-        ran = await asyncio.wait_for(asyncio.gather(*sleeps), 30)  # only bounds a hang
+        up = 'echo >>"$0.up"; for _ in $(seq 200); do [ "$(wc -l <"$0.up")" = "$1" ]'
+        up += " && exit 0; sleep 0.05; done; exit 1"  # each waits 10 s for all to be up
+        argv = ["sh", "-c", up, gate, str(beside)]
+        runs = (client.exec(argv, None, None, {}, None, None) for _ in range(beside))
+        ran = await asyncio.wait_for(asyncio.gather(*runs), 30)  # only bounds a hang
         assert [r.returncode for r in ran] == [0] * beside
         sandbox.sh(f"touch {gate}")
         await sandbox.until(f'[ "$(wc -l <{gate}.gone)" = {left} ]')

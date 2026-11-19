@@ -59,7 +59,7 @@
   detached from the command can survive. Those of a command that has ended are left
   running. Once execd has stopped reading a command's output, 100 ms after the command
   ended at the earliest, what it left running may write 1 MiB more in total to each of
-  the command's stdout and stderr, and what that pipe then holds; past that a write to
+  the command's stdout and stderr, plus that pipe's free space; past that a write to
   it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
   for at most half of its open-file limit (512 in a Kata guest), and past that it closes
   a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that

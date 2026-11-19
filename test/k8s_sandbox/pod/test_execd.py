@@ -151,16 +151,16 @@ async def no_spin(
         return
     spun: list[str] = []
     seen = [time.monotonic(), 0.0]  # the last beat or prompt, and our failure since
-    debuggers = ("pdb", "bdb", "pydevd")  # where a prompt waits; pydevd is an IDE's
+    prompts = {("pdb", "interaction"), ("pydevd", "do_wait_suspend")}  # pdb's, an IDE's
     capture = request.config.pluginmanager.getplugin("capturemanager")
     with capture.global_and_fixture_disabled() if capture else contextlib.nullcontext():
         shown = os.dup(2)  # the run's own stderr: what pytest captures, an exit loses
 
-    def end(_: int, frame: types.FrameType | None) -> None:
+    def end(_: int, at: types.FrameType | None) -> None:
         now = time.monotonic()
-        while frame and frame.f_globals.get("__name__") not in debuggers:
-            frame = frame.f_back
-        if frame:  # a debugger's prompt is no spin
+        while at and (at.f_globals.get("__name__"), at.f_code.co_name) not in prompts:
+            at = at.f_back
+        if at:  # a debugger's prompt is no spin
             seen[:] = now, 0.0
         elif seen[1] and now - seen[1] >= 15:  # what the spin queued has the loop
             signal.signal(signal.SIGALRM, signal.SIG_DFL)  # ends us if a write blocks
@@ -179,6 +179,7 @@ async def no_spin(
     async def beat() -> None:
         # Ours until another takes it: looked at each second, and put off by each turn.
         while signal.getsignal(signal.SIGALRM) is end:
+            signal.setitimer(signal.ITIMER_REAL, 1, 1)  # again, had another armed it
             seen[:] = time.monotonic(), 0.0
             await asyncio.sleep(1)
 
@@ -2389,10 +2390,9 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         for _ in range(more):
             await hold()
             ended[0] += 1
-            looks = clock.now + execd.PING_EVERY
             async with link._wlock:  # its PING waits 15 ms behind a write, or none
                 interval()
-                await until(lambda: clock.now == looks)
+                await until(lambda: link.closed or waiting(link))  # it has looked
                 clock.now += cost
             await until(pinged)
 
@@ -2404,7 +2404,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         await link._wlock.acquire()
         ended[0] += 1
         interval()
-        await until(lambda: clock.now == execd.PING_EVERY)  # looked: its PING waits
+        await until(lambda: link.closed or waiting(link))  # looked: its PING waits
         await comes(frame(execd.STDOUT, started[0][1], b"x"))
         clock.now += waits
         link._wlock.release()
