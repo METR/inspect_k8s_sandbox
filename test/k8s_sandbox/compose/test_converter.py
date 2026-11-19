@@ -9,6 +9,7 @@ import yaml
 
 import k8s_sandbox
 from k8s_sandbox._helm import validate_no_null_values
+from k8s_sandbox.compose import _converter
 from k8s_sandbox.compose._converter import (
     ComposeConverterError,
     convert_compose_to_helm_values,
@@ -55,6 +56,64 @@ services:
         "The provided Docker Compose file failed validation against the Compose schema:"
         " 42 is not of type 'object'. Compose file: '/" in str(exc_info.value)
     )
+
+
+@pytest.mark.parametrize(
+    ("compose", "message"),
+    [
+        pytest.param(
+            """
+services:
+  my-service:
+    image: my-image
+    environment:
+      - FOO: bar
+""",
+            "{'FOO': 'bar'} is not of type 'string'",
+            id="inside-a-one-of",
+        ),
+        pytest.param(
+            """
+services:
+  my-service:
+    image: my-image
+    ports:
+      -8080:80
+volumes:
+  - data
+""",
+            "['data'] is not of type 'object'",
+            id="second-of-two",
+        ),
+    ],
+)
+def test_converter_reports_most_relevant_schema_error(
+    tmp_compose: TmpComposeFixture, compose: str, message: str
+) -> None:
+    compose_path = tmp_compose(compose)
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert str(exc_info.value) == (
+        "The provided Docker Compose file failed validation against the Compose schema:"
+        f" {message}. Compose file: '{compose_path}'."
+    )
+    assert isinstance(exc_info.value.__cause__, jsonschema.ValidationError)
+
+
+def test_converting_again_does_not_check_compose_schema(
+    resources: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose_path = tmp_path / "again-compose.yaml"
+    compose_path.write_text("version: 3.8\nservices:\n  again:\n    image: my-image\n")
+    _converter.convert_compose_to_helm_values(resources / "compose.yaml")
+    # No file to reload; only the kept schema takes that version, and it fails a check.
+    monkeypatch.setattr(_converter, "COMPOSE_SCHEMA_PATH", tmp_path / "gone.json")
+    kept_properties = _converter._checked_compose_schema()["properties"]
+    monkeypatch.setitem(kept_properties, "version", {"title": 12})
+
+    _converter.convert_compose_to_helm_values(compose_path)
 
 
 ### Top level elements

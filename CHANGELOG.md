@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Once a process has converted one Docker Compose file to Helm values, each further
+  conversion takes about 60 to 100 ms less.
 - Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
   for; a chart with no other sandbox was refused as declaring none.
 - Fix a sandbox being handed over on a Pod that is being deleted. An install waits

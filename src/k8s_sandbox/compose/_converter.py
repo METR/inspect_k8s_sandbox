@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from functools import cached_property
+from functools import cache, cached_property
 from pathlib import Path
 from typing import Any, Callable
 
@@ -71,15 +71,25 @@ def convert_compose_to_helm_values(compose_file: Path) -> dict[str, Any]:
     return result
 
 
-def _validate_compose(compose: dict[str, Any], compose_file: Path) -> None:
+# shortcut: threads converting at once may each check it once; a lock can hang a fork.
+@cache
+def _checked_compose_schema() -> dict[str, Any]:
     schema = json.loads(COMPOSE_SCHEMA_PATH.read_text())
-    try:
-        jsonschema.validate(compose, schema)
-    except jsonschema.ValidationError as e:
+    jsonschema.validators.validator_for(schema).check_schema(schema)
+    return schema
+
+
+def _validate_compose(compose: dict[str, Any], compose_file: Path) -> None:
+    schema = _checked_compose_schema()
+    # A validator per conversion: jsonschema does not promise threads can share one.
+    validator = jsonschema.validators.validator_for(schema)(schema)
+    # jsonschema.validate() raises this same best match, not the first error.
+    e = jsonschema.exceptions.best_match(validator.iter_errors(compose))
+    if e is not None:
         raise ComposeConverterError(
             f"The provided Docker Compose file failed validation against the Compose "
             f"schema: {e.message}. Compose file: '{compose_file}'."
-        )
+        ) from e
 
 
 def _convert_services(src: dict[str, Any], compose_file: Path) -> dict[str, Any]:
