@@ -193,7 +193,9 @@ func TestAnyPodsNetworkNamespaceShowsTheLauncherThatItSeesThem(t *testing.T) {
 			t.Fatal(err)
 		}
 		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
-		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // it outlived its sandbox, as across a reboot
+		if err := os.RemoveAll(filepath.Join(l.vms, id("a")[:12])); err != nil { // it outlived its sandbox, as across a reboot
+			t.Fatal(err)
+		}
 
 		for range 2 {
 			if _, err := l.wanted(); err != nil {
