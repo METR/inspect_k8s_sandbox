@@ -605,6 +605,8 @@ class Release:
                     if self._is_ready(pods):
                         if not fresh:
                             pods = await asyncio.to_thread(self._list_release_pods)
+                            missing = self._missing_services(pods)
+                            absent = self._missing_pods(pods)
                         if self._is_ready(pods):
                             return pods
                 except Exception as e:
@@ -670,6 +672,7 @@ class Release:
             f"increasing the timeout by setting the {INSPECT_HELM_TIMEOUT} "
             f"environment variable.",
             release=self.release_name,
+            from_exception=poll_error,
             **extra,
         )
 
@@ -862,7 +865,8 @@ def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -
                 label_selector=_INSTANCE_LABEL,
                 timeout_seconds=_READY_WATCH_SECONDS,
             ):
-                if _pod_ready(pod):
+                # No pod that failed or is being deleted: its replacement may not exist.
+                if _pod_ready(pod) and pod.phase != "Failed" and not pod.deleting:
                     with _ready_waits_lock:
                         wait = waits.get(pod.labels[_INSTANCE_LABEL])
                     if wait is not None:
@@ -959,7 +963,7 @@ def _kubeconfig_context_args(context_name: str | None) -> list[str]:
 
 
 def _pod_ready(pod: PodSnapshot) -> bool:
-    """Helm's `isPodReady`, plus the completed-pod case Helm's own check gets wrong."""
+    """A pod that completed, or Helm's `isPodReady` less a pod being deleted."""
     # A pod that ran to completion reports Ready=False with reason PodCompleted, so
     # Helm blocks on it until the timeout. The Ready condition rather than
     # containerStatuses[].ready, because it also accounts for readiness gates.
@@ -985,7 +989,8 @@ _GO_FLOAT = re.compile(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?")
 
 def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float | str:
     """A number as Helm's reader, go-yaml, takes it; the text where that reads none."""
-    plain = node.value.replace("_", "")
+    # go-yaml takes a sign after `0b`, which Python takes only before it.
+    plain = re.sub(r"^0b([-+])", r"\g<1>0b", node.value.replace("_", ""))
     try:  # Go's ParseInt with base 0, where a leading zero is octal
         number = int(re.sub(r"^([-+]?)0(?=[0-7])", r"\g<1>0o", plain), 0)
     except ValueError:  # no integer, or more digits than Python reads
@@ -997,12 +1002,18 @@ def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float 
     return node.value if math.isinf(value) else value
 
 
+def _helm_binary(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
+    """A scalar tagged `!!binary` as Helm's reader takes it: the text it encodes."""
+    return loader.construct_yaml_binary(node).decode(errors="replace")
+
+
 # YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
 _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
     "tag:yaml.org,2002:bool": r"true|True|TRUE|false|False|FALSE",
-    "tag:yaml.org,2002:float": r"[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)",
-    _helm_number: r"[-+0-9][-+.0-9A-Za-z_]*|\.[0-9]+([eE][-+]?[0-9]+)?",
+    # After a leading `.` Helm takes a `_` only between two digits.
+    "tag:yaml.org,2002:int": r"[-+0-9][-+.0-9A-Za-z_]*"
+    r"|\.[0-9](_?[0-9])*([eE][-+]?[0-9](_?[0-9])*)?",
     "tag:yaml.org,2002:merge": r"<<",
 }
 
@@ -1016,23 +1027,47 @@ class _ManifestLoader(yaml.SafeLoader):
             for tag, pattern in _SCALAR_TAGS.items()
         ]
     }
-    # An untagged number's tag is its constructor: no manifest can write that as a tag.
     yaml_constructors = {
         **yaml.SafeLoader.yaml_constructors,
-        _helm_number: _helm_number,
+        # Tagged `!!int`, `!!float` or neither, Helm reads a number one way.
+        "tag:yaml.org,2002:int": _helm_number,
+        "tag:yaml.org,2002:float": _helm_number,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
+        # And a sequence tagged `!!omap` or `!!pairs` as a sequence, `!!binary` as text.
+        "tag:yaml.org,2002:omap": yaml.SafeLoader.construct_yaml_seq,
+        "tag:yaml.org,2002:pairs": yaml.SafeLoader.construct_yaml_seq,
+        "tag:yaml.org,2002:binary": _helm_binary,
     }
 
     def compose_scalar_node(self, anchor: Any) -> yaml.ScalarNode:
         event = self.peek_event()
-        # Helm reads a scalar tagged `!` as text, and still merges on a `! <<` key.
-        if event.tag == "!" and event.value != "<<":
+        # Helm reads a scalar tagged `!` or `!!merge` as text, and merges only on `<<`.
+        if event.tag in ("!", "tag:yaml.org,2002:merge") and event.value != "<<":
             event.tag = "tag:yaml.org,2002:str"
         return super().compose_scalar_node(anchor)
 
+    def compose_node(self, parent: Any, index: Any) -> yaml.Node | None:
+        alias = self.check_event(yaml.AliasEvent)
+        if not alias:  # Helm lets an anchor be defined again, and the later one wins.
+            self.anchors.pop(self.peek_event().anchor, None)
+        node = super().compose_node(parent, index)
+        # Helm merges on a `<<` written as the key: an alias to one is a key named `<<`.
+        if alias and isinstance(node, yaml.ScalarNode) and node.value == "<<":
+            return yaml.ScalarNode("tag:yaml.org,2002:str", node.value)
+        return node
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # Helm merges a `<<` where it stands: over the keys before it, not those after.
+        pairs = []
+        for pair in node.value:
+            alone = yaml.MappingNode(node.tag, [pair])
+            super().flatten_mapping(alone)
+            pairs += alone.value
+        node.value = pairs
+
 
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
-    """The manifest Helm rendered, as parsed documents.
+    """The objects of the manifest Helm rendered, as parsed documents.
 
     Raises RuntimeError if Helm's output cannot be read: treating that as "nothing to
     wait for" is how a release comes to be handed over before its pods exist.
@@ -1040,7 +1075,7 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
     try:
         manifest = json.loads(install_stdout)["manifest"]
         # load_all is lazy, so force the parse inside the try.
-        return list(yaml.load_all(manifest, Loader=_ManifestLoader))
+        return list(_objects(yaml.load_all(manifest, Loader=_ManifestLoader)))
     except Exception as e:
         _raise_runtime_error(
             "Could not read the rendered manifest from Helm, so the sandboxes to wait "
@@ -1050,15 +1085,45 @@ def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
         )
 
 
+def _objects(docs: Iterable[Any]) -> Iterator[Any]:
+    """Each object Helm installs: a document with `items` is a list of them."""
+    for doc in docs:
+        if not isinstance(doc, dict) or "items" not in doc:
+            yield doc
+            continue
+        # As Kubernetes decodes a list: an item that names neither takes both from it.
+        typed = {
+            "apiVersion": doc.get("apiVersion"),
+            "kind": doc["kind"].removesuffix("List"),
+        }
+        for item in doc["items"] or []:
+            yield item if item.get("kind") or item.get("apiVersion") else item | typed
+
+
 def _get_expected_services(docs: list[Any], release_name: str) -> frozenset[str]:
     """The sandboxes the manifest Helm rendered declares.
 
     Named rather than counted, so that readiness is stated in the vocabulary
     `get_sandbox_pods()` hands over and no other pod of the release can satisfy it.
 
-    Raises RuntimeError if the chart declares no sandbox.
+    Raises RuntimeError if the chart declares no sandbox, or scales one to none.
     """
     services = frozenset(_declared_services(docs))
+    # Only these are sure to scale by `replicas`: Helm 3 installs a stray one elsewhere.
+    live = (
+        doc
+        for doc in docs
+        if _dig(doc, "kind") not in ("Deployment", "StatefulSet")
+        or _dig(doc, "spec", "replicas") != 0
+    )
+    if scaled_to_none := sorted(services.difference(_declared_services(live))):
+        # Not left out: Inspect would take another sandbox for it, or fail mid-sample.
+        _raise_runtime_error(
+            f"The rendered chart declares the sandbox {', '.join(scaled_to_none)} "
+            "only under Deployments or StatefulSets at `replicas: 0`: render it with "
+            "at least one replica.",
+            release=release_name,
+        )
     if not services:
         _raise_runtime_error(
             f"The rendered chart declares no Pod labelled '{_SERVICE_LABEL}', so it "
@@ -1077,8 +1142,6 @@ def _declared_services(docs: Iterable[Any]) -> Iterator[str]:
         kind = _dig(doc, "kind")
         if kind == "Pod":
             yield from _service_name(_dig(doc, "metadata"))
-        elif kind == "List":
-            yield from _declared_services(_dig(doc, "items") or [])
         elif kind == "CronJob":
             yield from _service_name(
                 _dig(doc, "spec", "jobTemplate", "spec", "template", "metadata")
@@ -1092,22 +1155,9 @@ def _stateful_set_pods(
 ) -> Iterator[str]:
     """The name of each pod of the release that a manifest's StatefulSets make."""
     for doc in docs:
-        kind = _dig(doc, "kind")
-        if isinstance(kind, str) and kind.endswith("List"):
-            # Helm installs an item that names neither as its list's kind and version.
-            items = [
-                item
-                | {
-                    "apiVersion": item.get("apiVersion") or _dig(doc, "apiVersion"),
-                    "kind": item.get("kind") or kind.removesuffix("List"),
-                }
-                for item in _dig(doc, "items") or []
-                if isinstance(item, dict)
-            ]
-            yield from _stateful_set_pods(items, release_name, namespace)
         # The poll lists by this label in this namespace: no other pod is ever seen.
-        elif (
-            kind == "StatefulSet"
+        if (
+            _dig(doc, "kind") == "StatefulSet"
             # Another group's StatefulSet names its pods by rules of its own.
             and _dig(doc, "apiVersion") == "apps/v1"
             and _dig(doc, "spec", "template", "metadata", "labels", _INSTANCE_LABEL)
@@ -1124,9 +1174,6 @@ def _stateful_set_pods(
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:
     """Every name a rendered manifest gives an object, whatever its kind."""
     for doc in docs:
-        if _dig(doc, "kind") == "List":
-            yield from _declared_object_names(_dig(doc, "items") or [])
-            continue
         name = _dig(doc, "metadata", "name")
         if name is not None:
             yield str(name)
