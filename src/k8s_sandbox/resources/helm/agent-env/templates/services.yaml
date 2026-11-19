@@ -52,7 +52,7 @@ spec:
       {{- $noDnsVolume := $noCard }}
       {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}
       {{- range $service.volumes }}
-      {{- if not (kindIs "string" .) }}{{ if not (kindIs "string" (required (printf "services.%s has a volume with no name" $name) .name)) }}{{ fail (printf "services.%s has a volume named %s: quote the name" $name (toJson .name)) }}{{ end }}{{ if eq .name "coredns-config" }}{{ $noDnsVolume = false }}{{ end }}{{ end }}
+      {{- if not (kindIs "string" .) }}{{ if not (kindIs "string" (required (printf "services.%s has a volume with no name" $name) .name)) }}{{ fail (printf "services.%s has a volume named %s: quote the name" $name (toJson .name)) }}{{ end }}{{ if eq .name "coredns-config" }}{{ $noDnsVolume = false }}{{ end }}{{ else if eq (printf "%s-%s" (include "agentEnv.fullname" $) (split ":" .)._0) "coredns-config" }}{{ $noDnsVolume = false }}{{ end }}
       {{- end }}
       {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
       {{- range .volumeMounts }}

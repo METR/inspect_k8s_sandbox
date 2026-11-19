@@ -1072,7 +1072,9 @@ def _render_mount(
         "services.default.initContainers[0].name=setup,"
         "services.default.initContainers[0].image=busybox,"
         "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
-        "services.default.volumes[0].name=scratch,"  # which lifts no refusal
+        # Two volumes of its own, which lift no refusal.
+        "services.default.volumes[0].name=scratch,"
+        "services.default.volumes[1]=data:/data,"
         f"{container}.volumeMounts[0].name={mount},"
         f"{container}.volumeMounts[0].mountPath=/mnt",
         set_string=",".join(its + annotation for annotation in annotations),
@@ -1123,14 +1125,28 @@ def test_a_pod_with_a_network_card_may_still_mount_coredns_config(
     _render_mount(chart_dir, "services.default", "coredns-config")
 
 
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param(
+            "services.default.volumes[0].name=coredns-config,"
+            "services.default.volumes[0].emptyDir.medium=Memory",
+            id="by-name",
+        ),
+        # A colon-separated volume takes the release's full name before its own.
+        pytest.param(
+            "global.fullnameOverride=coredns,services.default.volumes[0]=config:/data",
+            id="by-a-generated-name",
+        ),
+    ],
+)
 def test_a_pod_with_no_network_card_may_mount_a_coredns_config_volume_of_its_own(
-    chart_dir: pathlib.Path,
+    chart_dir: pathlib.Path, declared: str
 ) -> None:
     # The volume is one the service declares itself: main renders this mount.
     _run_helm_template(
         chart_dir,
-        set_str="services.default.volumes[0].name=coredns-config,"
-        "services.default.volumes[0].emptyDir.medium=Memory,"
+        set_str=f"{declared},"
         "services.default.volumeMounts[0].name=coredns-config,"
         "services.default.volumeMounts[0].mountPath=/mnt",
         set_string=f"services.default.podAnnotations.{_NO_CARD}",
