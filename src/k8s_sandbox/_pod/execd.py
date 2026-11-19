@@ -596,7 +596,8 @@ class ExecdClient:
         self._daemon: Daemon | None = None
         self._link: Link | None = None
         self._opening: asyncio.Future[Link] | None = None  # one at a time, shared
-        self._since = float("inf")  # the last ask of the calls that share the opening
+        # Of the calls that share the opening: the last ask, and the first wait to end.
+        self._since = self._until = float("inf")
         self._strays = Strays()
         self._pace = Pace()
         self._opened = float("-inf")
@@ -604,11 +605,11 @@ class ExecdClient:
         self._failed: BaseException | None = None  # why the open under way last failed
         self._owed: dict[int, tuple[int, ...]] = {}  # a call's last frames, by its id
 
-    async def _open(self, deadline: float, until: float = float("inf")) -> Link:
-        """Open a connection; until: the end of a call asking for a silent one."""
+    async def _open(self, deadline: float) -> Link:
         # A connection dropped soon after it opened waits as a failed attempt would.
         recent = time.monotonic() - self._opened < PING_EVERY
-        delay = self._backoff if recent else 0.0
+        # One asked for in a silent one's place does not: a call's wait is running.
+        delay = self._backoff if recent and self._until == float("inf") else 0.0
         while True:
             # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
             await asyncio.sleep(delay)
@@ -624,11 +625,13 @@ class ExecdClient:
                 pipe = await _connect(daemon, self._pace)
                 old = self._link
                 # One still open that speaks in our own turns is kept: slow, not lost.
-                grace = 1000 * min(SPEAKS_WITHIN, (until - time.monotonic()) / 2)
+                grace = 1000 * SPEAKS_WITHIN
                 while old and not old.pipe._writer.transport.is_closing():
                     if old._last_rx > self._since:
                         await pipe.close()
                         return old
+                    # Half of what the first wait to end has left, as calls join.
+                    grace = min(grace, 1000 * (self._until - time.monotonic()) / 2)
                     if grace <= 0:
                         break
                     # Whole ms, 10 a turn: a loop's timer takes up to the next ms.
@@ -701,9 +704,8 @@ class ExecdClient:
     ) -> asyncio.Future[Link]:
         """The open under way, begun here if none is; since, until: of a call asking."""
         if self._opening is None or self._opening.done():
-            self._failed, self._since = None, since
-            opening = self._open(time.monotonic() + wait, until)
-            self._opening = asyncio.ensure_future(opening)
+            self._failed, self._since, self._until = None, since, until
+            self._opening = asyncio.ensure_future(self._open(time.monotonic() + wait))
             # Retrieved here, as no caller may still wait when it fails.
             self._opening.add_done_callback(lambda f: f.cancelled() or f.exception())
         return self._opening
@@ -811,7 +813,7 @@ class ExecdClient:
                             if not call.words:  # else once more, for the word that came
                                 break
                         elif now - probe >= 1:  # our loop was held: what came is unread
-                            probe = now + 1
+                            probe = now + min(1, (end - now) / 2)
                         elif now >= probe:
                             probe = never  # asked once
                             if link._last_rx < asked:
@@ -819,6 +821,7 @@ class ExecdClient:
                                 self._opens(RECONNECT_FOR, asked, end)
                                 # Joined: what answered an earlier ask is not ours.
                                 self._since = max(self._since, asked)
+                                self._until = min(self._until, end)  # nor a later end
                         continue
                     if isinstance(item, Dropped):
                         if item.args != (link,):  # a connection the call has left since

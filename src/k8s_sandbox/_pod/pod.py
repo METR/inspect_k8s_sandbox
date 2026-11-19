@@ -86,7 +86,7 @@ class Pod:
         self._execd = (
             ExecdClient(
                 self._start_execd,
-                # None once "raise" mode has kept a restart: nothing more starts in it.
+                # No pod once "raise" mode has kept a restart: nothing starts in it.
                 lambda: "" if self._restart_error else self._info.uid,
             )
             if execd in TRANSPORTS
@@ -179,10 +179,11 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        found = await self._run_async(self._check_for_pod_restart_sync)
-        if self._execd is not None:  # "warn" mode refreshes a replaced pod's UID
-            await self._execd.leave_replaced()
-        return found
+        try:
+            return await self._run_async(self._check_for_pod_restart_sync)
+        finally:  # also where it raises: "raise" mode leaves a pod found replaced too
+            if self._execd is not None:
+                await self._execd.leave_replaced()
 
     def _check_for_pod_restart_sync(
         self,
