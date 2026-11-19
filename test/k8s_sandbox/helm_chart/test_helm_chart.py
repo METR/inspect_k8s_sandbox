@@ -1051,7 +1051,7 @@ def test_egress_proxy_annotation_needs_the_forwarder_image(
 def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
     chart_dir: pathlib.Path, proxy: str
 ) -> None:
-    # The policy is cut from the name and port; the launcher would take 0, 03128, 65536.
+    # The policy is cut from the name and port.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _run_helm_template(
             chart_dir,
@@ -1060,6 +1060,25 @@ def test_egress_proxy_annotation_names_a_service_of_the_namespace_and_a_port(
             f"inspect-k8s-sandbox/egress-proxy={proxy}",
         )
     assert "<service>.default.svc.cluster.local:<port>" in exc_info.value.stderr
+
+
+def _render_mount(
+    chart_dir: pathlib.Path, container: str, mount: str, *annotations: str
+) -> list[dict[str, Any]]:
+    its = "services.default.podAnnotations."
+    return _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,"
+        "services.default.initContainers[0].name=setup,"
+        "services.default.initContainers[0].image=busybox,"
+        "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+        # Two volumes of its own, which lift no refusal.
+        "services.default.volumes[0].name=scratch,"
+        "services.default.volumes[1]=data:/data,"
+        f"{container}.volumeMounts[0].name={mount},"
+        f"{container}.volumeMounts[0].mountPath=/mnt",
+        set_string=",".join(its + annotation for annotation in annotations),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1071,17 +1090,95 @@ def test_no_other_container_can_mount_the_egress_forwarders_key(
 ) -> None:
     # Whoever reads the key can open streams to the node as the forwarder.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _run_helm_template(
-            chart_dir,
-            set_str="egressForwarderImage=vsock-egress:1,"
-            "services.default.initContainers[0].name=setup,"
-            "services.default.initContainers[0].image=busybox,"
-            "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
-            f"{container}.volumeMounts[0].name=egress-forwarder-key,"
-            f"{container}.volumeMounts[0].mountPath=/key",
-            set_string=f"services.default.podAnnotations.{_EGRESS_PROXY}",
-        )
+        _render_mount(chart_dir, container, "egress-forwarder-key", _EGRESS_PROXY)
     assert "egress-forwarder-key" in exc_info.value.stderr
+
+
+_NO_CARD = r"sandbox\.amazonaws\.com/network-isolated=true"
+
+
+@pytest.mark.parametrize(
+    ("container", "annotations"),
+    [
+        pytest.param("services.default", [_NO_CARD], id="its-own"),
+        pytest.param(
+            "services.default.initContainers[0]",
+            [_NO_CARD, _EGRESS_PROXY],
+            id="init-in-a-pod-that-names-a-proxy",
+        ),
+    ],
+)
+def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
+    chart_dir: pathlib.Path, container: str, annotations: list[str]
+) -> None:
+    # No DNS sidecar, so no such volume: the API server refused the mount mid-install.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _render_mount(chart_dir, container, "coredns-config", *annotations)
+
+    assert "services.default mounts the volume coredns-config" in exc_info.value.stderr
+
+
+def test_a_pod_with_a_network_card_may_still_mount_coredns_config(
+    chart_dir: pathlib.Path,
+) -> None:
+    # The refusal is for a pod with no DNS sidecar alone: main renders this mount.
+    _render_mount(chart_dir, "services.default", "coredns-config")
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param(
+            "services.default.volumes[0].name=coredns-config,"
+            "services.default.volumes[0].emptyDir.medium=Memory",
+            id="by-name",
+        ),
+        # A colon-separated volume takes the release's full name before its own.
+        pytest.param(
+            "global.fullnameOverride=coredns,services.default.volumes[0]=config:/data",
+            id="by-a-generated-name",
+        ),
+    ],
+)
+def test_a_pod_with_no_network_card_may_mount_a_coredns_config_volume_of_its_own(
+    chart_dir: pathlib.Path, declared: str
+) -> None:
+    # The volume is one the service declares itself: main renders this mount.
+    _run_helm_template(
+        chart_dir,
+        set_str=f"{declared},"
+        "services.default.volumeMounts[0].name=coredns-config,"
+        "services.default.volumeMounts[0].mountPath=/mnt",
+        set_string=f"services.default.podAnnotations.{_NO_CARD}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("named", "refusal"),
+    [
+        pytest.param("volumeMounts[0].name=123", "mounts a volume named 123: quote"),
+        # Before any name is compared: in a pod that names a proxy main failed there.
+        pytest.param(
+            f"podAnnotations.{_EGRESS_PROXY},egressForwarderImage=vsock-egress:1,"
+            "services.default.volumeMounts[0].name=123",
+            "mounts a volume named 123: quote",
+        ),
+        pytest.param("volumeMounts[0].mountPath=/mnt", "mounts a volume with no name"),
+        pytest.param("volumes[0].name=123", "has a volume named 123: quote the name"),
+        pytest.param("volumes[0].emptyDir.medium=Memory", "has a volume with no name"),
+        # On one line, as JSON: the client reads Helm's error for whole lines of Helm's.
+        pytest.param("volumeMounts[0].name={a\nb}", r'mounts a volume named ["a\nb"]:'),
+        pytest.param("volumes[0].name={a\nb}", r'has a volume named ["a\nb"]: quote'),
+    ],
+)
+def test_a_volume_or_a_mount_whose_name_is_no_text_is_refused(
+    chart_dir: pathlib.Path, named: str, refusal: str
+) -> None:
+    # Kubernetes takes neither for a name: the API server refused it mid-install.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(chart_dir, set_str=f"services.default.{named}")
+
+    assert f"services.default {refusal}" in exc_info.value.stderr
 
 
 def test_an_isolated_service_cannot_name_an_egress_proxy(
