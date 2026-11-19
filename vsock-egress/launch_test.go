@@ -123,11 +123,19 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 }
 
 func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *testing.T) {
-	for name, comes := range map[string]bool{"never": false, "after its record": true} {
+	for name, tc := range map[string]struct{ comes, unseen, unnamed bool }{"never": {}, "never, where the launcher sees no namespace": {unseen: true}, "never, where it sees none and a record names none": {unseen: true, unnamed: true}, "after its record": {comes: true}, "after its record, where the launcher sees no namespace": {comes: true, unseen: true}} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				out := capture(t)
 				l := fakeNode(t)
+				if tc.unseen {
+					l.netns = l.cni // a directory that is there and holds no pod's namespace: a mount of the wrong place
+				}
+				if tc.unnamed { // as libcni wrote its records before 1.2.0
+					if err := os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0"}`), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
 				proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 				vm := filepath.Join(l.vms, id("a")[:12])
@@ -135,18 +143,18 @@ func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *tes
 				var said []int
 				for pass, wait := range []time.Duration{0, 59 * time.Second, time.Second, 59 * time.Second, 2 * time.Second} { // on the minute, then past it
 					time.Sleep(wait)
-					if comes && pass == 2 {
+					if tc.comes && pass == 2 {
 						addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
 					}
 					wanted, err := l.wanted()
-					if _, ok := wanted[id("a")]; err != nil || ok != (comes && pass == 2) {
+					if _, ok := wanted[id("a")]; err != nil || ok != (tc.comes && pass == 2) {
 						t.Fatalf("pass %d: wanted %v, error %v: want a worker only once its directory has come", pass, wanted, err)
 					}
 					os.RemoveAll(vm) // a sandbox that is deleted loses its directory before its record, which can stay
 					said = append(said, strings.Count(out.String(), "ns/pod-aaaa: no_worker: no VM directory at "+vm))
 				}
 				want := []int{0, 0, 1, 1, 2}
-				if comes {
+				if tc.comes {
 					want = []int{0, 0, 0, 0, 0}
 				}
 				if !slices.Equal(said, want) {
@@ -172,6 +180,35 @@ func TestRecordThatOutlivedItsSandboxRaisesNoFault(t *testing.T) {
 		}
 		if out.String() != "" {
 			t.Fatalf("the log is %q: want nothing of a sandbox that has gone and left its record", out.String())
+		}
+	})
+}
+
+func TestAnyPodsNetworkNamespaceShowsTheLauncherThatItSeesThem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := capture(t)
+		l := fakeNode(t)
+		l.netns = l.vms // it holds the namespace of a pod that names no proxy, as the launcher's own does, and none for the record below
+		if err := os.WriteFile(filepath.Join(l.netns, "own"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0","netns":"/var/run/netns/own"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
+		if err := os.RemoveAll(filepath.Join(l.vms, id("a")[:12])); err != nil { // it outlived its sandbox, as across a reboot
+			t.Fatal(err)
+		}
+
+		for range 2 {
+			if _, err := l.wanted(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Minute)
+		}
+
+		if out.String() != "" {
+			t.Fatalf("the log is %q: want nothing of a record that outlived its sandbox on a node whose namespaces the launcher sees", out.String())
 		}
 	})
 }
