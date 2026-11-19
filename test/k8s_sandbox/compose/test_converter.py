@@ -101,10 +101,17 @@ secrets: {}
 ### Service elements
 
 
+@pytest.mark.parametrize(
+    "later",
+    [
+        pytest.param("*service", id="aliased"),
+        pytest.param("\n    <<: *service", id="merged"),
+    ],
+)
 def test_services_sharing_a_yaml_alias_each_keep_their_settings(
-    tmp_compose: TmpComposeFixture,
+    later: str, tmp_compose: TmpComposeFixture
 ) -> None:
-    compose_path = tmp_compose("""
+    compose_path = tmp_compose(f"""
 services:
   default: &service
     image: my-image
@@ -112,18 +119,15 @@ services:
       resources:
         limits:
           memory: 1G
-  merged:
-    <<: *service
-  aliased: *service
+  later: {later}
 """)
 
-    result = _converter.convert_compose_to_helm_values(compose_path)
+    services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
-    services = result["services"]
-    assert services["merged"] == services["aliased"] == services["default"]
+    assert services["later"] == services["default"]
 
 
-def test_rejects_service_name_that_yaml_reads_as_no_string(
+def test_rejects_service_name_that_yaml_reads_as_a_boolean(
     tmp_compose: TmpComposeFixture,
 ) -> None:
     compose_path = tmp_compose("""
@@ -566,52 +570,9 @@ services:
     }
 
 
-def test_rejects_healthcheck_disable_that_is_no_boolean(
-    tmp_compose: TmpComposeFixture,
-) -> None:
-    compose_path = tmp_compose("""
-services:
-  my-service:
-    image: my-image
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost"]
-      disable: ${HC_DISABLE:-false}
-""")
-
-    with pytest.raises(_converter.ComposeConverterError) as exc_info:
-        _converter.convert_compose_to_helm_values(compose_path)
-
-    assert "Invalid 'healthcheck.disable' value: '${HC_DISABLE:-false}'" in str(
-        exc_info.value
-    )
-
-
+@pytest.mark.parametrize("retries,threshold", [("0", 1), ("12", 13)])
 def test_converts_healthcheck_retries_given_as_string(
-    tmp_compose: TmpComposeFixture,
-) -> None:
-    compose_path = tmp_compose("""
-services:
-  my-service:
-    image: my-image
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost"]
-      retries: "0"
-""")
-
-    result = _converter.convert_compose_to_helm_values(compose_path)
-
-    assert result["services"]["my-service"]["readinessProbe"]["failureThreshold"] == 1
-
-
-@pytest.mark.parametrize(
-    "retries",
-    [
-        pytest.param("${HC_RETRIES:-3}", id="no-number"),
-        pytest.param("-1", id="negative"),
-    ],
-)
-def test_rejects_healthcheck_retries_that_are_no_count(
-    retries: str, tmp_compose: TmpComposeFixture
+    retries: str, threshold: int, tmp_compose: TmpComposeFixture
 ) -> None:
     compose_path = tmp_compose(f"""
 services:
@@ -619,13 +580,39 @@ services:
     image: my-image
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost"]
-      retries: {retries}
+      retries: "{retries}"
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    probe = result["services"]["my-service"]["readinessProbe"]
+    assert probe["failureThreshold"] == threshold
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        pytest.param("disable", "${HC_DISABLE}", id="disable-not-a-boolean"),
+        pytest.param("retries", "${HC_RETRIES}", id="retries-not-a-number"),
+        pytest.param("retries", "-1", id="retries-negative"),
+    ],
+)
+def test_rejects_invalid_healthcheck_disable_or_retries(
+    key: str, value: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      {key}: {value}
 """)
 
     with pytest.raises(_converter.ComposeConverterError) as exc_info:
         _converter.convert_compose_to_helm_values(compose_path)
 
-    assert f"Invalid 'healthcheck.retries' value: '{retries}'" in str(exc_info.value)
+    assert f"Invalid 'healthcheck.{key}' value: '{value}'" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -1869,7 +1856,7 @@ x-k8s:
     assert f"Expected {expected_type}" in str(exc_info.value)
 
 
-def test_rejects_extension_that_is_no_mapping(tmp_compose: TmpComposeFixture) -> None:
+def test_rejects_extension_that_is_a_list(tmp_compose: TmpComposeFixture) -> None:
     compose_path = tmp_compose("""
 services:
   my-service:

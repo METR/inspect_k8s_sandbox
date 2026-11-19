@@ -182,7 +182,7 @@ def _pop_extension(src: dict[str, Any], context: str) -> Any:
     Both the canonical 'x-inspect_k8s_sandbox' key and the shorter 'x-k8s' alias are
     accepted. Returns the extension value, or None if neither key is present. Raises
     if both keys are present, since which one would win is ambiguous, or if the value
-    is no mapping.
+    is a list or a plain value.
     """
     present = [key for key in _EXTENSION_KEYS if key in src]
     if len(present) > 1:
