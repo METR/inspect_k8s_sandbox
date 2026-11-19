@@ -2341,8 +2341,8 @@ async def test_an_exit_read_with_the_end_of_execds_session_is_kept(
 
 
 @pytest.mark.parametrize(
-    ("waits", "late", "kept"),
-    [(0, 0.015, 2), (17, 0, 1), (0, 16, 3)],
+    ("waits", "late", "cost", "kept"),
+    [(0, 0.015, 0, 2), (17, 0, 0, 1), (0, 16, 0.015, 2)],
     ids=["a PONG", "its PING waits", "our loop held"],
 )
 async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
@@ -2351,6 +2351,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     interval: collections.abc.Callable[[], None],
     waits: float,
     late: float,
+    cost: float,
     kept: int,
 ) -> None:
     """Only this fails where the keepalive never gives a silent connection up."""
@@ -2388,7 +2389,11 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         for _ in range(more):
             await hold()
             ended[0] += 1
-            interval()
+            looks = clock.now + execd.PING_EVERY
+            async with link._wlock:  # its PING waits 15 ms behind a write, or none
+                interval()
+                await until(lambda: clock.now == looks)
+                clock.now += cost
             await until(pinged)
 
     async def comes(sent: bytes) -> None:  # a frame of execd's, read at once
