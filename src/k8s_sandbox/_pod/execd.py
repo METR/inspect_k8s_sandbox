@@ -346,14 +346,16 @@ class Call:
     stdin_put: int = 0  # stdin execd has written to the process
     stdin_sent: int = 0  # stdin sent to execd: more can't have been written
     stdin_room: asyncio.Event = field(default_factory=asyncio.Event)
-    closed: bool = False  # left by its caller, or timed out
+    closed: bool = False  # left by its caller
     exited: bool = False
+    words: int = 0  # EXIT and ERROR frames queued that its loop has yet to take
     resuming: bool = False  # a RESUME awaits its one RESUMED
     ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
     hold: int = HOLD
     ack_every: int = ACK_EVERY
     # When its START was last written: execd counts the timeout from the start.
     started: float = field(default_factory=lambda: time.monotonic())
+    starts: int = 0  # how often: one that is written is with execd, or will be
 
 
 @dataclass
@@ -439,25 +441,18 @@ class Link:
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
-
-            async def write() -> bool:
-                # Read in the write's own step: wait_for may run it a turn on.
+            if kind == START:
                 now = time.monotonic()
-                if by is not None and now >= by:
-                    return False
-                if kind == START:
-                    self.calls[call_id].started = now
-                await self.pipe.write(data)
-                return True
-
+                if by is not None and now >= by:  # its call's time is up
+                    raise asyncio.TimeoutError
+                c = self.calls[call_id]
+                c.started, c.starts = now, c.starts + 1
             try:
-                sent = await asyncio.wait_for(write(), DEAD_AFTER)
+                await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
             except asyncio.TimeoutError:
                 # a peer that stopped reading must not hold the lock other calls need
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
-            if not sent:  # a START whose turn came once its call's time was up
-                raise asyncio.TimeoutError
             if kind == RELEASE:
                 self._released.append(call_id)
             elif kind == PING:
@@ -523,6 +518,7 @@ class Link:
                         c.ends += n
                         if c.ends > 4 * MAX_CONTROL:
                             return
+                        c.words += 1
                     if kind in (STDOUT, STDERR):
                         if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
@@ -615,17 +611,17 @@ class ExecdClient:
                         raise _port_held() from e
                 daemon = self._daemon
                 pipe = await _connect(daemon, self._pace)
-                old, turns = self._link, 100
+                old = self._link
                 # One still open that speaks in our own turns is kept: slow, not lost.
-                turn = min(SPEAKS_WITHIN, (until - time.monotonic()) / 2) / turns
+                turns = int(100 * min(SPEAKS_WITHIN, (until - time.monotonic()) / 2))
                 while old and not old.pipe._writer.transport.is_closing():
                     if old._last_rx > since:
                         await pipe.close()
                         return old
-                    if not turns:
+                    if turns <= 0:
                         break
                     turns -= 1
-                    await asyncio.sleep(turn)
+                    await asyncio.sleep(0.01)  # no shorter: a loop's timer has a ms
                 link = Link(
                     pipe, daemon, self._strays, self._pace, self._owed, self._pod
                 )
@@ -722,10 +718,7 @@ class ExecdClient:
         stdin: bytes | None,
         timeout: float | None,
     ) -> AsyncGenerator[tuple[int, Any], None]:
-        """Yield (STDOUT|STDERR, bytes), then (EXIT, status): None if we time it out.
-
-        And (PING, None) as our own timer passes: execd says whether it timed out.
-        """
+        """Yield output, (PING, None) at our timer, then (EXIT, status) if one comes."""
         tag = os.urandom(8).hex()
         request: dict[str, Any] = {
             "argv": argv,
@@ -764,6 +757,17 @@ class ExecdClient:
             ours = end if end < never else call.started + timeout + TIMER_LAG
             return max(0.0, ours - time.monotonic())
 
+        def turn() -> float | None:  # until our loop has a deadline to see to
+            wait = left()
+            return wait if wait is None else min(wait, probe - time.monotonic())
+
+        def ask() -> None:  # our timer has passed: execd is asked for its word
+            nonlocal asked, end, probe
+            asked = time.monotonic()
+            end, probe = asked + KILL_WAIT, asked + KILL_WAIT / 2
+            # No KILL: execd's own timeout ends it. Not waited for.
+            link.send_last(call.id, PING)
+
         sender: asyncio.Task[None] | None = None
         finished = False
         try:
@@ -773,28 +777,24 @@ class ExecdClient:
                     await asyncio.wait_for(first, timeout)
                 except NotSent:
                     raise
-                except asyncio.TimeoutError:  # out of time behind a write: not a drop
-                    raise
+                except asyncio.TimeoutError:
+                    if not call.starts:  # out of time behind a write: not a drop
+                        raise
                 except OSError:  # it may have left: the resume asks execd
                     call.queue.put_nowait(Dropped(link))
                 sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                 while True:
                     try:
-                        # Past our timer an exit that has come is taken, at any time.
-                        wait = None if call.exited and end < never else left()
-                        if wait is not None:  # at a deadline nothing queued is taken
-                            wait = max(0.0, min(wait, probe - time.monotonic()))
+                        # Past our timer execd's word that has come is always taken.
+                        wait = None if call.words and end < never else turn()
                         item = await _next(call.queue, wait)
                     except asyncio.TimeoutError:
                         now = time.monotonic()
-                        if end == never:  # our timer: execd is asked for its word
-                            # No KILL: execd's own timeout ends it. Not waited for.
-                            link.send_last(call.id, PING)
-                            asked, end = now, now + KILL_WAIT
-                            probe = now + KILL_WAIT / 2
+                        if end == never:  # our timer
+                            ask()
                             yield PING, None
                         elif now >= end:
-                            if not call.exited:  # else once more, for an exit that came
+                            if not call.words:  # else once more, for the word that came
                                 break
                         elif now - probe >= 1:  # our loop was held: what came is unread
                             probe = now + 1
@@ -823,8 +823,11 @@ class ExecdClient:
                     assert isinstance(item, tuple)
                     kind, payload = item
                     if kind in (STDOUT, STDERR):
+                        if end == never and left() == 0.0:  # our timer passed, unseen
+                            ask()
+                            yield PING, None
                         yield kind, payload
-                        await _taken(link, call, kind, len(payload), left())
+                        await _taken(link, call, kind, len(payload), turn())
                     elif kind == EXIT:
                         finished = True  # no KILL: it has ended
                         self._over(link, call.id, RELEASE)
@@ -859,13 +862,16 @@ class ExecdClient:
                     ):
                         # The same daemon never got the START: nothing ran, so start it.
                         call.resuming = False
+                        call.words -= 1
+                        written = call.starts
                         try:
                             again = link.send(START, call.id, start, late)
                             # Past it none is written, so its turn is not waited for.
                             within = None if late is None else late - time.monotonic()
                             await asyncio.wait_for(again, within)
-                        except asyncio.TimeoutError:  # out of time: nothing starts now
-                            raise
+                        except asyncio.TimeoutError:
+                            if call.starts == written:  # out of time: nothing starts
+                                raise
                         except OSError:  # dropped again: the next resume asks once more
                             call.queue.put_nowait(Dropped(link))
                             continue
@@ -875,7 +881,6 @@ class ExecdClient:
                             f"execd: {payload.decode(errors='replace')}",
                             pod=link.daemon.ip,
                         )
-                yield EXIT, None  # execd gave no word in our wait: our timer's stands
             except asyncio.TimeoutError as e:  # the builtin one, also on Python 3.10
                 raise TimeoutError(f"Command timed out after {timeout}s.") from e
             except (K8sError, ExecResultUnknownError):
@@ -1111,7 +1116,7 @@ async def _next(
     queue: asyncio.Queue[tuple[int, bytes] | Exception], timeout: float | None
 ) -> tuple[int, bytes] | Exception:
     """queue.get() within timeout; before 3.12 wait_for costs a loop turn per item."""
-    if timeout == 0:  # at a deadline: the call's loop sees to it first
+    if timeout is not None and timeout <= 0:  # at a deadline: its loop sees to it
         raise asyncio.TimeoutError
     if not queue.empty():
         return queue.get_nowait()
@@ -1137,10 +1142,17 @@ async def _taken(
     if sum(call.taken) - call.acked >= call.ack_every:
         call.acked = sum(call.taken)
         offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
-        # Out of time, the ack is left unsent: the call's own timeout ends it.
-        with contextlib.suppress(OSError, asyncio.TimeoutError):
-            ack = link.send(ACK, call.id, json.dumps(offsets).encode())
-            await asyncio.wait_for(ack, within)
+
+        async def send() -> None:
+            with contextlib.suppress(OSError):
+                await link.send(ACK, call.id, json.dumps(offsets).encode())
+
+        # In a task of its own: out of time it is waited for no longer, and still goes.
+        ack = asyncio.create_task(send())
+        link._last.add(ack)
+        ack.add_done_callback(link._last.discard)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(ack), within)
 
 
 class ExecdStream(ByteStream):

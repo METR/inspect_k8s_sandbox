@@ -164,7 +164,7 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	}
 }
 
-// refused runs execd where the kernel refuses PR_SET_DUMPABLE, or a thread its way back to root, as a seccomp profile can, and says so if execd then ran on.
+// refused runs execd where the kernel refuses PR_SET_DUMPABLE, or a thread its way back to root, and says so if execd ran on.
 func refused(at string) {
 	if at != "ran on" {
 		runtime.LockOSThread() // the filter is this thread's, and an exec keeps it

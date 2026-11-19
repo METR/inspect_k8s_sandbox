@@ -65,8 +65,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, an exit that has checked its pipes, and a kill that has found its command running; afterTaken tells them each time execd, past what it takes of a held pipe, has looked whether its writers have gone.
-var afterRead, afterDrainCheck, beforeKill, afterTaken atomic.Pointer[func(late bool)]
+// Tests hold execd at these points, or hear that it has reached them.
+var afterRead, afterDrainCheck, beforeKill, afterTaken, beforeExit, beforeWait atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -111,7 +111,7 @@ type call struct {
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
 	timedOut  bool // a timeout's kill went ahead on it: its exit says so, as the code alone can't
-	// a timeout's kill, execd's or its client's, went ahead on it, or will as it starts
+	// its timeout's kill went ahead on it
 	timeoutKilled bool
 }
 
@@ -241,7 +241,7 @@ func (s *server) dispatch(c *conn, f frame) {
 		}
 	case fKill:
 		if cl := s.get(f.id); cl != nil {
-			cl.stop(true) // as a timeout's: the client that sends it at its own timeout reads the exit
+			cl.kill()
 		}
 	case fResume:
 		s.resume(c, f)
@@ -366,6 +366,7 @@ func (s *server) resume(c *conn, f frame) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	for cl.abandoned && !cl.gone { // the kill that abandons it is under way: whether a timeout's got there first is known once it is done
+		hook(&beforeWait, false)
 		cl.room.Wait()
 	}
 	s.mu.Lock()
@@ -515,7 +516,7 @@ func (cl *call) run(req startRequest) error {
 				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
 					select {
 					case held <- struct{}{}:
-						go closeOnceUnheld(r) // a stack of its own: the wait can last as long as the pod, and this one holds the reader's 64 KiB
+						keep(r, keeper)
 						return
 					default: // no place left: closed, and that write fails
 					}
@@ -529,6 +530,7 @@ func (cl *call) run(req startRequest) error {
 	}
 	go func() {
 		ws := <-exited
+		hook(&beforeExit, false)
 		code := ws.ExitStatus()
 		if ws.Signaled() {
 			code = 128 + int(ws.Signal())
@@ -555,7 +557,7 @@ func (cl *call) run(req startRequest) error {
 		done := make(chan struct{})
 		go func() {
 			drained.Wait()
-			if said := signalLine(ws); said != "" && !byTimeout { // after the command's own stderr, as a shell's line is; none for a timeout's kill: its caller is told of the timeout
+			if said := signalLine(ws); said != "" && !byTimeout { // after the command's own stderr, as a shell's line is; none for a timeout's kill
 				cl.output(1, []byte(said))
 			}
 			close(done)
@@ -587,10 +589,10 @@ func (cl *call) run(req startRequest) error {
 	return nil
 }
 
-// leftOutput is how much execd takes of what a process left running writes to its command's pipe: Kubernetes exec takes 136 KiB, and the pipe alone holds 64 KiB, or 8 KiB on a node where execd's user has too many pipes.
+// leftOutput is how much execd takes of what a process left running writes to its command's pipe.
 const leftOutput = 1 << 20
 
-// held has a place for each pipe kept open for what a command left running: half of execd's descriptors, so that its calls and connections have the rest.
+// held has a place for each pipe kept open for what a command left running: half of execd's descriptors.
 var held = func() chan struct{} {
 	var files syscall.Rlimit
 	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) != nil {
@@ -599,32 +601,70 @@ var held = func() chan struct{} {
 	return make(chan struct{}, files.Cur/2)
 }()
 
-// closeOnceUnheld closes the pipe when no process holds its other end, and gives back its place. Until then it reads leftOutput bytes and drops them, as Kubernetes exec delivers none of them either, and then reads nothing: a writer without end waits, as it does there.
-func closeOnceUnheld(r *os.File) {
-	defer func() { r.Close(); <-held }()
-	r.SetReadDeadline(time.Time{})
-	var dropped [512]byte // on this goroutine's stack: io.Discard would keep 8 KiB of heap for as long as a quiet process holds the pipe
-	for left := leftOutput; left > 0; {
-		n, err := r.Read(dropped[:min(left, len(dropped))])
-		if left -= n; err != nil {
-			return
-		}
-	}
+// keep hands the pipe to the keeper, out of the runtime's own poller, which a pipe wakes at every write to it.
+func keep(r *os.File, keeper int) {
+	fd := -1
 	if rc, err := r.SyscallConn(); err == nil {
-		rc.Read(func(fd uintptr) bool {
-			p := struct { // a pollfd that asks for no event: poll then reports only that every writer has closed
-				fd              int32
-				events, revents int16
-			}{fd: int32(fd)}
-			errno := syscall.EINTR
-			for asked := 0; errno == syscall.EINTR && asked < 100; asked++ { // a signal cut the poll short: asked again, but not for ever where every answer is that
-				_, _, errno = syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&p)), 1, uintptr(unsafe.Pointer(&syscall.Timespec{})), 0, 0, 0)
-				hook(&afterTaken, false)
+		rc.Control(func(pipe uintptr) {
+			if dup, _, errno := syscall.Syscall(syscall.SYS_FCNTL, pipe, syscall.F_DUPFD_CLOEXEC, 0); errno == 0 {
+				fd = int(dup)
 			}
-			return p.revents != 0 || errno != 0 // refused, as a seccomp profile can, a poll would never see the writers go
 		})
 	}
+	r.Close()
+	if syscall.EpollCtl(keeper, syscall.EPOLL_CTL_ADD, fd, &syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}) != nil {
+		syscall.Close(fd) // no descriptor for it, or no keeper: let go, and the next write to it fails
+		<-held
+	}
 }
+
+// keeper is the epoll in which the kept pipes wait: for execd to take leftOutput bytes of each, and then for its writers to go.
+var keeper = -1
+
+// startKeeper starts the keeper's thread at execd's start: a pod out of PIDs can start none.
+var startKeeper = sync.OnceFunc(func() {
+	ep, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return
+	}
+	keeper = ep
+	go func() {
+		taken := map[int32]int{} // what execd has read of each pipe, and dropped
+		var events [64]syscall.EpollEvent
+		var dropped [4096]byte
+		for {
+			// The call the runtime's poller makes, which ends execd where it is refused. One a signal cut short is made again.
+			n, _, _ := syscall.Syscall6(syscall.SYS_EPOLL_PWAIT, uintptr(ep), uintptr(unsafe.Pointer(&events)), uintptr(len(events)), ^uintptr(0), 0, 0)
+			read := false
+			for _, e := range events[:max(int(n), 0)] {
+				fd, gone := e.Fd, e.Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0
+				for taken[fd] < leftOutput {
+					got, err := syscall.Read(int(fd), dropped[:min(leftOutput-taken[fd], len(dropped))])
+					if got <= 0 {
+						gone = err != syscall.EAGAIN && err != syscall.EINTR // read to its end, it has no writer
+						break
+					}
+					taken[fd], read = taken[fd]+got, true
+				}
+				if taken[fd] >= leftOutput {
+					hook(&afterTaken, false)
+				}
+				switch {
+				case gone:
+					syscall.EpollCtl(ep, syscall.EPOLL_CTL_DEL, int(fd), nil)
+					syscall.Close(int(fd))
+					delete(taken, fd)
+					<-held
+				case taken[fd] >= leftOutput: // asked for no event, an epoll tells only that every writer has gone
+					syscall.EpollCtl(ep, syscall.EPOLL_CTL_MOD, int(fd), &syscall.EpollEvent{Fd: fd})
+				}
+			}
+			if read {
+				time.Sleep(time.Millisecond) // what is written meanwhile takes one wake, not one for each write
+			}
+		}
+	}()
+})
 
 // buffered says how many bytes wait unread in a pipe (0 once it is closed).
 func buffered(f *os.File) int64 {
@@ -841,11 +881,10 @@ func signalLine(ws syscall.WaitStatus) string {
 // kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
-// stop is kill; a timeout's, execd's or its client's, notes that the command was running, so only then does the exit say "timed out".
+// stop is kill; a timeout's notes that the command was running, so only then does the exit say "timed out".
 func (cl *call) stop(timeout bool) {
 	cl.kmu.Lock()
 	cl.killed = true
-	cl.timeoutKilled = cl.timeoutKilled || timeout && cl.status == nil // not started yet: the kill that meets it as it starts is this timeout's
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
 	refused := false // waitid, as a seccomp profile can: nothing then says the command has stopped, and a kill does not wait to hear it
@@ -864,11 +903,21 @@ func (cl *call) stop(timeout bool) {
 	if running {
 		hook(&beforeKill, false)
 		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
-			for wait := 50 * time.Microsecond; wait < time.Second/2 && !seen(syscall.WEXITED|syscall.WSTOPPED) && !refused; wait *= 2 { // in its exit it takes no stop: that is waited for, under a second in all
-				time.Sleep(wait)
+			// Unlocked for the wait: other commands start, end and are killed meanwhile.
+			reaper.mu.Unlock()
+			told := make(chan os.Signal, 1)
+			signal.Notify(told, syscall.SIGCHLD) // told of the stop at once: a timer alone comes a millisecond late
+			// In its exit it takes no stop: that is waited for, a second at most.
+			for until := time.Now().Add(time.Second); !seen(syscall.WEXITED|syscall.WSTOPPED) && !refused && time.Now().Before(until); {
+				select {
+				case <-told:
+				case <-time.After(time.Millisecond):
+				}
 			}
+			signal.Stop(told)
+			reaper.mu.Lock()
 		}
-		running = !seen(syscall.WEXITED)
+		running = reaper.waiting[pid] == status && !seen(syscall.WEXITED) // reaped meanwhile, its id may be another's
 	}
 	if running {
 		hook(&beforeKill, true)
@@ -1112,10 +1161,10 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 // More than execve lets an environment hold (6 MiB at most).
 const maxEnviron = 8 << 20
 
-// Tests open another file in an environment's place for the search of a tag, as the kernel shows none of a process whose execve is under way.
+// Tests open another file in an environment's place for the search of a tag.
 var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
 
-// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all; it reads into room, and leaves a larger one where an environment filled it.
+// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
 func tagged(open func(string) (*os.File, error), environ string, needle []byte, room *[]byte) (is, none bool) {
 	// In one read: an execve between two lets the environment go, and the second ends the file short of its tag.
 	for {
