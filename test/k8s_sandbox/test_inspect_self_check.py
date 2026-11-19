@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from inspect_ai.util._sandbox.self_check import *  # noqa: F401, F403
 
+from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._sandbox_environment import K8sSandboxEnvironment
 from test.k8s_sandbox.utils import install_sandbox_environments
 
@@ -111,14 +112,18 @@ async def test_a_command_is_found_on_the_path_as_its_user(
     assert result.stdout == "nobody\n", result
 
 
+@pytest.mark.parametrize("service", ["default", "runc"])  # on gVisor, and on Linux
 async def test_a_kill_reaches_what_another_users_command_detached(
-    transport: str, sandboxes: dict[str, K8sSandboxEnvironment]
+    transport: str,
+    sandboxes: dict[str, _sandbox_environment.K8sSandboxEnvironment],
+    service: str,
 ) -> None:
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
-    root = sandboxes["runc"]
-    # setsid takes it out of the process group a kill signals.
-    detach = "setsid sh -c 'echo $$ > /tmp/detached; kill -STOP $$' & wait"
+    root = sandboxes[service]
+    # Out of the group a kill signals, its parent gone: only the tag leads a kill to it.
+    orphan = "while kill -0 $PPID 2>/dev/null; do :; done; echo $$ > /tmp/detached"
+    detach = f"(setsid sh -c '{orphan}; kill -STOP $$' &); sleep 600"
     command = asyncio.ensure_future(root.exec(["sh", "-c", detach], user="nobody"))
 
     async def detached() -> str:
@@ -126,12 +131,18 @@ async def test_a_kill_reaches_what_another_users_command_detached(
             await asyncio.sleep(0.1)
         return pid.strip()
 
-    pid = await asyncio.wait_for(detached(), 30)
-    command.cancel()
-
     async def gone() -> None:
         while (await root.exec(["test", "-e", f"/proc/{pid}"])).success:
             await asyncio.sleep(0.1)
 
-    # Without CAP_SYS_PTRACE root can't read the user's environment for the call's tag.
-    await asyncio.wait_for(gone(), 30)
+    left = "kill -9 $(cat /tmp/detached); "  # what a failed run leaves
+    try:
+        pid = await asyncio.wait_for(detached(), 30)
+        command.cancel()
+
+        # Without CAP_SYS_PTRACE root can't read the user's environment for its tag.
+        await asyncio.wait_for(gone(), 30)
+        left = ""
+    finally:
+        command.cancel()
+        await root.exec(["sh", "-c", left + "rm -f /tmp/detached"])

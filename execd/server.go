@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -66,8 +65,8 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
-// Tests hold a reader here with output taken but not counted, and an exit that has checked its pipes.
-var afterRead, afterDrainCheck atomic.Pointer[func(late bool)]
+// Tests hold execd at these points, or hear that it has reached them.
+var afterRead, afterDrainCheck, beforeKill, afterTaken, beforeExit, beforeWait atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -87,7 +86,7 @@ type call struct {
 	kmu sync.Mutex // guards pid, status, as, killed and timeoutKilled: a kill must not wait for mu
 	pid int
 	// where the reaper sends its command's exit status
-	status chan int
+	status chan syscall.WaitStatus
 	as     *syscall.Credential // who its command runs as, if not execd
 	// queued for a writer goroutine, so a command that ignores stdin can't stall the connection
 	stdinQ   [][]byte
@@ -111,8 +110,8 @@ type call struct {
 	// killed for want of a client, and kept so a RESUME can be told so
 	abandoned bool
 	killed    bool // asked to stop: a start still under way sees to it
-	timedOut  bool // its timeout killed it: its exit says so, as the code alone can't
-	// its timeout found it running and signalled it
+	timedOut  bool // a timeout's kill went ahead on it: its exit says so, as the code alone can't
+	// its timeout's kill went ahead on it
 	timeoutKilled bool
 }
 
@@ -366,13 +365,20 @@ func (s *server) resume(c *conn, f frame) {
 	}
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	for cl.abandoned && !cl.gone { // the kill that abandons it is under way: whether a timeout's got there first is known once it is done
+		hook(&beforeWait, false)
+		cl.room.Wait()
+	}
 	s.mu.Lock()
 	replaced := s.current != nil && s.current != c // the call is the new connection's to resume
 	s.mu.Unlock()
 	if replaced {
 		return
 	}
-	if cl.abandoned {
+	cl.kmu.Lock()
+	byTimeout := cl.timeoutKilled // the kill's own word: its exit may not have said so yet
+	cl.kmu.Unlock()
+	if cl.abandoned && !byTimeout { // one its own timeout ended still says so: that takes none of the output let go
 		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
 		return
 	}
@@ -478,6 +484,7 @@ func (cl *call) run(req startRequest) error {
 	cl.kmu.Unlock()
 	if killed { // while it started: nothing is reaped under this lock, so the id is its own
 		killTree(p.Pid)
+		killAs(p.Pid, as)
 	}
 	reaper.mu.Unlock()
 	if killed { // that holds for what it left running too
@@ -498,7 +505,6 @@ func (cl *call) run(req startRequest) error {
 		drained.Add(1)
 		go func() {
 			defer drained.Done()
-			defer r.Close()
 			buf := make([]byte, pipeRead)
 			for {
 				n, err := r.Read(buf)
@@ -507,14 +513,28 @@ func (cl *call) run(req startRequest) error {
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
+				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would raise SIGPIPE at the next write of what the command left running
+					select {
+					case held <- struct{}{}:
+						keep(r, keeper, held)
+						return
+					default: // no place left: closed, and that write raises SIGPIPE
+					}
+				}
 				if err != nil {
+					r.Close()
 					return
 				}
 			}
 		}()
 	}
 	go func() {
-		code := <-exited
+		ws := <-exited
+		hook(&beforeExit, false)
+		code := ws.ExitStatus()
+		if ws.Signaled() {
+			code = 128 + int(ws.Signal())
+		}
 		if stdinW != nil {
 			stdinW.Close() // or its writer waits for ever on what the command left holding its stdin
 		}
@@ -526,7 +546,7 @@ func (cl *call) run(req startRequest) error {
 		byTimeout := cl.timeoutKilled
 		cl.kmu.Unlock()
 		cl.mu.Lock()
-		cl.timedOut = byTimeout && code == 128+int(syscall.SIGKILL)
+		cl.timedOut = byTimeout
 		cl.mu.Unlock()
 		// Deliver all output written before exit; stop 100 ms on, so a background child can't hold the call.
 		var want [2]int64
@@ -535,7 +555,13 @@ func (cl *call) run(req startRequest) error {
 			want[i] += read[i].Load() + pipeRead // a read under way has taken bytes it hasn't counted
 		}
 		done := make(chan struct{})
-		go func() { drained.Wait(); close(done) }()
+		go func() {
+			drained.Wait()
+			if said := signalLine(ws); said != "" && !byTimeout { // after the command's own stderr, as a shell's line is; none for a timeout's kill
+				cl.output(1, []byte(said))
+			}
+			close(done)
+		}()
 		grace := time.Now().Add(100 * time.Millisecond)
 		for {
 			select {
@@ -562,6 +588,88 @@ func (cl *call) run(req startRequest) error {
 	}()
 	return nil
 }
+
+// leftOutput is how much execd takes of what a process left running writes to its command's pipe.
+const leftOutput = 1 << 20
+
+// held bounds the kept pipes to half of execd's descriptors, and to what leaves it 24: its own nine, and a command's start beside one that runs.
+var held = func() chan struct{} {
+	var files syscall.Rlimit
+	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) != nil {
+		files.Cur = 0 // a limit execd cannot read: it keeps no pipe
+	}
+	return make(chan struct{}, min(files.Cur/2, max(files.Cur, 24)-24))
+}()
+
+// keep hands the pipe to the keeper, out of the runtime's own poller, which a pipe wakes at every write to it.
+func keep(r *os.File, keeper int, places chan struct{}) {
+	fd := -1
+	if rc, err := r.SyscallConn(); err == nil {
+		rc.Control(func(pipe uintptr) {
+			if dup, _, errno := syscall.Syscall(syscall.SYS_FCNTL, pipe, syscall.F_DUPFD_CLOEXEC, 0); errno == 0 {
+				fd = int(dup)
+			}
+		})
+	}
+	r.Close()
+	if syscall.EpollCtl(keeper, syscall.EPOLL_CTL_ADD, fd, &syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}) != nil {
+		syscall.Close(fd) // no descriptor for it, or no keeper: let go
+		<-places
+	}
+}
+
+// keeper is the epoll in which the kept pipes wait: for execd to take leftOutput bytes of each, and then for its writers to go.
+var keeper = -1
+
+// startKeeper starts the keeper's thread at execd's start: a pod out of PIDs can start none.
+var startKeeper = sync.OnceFunc(func() {
+	ep, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return
+	}
+	keeper = ep
+	go func() {
+		taken := map[int32]int{} // what execd has read of each pipe, and dropped
+		var events [64]syscall.EpollEvent
+		var dropped [4096]byte
+		for {
+			// The call the runtime's poller makes, and as there: one a signal cut short is made again, and one refused ends execd.
+			n, _, errno := syscall.Syscall6(syscall.SYS_EPOLL_PWAIT, uintptr(ep), uintptr(unsafe.Pointer(&events)), uintptr(len(events)), ^uintptr(0), 0, 0)
+			if errno != 0 && errno != syscall.EINTR {
+				fail("epoll_pwait: " + errno.Error())
+			}
+			read := false
+			for _, e := range events[:max(int(n), 0)] {
+				fd, gone := e.Fd, e.Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0
+				for taken[fd] < leftOutput {
+					got, err := syscall.Read(int(fd), dropped[:min(leftOutput-taken[fd], len(dropped))])
+					if got <= 0 {
+						gone = err != syscall.EAGAIN && err != syscall.EINTR // read to its end, it has no writer
+						break
+					}
+					taken[fd], read = taken[fd]+got, true
+				}
+				if taken[fd] >= leftOutput {
+					// Asked for no event, an epoll tells only that every writer has gone. A pipe that cannot be asked so is let go.
+					gone = gone || syscall.EpollCtl(ep, syscall.EPOLL_CTL_MOD, int(fd), &syscall.EpollEvent{Fd: fd}) != nil
+					hook(&afterTaken, false)
+				}
+				if gone {
+					// Left in the epoll, a pipe closed here is told of again while a child not yet exec'd holds it, and gives back a place each time.
+					if err := syscall.EpollCtl(ep, syscall.EPOLL_CTL_DEL, int(fd), nil); err != nil {
+						fail("epoll_ctl: " + err.Error())
+					}
+					syscall.Close(int(fd))
+					delete(taken, fd)
+					<-held
+				}
+			}
+			if read {
+				time.Sleep(time.Millisecond) // what is written meanwhile takes one wake, not one for each write
+			}
+		}
+	}()
+})
 
 // buffered says how many bytes wait unread in a pipe (0 once it is closed).
 func buffered(f *os.File) int64 {
@@ -756,6 +864,25 @@ func (cl *call) ackLocked(req resumeRequest) {
 	cl.room.Broadcast()
 }
 
+// signalLine is dash's line on stderr for a command a signal ended, in glibc's words: here execd is the command's parent, not a shell.
+func signalLine(ws syscall.WaitStatus) string {
+	sig := ws.Signal()
+	if !ws.Signaled() || sig == syscall.SIGINT || sig == syscall.SIGPIPE {
+		return ""
+	}
+	said := strings.ToUpper(sig.String()[:1]) + sig.String()[1:]
+	switch { // Go names 1 to 31 as glibc does, and no other
+	case sig > 33:
+		said = "Real-time signal " + strconv.Itoa(int(sig)-34)
+	case sig > 31:
+		said = "Unknown signal " + strconv.Itoa(int(sig))
+	}
+	if ws.CoreDump() {
+		said += " (core dumped)"
+	}
+	return said + "\n"
+}
+
 // kill stops the call's process group, what descends from its command, and every process still carrying its tag.
 func (cl *call) kill() { cl.stop(false) }
 
@@ -765,23 +892,65 @@ func (cl *call) stop(timeout bool) {
 	cl.killed = true
 	pid, as, status := cl.pid, cl.as, cl.status
 	cl.kmu.Unlock()
-	var ended [128]byte // a siginfo_t: waitid sets its first field for a child exited and not yet reaped
-	syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&ended)), syscall.WEXITED|syscall.WNOHANG|syscall.WNOWAIT, 0, 0)
+	refused := false // waitid, as a seccomp profile can: nothing then says the command has stopped, and a kill does not wait to hear it
+	seen := func(states int) bool {
+		var info [128]byte // a siginfo_t: waitid sets its first field for a child in one of the states, and leaves it unreaped
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, 1, uintptr(pid), uintptr(unsafe.Pointer(&info)), uintptr(states|syscall.WNOHANG|syscall.WNOWAIT), 0, 0)
+		refused = errno != 0
+		return info[0] != 0
+	}
 	// Not started, or ended and not yet reaped: what it left running is not the call's to kill.
-	if pid <= 0 || ended[0] != 0 {
+	if pid <= 0 || seen(syscall.WEXITED) {
 		return
 	}
 	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own
 	running := reaper.waiting[pid] == status
 	if running {
+		hook(&beforeKill, false)
+		if syscall.Kill(pid, syscall.SIGSTOP) == nil { // stopped, it cannot end by itself between the look that follows and its kill
+			// Unlocked for the wait: other commands start, end and are killed meanwhile.
+			reaper.mu.Unlock()
+			told := make(chan os.Signal, 1)
+			signal.Notify(told, syscall.SIGCHLD) // told of the stop at once: a timer alone comes a millisecond late
+			// In its exit it takes no stop: that is waited for, a second at most.
+			for until := time.Now().Add(time.Second); !seen(syscall.WEXITED|syscall.WSTOPPED) && !refused && time.Now().Before(until); {
+				select {
+				case <-told:
+				case <-time.After(time.Millisecond):
+				}
+			}
+			signal.Stop(told)
+			reaper.mu.Lock()
+		}
+		running = reaper.waiting[pid] == status && !seen(syscall.WEXITED) // reaped meanwhile, its id may be another's
+	}
+	if running {
+		hook(&beforeKill, true)
 		cl.kmu.Lock()
 		cl.timeoutKilled = cl.timeoutKilled || timeout
 		cl.kmu.Unlock()
 		killTree(pid)
+		killAs(pid, as)
 	}
 	reaper.mu.Unlock()
-	if running { // else reaped: what it left running is not the call's to kill, and its id may be another's
+	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		cl.end(as)
+	}
+}
+
+// killAs sends another user's command and its group that user's own SIGKILL: root's reaches neither without CAP_KILL.
+func killAs(pid int, as *syscall.Credential) {
+	if as == nil {
+		return
+	}
+	runtime.LockOSThread() // the identity it takes is this thread's alone
+	defer runtime.UnlockOSThread()
+	setids(as.Uid, as.Gid)
+	syscall.Kill(pid, syscall.SIGKILL)
+	syscall.Kill(-pid, syscall.SIGKILL)
+	setids(uint32(os.Getuid()), uint32(os.Getgid()))
+	if os.Geteuid() != os.Getuid() || os.Getegid() != os.Getgid() { // unlocked so, the thread would do execd's own work as that user
+		fail("a thread could not take execd's identity back")
 	}
 }
 
@@ -858,6 +1027,11 @@ func (cl *call) end(as *syscall.Credential) {
 	killTagged(cl.tag)
 	if as != nil { // without CAP_SYS_PTRACE only the command's user may read its processes' environments
 		go func() { searches <- search{cl.tag, as} }()
+		// gVisor lets them be read only with the user's real ids, which let the user signal their holder: a child holds them, not execd.
+		argv := []string{"/proc/self/exe", "search", fmt.Sprint(as.Uid), fmt.Sprint(as.Gid), strings.Trim(fmt.Sprint(as.Groups), "[]"), cl.tag}
+		if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}}); err == nil {
+			child.Release()
+		}
 	}
 }
 
@@ -967,10 +1141,13 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	} else if u, err = user.Lookup(name); err != nil {
 		return nil, "", "", fmt.Errorf("unknown user %s", name)
 	}
-	uid, _ := strconv.Atoi(u.Uid)
-	gid, _ := strconv.Atoi(u.Gid)
-	if uid == os.Getuid() {
+	uid, uidErr := strconv.ParseInt(u.Uid, 10, 64)
+	if uidErr == nil && uid == int64(os.Getuid()) {
 		return nil, u.HomeDir, u.Username, nil
+	}
+	gid, gidErr := strconv.ParseInt(u.Gid, 10, 64)
+	if uidErr != nil || gidErr != nil || uid>>32 != 0 || gid>>32 != 0 { // narrowed to 32 bits, 4294967296 would be root's
+		return nil, "", "", fmt.Errorf("unknown user %s", name)
 	}
 	if os.Getuid() != 0 {
 		return nil, "", "", fmt.Errorf("cannot run as %s: execd is not root", name)
@@ -978,7 +1155,7 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	var groups []uint32
 	if ids, err := u.GroupIds(); err == nil {
 		for _, g := range ids {
-			if n, err := strconv.Atoi(g); err == nil {
+			if n, err := strconv.ParseInt(g, 10, 64); err == nil && n>>32 == 0 && n != 1<<32-1 { // setgroups refuses the whole list for (gid_t)-1
 				groups = append(groups, uint32(n))
 			}
 		}
@@ -986,31 +1163,65 @@ func lookupUser(name string) (*syscall.Credential, string, string, error) {
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: groups}, u.HomeDir, u.Username, nil
 }
 
-// More than execve lets an environment hold (6 MiB).
+// More than execve lets an environment hold (6 MiB at most).
 const maxEnviron = 8 << 20
 
-// tagged says whether the environment a /proc/PID/environ file shows holds needle.
-func tagged(environ string, needle []byte) bool {
-	f, err := os.Open(environ)
-	if err != nil {
-		return false
+// Tests open another file in an environment's place for the search of a tag.
+var openEnviron atomic.Pointer[func(tag, environ string) (*os.File, error)]
+
+// tagged says whether the environment that open shows of a /proc/PID/environ file holds needle, and whether it shows none at all.
+func tagged(open func(string) (*os.File, error), environ string, needle []byte, room *[]byte) (is, none bool) {
+	// In one read: an execve between two lets the environment go, and the second ends the file short of its tag.
+	for {
+		f, err := open(environ)
+		if err != nil {
+			return false, false
+		}
+		data := *room
+		n, _ := f.Read(data)
+		f.Close()
+		// A read it fills may not hold it all: a process can make its own look any size.
+		whole := n < len(data) || len(data) == maxEnviron
+		is = bytes.Contains(data[:n], needle)
+		if is || whole { // a tag it shows is enough: the next open may fail
+			return is, n == 0
+		}
+		*room = make([]byte, min(4*len(data), maxEnviron)) // kept for the search's later reads: each open more is one an execve can empty
 	}
-	defer f.Close()
-	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron)) // a process can make its own look any size
-	return bytes.Contains(append(data, 0), needle)
 }
 
 // killTagged SIGKILLs every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid.
 func killTagged(tag string) {
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
+	open := os.Open
+	if stand := openEnviron.Load(); stand != nil {
+		open = func(environ string) (*os.File, error) { return (*stand)(tag, environ) }
+	}
+	read, room := map[int]bool{}, make([]byte, 4<<10)
+	// Eight listings at most, until one holds no process not yet read: what a process starts while one is read is in the next.
+	for pass, more, starting := 0, true, false; more && pass < 8; pass++ {
+		if starting {
+			time.Sleep(time.Millisecond) // an execve takes about a tenth of that
 		}
-		if tagged("/proc/"+e.Name()+"/environ", needle) {
-			syscall.Kill(pid, syscall.SIGKILL)
+		more, starting = false, false
+		entries, _ := os.ReadDir("/proc")
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == os.Getpid() || read[pid] {
+				continue
+			}
+			more = true
+			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle, &room)
+			if none {
+				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
+					starting = true
+					continue
+				}
+			}
+			read[pid] = true
+			if is {
+				syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 }
@@ -1018,14 +1229,14 @@ func killTagged(tag string) {
 // The reaper reaps every child under mu, so an id is never reused before its status is sent.
 type reaperState struct {
 	mu      sync.Mutex
-	waiting map[int]chan int
+	waiting map[int]chan syscall.WaitStatus
 }
 
-var reaper = &reaperState{waiting: map[int]chan int{}}
+var reaper = &reaperState{waiting: map[int]chan syscall.WaitStatus{}}
 
 // watch must be called with mu held.
-func (r *reaperState) watch(pid int) chan int {
-	ch := make(chan int, 1)
+func (r *reaperState) watch(pid int) chan syscall.WaitStatus {
+	ch := make(chan syscall.WaitStatus, 1)
 	r.waiting[pid] = ch
 	return ch
 }
@@ -1043,13 +1254,9 @@ func startReaper() {
 					reaper.mu.Unlock()
 					break
 				}
-				code := ws.ExitStatus()
-				if ws.Signaled() {
-					code = 128 + int(ws.Signal())
-				}
 				if ch, ok := reaper.waiting[pid]; ok {
 					delete(reaper.waiting, pid)
-					ch <- code
+					ch <- ws
 				}
 				reaper.mu.Unlock()
 			}

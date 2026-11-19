@@ -291,6 +291,91 @@ async def test_a_command_for_another_user_does_not_run_with_groups_it_cannot_tak
     assert (result.returncode, result.stdout) == (126, "")
 
 
+@pytest.mark.parametrize(("limit", "left", "beside"), [(64, 32, 6), (32, 12, 2)])
+async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+    left: int,
+    beside: int,
+) -> None:
+    """Regression: in a Kata guest, with 1,024, the 506th such command failed."""
+    name = f"{sandbox.name}-nofile"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    nofile = f"nofile={limit}:{limit}"
+    run = ["run", "-d", "--name", name, "--ulimit", nofile, sandbox.name]
+    gate = f"/tmp/{uuid.uuid4().hex}"
+    # A process that holds its command's stdout and stderr until it is let go.
+    held = 'until [ -e "$0" ]; do sleep 0.05; done; echo >>"$0.gone"'
+    # One that then writes to the stdout it kept, and says how the write ended.
+    late = 'trap "" PIPE; until [ -e "$0.go" ]; do sleep 0.05; done; echo late'
+    late += '; echo $? >"$0.wrote"'
+
+    async def leave(script: str) -> int:
+        argv = ["sh", "-c", f"({script}) &", gate]
+        ran = client.exec(argv, None, None, {}, None, None)
+        return (await asyncio.wait_for(ran, 30)).returncode  # only bounds a hang
+
+    try:
+        assert docker(*run, "sleep", "3600").returncode == 0
+        monkeypatch.setattr(sandbox, "name", name)
+        ip = docker("inspect", "-f", address, name).stdout.strip()
+        monkeypatch.setattr(relay, "ip", ip)
+        # All kept, their pipes were every descriptor of 64; half of 32 left too few.
+        for _ in range(left):
+            assert await leave(held) == 0
+        # With all but 24 of 64 kept, four of these ran; with all but 18 of 32, one.
+        up = 'echo >>"$0.up"; for _ in $(seq 200); do [ "$(wc -l <"$0.up")" = "$1" ]'
+        up += " && exit 0; sleep 0.05; done; exit 1"  # each waits 10 s for all to be up
+        argv = ["sh", "-c", up, gate, str(beside)]
+        runs = (client.exec(argv, None, None, {}, None, None) for _ in range(beside))
+        ran = await asyncio.wait_for(asyncio.gather(*runs), 30)  # only bounds a hang
+        assert [r.returncode for r in ran] == [0] * beside
+        sandbox.sh(f"touch {gate}")
+        await sandbox.until(f'[ "$(wc -l <{gate}.gone)" = {left} ]')
+        assert await leave(late) == 0
+        sandbox.sh(f"touch {gate}.go")
+        await sandbox.until(f"test -s {gate}.wrote")
+        wrote = sandbox.sh(f"cat {gate}.wrote").stdout
+    finally:
+        docker("rm", "-f", name)
+
+    assert wrote == "0\n"  # the places of the pipes execd let go went to new ones
+
+
+async def test_an_id_no_uid_holds_is_not_narrowed_to_one(
+    sandbox: Sandbox, client: execd.ExecdClient
+) -> None:
+    """Narrowed to 32 bits, a uid or gid of 4294967296 or -4294967296 is root's."""
+    users = "cp -p /etc/passwd /etc/passwd.kept && cp -p /etc/group /etc/group.kept"
+    users += " && echo wideuid:x:4294967296:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo negative:x:-4294967296:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo widegid:x:4243:4294967296::/:/bin/sh >>/etc/passwd"
+    users += " && echo o:x:4242:4242::/:/bin/sh >>/etc/passwd"
+    users += " && echo wide:x:4294967296:o >>/etc/group"
+    users += " && echo last:x:4294967295:o >>/etc/group"  # setgroups takes no (gid_t)-1
+    users += " && sed -i s/^root:x:0:0:/root:x:0:4294967296:/ /etc/passwd"
+
+    async def run(user: str, *argv: str) -> str:
+        ran = client.exec(list(argv), None, None, {}, user, None)
+        return (await asyncio.wait_for(ran, 30)).stdout  # only bounds a hang
+
+    try:
+        assert sandbox.sh(users).returncode == 0
+        for user in ("wideuid", "negative", "widegid"):
+            with pytest.raises(RuntimeError, match="does not appear to exist"):
+                await run(user, "id")
+        groups = await run("o", "id", "-G")
+        own = await run("root", "id", "-u")  # execd's own user: nothing to switch
+    finally:  # the module's other tests share this container
+        kept = "mv /etc/passwd.kept /etc/passwd && mv /etc/group.kept /etc/group"
+        assert sandbox.sh(kept).returncode == 0
+
+    assert (groups, own) == ("4242\n", "0\n")  # o without root's group; root still runs
+
+
 @pytest.mark.parametrize(
     ("mode", "read_fails"),
     [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],

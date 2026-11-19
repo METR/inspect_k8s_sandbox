@@ -76,17 +76,23 @@
   `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
   a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
   its environment holds `HAWK_NEXT_EXEC`, a `cwd` that does not exist ends it with
-  status 1, and with no `stdin` it reads end-of-file. If a symbolic link on the path to
+  status 1, and with no `stdin` it reads end-of-file. Run as another user, it has a
+  soft open-file limit of 1024 where the hard limit is no lower, whatever the image's
+  PAM limits say, and may raise it to the hard limit. If a symbolic link on the path to
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
-  status 1 once that directory is gone. A timed-out `exec()` whose command is still
-  running gets SIGKILL, and so do the processes under it that execd may
-  signal: all where it has `CAP_KILL`, else its own user's. So do the
-  others it started, unless one has left its process group, or is one execd may not
-  signal, and has cleared its environment or made it unreadable to execd, runs as a
-  user that is neither execd's nor the command's where execd lacks `CAP_SYS_PTRACE`,
-  or on gVisor comes from a command run as another user;
-  those of a command that has ended are left running. A command that ends execd, by
+  status 1 once that directory is gone. On a timed-out `exec()` whose command is still
+  running, execd sends SIGKILL to the command, to its process group and to the other
+  processes it started that it can find, as far as it may signal each; one that has
+  detached from the command can survive. Those of a command that has ended are left
+  running. Once execd has stopped reading a command's output, 100 ms after the command
+  ended at the earliest, what it left running may write 1 MiB more in total to each of
+  the command's stdout and stderr, plus that pipe's free space; past that a write to
+  it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
+  for at most half of its open-file limit (512 in a Kata guest), and past that it closes
+  a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
+  signal is ignored. Both hold where execd holds the pipe's only read end. A command
+  that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()`,
   `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
   timeout passes first raises `TimeoutError`. Commands still running lose their
