@@ -261,7 +261,8 @@ class Pod:
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod. This will not
             terminate background processes started by cmd. On a pod with execd, cmd and
-            its background processes get SIGKILL instead.
+            the processes it started that execd finds and may signal get SIGKILL
+            instead; one that has detached from cmd can survive.
         """
         if (execd := self._execd) is not None:
             return await self._over_execd(

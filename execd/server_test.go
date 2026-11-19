@@ -2152,7 +2152,7 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	}
 	write(136<<10, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
 	// All but a byte of what execd takes, and all of it read: the two bytes that follow come in one read, which may take one.
-	write(leftOutput-136<<10-1, "which is the rest of what execd takes, but a byte")
+	write(1<<20-136<<10-1, "which is the rest of the megabyte execd takes, but a byte")
 	for deadline := time.Now().Add(30 * time.Second); unread() > 0; time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d bytes wait unread of what execd takes of a pipe", unread())

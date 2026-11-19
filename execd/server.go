@@ -513,12 +513,12 @@ func (cl *call) run(req startRequest) error {
 					read[i].Add(int64(n))
 					cl.output(i, buf[:n])
 				}
-				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
+				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would raise SIGPIPE at the next write of what the command left running
 					select {
 					case held <- struct{}{}:
 						keep(r, keeper, held)
 						return
-					default: // no place left: closed, and that write fails
+					default: // no place left: closed, and that write raises SIGPIPE
 					}
 				}
 				if err != nil {
