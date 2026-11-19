@@ -240,7 +240,8 @@ fi
 keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
-launchers() { peek "pgrep -f '^[^ ]*vsock-egress launch'; echo looked" | tr '\n' ' '; }
+# `looked` only after a scan that ended: pgrep exits 0 or 1 for one, and a scan cut short names no launcher either.
+launchers() { peek "pgrep -f '^[^ ]*vsock-egress launch'; [ \$? -le 1 ] && echo looked" | tr '\n' ' '; }
 named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete, and the parent of the pod's worker, '$from', is none of them" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
@@ -252,7 +253,7 @@ k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
 down() { [ "$(launchers)" = "looked " ]; }
 wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 30 down \
-  || fail "the launcher $old is still there, or the node still names a launcher's process: '$(launchers)'"
+  || fail "the launcher $old is still there, the node still names a launcher's process, or its scan did not end: '$(launchers)'"
 keep "the release is uninstalled"
 h uninstall "$REL" --wait --timeout 180s > /dev/null 2>&1 || fail "helm uninstall"
 # A pod can leave the API before its node has stopped it: that the VM's directory has gone is the node's own word.
