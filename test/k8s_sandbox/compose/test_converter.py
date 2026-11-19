@@ -9,6 +9,7 @@ import yaml
 
 import k8s_sandbox
 from k8s_sandbox._helm import validate_no_null_values
+from k8s_sandbox.compose import _converter
 from k8s_sandbox.compose._converter import (
     ComposeConverterError,
     convert_compose_to_helm_values,
@@ -98,6 +99,43 @@ secrets: {}
 
 
 ### Service elements
+
+
+def test_services_sharing_a_yaml_alias_each_keep_their_settings(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default: &service
+    image: my-image
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+  merged:
+    <<: *service
+  aliased: *service
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    services = result["services"]
+    assert services["merged"] == services["aliased"] == services["default"]
+
+
+def test_rejects_service_name_that_yaml_reads_as_no_string(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  on:
+    image: my-image
+""")
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert "A key of the Compose file is not a string. Quote it" in str(exc_info.value)
 
 
 def test_converts_runtime(tmp_compose: TmpComposeFixture) -> None:
@@ -456,19 +494,138 @@ services:
     assert "Unsupported 'healthcheck.test'" in str(exc_info.value)
 
 
-def test_rejects_unsupported_healthcheck_key(tmp_compose: TmpComposeFixture) -> None:
+def test_passes_every_cmd_shell_item_to_the_shell(
+    tmp_compose: TmpComposeFixture,
+) -> None:
     compose_path = tmp_compose("""
 services:
   my-service:
+    image: my-image
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost"]
-      disable: true
+      test: ["CMD-SHELL", "exit $0", "0"]
 """)
 
-    with pytest.raises(ComposeConverterError) as exc_info:
-        convert_compose_to_helm_values(compose_path)
+    result = _converter.convert_compose_to_helm_values(compose_path)
 
-    assert "Unsupported key(s) in 'healthcheck'" in str(exc_info.value)
+    assert result["services"]["my-service"]["readinessProbe"] == {
+        "exec": {"command": ["sh", "-c", "exit $0", "0"]}
+    }
+
+
+@pytest.mark.parametrize(
+    "healthcheck",
+    [
+        pytest.param(
+            'test: ["CMD", "curl", "-f", "http://localhost"]\n      disable: true',
+            id="disabled",
+        ),
+        pytest.param(
+            'test: ["CMD", "curl", "-f", "http://localhost"]\n      disable: "yes"',
+            id="disabled-in-a-word",
+        ),
+        pytest.param(
+            'test: ["NONE", "curl", "-f", "http://localhost"]', id="test-none"
+        ),
+        pytest.param("test: []", id="empty-test"),
+        pytest.param("interval: 500ms", id="no-test"),
+    ],
+)
+def test_converts_healthcheck_with_nothing_to_run_to_no_probe(
+    healthcheck: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      {healthcheck}
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["readinessProbe"] == {}
+
+
+@pytest.mark.parametrize("disable", ["false", '"off"'])
+def test_keeps_probe_of_healthcheck_with_disable_false(
+    disable: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      disable: {disable}
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["readinessProbe"] == {
+        "exec": {"command": ["curl", "-f", "http://localhost"]}
+    }
+
+
+def test_rejects_healthcheck_disable_that_is_no_boolean(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      disable: ${HC_DISABLE:-false}
+""")
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert "Invalid 'healthcheck.disable' value: '${HC_DISABLE:-false}'" in str(
+        exc_info.value
+    )
+
+
+def test_converts_healthcheck_retries_given_as_string(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      retries: "0"
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["readinessProbe"]["failureThreshold"] == 1
+
+
+@pytest.mark.parametrize(
+    "retries",
+    [
+        pytest.param("${HC_RETRIES:-3}", id="no-number"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_rejects_healthcheck_retries_that_are_no_count(
+    retries: str, tmp_compose: TmpComposeFixture
+) -> None:
+    compose_path = tmp_compose(f"""
+services:
+  my-service:
+    image: my-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      retries: {retries}
+""")
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert f"Invalid 'healthcheck.retries' value: '{retries}'" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -616,6 +773,7 @@ services:
 @pytest.mark.parametrize(
     "value,expected",
     [
+        ("42", "42"),
         ("512b", "512"),
         ("512B", "512"),
         ("1k", "1Ki"),
@@ -641,7 +799,7 @@ services:
     mem_limit: {value}
 """)
 
-    result = convert_compose_to_helm_values(compose_path)
+    result = _converter.convert_compose_to_helm_values(compose_path)
 
     actual = result["services"]["my-service"]["resources"]["limits"]["memory"]
     assert actual == expected
@@ -658,6 +816,20 @@ services:
         convert_compose_to_helm_values(compose_path)
 
     assert "Unsupported byte value (memory quantity)" in str(exc_info.value)
+
+
+def test_converts_deploy_with_no_value(tmp_compose: TmpComposeFixture) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+    mem_limit: 1g
+    deploy:
+""")
+
+    result = _converter.convert_compose_to_helm_values(compose_path)
+
+    assert result["services"]["my-service"]["resources"]["limits"] == {"memory": "1Gi"}
 
 
 def test_rejects_unsupported_deploy_key(tmp_compose: TmpComposeFixture) -> None:
@@ -1695,6 +1867,20 @@ x-k8s:
 
     assert f"Invalid '{setting}' type" in str(exc_info.value)
     assert f"Expected {expected_type}" in str(exc_info.value)
+
+
+def test_rejects_extension_that_is_no_mapping(tmp_compose: TmpComposeFixture) -> None:
+    compose_path = tmp_compose("""
+services:
+  my-service:
+    image: my-image
+x-inspect_k8s_sandbox: []
+""")
+
+    with pytest.raises(_converter.ComposeConverterError) as exc_info:
+        _converter.convert_compose_to_helm_values(compose_path)
+
+    assert "Invalid 'x-inspect_k8s_sandbox' type" in str(exc_info.value)
 
 
 def test_rejects_unsupported_extension_key(tmp_compose: TmpComposeFixture) -> None:
