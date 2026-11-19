@@ -71,7 +71,7 @@ def convert_compose_to_helm_values(compose_file: Path) -> dict[str, Any]:
     return result
 
 
-# shortcut: threads converting at once may each check it once, lock if that costs.
+# shortcut: threads converting at once may each check it once; a lock can hang a fork.
 @cache
 def _checked_compose_schema() -> dict[str, Any]:
     schema = json.loads(COMPOSE_SCHEMA_PATH.read_text())
