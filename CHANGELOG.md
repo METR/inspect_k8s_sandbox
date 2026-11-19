@@ -4,8 +4,8 @@
 
 - Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
   for; a chart with no other sandbox was refused as declaring none.
-- Fix a sandbox being handed over on a Pod that is being deleted. An install waits until
-  any Pod of the release that is being deleted has stopped.
+- Fix a sandbox being handed over on a Pod that is being deleted. An install waits
+  while any Pod of the release is being deleted and has not stopped.
 - Fix the install failing with "Could not read the rendered manifest from Helm" when
   one document of a manifest defines a YAML anchor twice.
 - **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
