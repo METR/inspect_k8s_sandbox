@@ -57,11 +57,12 @@
   running, execd sends SIGKILL to the command, to its process group and to the other
   processes it started that it can find, as far as it may signal each; one that has
   detached from the command can survive. Those of a command that has ended are left
-  running. What a command leaves running may write 1 MiB to each of the command's
-  stdout and stderr, and what that pipe then holds, before a write to it would block;
-  execd keeps such pipes for at most half of its open-file limit (512 in a Kata guest),
-  and past that it closes a further one: the next write to it raises SIGPIPE, or fails
-  with EPIPE where that signal is ignored. A command that ends execd, by
+  running. What a command leaves running may write 1 MiB in total to each of the
+  command's stdout and stderr, and what that pipe then holds; past that a write to it
+  blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
+  for at most half of its open-file limit (512 in a Kata guest), and past that it closes
+  a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
+  signal is ignored. A command that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()`,
   `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
   timeout passes first raises `TimeoutError`. Commands still running lose their

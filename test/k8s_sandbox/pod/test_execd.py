@@ -150,7 +150,7 @@ async def no_spin(
         yield
         return
     spun: list[str] = []
-    told: list[str] = []  # since the loop's last turn
+    told: list[str] = []  # since our last beat
     capture = request.config.pluginmanager.getplugin("capturemanager")
     with capture.global_and_fixture_disabled() if capture else contextlib.nullcontext():
         shown = os.dup(2)  # the run's own stderr: what pytest captures, an exit loses
@@ -158,10 +158,12 @@ async def no_spin(
     def end(*_: object) -> None:
         spun.append("the event loop gave this test's own timeouts no turn in 30 s")
         if told:  # nor since it failed for that: what the spin queued has the loop
-            said = f"{request.node.nodeid}: {spun[0]}, nor in the 15 s since\n"
-            os.write(shown, said.encode())
-            faulthandler.dump_traceback(file=shown)
-            os._exit(1)
+            try:
+                said = f"{request.node.nodeid}: {spun[0]}, nor in the 15 s since\n"
+                os.write(shown, said.encode())
+                faulthandler.dump_traceback(file=shown)
+            finally:  # also where nothing reads the run's stderr any more
+                os._exit(1)
         told.append(spun[0])
         pytest.fail(spun[0])  # in the task that spins: the test's end says it too
 
@@ -172,9 +174,16 @@ async def no_spin(
             told.clear()
             await asyncio.sleep(1)
 
+    class Prompt:
+        def pytest_enter_pdb(self) -> None:  # a debugger's prompt is no spin
+            if signal.getsignal(signal.SIGALRM) is end:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+
     was = signal.signal(signal.SIGALRM, end)
     beating = asyncio.ensure_future(beat())
+    request.config.pluginmanager.register(prompt := Prompt())
     yield
+    request.config.pluginmanager.unregister(prompt)
     beating.cancel()
     if signal.getsignal(signal.SIGALRM) is end:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1785,7 +1794,6 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     """Regression: our timer's KILL ended a command execd had started late."""
     connections = [0]
     got: list[int] = []
-    asked: list[tuple[asyncio.StreamWriter, int]] = []
 
     async def started_late(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         connections[0] += 1
@@ -1793,8 +1801,8 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
             kind, call_id, _ = await read_frame(r)
             got.append(kind)
             if kind == execd.PING:  # it answers: by its own count there is time
-                asked.append((w, call_id))
                 w.write(frame(execd.PONG, call_id))
+                w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))  # ends by itself
             elif kind == execd.KILL:  # as execd ends a command it is told to kill
                 w.write(frame(execd.EXIT, call_id, b'{"code": 137}'))
 
@@ -1804,13 +1812,10 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
     await until(lambda: starts_written(client) == 1)
     clock.now += 2000  # past our timer: the wait for execd's word begins
-    await until(lambda: bool(asked))  # execd has our timer's PING
-    w, call_id = asked[0]
-    w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))  # the command ends by itself
 
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
     await until(lambda: execd.RELEASE in got)  # the call's last frame
-    assert (result.returncode, connections[0]) == (7, 1)
+    assert (result.returncode, connections[0], execd.KILL in got) == (7, 1, False)
 
 
 @pytest.mark.parametrize("dropped", [False, True], ids=["its own", "a new one"])
@@ -1846,7 +1851,7 @@ async def test_a_command_execd_still_gives_time_has_its_stdin_past_our_timer(
     stdin = b"x" * (execd.STDIN_WINDOW + execd.CHUNK)
     call = asyncio.ensure_future(client.exec(["cat"], stdin, None, {}, None, 9))
     await until(lambda: took[0] == execd.STDIN_WINDOW)  # the rest waits for room
-    clock.now += 2000  # past our timer
+    clock.now += 10  # past our timer, and short of a write's 45 s: one may be in flight
 
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
     await until(lambda: execd.RELEASE in got)  # the call's last frame

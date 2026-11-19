@@ -748,7 +748,7 @@ class ExecdClient:
             ours = end if end < never else call.started + timeout + TIMER_LAG
             return max(0.0, ours - time.monotonic())
 
-        def ask() -> None:  # our timer has passed: execd is asked for its word
+        def ask() -> None:  # our timer has passed: execd's word is waited for
             nonlocal end
             end = time.monotonic() + KILL_WAIT
             # No KILL: execd's own timeout ends it. Not waited for.
@@ -929,7 +929,7 @@ class ExecdClient:
         out = {STDOUT: LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)}
         out[STDERR] = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
         status = None
-        asked = False  # our timer has passed: execd is asked for its word
+        asked = False  # our timer has passed: execd's word is waited for
         timeout = timeout or None  # 0 is none, as coreutils' `timeout 0` is
         run = self.run(cmd, env=env, cwd=cwd, user=user, stdin=data, timeout=timeout)
         async with contextlib.aclosing(run) as chunks:
