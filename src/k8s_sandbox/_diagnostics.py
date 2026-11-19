@@ -72,7 +72,9 @@ def _collect_diagnostics(
         if pod.metadata is None or pod.metadata.name is None:
             continue
         pod_names.add(pod.metadata.name)
-        if pod.metadata.deletion_timestamp:  # while it runs, the wait holds for it
+        # While it runs, the wait holds for it; once it has stopped, it does not.
+        stopped = getattr(pod.status, "phase", None) in ("Succeeded", "Failed")
+        if pod.metadata.deletion_timestamp and not stopped:
             lines.append(f"pod '{pod.metadata.name}': being deleted")
         if pod.status is None:
             continue
