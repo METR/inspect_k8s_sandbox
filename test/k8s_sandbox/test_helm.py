@@ -1354,11 +1354,10 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
         "kind: ConfigMap\nmetadata: {name: cm}\n",
         _stateful_set("default"),
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
-        "apiVersion: apps/v1\nkind: StatefulSetList\n"
-        "items: [{metadata: {name: helper}}]\n",
+        "apiVersion: v1\nkind: ConfigMapList\nitems: [{metadata: {name: helper}}]\n",
         # Helm installs nothing for a null document, nor for one whose `items` is null.
         "# a template that rendered this comment alone\n",
-        "kind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
+        "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
     )
 
     names = frozenset(_declared_object_names(_rendered_docs(stdout, "abcdefgh")))
@@ -1665,9 +1664,10 @@ def test_a_pod_being_deleted_holds_its_release_back_until_it_stops(
     ready = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
     sandbox = {"name": "p", "uid": "p", "labels": {_SERVICE_LABEL: "default"}}
     helper = {"name": "h", "uid": "h", "deletionTimestamp": "2026-11-18T00:00:00Z"}
+    gone = {"phase": stopped, "conditions": [{"type": "Ready", "status": "False"}]}
     items = [
         {"metadata": sandbox, "status": ready},
-        {"metadata": helper, "status": {"phase": stopped} if stopped else ready},
+        {"metadata": helper, "status": gone if stopped else ready},
     ]
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default"})
