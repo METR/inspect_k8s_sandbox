@@ -575,13 +575,14 @@ func TestASignalsLineFollowsWhatTheCommandWroteItself(t *testing.T) {
 	}
 }
 
-func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
+func TestACommandThatEndsByItselfAsItsTimerFiresIsTimedOutOnlyIfTheKillHadGoneAhead(t *testing.T) {
 	for _, end := range []struct {
-		code int
-		late bool // the timer's kill has found the command running, and the command ends before the kill reaches it
-	}{{3, false}, {137, false}, {137, true}} { // 137: a kill's exit code, from a command nothing killed
+		code  int
+		late  bool // the timer's kill has found the command running, and the command ends before the kill reaches it
+		ahead bool // the kill had seen it stopped by then, and gone ahead on what it left running: the exit says so, whatever its code
+	}{{3, false, false}, {137, false, false}, {137, true, false}, {7, true, true}} { // 137: a kill's exit code, from a command nothing killed
 		code := end.code
-		t.Run(strconv.Itoa(code)+", late "+strconv.FormatBool(end.late), func(t *testing.T) {
+		t.Run(strconv.Itoa(code)+", late "+strconv.FormatBool(end.late)+", ahead "+strconv.FormatBool(end.ahead), func(t *testing.T) {
 			var fire func()
 			afterFunc = func(_ time.Duration, f func()) *time.Timer {
 				fire = f
@@ -604,7 +605,11 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 			if end.late {
 				found, kill := make(chan struct{}), make(chan struct{})
 				var once sync.Once
-				hold := func(bool) { once.Do(func() { close(found); <-kill }) } // the kill waits here, holding the reaper's lock
+				hold := func(ahead bool) { // the kill waits here, holding the reaper's lock
+					if ahead == end.ahead {
+						once.Do(func() { close(found); <-kill })
+					}
+				}
 				beforeKill.Store(&hold)
 				noted = sync.OnceFunc(func() {
 					close(kill)
@@ -622,6 +627,7 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 				case <-time.After(30 * time.Second):
 					t.Fatal("the timer's kill never found the command running")
 				}
+				syscall.Kill(pid, syscall.SIGCONT) // stopped, where the kill has gone ahead: it runs on to its end
 			} else {
 				reaper.mu.Lock() // the command ends, and execd has yet to note it
 				t.Cleanup(noted)
@@ -650,8 +656,8 @@ func TestACommandThatEndsByItselfAsItsTimerFiresIsNotTimedOut(t *testing.T) {
 				return
 			}
 
-			if status := exitStatus(t, frames); status["code"] != float64(code) || status["timeout"] != nil {
-				t.Fatalf("EXIT %v, want code %d and no timeout", status, code)
+			if status := exitStatus(t, frames); status["code"] != float64(code) || (status["timeout"] == true) != end.ahead {
+				t.Fatalf("EXIT %v, want code %d and a timeout only where the kill had gone ahead (%v)", status, code, end.ahead)
 			}
 		})
 	}

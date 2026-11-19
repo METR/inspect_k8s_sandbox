@@ -4644,14 +4644,16 @@ async def test_a_file_write_stops_at_the_output_limit(
 
 
 @pytest.mark.parametrize("kind", [execd.STDERR, execd.STDOUT])
-async def test_a_command_stops_at_the_output_limit(
-    daemons: Daemons, monkeypatch: pytest.MonkeyPatch, kind: int
-) -> None:
-    monkeypatch.setattr(execd.limits, "MAX_EXEC_OUTPUT_SIZE", 1024)
+async def test_a_command_stops_at_the_output_limit(daemons: Daemons, kind: int) -> None:
+    full = b"x" * execd.ACK_EVERY
 
     async def chatters(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(kind, call_id, b"x" * 2048))  # past the limit, then done
+        for _ in range(execd.limits.MAX_EXEC_OUTPUT_SIZE // len(full)):
+            w.write(frame(kind, call_id, full))
+            while (await read_frame(r))[0] != execd.ACK:  # taken: the next may come
+                pass
+        w.write(frame(kind, call_id, b"x"))  # past the limit, then done
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         await r.read()
 
@@ -4914,23 +4916,24 @@ async def test_the_timeout_runs_from_the_start_of_the_command(
 async def test_a_command_times_out_while_its_daemon_is_restarted(
     daemons: Daemons, clock: types.SimpleNamespace, timers: None
 ) -> None:
-    client = daemons.client()
     first: asyncio.Server
     restarting = asyncio.Event()
 
-    async def stuck(replace: bool) -> execd.Daemon:
-        restarting.set()
+    async def start(replace: bool) -> execd.Daemon:
+        if daemons.unstarted:
+            return daemons.unstarted.pop(0)
+        restarting.set()  # the restart never finishes
         return await asyncio.get_running_loop().create_future()
 
     async def dies_after_start(
         r: asyncio.StreamReader, w: asyncio.StreamWriter
     ) -> None:
         await read_frame(r)  # START
-        client._start = stuck  # the restart never finishes
         first.close()
         w.close()
 
     first = await daemons.serve(dies_after_start)
+    client = execd.ExecdClient(start)
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, 9))
     await asyncio.wait_for(restarting.wait(), 30)  # only bounds a hang
     expired = clock.expired

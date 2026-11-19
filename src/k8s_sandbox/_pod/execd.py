@@ -467,17 +467,20 @@ class Link:
                 self._pinged.append(self._released)
                 self._released = []
 
-    def send_last(self, call_id: int, *kinds: int) -> None:
-        """Send a call's last empty frames in a task of their own: no caller waits."""
+    def send_last(
+        self, call_id: int, *kinds: int, payload: bytes = b""
+    ) -> asyncio.Task[None]:
+        """Send a call's frames in a task of their own, held until they are sent."""
 
         async def send() -> None:
             with contextlib.suppress(OSError):
                 for kind in kinds:
-                    await self.send(kind, call_id)
+                    await self.send(kind, call_id, payload)
 
         task = asyncio.create_task(send())
         self._last.add(task)
         task.add_done_callback(self._last.discard)
+        return task
 
     async def _read(self) -> None:
         reader = self.pipe
@@ -495,6 +498,9 @@ class Link:
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
                 c = self.calls.get(call_id)
+                if kind == EXIT and c is not None:
+                    c.exited = True
+                    c.stdin_room.set()  # a send waiting for room sees the exit
                 put = json.loads(payload)["stdin"] if kind == STDIN_ACK else 0
                 if kind == PONG and self._pinged:  # execd read what its PING followed
                     for released in self._pinged.pop(0):
@@ -533,9 +539,6 @@ class Link:
                         c.got[kind - STDOUT] += n
                     if kind == RESUMED:
                         c.resuming = False
-                    if kind == EXIT:  # as it is queued: who sees it set finds the exit
-                        c.exited = True
-                        c.stdin_room.set()  # a send waiting for room sees the exit
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
@@ -1156,15 +1159,8 @@ async def _taken(
     if sum(call.taken) - call.acked >= call.ack_every:
         call.acked = sum(call.taken)
         offsets = {"stdout": call.taken[0], "stderr": call.taken[1]}
-
-        async def send() -> None:
-            with contextlib.suppress(OSError):
-                await link.send(ACK, call.id, json.dumps(offsets).encode())
-
         # In a task of its own: out of time it is waited for no longer, and still goes.
-        ack = asyncio.create_task(send())
-        link._last.add(ack)
-        ack.add_done_callback(link._last.discard)
+        ack = link.send_last(call.id, ACK, payload=json.dumps(offsets).encode())
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(ack), within)
 
