@@ -244,7 +244,7 @@ keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
 launchers() { scan '^[^ ]*vsock-egress launch' 'echo looked'; }
-named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete, and the parent of the pod's worker, '$from', is none of them" ;; esac
+named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete: the parent of the pod's worker, '$from', is none of them, or the scan did not end" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
 owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
