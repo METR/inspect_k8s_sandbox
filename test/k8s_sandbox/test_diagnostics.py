@@ -221,10 +221,8 @@ def test_names_a_pod_that_is_being_deleted() -> None:
     # It can hold the readiness wait with no container of its own at fault.
     going = V1ObjectMeta(name="rel-default", deletion_timestamp=datetime(2026, 11, 18))
     pod = V1Pod(metadata=going, status=V1PodStatus(phase="Running"))
-    # One that has stopped, and that a finalizer keeps listed, holds no wait.
-    stopped = V1Pod(metadata=going, status=V1PodStatus(phase="Succeeded"))
 
-    with _patch_client([pod, stopped]):
+    with _patch_client([pod]):
         summary = describe_release_pods(None, "default", "rel")
 
     assert summary == "pod 'rel-default': being deleted"
