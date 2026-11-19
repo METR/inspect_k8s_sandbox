@@ -63,7 +63,8 @@
   it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
   for at most half of its open-file limit (512 in a Kata guest), and past that it closes
   a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
-  signal is ignored. A command that ends execd, by
+  signal is ignored. Both hold where execd holds the pipe's only read end. A command
+  that ends execd, by
   killing every process or taking the pod's last PID, makes each running `exec()`,
   `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
   timeout passes first raises `TimeoutError`. Commands still running lose their
