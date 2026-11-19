@@ -1002,6 +1002,11 @@ def _helm_number(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int | float 
     return node.value if math.isinf(value) else value
 
 
+def _helm_binary(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
+    """A scalar tagged `!!binary` as Helm's reader takes it: the text it encodes."""
+    return loader.construct_yaml_binary(node).decode(errors="replace")
+
+
 # YAML 1.2's null and booleans, Helm's numbers, and `<<` so that a `<<` key merges.
 _SCALAR_TAGS = {
     "tag:yaml.org,2002:null": r"null|Null|NULL|~|",
@@ -1028,6 +1033,10 @@ class _ManifestLoader(yaml.SafeLoader):
         "tag:yaml.org,2002:int": _helm_number,
         "tag:yaml.org,2002:float": _helm_number,
         "tag:yaml.org,2002:merge": yaml.SafeLoader.construct_yaml_str,
+        # And a sequence tagged `!!omap` or `!!pairs` as a sequence, `!!binary` as text.
+        "tag:yaml.org,2002:omap": yaml.SafeLoader.construct_yaml_seq,
+        "tag:yaml.org,2002:pairs": yaml.SafeLoader.construct_yaml_seq,
+        "tag:yaml.org,2002:binary": _helm_binary,
     }
 
     def compose_scalar_node(self, anchor: Any) -> yaml.ScalarNode:

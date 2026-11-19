@@ -1502,6 +1502,22 @@ def _services(stdout: str) -> frozenset[str]:
             {"a"},
             id="typed-list-wrapping-pods",
         ),
+        # Helm reads these three tags so: a list that held one failed the install.
+        pytest.param(
+            _manifest("kind: List\nitems: !!omap [" + _list_item("a") + "]"),
+            {"a"},
+            id="list-tagged-omap",
+        ),
+        pytest.param(
+            _manifest("kind: List\nitems: !!pairs [" + _list_item("a") + "]"),
+            {"a"},
+            id="list-tagged-pairs",
+        ),
+        pytest.param(
+            _manifest("kind: !!binary TGlzdA==\nitems: [" + _list_item("a") + "]"),
+            {"a"},
+            id="list-kind-tagged-binary",
+        ),
         # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
             _manifest(
