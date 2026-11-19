@@ -224,7 +224,7 @@ was=$(echo $(workers)); before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS"
 reborn() { local now; now=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}') && [ "${now% *}" != "$uid" ] && [ "${now#* }" = True ]; }
 dir_gone() { [ "$(peek "[ -e /vms/. ] && { [ -e /vms/$1 ] || echo gone; }")" = gone ]; } # not where the VM directories cannot be read at all
 moved() { # one new worker and no other, nor the old one unreaped: that has a process entry and no command line
-  seen=$(echo $(workers "awk '/^State/ && \$2 == \"Z\" {print \"$was:\" \$2}' /proc/$was/status 2>/dev/null; echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
+  seen=$(echo $(workers "awk '/^State/ && \$2 == \"Z\" {print \"$was:\" \$2}' /proc/$was/status 2>/dev/null || [ ! -e /proc/$was/status ] && echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
   [ "$seen" != "$now" ] && [ -n "$new" ] && [ "$new" != "$before" ]
 }
 if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
