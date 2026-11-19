@@ -4,6 +4,17 @@
 
 - Once a process has converted one Docker Compose file to Helm values, each further
   conversion takes about 60 to 100 ms less.
+- Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
+  for; a chart with no other sandbox was refused as declaring none.
+- Fix a sandbox being handed over on a Pod that is being deleted. An install waits
+  while any Pod of the release is being deleted and has not stopped.
+- Fix the install failing with "Could not read the rendered manifest from Helm" when
+  one document of a manifest defines a YAML anchor twice.
+- Fix a "Helm release did not become ready" error hiding the API error that its last
+  check of the Pods failed with: it is now that error's cause.
+- **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
+  declared only by Deployments or StatefulSets at `replicas: 0`, even if something would
+  scale one up later. Render each sandbox with at least one replica.
 - A sandbox is handed over as soon as its pods are ready, where it took up to 2 s.
   This needs the `watch` verb on Pods; without it a sandbox is handed over as before.
 - A pod annotated
