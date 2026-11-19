@@ -45,17 +45,25 @@ spec:
       {{- $egressProxy := include "agentEnv.egressProxy" (dict "root" $ "service" $service) }}
       {{- if $egressProxy }}
       {{- $_ := set $podAnnotations "inspect-k8s-sandbox/egress-proxy" $egressProxy }}
-      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- end }}
+      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
+      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
+      {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
+      {{- $noDnsVolume := $noCard }}
+      {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}
+      {{- range $service.volumes }}
+      {{- if not (kindIs "string" .) }}{{ if not (kindIs "string" (required (printf "services.%s has a volume with no name" $name) .name)) }}{{ fail (printf "services.%s has a volume named %s: quote the name" $name (toJson .name)) }}{{ end }}{{ if eq .name "coredns-config" }}{{ $noDnsVolume = false }}{{ end }}{{ else if eq (printf "%s-%s" (include "agentEnv.fullname" $) (split ":" .)._0) "coredns-config" }}{{ $noDnsVolume = false }}{{ end }}
+      {{- end }}
       {{- range concat (list $service) (default (list) $service.initContainers) (default (list) $.Values.extraContainers) }}
       {{- range .volumeMounts }}
-      {{- if eq .name "egress-forwarder-key" }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
-      {{- end }}
+      {{- if not (kindIs "string" (required (printf "a container of services.%s mounts a volume with no name" $name) .name)) }}{{ fail (printf "a container of services.%s mounts a volume named %s: quote the name" $name (toJson .name)) }}{{ end }}
+      {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
+      {{- if and $egressProxy (eq .name "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- if and $noDnsVolume (eq .name "coredns-config") }}{{ fail (printf "a container of services.%s mounts the volume coredns-config: that is the DNS sidecar's, and a pod with no network device runs none" $name) }}{{ end }}
       {{- end }}
       {{- end }}
       annotations:
         {{- include "agentEnv.toYaml" $podAnnotations | nindent 8 }}
-      {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
-      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
     spec:
       {{- /* "CLUSTER_DEFAULT" (magic string) prevents runtimeClassName being set. */}}
       {{- if ne $service.runtimeClassName "CLUSTER_DEFAULT" }}
@@ -101,7 +109,7 @@ spec:
           {{- $volumeName := (split ":" .)._0 }}
           {{- $_ := set $generated $volumeName (printf "%s-%s" (include "agentEnv.fullname" $) $volumeName) }}
         {{- else }}
-          {{- $volumeNames = append $volumeNames (toString .name) }}
+          {{- $volumeNames = append $volumeNames .name }}
         {{- end }}
       {{- end }}
       {{- range concat $volumeNames (values $generated) }}
@@ -167,7 +175,7 @@ spec:
           {{- with .volumeMounts }}
           volumeMounts:
           {{- range . }}
-            - {{- include "agentEnv.toYaml" (set (deepCopy .) "name" (get $generated (toString .name) | default .name)) | nindent 14 }}
+            - {{- include "agentEnv.toYaml" (set (deepCopy .) "name" (get $generated .name | default .name)) | nindent 14 }}
           {{- end }}
           {{- end }}
           {{- if .resources }}

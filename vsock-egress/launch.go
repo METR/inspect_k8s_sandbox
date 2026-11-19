@@ -23,7 +23,7 @@ import (
 const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
 
 // A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
-var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:[0-9]{1,5}$`)
+var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([0-9]{1,5})$`)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
 type node struct {
@@ -232,6 +232,7 @@ type launcher struct {
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]time.Time // when each sandbox without a worker was first seen so, or last in the log
 	had      map[string]bool      // sandboxes whose VM directory has been there
+	sees     bool                 // a record's network namespace has been there: only then does a missing one tell of a sandbox that has gone
 	started  map[string]bool      // sandboxes that have had a worker
 }
 
@@ -266,8 +267,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	wanted, present, vms := map[string]sandbox{}, map[string]bool{}, map[uint32]int{}
 	for _, r := range records {
-		if sb, err := l.sandbox(r); err == nil {
+		sb, err := l.sandbox(r)
+		if err == nil {
 			vms[sb.uid]++
+		}
+		if fi, err := os.Stat(sb.netns); err == nil && !fi.IsDir() { // a record that names no namespace names their directory
+			l.sees = true
 		}
 	}
 	for _, r := range records {
@@ -278,8 +283,8 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		sb, err := l.sandbox(r)
 		gone := errors.Is(err, os.ErrNotExist)
 		l.had[r.ContainerID] = l.had[r.ContainerID] || !gone
-		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0]) {
-			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port>", proxyAnnotation, sb.target)
+		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0] || !isPort(m[4])) {
+			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port from 1 to 65535>", proxyAnnotation, sb.target)
 		}
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
@@ -289,7 +294,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		case err == nil:
 			wanted[r.ContainerID] = sb
 		case gone && l.had[r.ContainerID]: // its sandbox is being deleted: the directory goes before the record does
-		case gone && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
+		case gone && l.sees && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
 		default:
 			l.fault(r.ContainerID, sb.pod, err)
 		}
@@ -302,6 +307,11 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		}
 	}
 	return wanted, nil
+}
+
+func isPort(digits string) bool {
+	port, err := strconv.ParseUint(digits, 10, 16)
+	return err == nil && port > 0
 }
 
 // fault writes why a sandbox has no worker once that has lasted faultAgain: a VM's directory follows its record, and is root's at first.
