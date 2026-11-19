@@ -19,7 +19,11 @@ from typing import IO, Any, cast
 
 import anyio
 from anyio.abc import ByteStream
-from inspect_ai.util import ExecResult, OutputLimitExceededError
+from inspect_ai.util import (
+    ExecResult,
+    OutputLimitExceededError,
+    SandboxUserUnsupportedError,
+)
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.client.exceptions import ApiException
 
@@ -911,14 +915,14 @@ class ExecdClient:
             )
         return result
 
-    async def write_file(self, data: bytes, dst: Path) -> None:
+    async def write_file(self, data: bytes, dst: Path, user: str | None = None) -> None:
         """Pod.write_file(), over execd: cat, which gets EOF here; the same errors."""
         script = (
             f"PATH={SYSTEM_PATH}; mkdir -p -- {shlex.quote(dst.parent.as_posix())} "
             f"&& cat > {shlex.quote(dst.as_posix())}"
         )
         stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = await self._file_op(["/bin/sh", "-c", script], data, None, stderr)
+        code = await self._file_op(["/bin/sh", "-c", script], data, None, stderr, user)
         if code != 0:
             said = str(stderr)  # once: 10 MiB of it holds the event loop 100 ms
             raise_for_known_read_write_errors(said)
@@ -928,10 +932,12 @@ class ExecdClient:
                 stderr=said,
             )
 
-    async def read_file(self, src: Path, dst: IO[bytes]) -> None:
+    async def read_file(
+        self, src: Path, dst: IO[bytes], user: str | None = None
+    ) -> None:
         """Pod.read_file(), over execd: the same command, limit and errors."""
         stderr = LimitedBuffer(limits.MAX_EXEC_OUTPUT_SIZE)
-        code = await self._file_op(read_command(src), None, dst, stderr)
+        code = await self._file_op(read_command(src), None, dst, stderr, user)
         if code != 0:
             said = str(stderr)  # once: 10 MiB of it holds the event loop 100 ms
             raise_for_known_read_write_errors(said)
@@ -948,17 +954,30 @@ class ExecdClient:
         stdin: bytes | None,
         dst: IO[bytes] | None,
         stderr: LimitedBuffer,
+        user: str | None = None,
     ) -> int:
         start = None if dst is None else dst.tell()
         unread = 0  # a write's stdout
-        run = self.run(cmd, env={}, cwd=None, user=None, stdin=stdin, timeout=None)
+        run = self.run(cmd, env={}, cwd=None, user=user, stdin=stdin, timeout=None)
         async with contextlib.aclosing(run) as chunks:
             async for kind, payload in chunks:
                 if kind == EXIT:
-                    if payload.get("error"):  # execd's: nothing ran to tell of the file
+                    error = payload.get("error", "")
+                    # execd's own words for a user it would not run as: no such user,
+                    # or it is not root. Or its launcher's, which could not take the
+                    # user's identity (no CAP_SETUID or CAP_SETGID).
+                    refused = error.startswith(("unknown user", "cannot run as")) or (
+                        payload["code"],
+                        str(stderr),
+                    ) == (126, "execd: operation not permitted\n")
+                    if user is not None and refused:
+                        raise SandboxUserUnsupportedError(
+                            f"The container cannot read or write files as user "
+                            f"'{user}'. Docs: {EXEC_USER_URL}\n{error or stderr}"
+                        )
+                    if error:  # execd's: nothing ran to tell of the file
                         raise PodError(
-                            "execd could not start the file operation.",
-                            error=payload["error"],
+                            "execd could not start the file operation.", error=error
                         )
                     return payload["code"]
                 if kind == STDERR:

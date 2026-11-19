@@ -172,11 +172,19 @@ class ExecuteOperation(PodOperation):
         )
         return stack, ws_client
 
-    def probe_switch(self, user: str) -> bool:
-        """Whether exec(user=...) can start `runuser` directly to run as `user`."""
+    def probe_switch(self, user: str) -> bool | None:
+        """Whether exec(user=...) can start `runuser` directly to run as `user`.
+
+        True if it can; False if the container already runs as them; None if it cannot
+        run as them. A root user, which only a file operation probes, is never switched
+        to: False if the container is uid 0, else None.
+        """
         quoted = shlex.quote(user)
         probe = (
-            f"if {_runs_as(user)}; then exit 0; fi; "
+            # A root user is uid 0 or nothing (see ROOT_USERS): runuser cannot help.
+            f"{_ROOT_CHECK}exit 0"
+            if user in ROOT_USERS
+            else f"if {_runs_as(user)}; then exit 0; fi; "
             f"if {_RUNUSER} -u {quoted} -- /bin/sh -c : 2>/dev/null; then exit 1; fi; "
             "exit 2"
         )
@@ -188,7 +196,9 @@ class ExecuteOperation(PodOperation):
                 pod=self._pod.name,
                 returncode=returncode,
             )
-        return returncode == 1
+        if user in ROOT_USERS:
+            return False if returncode == 0 else None
+        return {0: False, 1: True}.get(returncode)
 
     def run_argv(self, cmd: list[str]) -> tuple[int, bytes, bytes]:
         """Run `cmd` with nothing on its stdin; return its status, stdout and stderr."""

@@ -8,7 +8,7 @@ from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 from websocket import WebSocketException
 
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
-from k8s_sandbox._pod.execute import STREAM_END_GRACE_SECONDS
+from k8s_sandbox._pod.execute import STREAM_END_GRACE_SECONDS, _shell_command
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
@@ -36,8 +36,10 @@ def write_command(dst: Path, file_size: int) -> list[str]:
 
 
 class WriteFileOperation(PodOperation):
-    def write_file(self, data: bytes, dst: Path) -> None:
-        with self._start_write_command(dst, len(data)) as ws_client:
+    def write_file(
+        self, data: bytes, dst: Path, user: str | None = None, switch: bool = False
+    ) -> None:
+        with self._start_write_command(dst, len(data), user, switch) as ws_client:
             try:
                 self._write_stdin_chunked(ws_client, data)
             except (OSError, WebSocketException) as e:
@@ -50,10 +52,11 @@ class WriteFileOperation(PodOperation):
 
     @contextmanager
     def _start_write_command(
-        self, dst: Path, file_size: int
+        self, dst: Path, file_size: int, user: str | None = None, switch: bool = False
     ) -> Generator[WSClient, None, None]:
         yield from self.create_websocket_client_for_exec(
-            command=write_command(dst, file_size),
+            # As `user`, switched to as exec() does: directories and file are theirs.
+            command=_shell_command(user, switch, write_command(dst, file_size)),
             stderr=True,
             stdin=True,
             stdout=True,
