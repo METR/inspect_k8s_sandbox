@@ -106,16 +106,14 @@ def test_converting_again_does_not_check_compose_schema(
     resources: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     compose_path = tmp_path / "again-compose.yaml"
-    compose_path.write_text("services:\n  again:\n    image: my-image\n")
+    compose_path.write_text("version: 3.8\nservices:\n  again:\n    image: my-image\n")
     _converter.convert_compose_to_helm_values(resources / "compose.yaml")
-    # No file to load again, and a title that fails the schema check but no validation.
+    # No file to reload; only the kept schema takes that version, and it fails a check.
     monkeypatch.setattr(_converter, "COMPOSE_SCHEMA_PATH", tmp_path / "gone.json")
-    monkeypatch.setitem(_converter._checked_compose_schema(), "title", 12)
+    kept_properties = _converter._checked_compose_schema()["properties"]
+    monkeypatch.setitem(kept_properties, "version", {"title": 12})
 
     _converter.convert_compose_to_helm_values(compose_path)
-
-    # A loader that parses kept text again gets this far, and returns the file's title.
-    assert _converter._checked_compose_schema()["title"] == 12
 
 
 ### Top level elements
