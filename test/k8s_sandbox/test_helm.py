@@ -1940,7 +1940,7 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
     # A pod that fails with no deletion, as one evicted does, is replaced after it too.
     [("Succeeded", True), ("Failed", True), ("Failed", False)],
 )
-async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_deleted(
+async def test_wait_until_ready_is_woken_by_a_completed_pod_not_a_failed_or_deleted_one(
     phase: str,
     deleted: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -1958,6 +1958,8 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
     if deleted:
         going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
     completed = {"phase": "Succeeded"}
+    # Kubernetes' pod GC marks a lost node's pod Failed and leaves its Ready condition.
+    stopped = {"phase": phase, "conditions": [{"type": "Ready", "status": "True"}]}
 
     def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
         (woken if polled.is_set() else polled).set()
@@ -1965,7 +1967,7 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
 
     def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
         polled.wait(30)
-        yield snapshot._parse_pod({"metadata": going, "status": {"phase": phase}})
+        yield snapshot._parse_pod({"metadata": going, "status": stopped})
         judged.set()
         again.wait(30)
         yield snapshot._parse_pod({"metadata": done, "status": completed})
