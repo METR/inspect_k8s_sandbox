@@ -1447,6 +1447,7 @@ def _services(stdout: str) -> frozenset[str]:
             {"default"},
             id="daemon-set-with-replicas",
         ),
+        # A kind the reader does not know is waited for: it may not scale by `replicas`.
         pytest.param(
             _manifest(_stateful_set(replicas=0).replace("StatefulSet", "BroadcastJob")),
             {"default"},

@@ -6,8 +6,8 @@
   for; a chart with no other sandbox was refused as declaring none.
 - Fix a sandbox being handed over on a Pod that is being deleted. An install waits until
   any Pod of the release that is being deleted has stopped.
-- Fix the install failing with "Could not read the rendered manifest from Helm" when a
-  manifest defines a YAML anchor twice.
+- Fix the install failing with "Could not read the rendered manifest from Helm" when
+  one document of a manifest defines a YAML anchor twice.
 - **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
   declared only by Deployments or StatefulSets at `replicas: 0`, even if something would
   scale one up later. Render each sandbox with at least one replica.
