@@ -2343,8 +2343,8 @@ async def test_an_exit_read_with_the_end_of_execds_session_is_kept(
 
 @pytest.mark.parametrize(
     ("waits", "late", "cost", "kept"),
-    [(0, 0.015, 0, 2), (17, 0, 0, 1), (0, 16, 0.015, 2)],
-    ids=["a PONG", "its PING waits", "our loop held"],
+    [(0, 7, 0, 2), (17, 0, 0, 1), (0, 16, 0.015, 2), (0, 90, 0.015, 2)],
+    ids=["a PONG", "its PING waits", "our loop held", "held long"],
 )
 async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     daemons: Daemons,
@@ -2384,7 +2384,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
 
     async def hold() -> None:
         await until(lambda: link.closed or clock.sleeps > ended[0])  # it sleeps
-        clock.now += late  # that sleep ends 15 ms late, or 16 s: our loop held
+        clock.now += late  # that sleep ends 7 s late; or 16 s, or 90: our loop held
 
     async def intervals(more: int) -> None:
         for _ in range(more):
@@ -2398,7 +2398,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
 
     async def comes(sent: bytes) -> None:  # a frame of execd's, read at once
         started[0][0].write(sent)
-        await until(lambda: link._last_rx == clock.now)
+        await until(lambda: link.closed or link._last_rx == clock.now)
 
     if waits:  # Regression: a PING's 17 s behind another call's write were no silence.
         await link._wlock.acquire()
