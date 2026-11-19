@@ -242,7 +242,7 @@ func refused(at string) {
 			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ended"}, os.Environ())
 		}
 		if strings.HasSuffix(at, " back") { // of no process: only the user's identity is taken, and given back
-			killAs(1<<30, &syscall.Credential{Uid: 65534, Gid: 65534})
+			signalAs(&syscall.Credential{Uid: 65534, Gid: 65534}, 1<<30, syscall.SIGKILL)
 		}
 		setids(uint32(os.Getuid()), uint32(os.Getgid()))
 	}

@@ -139,7 +139,9 @@ class Pod:
         self._execd_lost = False
         self._execd_started = time.monotonic()
         stdio = self._execd_stdio if self._execd_by_stdio else None
-        return Daemon(pod.ip, said[1].decode(), key, pod.uid, stdio)
+        # Where PIDs are shared, the container execd names is the pod's: none is named.
+        container = b"" if pod.shares_pids else said[2]
+        return Daemon(pod.ip, said[1].decode(), key, pod.uid, stdio, container)
 
     async def _execd_stdio(self) -> PodStdio:
         """An exec whose stdin and stdout are joined to the daemon's socket."""
@@ -261,8 +263,8 @@ class Pod:
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
             elapsed. This is enforced by the `timeout` command on the pod: processes
             that cmd started can survive it. On a pod with execd, cmd and the processes
-            it started that execd finds and may signal get SIGKILL instead; one that
-            has detached from cmd can survive.
+            it started that execd finds and may signal get SIGTERM, and what still runs
+            5 seconds later gets SIGKILL; one that has detached from cmd can survive.
         """
         if (execd := self._execd) is not None:
             return await self._over_execd(

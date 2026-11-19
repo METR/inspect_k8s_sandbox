@@ -91,7 +91,8 @@ RECONNECT_FOR = 300.0
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
-KILL_WAIT = 10.0  # for execd's word on a call our timer has passed: then we kill
+# For execd's word on a call past our timer, its SIGTERM's 5 s with it: then we kill.
+KILL_WAIT = 15.0
 TIMER_LAG = 1.0  # ours follows execd's own, which counts from the command's start
 
 
@@ -105,6 +106,7 @@ class Daemon:
     pod: str = ""  # the pod's UID
     # Opens an exec joined to the daemon's socket, for a pod with no network card.
     stdio: Callable[[], Awaitable[ByteStream]] | None = None
+    container: bytes = b""  # execd's name for the container it started in
 
 
 class Dropped(Exception):
@@ -748,6 +750,9 @@ class ExecdClient:
             ours = end if end < never else call.started + timeout + TIMER_LAG
             return max(0.0, ours - time.monotonic())
 
+        def due() -> bool:  # its time is up as execd counts it: our timer follows
+            return timeout is not None and time.monotonic() >= call.started + timeout
+
         def ask() -> None:  # our timer has passed: execd's word is waited for
             nonlocal end
             end = time.monotonic() + KILL_WAIT
@@ -782,20 +787,24 @@ class ExecdClient:
                             break  # with a word that came, once more to take it
                         continue
                     if isinstance(item, Dropped):
-                        if item.args != (link,):  # a connection the call has left since
+                        if item.args[:1] != (link,):  # one the call has left since
                             continue
                         sender.cancel()
                         link.calls.pop(call.id, None)
+                        # Up as it dropped, or not: a restart's seconds are not its own.
+                        up = item.args[1:] or (due(),)
                         # No shield: _get waits without cancelling the shared reopen.
                         try:
                             link = await asyncio.wait_for(self._get(stale=link), left())
-                            self._resume(link, call)
+                            if self._resume(link, call, *up):
+                                break  # out of time when its execd was killed
                         except Exception as e:
                             if end < never:  # execd out of reach: our timer's word
                                 break
                             if not isinstance(e, asyncio.TimeoutError):
                                 raise
-                            call.queue.put_nowait(item)  # asked again past our timer
+                            # Asked again past our timer.
+                            call.queue.put_nowait(Dropped(link, *up))
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item
@@ -893,12 +902,20 @@ class ExecdClient:
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
-    def _resume(self, link: Link, call: Call) -> None:
-        """Ask execd, over a new connection, to send the call on from what we have."""
-        if link.daemon is not call.daemon:
-            raise ExecdStoppedError(
-                "execd stopped while it ran the command", pod=call.daemon.ip
-            )
+    def _resume(self, link: Link, call: Call, late: bool) -> bool:
+        """Resume the call on a new connection; True if late and execd was killed."""
+        new, old = link.daemon, call.daemon
+        if new is not old:
+            here = (new.pod, new.container) == (old.pod, old.container)
+            named = old.container not in (b"", b"unknown")  # execd's word for none
+            if not named or not here:
+                raise ExecdStoppedError(
+                    "execd stopped while it ran the command", pod=old.ip
+                )
+            log_warn("execd was killed: started again", pod=old.ip)
+            # Killed with it, or left: as Kubernetes exec ends one, unless out of time.
+            call.queue.put_nowait((EXIT, b'{"code": 137}'))
+            return late
         link.calls[call.id] = call
         at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
         call.resuming = True  # before the RESUMED can arrive
@@ -914,6 +931,7 @@ class ExecdClient:
         link._last.add(task)
         task.add_done_callback(link._last.discard)
         log_warn("execd connection lost: resuming", pod=call.daemon.ip)
+        return False
 
     async def exec(
         self,
@@ -951,15 +969,15 @@ class ExecdClient:
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(out[STDOUT]) + str(out[STDERR]),
             )
-        if status is None or timed_out:
-            raise TimeoutError(f"Command timed out after {timeout}s.")
-        code = status["code"]
+        code = 124 if status is None or timed_out else status["code"]  # `timeout`'s
         result = ExecResult(
             success=code == 0,
             returncode=code,
             stdout=str(out[STDOUT]),
             stderr=str(out[STDERR]),
         )
+        if status is None or timed_out:  # with what it wrote, as over Kubernetes exec
+            raise TimeoutError(f"Command timed out after {timeout}s. {result}")
         if code == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
         error = status.get("error", "")  # execd's, only if the command never started

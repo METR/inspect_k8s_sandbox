@@ -321,7 +321,7 @@ func TestAStreamsCommandIsKilledWhenItsConnectionDrops(t *testing.T) {
 
 	s.detach(c)
 
-	if code := exitCode(t, cl); code != 137 || s.get(36) != nil {
+	if code := exitCode(t, cl); code != 143 || s.get(36) != nil {
 		t.Fatalf("exit %d, still held %v: nothing resumes a stream, so its command would run on unseen", code, s.get(36) != nil)
 	}
 }
@@ -693,7 +693,9 @@ func TestATimeoutKillsACommandWhoseOutputWaitsOnAStalledConnection(t *testing.T)
 		}
 	}
 
-	go timeout()
+	var killed sync.WaitGroup
+	killed.Go(timeout)
+	defer killed.Wait() // back before the test's timers are put back: the kill starts its grace by one
 
 	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		written, _ := os.ReadFile(pidFile)
@@ -1327,7 +1329,130 @@ func dumpable() bool {
 // endAsNobody kills what a failed test left of that user's: without CAP_KILL root's own signal reaches none of it.
 func endAsNobody(pids ...int) {
 	for _, pid := range pids {
-		killAs(pid, &syscall.Credential{Uid: 65534, Gid: 65534})
+		signalAs(&syscall.Credential{Uid: 65534, Gid: 65534}, pid, syscall.SIGKILL)
+		signalAs(&syscall.Credential{Uid: 65534, Gid: 65534}, -pid, syscall.SIGKILL)
+	}
+}
+
+func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil, nil) } // what a test left carrying a tag
+
+// graced has each kill's grace, timeout(1)'s -k 5s over Kubernetes exec, last until the test ends it; end says how many it ended.
+func graced(t *testing.T) (end func() int) {
+	up, kept := make(chan func(), 64), afterFunc
+	afterFunc = func(d time.Duration, f func()) *time.Timer {
+		if d != 5*time.Second {
+			return kept(d, f)
+		}
+		up <- f
+		return nil
+	}
+	end = func() (n int) {
+		for ; len(up) > 0; n++ {
+			(<-up)()
+		}
+		return n
+	}
+	t.Cleanup(func() { end(); afterFunc = kept }) // one the test left open: its kill ends with the test
+	return end
+}
+
+// ready starts a command under a tag of the run's own, which the last run's kill is not searching by, and takes its first frame.
+func ready(t *testing.T, argv ...string) (s *server, c *conn, frames <-chan frame, tag string) {
+	tag = strconv.FormatInt(time.Now().UnixNano(), 36)
+	s, _ = newServer(strings.Repeat("00", 32))
+	c, frames = recordedConn(t)
+	s.authenticated(c)
+	t.Cleanup(func() { killTagged(tag) })
+	req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, Tag: tag})
+	s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
+	nextFrame(t, frames)
+	return s, c, frames, tag
+}
+
+// said is what a command goes on to print, until that is enough.
+func said(t *testing.T, frames <-chan frame, enough func(string) bool) (out string) {
+	for !enough(out) {
+		if f := nextFrame(t, frames); f.kind == fStdout {
+			out += string(f.payload)
+		}
+	}
+	return out
+}
+
+// until waits for a condition; its budget only bounds a hang.
+func until(t *testing.T, what string, met func() bool) {
+	for deadline := time.Now().Add(30 * time.Second); !met(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+	}
+}
+
+func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) {
+	end := graced(t)
+	// It counts each SIGTERM it takes and runs on; with no tag of the call's, only the kill of the command itself ends it.
+	s, c, frames, _ := ready(t, "env", "-i", "/bin/sh", "-c", `trap 'echo x' TERM; echo ready; while :; do echo .; sleep 0.01; done`)
+	on := func(out string) bool { return strings.Count(out[strings.LastIndex(out, "x")+1:], ".") >= 3 }
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	said(t, frames, func(out string) bool { return strings.Contains(out, "x") && on(out) })
+	s.dispatch(c, frame{kind: fKill, id: 80}) // as its client's, behind its timeout's
+	if out := said(t, frames, on); strings.Contains(out, "x") {
+		t.Fatalf("a second kill sent a second SIGTERM, which cuts short what the first began: %q", out)
+	}
+	if n, status := end(), exitStatus(t, frames); n != 1 || status["code"] != 137.0 {
+		t.Fatalf("%d timers of 5 s, EXIT %v: want one, and the SIGKILL of a command that ran on to its grace's end", n, status)
+	}
+}
+
+func TestAKillsSearchByTagSendsSigtermOnceAndWhenTheGraceIsUpSigkill(t *testing.T) {
+	end := graced(t)
+	script := filepath.Join(t.TempDir(), "helper") // which the command's handler starts: it counts its SIGTERMs too
+	os.WriteFile(script, []byte(`trap 'echo y' TERM; echo h; while :; do echo .; sleep 0.01; done`), 0o644)
+	// In a session of its own, its parent gone, only the tag leads to the first: it notes its id at its SIGTERM, and runs on.
+	detached := `(setsid sh -c 'trap "echo \$\$ >\"$0.noted\"" TERM; echo ready; while :; do sleep 0.01; done' "$0" &); `
+	s, c, frames, tag := ready(t, "sh", "-c", `trap 'echo x; /bin/sh "$0" & wait' TERM; `+detached+`while :; do sleep 0.01; done`, script)
+	seen := ""
+	held := func(of, environ string) (*os.File, error) { // the search reads on once the handler's helper runs, as a slow one would
+		for of == tag && !strings.Contains(seen, "h") {
+			seen += said(t, frames, func(out string) bool { return out != "" })
+		}
+		return os.Open(environ)
+	}
+	openEnviron.Store(&held)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+	s.dispatch(c, frame{kind: fKill, id: 80}) // back once its search is done
+	out := seen + said(t, frames, func(out string) bool { return strings.Count(out, ".") >= 3 })
+	if strings.Count(out, "x") != 1 || strings.Contains(out, "y") {
+		t.Fatalf("the command and its handler's helper said %q: want one SIGTERM for the command and none for the helper", out)
+	}
+	noted := func() int {
+		id, _ := os.ReadFile(script + ".noted")
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(id)))
+		return pid
+	}
+	until(t, "what only the call's tag leads to got no SIGTERM", func() bool { return noted() != 0 && syscall.Kill(noted(), 0) == nil })
+	end()
+	until(t, "what only the call's tag leads to outlived the kill's grace", func() bool { f := stat(noted()); return len(f) == 0 || strings.Contains("ZX", f[0]) })
+}
+
+func TestWhatAHandlerLeavesInTheCommandsGroupIsKilledWhenTheGraceIsUpAndTheExitWaitsForIt(t *testing.T) {
+	end := graced(t)
+	// At its SIGTERM it leaves one that ignores it, with no tag and none of its output, says its id and ends: only its group leads there.
+	left := `trap '(trap "" TERM; exec sleep 600) >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`
+	s, c, frames, _ := ready(t, "env", "-i", "/bin/sh", "-c", left)
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	straggler, _ := strconv.Atoi(strings.TrimSpace(said(t, frames, func(out string) bool { return strings.HasSuffix(out, "\n") })))
+	until(t, "the command did not end at its SIGTERM", func() bool { cl := s.get(80); cl.kmu.Lock(); defer cl.kmu.Unlock(); return cl.pid == 0 })
+	// Another call runs meanwhile, from its START to its EXIT: an exit that did not wait would have come by then.
+	other, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "other"})
+	s.dispatch(c, frame{kind: fStart, id: 81, payload: other})
+	if f := awaited(t, frames, fExit, time.Now().Add(30*time.Second)); f.id != 81 {
+		t.Fatal("the killed call's exit did not wait for what its handler left running")
+	}
+	end()
+	exitStatus(t, frames)
+	if f := stat(straggler); len(f) > 0 && !strings.Contains("ZX", f[0]) { // the exit waited for its end: a zombie, or one being reaped
+		t.Fatalf("what the command's handler left in its group outlived the kill's grace, in state %s", f[0])
 	}
 }
 
@@ -1578,6 +1703,7 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesAChildThatLeftTheGroupAn
 }
 
 func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
+	end := graced(t)
 	prctl(prSetChildSubreaper, 1) // as execd: what the kill ends is reaped here
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
 	// Fewer descriptors than it has processes to kill: a kill that keeps one for each runs out.
@@ -1591,8 +1717,8 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 	s.authenticated(c)
 	this, _ := os.Executable()
 	// In the middle of starting 3,000 processes, each out of the group and with no tag: more than eight listings take.
-	starting := `i=0; while [ $i -lt 3000 ]; do env -i setsid sleep "$0" & i=$((i+1)); done; wait`
-	for id := uint64(60); id < 72; id++ { // a kill that lists them once, or lets their starter run on, leaves one in most
+	starting := `trap "" TERM; i=0; while [ $i -lt 3000 ]; do env -i setsid sleep "$0" & i=$((i+1)); done; wait` // deaf to SIGTERM: the SIGKILL of a grace's end must reach each
+	for id := uint64(60); id < 72; id++ {                                                                        // a kill that lists them once, or lets their starter run on, leaves one in most
 		mark := "600." + strconv.Itoa(int(id))
 		argv := []string{"sh", "-c", starting, mark} // the command starts them itself
 		switch id % 4 {
@@ -1603,8 +1729,8 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 		case 3: // or its child does, for longer than a kill waits for a process to stop
 			argv = []string{"sh", "-c", `setsid sh -c "$1" "$0" & wait`, mark, strings.Replace(starting, "&", "& sleep 0.001;", 1)}
 		}
-		req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, Tag: "starting"})
-		live := func() (pids []int) { // what it started, and itself, by their last argument
+		req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, Tag: "starting" + mark}) // its own: the last one's kill may still be searching by its tag
+		live := func() (pids []int) {                                                                      // what it started, and itself, by their last argument
 			entries, _ := os.ReadDir("/proc")
 			for _, e := range entries {
 				cmdline, _ := os.ReadFile("/proc/" + e.Name() + "/cmdline")
@@ -1627,6 +1753,7 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 		}
 
 		s.dispatch(c, frame{kind: fKill, id: id})
+		end()
 
 		for deadline := time.Now().Add(30 * time.Second); len(live()) > 0; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
@@ -2490,12 +2617,17 @@ func TestAKillThatFindsItsCommandRunningLeavesWhatItLeftRunningIfItEndsFirst(t *
 }
 
 func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
+	user := ""
+	if os.Getuid() == 0 { // as one root's own SIGSTOP does not reach without CAP_KILL, as in CI's second job
+		user = "65534"
+	}
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "read x; exit 3"}, Env: map[string]string{}, Stdin: true, Tag: tag})
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", "echo up; read x; exit 3"}, Env: map[string]string{}, Stdin: true, User: user, Tag: tag})
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	s.dispatch(c, frame{kind: fStart, id: 37, payload: req})
+	awaited(t, frames, fStdout, time.Now().Add(30*time.Second)) // it runs as its user: its launcher is still root's to stop
 	cl := s.get(37)
 	cl.kmu.Lock()
 	pid := cl.pid
@@ -2526,7 +2658,7 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 
 	letGo()
 
-	if status := exitStatus(t, frames); status["code"] != 137.0 {
+	if status := exitStatus(t, frames); status["code"] != 143.0 {
 		t.Fatalf("EXIT %v: the command ended by itself after the kill's last look, and the kill went on to end what it left running", status)
 	}
 }
@@ -2556,7 +2688,7 @@ func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the kill waits for ever to hear that its command has stopped, and never kills it")
 	}
-	if status := exitStatus(t, frames); status["code"] != 137.0 {
+	if status := exitStatus(t, frames); status["code"] != 143.0 {
 		t.Fatalf("EXIT %v: the kill did not go ahead", status)
 	}
 }
@@ -2572,7 +2704,7 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	s.start(first, frame{kind: fStart, id: 23, payload: req})
 	s.detach(first)
 	timers[0]() // six minutes with no client
-	if code := exitCode(t, s.get(23)); code != 137 {
+	if code := exitCode(t, s.get(23)); code != 143 {
 		t.Fatalf("exit %d: an abandoned call is killed", code)
 	}
 	late, frames := recordedConn(t)

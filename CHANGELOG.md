@@ -81,10 +81,14 @@
   PAM limits say, and may raise it to the hard limit. If a symbolic link on the path to
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
-  status 1 once that directory is gone. On a timed-out `exec()` whose command is still
-  running, execd sends SIGKILL to the command, to its process group and to the other
-  processes it started that it can find, as far as it may signal each; one that has
-  detached from the command can survive. Those of a command that has ended are left
+  status 1 once that directory is gone. On a timed-out or cancelled `exec()` whose
+  command is still running, execd sends SIGTERM, and 5 seconds later SIGKILL to what
+  has not ended: to the command, to its process group and to the other processes it
+  started that it can find, as far as it may signal each; one that has detached from
+  the command can survive, and so can one the command was starting as its SIGTERM
+  came. A timed-out `exec()` raises `TimeoutError`, with what the command wrote, once
+  the command, its process group and the processes under it have ended, up to about
+  6 seconds after its timeout. Those of a command that has ended are left
   running. Once execd has stopped reading a command's output, 100 ms after the command
   ended at the earliest, what it left running may write 1 MiB more in total to each of
   the command's stdout and stderr, plus that pipe's free space; past that a write to
@@ -92,11 +96,12 @@
   for at most half of its open-file limit (512 in a Kata guest), and past that it closes
   a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
   signal is ignored. Both hold where execd holds the pipe's only read end. A command
-  that ends execd, by
-  killing every process or taking the pod's last PID, makes each running `exec()`,
-  `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
-  timeout passes first raises `TimeoutError`. Commands still running lose their
-  timeout and get end-of-file on `stdin`.
+  that ends execd, by killing every process or taking the pod's last PID, ends each
+  running `exec()` as a killed command, with status 137 and the output so far, or with
+  `TimeoutError` if its timeout had passed; a running `read_file()` or `write_file()`
+  is run again. Where the pod sets `shareProcessNamespace` or `hostPID`, they raise
+  `ExecResultUnknownError` instead. Commands still running lose their timeout and get
+  end-of-file on `stdin`.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
