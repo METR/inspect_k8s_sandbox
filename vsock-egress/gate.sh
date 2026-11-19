@@ -1,5 +1,6 @@
 #!/bin/bash
 # The gate for egress over the vsock: real traffic from a sandbox with no network card to its egress proxy, under the seccomp profiles the nodes hold.
+# Its rule: every step fails closed. A read that fails, is killed or is cut short fails its step, so a scan says `looked` only after every read in it ended.
 usage() {
   cat >&2 <<'EOF'
 usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
@@ -41,7 +42,7 @@ say() { echo "== $(date -u +%T) $*"; }
 pass() { echo "   PASS  $*"; }
 fail() { echo "   FAIL  $*"; failed=1; }
 in_sandbox() { k -n "$NS" exec "$SANDBOX" -c default -- "$@"; }
-peek() { k -n "$NS" exec "$REL-peek" -- sh -c "$1"; }
+peek() { k -n "$NS" exec "$REL-peek" -- sh -c "set -o pipefail; $1"; }
 launcher() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node,status.phase=Running" -o jsonpath='{.items[0].metadata.name}'; }
 keep() { [ "$failed" = 0 ] || [ "${KEEP:-}" != 1 ] || { echo; echo "GATE FAILED $(date -u +%FT%TZ) on $NODE: with KEEP=1 it ends before $*"; exit 1; }; }
 wait_for() { # wait_for SECONDS COMMAND...: until the command succeeds
@@ -78,7 +79,8 @@ node=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.spec.nodeName}')
 selector=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{range .spec.selector.matchLabels}{end}{.spec.selector.matchLabels}' | python3 -c 'import json,sys; print(",".join(f"{k}={v}" for k, v in json.load(sys.stdin).items()))')
 [ -n "$selector" ] || { fail "no labels select the launchers: DaemonSet $LAUNCHERS was not read, or has no matchLabels"; exit 1; }
 echo "   node $node; launcher $(launcher); annotations: $(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.annotations.sandbox\.amazonaws\.com/network-isolated} {.metadata.annotations.inspect-k8s-sandbox/egress-proxy}')"
-[ "$(in_sandbox sh -c 'ls /sys/class/net | grep -vc -e "^lo$" -e "^dummy"; true')" = 0 ] && pass "the guest has no network device" || fail "the guest has a network device: $(in_sandbox ls /sys/class/net | tr '\n' ' ')"
+nics=$(in_sandbox sh -c 'ls /sys/class/net && echo looked' | grep -v -e '^lo$' -e '^dummy' | tr '\n' ' ')
+[ "$nics" = "looked " ] && pass "the guest has no network device" || fail "the guest has a network device, or did not list them all: '$nics'"
 k -n "$NS" get pod "$SANDBOX" -o jsonpath='{range .spec.initContainers[*]}{.name}={.securityContext.seccompProfile}{"\n"}{end}' | grep -q 'egress-forwarder=.*"localhostProfile":"profiles/vsock-egress.json"' \
   && pass "the forwarder runs under the node's profile profiles/vsock-egress.json" || fail "the forwarder is not under profiles/vsock-egress.json"
 k -n "$LNS" get pod "$(launcher)" -o jsonpath='{.spec.containers[0].securityContext}' | grep -q '"localhostProfile":"profiles/vsock-egress-launcher.json"' \
@@ -95,8 +97,9 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
-workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^/vsock-egress work .*'"$NS/$SANDBOX"'" && echo ${p#/proc/}; done; '"${1:-true}" | tr '\n' ' '; }
-# The node says `looked` after naming every worker: an answer cut short does not.
+# scan RE [THEN]: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, and the scan met its own shell.
+scan() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p/cmdline ] || exit; [ $p = /proc/$$ ] && me=1; done; [ -n "$me" ] && { '"${2:-true}"'; }' | tr '\n' ' '; }
+workers() { scan "^/vsock-egress work .*$NS/$SANDBOX" "$@"; }
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
   && pass "one worker for the pod on its node: pid $worker, uid $uid, CapEff $caps" \
@@ -232,7 +235,7 @@ if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod 
   # A launcher that ended instead would have taken every worker on the node with it, and its successor would start this one too.
   wait_for 60 moved && vm=$new && dir_gone "$before" && [ "$(by "$now")" = "$from" ] \
     && pass "worker $was and VM directory $before went with the pod; the pod that followed has worker $now and VM directory $vm, from the same launcher (pid $from)" \
-    || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was', named again as '$was:Z' if it ended and was not reaped) at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
+    || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was', named again as '$was:Z' if it ended and was not reaped; with no looked, a read of the node did not end) at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
 else
   fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
 fi
@@ -240,8 +243,7 @@ fi
 keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
-# `looked` only after a scan that ended: pgrep exits 0 or 1 for one, and a scan cut short names no launcher either.
-launchers() { peek "pgrep -f '^[^ ]*vsock-egress launch'; [ \$? -le 1 ] && echo looked" | tr '\n' ' '; }
+launchers() { scan '^[^ ]*vsock-egress launch' 'echo looked'; }
 named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete, and the parent of the pod's worker, '$from', is none of them" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
