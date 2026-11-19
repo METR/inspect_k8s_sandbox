@@ -561,6 +561,8 @@ class Link:
             except OSError:
                 await self.close()
                 return
+            if self._last_rx != last:  # read as the PING waited its turn: not the next
+                quiet, last = 0, self._last_rx
 
     async def close(self) -> None:
         if self.closed:

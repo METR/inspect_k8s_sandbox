@@ -2374,16 +2374,20 @@ async def test_a_connection_is_not_given_up_for_time_our_own_loop_was_held(
     assert (await asyncio.wait_for(call, 30)).success  # only bounds a hang
 
 
+@pytest.mark.parametrize("early", [False, True], ids=["a PONG", "as the PING waits"])
 async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     daemons: Daemons,
     clock: types.SimpleNamespace,
     interval: collections.abc.Callable[[], None],
+    early: bool,
 ) -> None:
     """Only this fails where the keepalive never gives a silent connection up."""
     connections, pings = [0], [0]
+    writers: list[asyncio.StreamWriter] = []
 
     async def falls_silent(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         connections[0] += 1
+        writers.append(w)
         kind, call_id, _ = await read_frame(r)  # START, then its RESUME
         if kind == execd.RESUME:
             resumed = b'{"stdin": 0, "eof": false, "put": 0}'
@@ -2392,7 +2396,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         while True:
             if (await read_frame(r))[0] == execd.PING:
                 pings[0] += 1
-                if pings[0] == 1:  # its last frame on this connection
+                if pings[0] == 1 and not early:  # its last frame on this connection
                     w.write(frame(execd.PONG, 0))
 
     await daemons.serve(falls_silent)
@@ -2403,7 +2407,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     assert link is not None
     ended = [0]
 
-    def pinged() -> bool:  # execd has the interval's ping, and we the one PONG it sends
+    def pinged() -> bool:  # execd has the interval's ping, and we its one frame
         heard = pings[0] > 1 or link._last_rx == clock.now
         return link.closed or pings[0] == ended[0] and heard
 
@@ -2413,7 +2417,17 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
             interval()
             await until(pinged)
 
-    await asyncio.wait_for(intervals(4), 30)  # the PONG's, and two with no frame
+    if early:  # Regression: read as the PING waited its turn, it counted for the next.
+        await link._wlock.acquire()  # as another call's write has the turn
+        ended[0] += 1
+        interval()
+        await until(lambda: waiting(link))
+        writers[0].write(frame(execd.PONG, 0))
+        await until(lambda: link._last_rx == clock.now)
+        link._wlock.release()
+        await until(pinged)
+    # Two with no frame, after the PING's interval and the PONG's where one came.
+    await asyncio.wait_for(intervals(2 if early else 4), 30)
     assert not link.closed
     await asyncio.wait_for(intervals(1), 30)  # the third: DEAD_AFTER is three
 
