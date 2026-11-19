@@ -268,10 +268,10 @@ fi
 k taint node "$node" "$TAINT-" > /dev/null && tainted= || fail "the taint $TAINT was not taken off $node"
 # Running is also the phase of a launcher that keeps ending.
 judged() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[?(@.controller==true)].uid} {.metadata.deletionTimestamp} {range .status.conditions[?(@.type=="Ready")]}{.status} {.lastTransitionTime}{end} {.status.containerStatuses[*].restartCount}{"\n"}{end}'; }
-steady() { judged | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
+steady() { local rows; rows=$(judged) && echo "$rows" | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
 stays() { first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
 wait_for 120 stays && pass "a new launcher runs on the node, Ready with no restart for 10 s: ${first%% *} (the old one was $old)" \
-  || fail "no new launcher of DaemonSet $LAUNCHERS ($owner) stays up on $node (name, owner, deleted at, Ready, since, restarts): $(judged 2>&1 | tr '\n' '|')"
+  || fail "no new launcher of DaemonSet $LAUNCHERS ($owner) stays up on $node, or a read of the launchers failed (name, owner, deleted at, Ready, since, restarts): $(judged 2>&1 | tr '\n' '|')"
 # The node names each worker and the VM directory it finds, then says `looked`: an exec that fails, or is cut short, does not.
 left() { echo $(workers "[ -e /vms/$vm ] && echo /vms/$vm; [ -e /vms/. ] && echo looked"); }
 gone() { found=$(left); [ "$found" = looked ]; }
