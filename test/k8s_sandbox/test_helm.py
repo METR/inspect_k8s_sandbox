@@ -1577,7 +1577,9 @@ def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
     # Only `victim` has a replica: left out, Inspect would make it the default sandbox.
     idle = _stateful_set(replicas=0).replace("StatefulSet", "Deployment")
     served = [idle.replace("default", "victim"), _stateful_set("victim")]
-    stdout = _manifest(idle, *served, _stateful_set("other", replicas=0))
+    # Another group's StatefulSet makes no pod at 0 either: OpenKruise's, PingCAP's.
+    other = "apiVersion: apps.kruise.io/v1beta1\n" + _stateful_set("other", replicas=0)
+    stdout = _manifest(idle, *served, other)
 
     with pytest.raises(RuntimeError, match="the sandbox default, other only under"):
         _services(stdout)
