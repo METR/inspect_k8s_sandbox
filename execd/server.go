@@ -655,7 +655,7 @@ var startKeeper = sync.OnceFunc(func() {
 					hook(&afterTaken, false)
 				}
 				if gone {
-					// Left in the epoll, a pipe closed here is told of again while a child not yet exec'd holds it, and takes a place each time.
+					// Left in the epoll, a pipe closed here is told of again while a child not yet exec'd holds it, and gives back a place each time.
 					if err := syscall.EpollCtl(ep, syscall.EPOLL_CTL_DEL, int(fd), nil); err != nil {
 						fail("epoll_ctl: " + err.Error())
 					}

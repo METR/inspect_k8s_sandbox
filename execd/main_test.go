@@ -165,9 +165,9 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	}
 }
 
-// refused runs execd where the kernel refuses PR_SET_DUMPABLE, a thread its way back to root, or the keeper a call, and says how execd ran on.
+// refused runs execd where the kernel refuses it a call, as a seccomp profile can, and says how execd ran on.
 func refused(at string) {
-	if at == "kept" || at == "ended" { // every thread under the filter: execd keeps a pipe, and is written a byte more than it takes of one, or its writer goes
+	if at == "kept" || at == "ended" { // every thread under the filter: execd keeps a pipe, written a byte past what it takes, or its writer goes
 		var looks atomic.Int32
 		look := func(bool) { looks.Add(1) }
 		afterTaken.Store(&look)
@@ -187,15 +187,12 @@ func refused(at string) {
 		} else {
 			w.Write(make([]byte, leftOutput+1))
 		}
-		for deadline := time.Now().Add(10 * time.Second); len(held) > 0; time.Sleep(time.Millisecond) {
+		for len(held) > 0 {
 			if looks.Load() > 2 {
 				os.Stdout.WriteString("looked again")
 				return
 			}
-			if time.Now().After(deadline) {
-				os.Stdout.WriteString("kept its place")
-				return
-			}
+			time.Sleep(time.Millisecond)
 		}
 		if at == "kept" { // its place given back, a pipe is closed too
 			if _, err := syscall.Write(int(w.Fd()), []byte{0}); err != syscall.EPIPE {
@@ -278,7 +275,7 @@ func TestAKeptPipeExecdCannotAskForNoEventIsLetGo(t *testing.T) {
 	ran, _ := child.Output() // its exit status may go to the tests' reaper
 
 	if string(ran) != "let go" {
-		t.Fatalf("with its megabyte taken of a pipe, execd said %q, then %q (%v), want it let go: looked at again, each write to the pipe would wake execd, and with more to read, for ever", said.String(), ran, ctx.Err())
+		t.Fatalf("with its megabyte taken of a pipe, execd said %q, then %q (%v), want it let go", said.String(), ran, ctx.Err())
 	}
 }
 

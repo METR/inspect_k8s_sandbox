@@ -84,7 +84,11 @@ class Pod:
         self._restart_lock = threading.Lock()
         # Operations go to execd, if the pod has it: at its address, or through an exec.
         self._execd = (
-            ExecdClient(self._start_execd, lambda: self._info.uid)
+            ExecdClient(
+                self._start_execd,
+                # None once "raise" mode has kept a restart: nothing more starts in it.
+                lambda: "" if self._restart_error else self._info.uid,
+            )
             if execd in TRANSPORTS
             else None
         )
