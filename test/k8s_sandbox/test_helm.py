@@ -79,7 +79,7 @@ def _manifest(*docs: str) -> str:
 
 def _stateful_set(service: str = "default", replicas: int = 1) -> str:
     return (
-        f"kind: StatefulSet\nmetadata: {{name: {service}}}\n"
+        f"apiVersion: apps/v1\nkind: StatefulSet\nmetadata: {{name: {service}}}\n"
         f"spec:\n  replicas: {replicas}\n  template:\n    metadata:\n"
         f"      labels: {{{_SERVICE_LABEL}: {service}}}\n"
     )
@@ -1447,11 +1447,11 @@ def _services(stdout: str) -> frozenset[str]:
             {"default"},
             id="daemon-set-with-replicas",
         ),
-        # A kind the reader does not know is waited for: it may not scale by `replicas`.
+        # Another group's kind of that name scales by its own rules: it is waited for.
         pytest.param(
-            _manifest(_stateful_set(replicas=0).replace("StatefulSet", "BroadcastJob")),
+            _manifest(_stateful_set(replicas=0).replace("apps/", "apps.kruise.io/")),
             {"default"},
-            id="custom-kind-with-replicas",
+            id="another-groups-stateful-set-at-0",
         ),
         # Replicas do not add sandboxes: get_sandbox_pods() keys one entry per label.
         pytest.param(

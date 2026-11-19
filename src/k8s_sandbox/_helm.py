@@ -1105,6 +1105,7 @@ def _get_expected_services(docs: list[Any], release_name: str) -> frozenset[str]
         doc
         for doc in docs
         if _dig(doc, "kind") not in ("Deployment", "StatefulSet")
+        or _dig(doc, "apiVersion") != "apps/v1"
         or _dig(doc, "spec", "replicas") != 0
     )
     if scaled_to_none := sorted(services.difference(_declared_services(live))):
