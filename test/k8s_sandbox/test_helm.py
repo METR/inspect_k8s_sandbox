@@ -1907,25 +1907,30 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
-async def test_wait_until_ready_is_not_woken_as_a_pod_being_deleted_completes(
+async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_deleted(
     monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
 ) -> None:
-    # Woken then, it read before a DaemonSet had made that pod's replacement.
+    # Woken as a pod being deleted completed, it read before a DaemonSet replaced it.
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default", "other"})
     release._namespace = "going"  # where no other test's watch runs
-    polled, judged, over = threading.Event(), threading.Event(), threading.Event()
+    polled, judged, woken = threading.Event(), threading.Event(), threading.Event()
+    again, over = threading.Event(), threading.Event()
     labels = {"app.kubernetes.io/instance": release.release_name}
-    going = {"name": "h", "uid": "h", "labels": labels, "deletionTimestamp": "2026"}
+    done = {"name": "h", "uid": "h", "labels": labels}
+    going = done | {"deletionTimestamp": "2026-11-18T00:00:00Z"}
+    completed = {"phase": "Succeeded"}
 
     def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
-        polled.set()
+        (woken if polled.is_set() else polled).set()
         return [_pod()]
 
     def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
         polled.wait(30)
-        yield snapshot._parse_pod({"metadata": going, "status": {"phase": "Succeeded"}})
+        yield snapshot._parse_pod({"metadata": going, "status": completed})
         judged.set()
+        again.wait(30)
+        yield snapshot._parse_pod({"metadata": done, "status": completed})
         over.wait(30)
 
     _mock_release_pods.side_effect = list_pods
@@ -1938,7 +1943,10 @@ async def test_wait_until_ready_is_not_woken_as_a_pod_being_deleted_completes(
         # Time for a wake-up to bring a second read; a stalled machine only hides one.
         await asyncio.sleep(0.2)
         assert _mock_release_pods.call_count == 1
+        again.set()  # completed with no deletion, the pod wakes its release
+        assert await asyncio.to_thread(woken.wait, 30)
     finally:
+        again.set()
         over.set()
         wait.cancel()
 
