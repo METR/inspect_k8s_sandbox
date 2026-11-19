@@ -605,6 +605,8 @@ class Release:
                     if self._is_ready(pods):
                         if not fresh:
                             pods = await asyncio.to_thread(self._list_release_pods)
+                            missing = self._missing_services(pods)
+                            absent = self._missing_pods(pods)
                         if self._is_ready(pods):
                             return pods
                 except Exception as e:

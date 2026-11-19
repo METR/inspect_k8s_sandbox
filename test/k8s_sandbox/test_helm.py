@@ -2029,6 +2029,24 @@ async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
     assert "default" not in str(excinfo.value).split("missing_sandboxes")[1]
 
 
+async def test_wait_until_ready_names_what_its_confirming_read_found_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The timeout named what the cached read found missing: nothing, where this is.
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._expected_pods = frozenset({"helper-0"})
+    reads = [[_pod(name="helper-0")], [_pod(name="helper-0", ready=False)]]
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, itertools.cycle(reads), monkeypatch)
+
+    assert "default" in str(excinfo.value).split("missing_sandboxes")[1]
+    assert "helper-0" in str(excinfo.value).split("missing_pods")[1]
+
+
 async def test_wait_until_ready_names_the_stateful_set_pod_which_never_arrived(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
