@@ -1382,6 +1382,51 @@ def test_a_stateful_sets_counts_read_as_numbers(replicas: str, number: int) -> N
     assert spec["replicas"] == number
 
 
+@pytest.mark.parametrize(
+    ("spec", "read"),
+    [
+        # PyYAML puts a `<<` under every other key: the sandbox read as scaled to none.
+        pytest.param(
+            "{replicas: 0, <<: {replicas: 1}}", {"replicas": 1}, id="after-the-key"
+        ),
+        # Nor does it win over the keys after it: a sandbox at 0 would be waited for.
+        pytest.param(
+            "{<<: {replicas: 1}, replicas: 0}", {"replicas": 0}, id="before-the-key"
+        ),
+        # Helm merges no alias to a `<<`: it is a key of that name, and no sandbox at 0.
+        pytest.param(
+            "{replicas: *one, *key : {replicas: 0}}",
+            {"replicas": 1, "<<": {"replicas": 0}},
+            id="an-alias-to-the-key",
+        ),
+        # Nor a key of another name tagged `!!merge`: PyYAML merges on the tag alone.
+        pytest.param(
+            "{replicas: 1, !!merge standby: {replicas: 0}}",
+            {"replicas": 1, "standby": {"replicas": 0}},
+            id="another-key-tagged-a-merge",
+        ),
+        # A `<<` tagged `!!merge` still merges: as text, a sandbox at 0 is waited for.
+        pytest.param(
+            "{replicas: 1, !!merge <<: {replicas: 0}}",
+            {"replicas": 0},
+            id="a-tagged-key",
+        ),
+        # The first mapping of a list wins, as in Helm: PyYAML's main reads the last.
+        pytest.param(
+            "{<<: [{replicas: 1}, {replicas: 0}]}", {"replicas": 1}, id="a-list"
+        ),
+    ],
+)
+def test_a_merge_key_is_read_where_it_stands(spec: str, read: dict[str, Any]) -> None:
+    stdout = _manifest(
+        "kind: StatefulSet\n"
+        "metadata: {annotations: {key: &key <<}, generation: &one 1}\n"
+        f"spec: {spec}\n"
+    )
+
+    assert _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"] == read
+
+
 def _services(stdout: str) -> frozenset[str]:
     docs = _helm._rendered_docs(stdout, "abcdefgh")
     return _helm._get_expected_services(docs, "abcdefgh")
@@ -1461,6 +1506,16 @@ def _services(stdout: str) -> frozenset[str]:
             _manifest(_stateful_set("1e400"), _stateful_set(hex(2**64))),
             {"1e400", hex(2**64)},
             id="numbers-too-large",
+        ),
+        # Helm lets an anchor be defined again, and the later one wins: PyYAML refused.
+        pytest.param(
+            _manifest(
+                "kind: Pod\nmetadata:\n"
+                "  annotations: {a: &name first, b: &name default}\n"
+                f"  labels: {{{_SERVICE_LABEL}: *name}}\n"
+            ),
+            {"default"},
+            id="an-anchor-defined-twice",
         ),
         # A bare null is no name; quoted, `null` is a name like any other.
         pytest.param(

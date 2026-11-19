@@ -1028,10 +1028,29 @@ class _ManifestLoader(yaml.SafeLoader):
 
     def compose_scalar_node(self, anchor: Any) -> yaml.ScalarNode:
         event = self.peek_event()
-        # Helm reads a scalar tagged `!` as text, and still merges on a `! <<` key.
-        if event.tag == "!" and event.value != "<<":
+        # Helm reads a scalar tagged `!` or `!!merge` as text, and merges only on `<<`.
+        if event.tag in ("!", "tag:yaml.org,2002:merge") and event.value != "<<":
             event.tag = "tag:yaml.org,2002:str"
         return super().compose_scalar_node(anchor)
+
+    def compose_node(self, parent: Any, index: Any) -> yaml.Node | None:
+        alias = self.check_event(yaml.AliasEvent)
+        if not alias:  # Helm lets an anchor be defined again, and the later one wins.
+            self.anchors.pop(self.peek_event().anchor, None)
+        node = super().compose_node(parent, index)
+        # Helm merges on a `<<` written as the key: an alias to one is a key named `<<`.
+        if alias and isinstance(node, yaml.ScalarNode) and node.value == "<<":
+            return yaml.ScalarNode("tag:yaml.org,2002:str", node.value)
+        return node
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # Helm merges a `<<` where it stands: over the keys before it, not those after.
+        pairs = []
+        for pair in node.value:
+            alone = yaml.MappingNode(node.tag, [pair])
+            super().flatten_mapping(alone)
+            pairs += alone.value
+        node.value = pairs
 
 
 def _rendered_docs(install_stdout: str, release_name: str) -> list[Any]:
