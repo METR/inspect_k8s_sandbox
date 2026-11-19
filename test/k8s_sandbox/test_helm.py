@@ -1919,8 +1919,9 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
     polled, judged, woken = threading.Event(), threading.Event(), threading.Event()
     again, over = threading.Event(), threading.Event()
     labels = {"app.kubernetes.io/instance": release.release_name}
-    done = {"name": "h", "uid": "h", "labels": labels}
-    going = done | {"deletionTimestamp": "2026-11-18T00:00:00Z"}
+    done = {"name": "j", "uid": "j", "labels": labels}
+    going = {"name": "h", "uid": "h", "labels": labels}
+    going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
     completed = {"phase": "Succeeded"}
 
     def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
@@ -1945,7 +1946,7 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
         # Time for a wake-up to bring a second read; a stalled machine only hides one.
         await asyncio.sleep(0.2)
         assert _mock_release_pods.call_count == 1
-        again.set()  # completed with no deletion, the pod wakes its release
+        again.set()  # another pod, completed with no deletion, wakes its release
         assert await asyncio.to_thread(woken.wait, 30)
     finally:
         again.set()
