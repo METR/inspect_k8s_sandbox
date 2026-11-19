@@ -25,7 +25,10 @@
 - A `CMD-SHELL` healthcheck `test` passes every item after `CMD-SHELL` to `sh -c`,
   where only the first was kept.
 - **BREAKING CHANGE**: A negative `healthcheck.retries`, and a top-level
-  `x-inspect_k8s_sandbox` that is a list or a plain value, now fail the conversion.
+  `x-inspect_k8s_sandbox` that is a list or a plain value, now fail the conversion. So
+  does a file that converted only because a YAML alias hid an error: it fails as it does
+  with the alias written out. Where a service reuses a top-level `x-inspect_k8s_sandbox`
+  as its own, move the anchor into the first service that uses it.
 - A pod annotated
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at

@@ -120,11 +120,12 @@ services:
         limits:
           memory: 1G
   later: {later}
+  last: {later}
 """)
 
     services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
-    assert services["later"] == services["default"]
+    assert services["last"] == services["later"] == services["default"]
 
 
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
@@ -593,7 +594,7 @@ services:
     "key,value",
     [
         pytest.param("disable", "${HC_DISABLE}", id="disable-not-a-boolean"),
-        pytest.param("retries", "${HC_RETRIES}", id="retries-not-a-number"),
+        pytest.param("retries", "3s", id="retries-not-a-number"),
         pytest.param("retries", "-1", id="retries-negative"),
     ],
 )
