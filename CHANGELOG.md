@@ -8,6 +8,8 @@
   while any Pod of the release is being deleted and has not stopped.
 - Fix the install failing with "Could not read the rendered manifest from Helm" when
   one document of a manifest defines a YAML anchor twice.
+- Fix a "Helm release did not become ready" error hiding the API error that its last
+  check of the Pods failed with: it is now that error's cause.
 - **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
   declared only by Deployments or StatefulSets at `replicas: 0`, even if something would
   scale one up later. Render each sandbox with at least one replica.
