@@ -2400,13 +2400,13 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         started[0][0].write(sent)
         await until(lambda: link.closed or link._last_rx == clock.now)
 
-    if waits:  # Regression: a PING's 34 s behind another call's write were no silence.
+    if waits:  # Regression: a PING's 31 s behind another call's write were no silence.
         await link._wlock.acquire()
         ended[0] += 1
         interval()
         await until(lambda: link.closed or waiting(link))  # looked: its PING waits
-        clock.now += waits
-        await comes(frame(execd.STDOUT, started[0][1], b"x"))  # read 17 s into the wait
+        clock.now += 14
+        await comes(frame(execd.STDOUT, started[0][1], b"x"))  # read 14 s into the wait
         clock.now += waits
         link._wlock.release()
         await until(pinged)
