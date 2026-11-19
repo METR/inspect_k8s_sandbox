@@ -1096,12 +1096,19 @@ def _get_expected_services(docs: list[Any], release_name: str) -> frozenset[str]
     Raises RuntimeError if the chart declares no sandbox, or scales one to none.
     """
     services = frozenset(_declared_services(docs))
-    live = (doc for doc in docs if _dig(doc, "spec", "replicas") != 0)
+    # Only these are sure to scale by `replicas`: Helm 3 installs a stray one elsewhere.
+    live = (
+        doc
+        for doc in docs
+        if _dig(doc, "kind") not in ("Deployment", "StatefulSet")
+        or _dig(doc, "spec", "replicas") != 0
+    )
     if scaled_to_none := sorted(services.difference(_declared_services(live))):
         # Not left out: Inspect would take another sandbox for it, or fail mid-sample.
         _raise_runtime_error(
-            f"The rendered chart scales the sandbox {', '.join(scaled_to_none)} to "
-            "`replicas: 0`: no Pod would ever serve it.",
+            f"The rendered chart declares the sandbox {', '.join(scaled_to_none)} "
+            "only under Deployments or StatefulSets at `replicas: 0`: render it with "
+            "at least one replica.",
             release=release_name,
         )
     if not services:

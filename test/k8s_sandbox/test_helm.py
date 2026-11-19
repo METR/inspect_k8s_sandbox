@@ -1441,6 +1441,17 @@ def _services(stdout: str) -> frozenset[str]:
         ),
         # The documented custom-chart shape.
         pytest.param(_manifest(_BARE_POD), {"default"}, id="bare-pod"),
+        # Helm 3 installs a kind that has no `replicas` with a stray one: its pod runs.
+        pytest.param(
+            _manifest(_stateful_set(replicas=0).replace("StatefulSet", "DaemonSet")),
+            {"default"},
+            id="daemon-set-with-replicas",
+        ),
+        pytest.param(
+            _manifest(_stateful_set(replicas=0).replace("StatefulSet", "BroadcastJob")),
+            {"default"},
+            id="custom-kind-with-replicas",
+        ),
         # Replicas do not add sandboxes: get_sandbox_pods() keys one entry per label.
         pytest.param(
             _manifest(_stateful_set("default", replicas=3)), {"default"}, id="replicas"
@@ -1567,7 +1578,7 @@ def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
     served = [idle.replace("default", "victim"), _stateful_set("victim")]
     stdout = _manifest(idle, *served, _stateful_set("other", replicas=0))
 
-    with pytest.raises(RuntimeError, match="sandbox default, other to `replicas: 0`"):
+    with pytest.raises(RuntimeError, match="the sandbox default, other only under"):
         _services(stdout)
 
 
