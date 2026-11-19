@@ -1112,8 +1112,14 @@ def test_a_pod_with_no_network_card_cannot_mount_the_dns_sidecars_volume(
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _render_mount(chart_dir, container, "coredns-config", *annotations)
 
-    refusal = "services.default mounts the volume coredns-config"
-    assert refusal in exc_info.value.stderr
+    assert "services.default mounts the volume coredns-config" in exc_info.value.stderr
+
+
+def test_a_pod_with_a_network_card_may_still_mount_coredns_config(
+    chart_dir: pathlib.Path,
+) -> None:
+    # The refusal is for a pod with no DNS sidecar alone: main renders this mount.
+    _render_mount(chart_dir, "services.default", "coredns-config", _EGRESS_PROXY)
 
 
 @pytest.mark.parametrize(
