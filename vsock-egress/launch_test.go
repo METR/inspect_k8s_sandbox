@@ -186,8 +186,12 @@ func TestAnyPodsNetworkNamespaceShowsTheLauncherThatItSeesThem(t *testing.T) {
 		out := capture(t)
 		l := fakeNode(t)
 		l.netns = l.vms // it holds the namespace of a pod that names no proxy, as the launcher's own does, and none for the record below
-		os.WriteFile(filepath.Join(l.netns, "own"), nil, 0o600)
-		os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0","netns":"/var/run/netns/own"}`), 0o600)
+		if err := os.WriteFile(filepath.Join(l.netns, "own"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0","netns":"/var/run/netns/own"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}, vmUID)
 		os.RemoveAll(filepath.Join(l.vms, id("a")[:12])) // it outlived its sandbox, as across a reboot
 
