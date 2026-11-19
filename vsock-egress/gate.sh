@@ -244,7 +244,7 @@ keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 there=$(peek "ls -d /vms/${vm:-none}" 2> /dev/null) && [ "$there" = "/vms/${vm:-none}" ] || fail "the pod's VM directory was not found before the delete, or the look for it did not end: '${vm:-}' (the node said '$there')"
 launchers() { scan '^[^ ]*vsock-egress launch' 'echo looked'; }
-named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete: the parent of the pod's worker, '$from', is none of them, or the scan did not end" ;; esac
+named=$(launchers); [ -z "$from" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete: the parent of the pod's worker, '$from', is none of them, or the scan did not end" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
 owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
@@ -268,7 +268,7 @@ fi
 k taint node "$node" "$TAINT-" > /dev/null && tainted= || fail "the taint $TAINT was not taken off $node"
 # Running is also the phase of a launcher that keeps ending.
 judged() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[?(@.controller==true)].uid} {.metadata.deletionTimestamp} {range .status.conditions[?(@.type=="Ready")]}{.status} {.lastTransitionTime}{end} {.status.containerStatuses[*].restartCount}{"\n"}{end}'; }
-steady() { local rows; rows=$(judged) && echo "$rows" | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
+steady() { rows=$(judged) && echo "$rows" | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
 stays() { first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
 wait_for 120 stays && pass "a new launcher runs on the node, Ready with no restart for 10 s: ${first%% *} (the old one was $old)" \
   || fail "no new launcher of DaemonSet $LAUNCHERS ($owner) stays up on $node, or a read of the launchers failed (name, owner, deleted at, Ready, since, restarts): $(judged 2>&1 | tr '\n' '|')"
