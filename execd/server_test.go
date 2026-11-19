@@ -2114,8 +2114,8 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	t.Cleanup(func() { killTagged("spender") })
 	base := filepath.Join(t.TempDir(), "f")
 	let, wrote := mkfifo(t, base+".go"), mkfifo(t, base+".wrote")
-	// It says which pipe its stdout is, and leaves a process that writes there as many whole pages as it is told.
-	left := `readlink /proc/$$/fd/1; (while read n <"$0.go"; do dd if=/dev/zero bs=4096 count="$n" 2>/dev/null && echo "$n" >"$0.wrote"; done) &`
+	// It says which pipe its stdout is, and leaves a process that writes there as many bytes as it is told.
+	left := `readlink /proc/$$/fd/1; (while read n <"$0.go"; do head -c "$n" /dev/zero && echo "$n" >"$0.wrote"; done) &`
 	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", left, base}, Env: map[string]string{}, Tag: "spender"})
 	s.dispatch(c, frame{kind: fStart, id: 44, payload: req})
 	var pipe string
@@ -2133,32 +2133,32 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 			held = uintptr(n)
 		}
 	}
-	size, _, _ := syscall.Syscall(syscall.SYS_FCNTL, held, syscall.F_GETPIPE_SZ, 0) // 64 KiB, or the 8 KiB a user with too many pipes gets
 	write := func(n int, why string) {
-		let.Write([]byte(strconv.Itoa(n/4096) + "\n"))
+		let.Write([]byte(strconv.Itoa(n) + "\n"))
 		wrote.SetReadDeadline(time.Now().Add(30 * time.Second))
 		if _, err := wrote.Read(make([]byte, 16)); err != nil {
 			t.Fatalf("its write of %d bytes has not gone through, %s", n, why)
 		}
 	}
-	write(136<<10, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
-	write(leftOutput-136<<10, "which is the rest of what execd takes")
+	// A byte over: what execd takes then ends inside one of its reads, with more to read behind it.
+	write(136<<10+1, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
+	write(leftOutput-136<<10-1+4096, "which is the rest of what execd takes, and a page more")
 	// Read without end, a writer that never stops would have the sandbox's CPU; over Kubernetes exec it waits.
 	looked(0, "execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go")
-	seen := looks.Load()
-	write(int(size), "which the pipe itself holds")
 
 	var unread int32
 	syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&unread)))
-	if uintptr(unread) != size {
-		t.Fatalf("%d of the last %d bytes wait unread, want all: execd has read on, or has let the pipe go", unread, size)
+	if unread != 4096 {
+		t.Fatalf("%d bytes wait unread, want the page written past what execd takes: execd has read on, or has let the pipe go", unread)
 	}
-	time.Sleep(50 * time.Millisecond) // past the keeper's pause: were the pipe still armed, execd would wake for what waits in it
+	// What execd's epoll is asked to tell of each pipe: of this one, that its writers have gone, and not that it holds more to read.
+	asked, _ := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(keeper))
+	want := "tfd: " + strconv.Itoa(int(held)) + " events: " + strconv.FormatInt(syscall.EPOLLERR|syscall.EPOLLHUP, 16) + " "
+	if !strings.Contains(strings.Join(strings.Fields(string(asked)), " "), want) {
+		t.Fatalf("of a pipe it reads no more, execd's epoll is asked:\n%swant %q: a write to the pipe must not wake execd", asked, want)
+	}
 	killTagged("spender")
 	unheld(t, pipe, "which it had stopped reading and no process has open to write")
-	if woken := looks.Load() - seen; woken != 1 {
-		t.Fatalf("execd looked %d times at a pipe it reads no more, want once, as its writers went: a write to it must not wake execd", woken)
-	}
 }
 
 // answered has one call of this thread's return an errno from now on (0: nothing, with nothing done), as a seccomp profile can.
@@ -2205,18 +2205,16 @@ func TestAPipeExecdCannotKeepIsLetGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	places := len(held)
-	held <- struct{}{}
+	place := make(chan struct{}, 1) // its own: execd's are taken and given back by what other tests left running
+	place <- struct{}{}
 
-	keep(r, -1) // as where execd had no descriptor for a keeper at its start
+	keep(r, -1, place) // as where execd had no descriptor for a keeper at its start
 
 	if _, err := w.Write([]byte("late")); err == nil {
 		t.Fatal("a write to the pipe went through: execd holds a pipe that nothing will let go")
 	}
-	for deadline := time.Now().Add(30 * time.Second); len(held) > places; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the pipe's place was not given back: each one lost is a pipe the less that execd keeps")
-		}
+	if len(place) != 0 {
+		t.Fatal("the pipe's place was not given back: each one lost is a pipe the less that execd keeps")
 	}
 }
 

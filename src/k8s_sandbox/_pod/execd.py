@@ -441,18 +441,26 @@ class Link:
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
-            if kind == START:
-                now = time.monotonic()
-                if by is not None and now >= by:  # its call's time is up
-                    raise asyncio.TimeoutError
-                c = self.calls[call_id]
-                c.started, c.starts = now, c.starts + 1
+
+            async def write() -> bool:
+                if kind == START:
+                    # Read in the write's own step: wait_for may run it a turn on.
+                    now = time.monotonic()
+                    if by is not None and now >= by:
+                        return False
+                    c = self.calls[call_id]
+                    c.started, c.starts = now, c.starts + 1
+                await self.pipe.write(data)
+                return True
+
             try:
-                await asyncio.wait_for(self.pipe.write(data), DEAD_AFTER)
+                sent = await asyncio.wait_for(write(), DEAD_AFTER)
             except asyncio.TimeoutError:
                 # a peer that stopped reading must not hold the lock other calls need
                 await self.close()
                 raise ConnectionError("execd stopped reading") from None
+            if not sent:  # a START whose turn came once its call's time was up
+                raise asyncio.TimeoutError
             if kind == RELEASE:
                 self._released.append(call_id)
             elif kind == PING:
@@ -613,15 +621,16 @@ class ExecdClient:
                 pipe = await _connect(daemon, self._pace)
                 old = self._link
                 # One still open that speaks in our own turns is kept: slow, not lost.
-                turns = int(100 * min(SPEAKS_WITHIN, (until - time.monotonic()) / 2))
+                grace = min(SPEAKS_WITHIN, (until - time.monotonic()) / 2)
                 while old and not old.pipe._writer.transport.is_closing():
                     if old._last_rx > since:
                         await pipe.close()
                         return old
-                    if turns <= 0:
+                    if grace <= 0:
                         break
-                    turns -= 1
-                    await asyncio.sleep(0.01)  # no shorter: a loop's timer has a ms
+                    # Turns of 10 ms, the last what is left: a loop's timer has a ms.
+                    await asyncio.sleep(min(grace, 0.01))
+                    grace -= 0.01
                 link = Link(
                     pipe, daemon, self._strays, self._pace, self._owed, self._pod
                 )
@@ -805,7 +814,8 @@ class ExecdClient:
                                 self._opens(RECONNECT_FOR, asked, end)
                         continue
                     if isinstance(item, Dropped):
-                        if item.args != (link,):  # a connection the call has left since
+                        # One the call has left; or execd's word is here: it needs none.
+                        if item.args != (link,) or call.words:
                             continue
                         sender.cancel()
                         link.calls.pop(call.id, None)
@@ -814,6 +824,10 @@ class ExecdClient:
                             link = await asyncio.wait_for(self._get(stale=link), left())
                             self._resume(link, call)
                         except Exception as e:
+                            # Come meanwhile: taken, the call back on its connection.
+                            if call.words:
+                                link.calls[call.id] = call
+                                continue
                             if end < never:  # execd out of reach: our timer's word
                                 break
                             if not isinstance(e, asyncio.TimeoutError):

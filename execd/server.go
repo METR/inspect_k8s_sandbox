@@ -516,7 +516,7 @@ func (cl *call) run(req startRequest) error {
 				if errors.Is(err, os.ErrDeadlineExceeded) { // closed now, the pipe would fail the next write of what the command left running
 					select {
 					case held <- struct{}{}:
-						keep(r, keeper)
+						keep(r, keeper, held)
 						return
 					default: // no place left: closed, and that write fails
 					}
@@ -602,7 +602,7 @@ var held = func() chan struct{} {
 }()
 
 // keep hands the pipe to the keeper, out of the runtime's own poller, which a pipe wakes at every write to it.
-func keep(r *os.File, keeper int) {
+func keep(r *os.File, keeper int, places chan struct{}) {
 	fd := -1
 	if rc, err := r.SyscallConn(); err == nil {
 		rc.Control(func(pipe uintptr) {
@@ -614,7 +614,7 @@ func keep(r *os.File, keeper int) {
 	r.Close()
 	if syscall.EpollCtl(keeper, syscall.EPOLL_CTL_ADD, fd, &syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}) != nil {
 		syscall.Close(fd) // no descriptor for it, or no keeper: let go, and the next write to it fails
-		<-held
+		<-places
 	}
 }
 
@@ -633,8 +633,11 @@ var startKeeper = sync.OnceFunc(func() {
 		var events [64]syscall.EpollEvent
 		var dropped [4096]byte
 		for {
-			// The call the runtime's poller makes, which ends execd where it is refused. One a signal cut short is made again.
-			n, _, _ := syscall.Syscall6(syscall.SYS_EPOLL_PWAIT, uintptr(ep), uintptr(unsafe.Pointer(&events)), uintptr(len(events)), ^uintptr(0), 0, 0)
+			// The call the runtime's poller makes, and as there: one a signal cut short is made again, and one refused ends execd.
+			n, _, errno := syscall.Syscall6(syscall.SYS_EPOLL_PWAIT, uintptr(ep), uintptr(unsafe.Pointer(&events)), uintptr(len(events)), ^uintptr(0), 0, 0)
+			if errno != 0 && errno != syscall.EINTR {
+				fail("epoll_pwait: " + errno.Error())
+			}
 			read := false
 			for _, e := range events[:max(int(n), 0)] {
 				fd, gone := e.Fd, e.Events&(syscall.EPOLLHUP|syscall.EPOLLERR) != 0
@@ -647,16 +650,15 @@ var startKeeper = sync.OnceFunc(func() {
 					taken[fd], read = taken[fd]+got, true
 				}
 				if taken[fd] >= leftOutput {
+					// Asked for no event, an epoll tells only that every writer has gone. A pipe that cannot be asked so is let go.
+					gone = gone || syscall.EpollCtl(ep, syscall.EPOLL_CTL_MOD, int(fd), &syscall.EpollEvent{Fd: fd}) != nil
 					hook(&afterTaken, false)
 				}
-				switch {
-				case gone:
+				if gone {
 					syscall.EpollCtl(ep, syscall.EPOLL_CTL_DEL, int(fd), nil)
 					syscall.Close(int(fd))
 					delete(taken, fd)
 					<-held
-				case taken[fd] >= leftOutput: // asked for no event, an epoll tells only that every writer has gone
-					syscall.EpollCtl(ep, syscall.EPOLL_CTL_MOD, int(fd), &syscall.EpollEvent{Fd: fd})
 				}
 			}
 			if read {
@@ -1177,8 +1179,7 @@ func tagged(open func(string) (*os.File, error), environ string, needle []byte, 
 		f.Close()
 		// A read it fills may not hold it all: a process can make its own look any size.
 		whole := n < len(data) || len(data) == maxEnviron
-		// The last variable of a whole one may lack its NUL.
-		is = bytes.Contains(data[:n], needle) || whole && bytes.HasSuffix(data[:n], needle[:len(needle)-1])
+		is = bytes.Contains(data[:n], needle)
 		if is || whole { // a tag it shows is enough: the next open may fail
 			return is, n == 0
 		}

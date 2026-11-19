@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -164,8 +165,34 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	}
 }
 
-// refused runs execd where the kernel refuses PR_SET_DUMPABLE, or a thread its way back to root, and says so if execd ran on.
+// refused runs execd where the kernel refuses PR_SET_DUMPABLE, a thread its way back to root, or the keeper a call, and says how execd ran on.
 func refused(at string) {
+	if at == "kept" { // every thread under the filter: execd keeps a pipe, and is written a byte more than it takes of one
+		var looks atomic.Int32
+		look := func(bool) { looks.Add(1) }
+		afterTaken.Store(&look)
+		startKeeper()
+		r, w, _ := os.Pipe()
+		held <- struct{}{}
+		keep(r, keeper, held)
+		for range 1000 { // a signal at each thread, as any may come while the keeper waits
+			tasks, _ := os.ReadDir("/proc/self/task")
+			for _, task := range tasks {
+				tid, _ := strconv.Atoi(task.Name())
+				syscall.Tgkill(os.Getpid(), tid, syscall.SIGURG)
+			}
+		}
+		w.Write(make([]byte, leftOutput+1))
+		for len(held) > 0 {
+			if looks.Load() > 2 {
+				os.Stdout.WriteString("looked again")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		os.Stdout.WriteString("let go")
+		return
+	}
 	if at != "ran on" {
 		runtime.LockOSThread() // the filter is this thread's, and an exec keeps it
 		// What is refused: prctl's first argument, the option; or the second of setresuid or setresgid, root as the effective id.
@@ -174,6 +201,10 @@ func refused(at string) {
 			call, argument, value = syscall.SYS_SETRESUID, 24, 0
 		} else if at == "group back" {
 			call, argument, value = syscall.SYS_SETRESGID, 24, 0
+		} else if at == "no event" { // epoll_ctl's second, the change that asks a pipe for no event: the runtime's poller makes none
+			call, argument, value = syscall.SYS_EPOLL_CTL, 24, syscall.EPOLL_CTL_MOD
+		} else if at == "wait" { // epoll_pwait's third, the events the keeper takes at once: the runtime's poller takes 128
+			call, argument, value = syscall.SYS_EPOLL_PWAIT, 32, 64
 		}
 		filter := []syscall.SockFilter{
 			{Code: 0x20, K: 0},                               // the call's number
@@ -191,6 +222,9 @@ func refused(at string) {
 		}
 		if at == "start" { // init() runs again, under the filter
 			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ran on"}, os.Environ())
+		}
+		if at == "no event" || at == "wait" { // the keeper's thread is another
+			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "kept"}, os.Environ())
 		}
 		if strings.HasSuffix(at, " back") { // of no process: only the user's identity is taken, and given back
 			killAs(1<<30, &syscall.Credential{Uid: 65534, Gid: 65534})
@@ -213,6 +247,34 @@ func TestExecdEndsWhereItCannotBeMadeNonDumpable(t *testing.T) {
 		if len(ran) > 0 || !strings.Contains(said.String(), "prctl(PR_SET_DUMPABLE): operation not permitted") {
 			t.Errorf("at its %s execd said %q, then %q: its user could read its memory", at, said.String(), ran)
 		}
+	}
+}
+
+func TestAKeptPipeExecdCannotAskForNoEventIsLetGo(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "refused", "no event")
+	var said strings.Builder
+	child.Stderr = &said
+
+	ran, _ := child.Output() // its exit status may go to the tests' reaper
+
+	if string(ran) != "let go" {
+		t.Fatalf("with its megabyte taken of a pipe, execd said %q, then %q (%v): each write to the pipe would wake it, and with more to read, for ever", said.String(), ran, ctx.Err())
+	}
+}
+
+func TestExecdEndsWhereItsKeepersWaitIsRefused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "refused", "wait")
+	var said strings.Builder
+	child.Stderr = &said
+
+	ran, _ := child.Output() // its exit status may go to the tests' reaper
+
+	if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "epoll_pwait: operation not permitted") {
+		t.Fatalf("execd said %q, then %q (%v): it would make the call again and again, and let no kept pipe go", said.String(), ran, ctx.Err())
 	}
 }
 
