@@ -1514,7 +1514,10 @@ def _services(stdout: str) -> frozenset[str]:
             id="list-tagged-pairs",
         ),
         pytest.param(
-            _manifest("kind: !!binary TGlzdA==\nitems: [" + _list_item("a") + "]"),
+            _manifest(
+                "kind: !!binary UG9kTGlzdA==\nitems: [{metadata: {annotations: "
+                f"{{a: !!binary /w==}}, labels: {{{_SERVICE_LABEL}: a}}}}}}]"
+            ),
             {"a"},
             id="list-kind-tagged-binary",
         ),
@@ -1594,7 +1597,7 @@ def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
     idle = _stateful_set(replicas=0).replace("StatefulSet", "Deployment")
     served = [idle.replace("default", "victim"), _stateful_set("victim")]
     # Another group's StatefulSet makes no pod at 0 either: OpenKruise's, PingCAP's.
-    other = "apiVersion: apps.kruise.io/v1beta1\n" + _stateful_set("other", replicas=0)
+    other = _stateful_set("other", replicas=0) + "apiVersion: apps.kruise.io/v1beta1\n"
     stdout = _manifest(idle, *served, other)
 
     with pytest.raises(RuntimeError, match="the sandbox default, other only under"):
@@ -1959,12 +1962,12 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
 
     wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
     try:
-        assert await asyncio.to_thread(judged.wait, 30)
+        assert await asyncio.to_thread(judged.wait, 10)
         # Time for a wake-up to bring a second read; a stalled machine only hides one.
         await asyncio.sleep(0.2)
         assert _mock_release_pods.call_count == 1
         again.set()  # another pod, completed with no deletion, wakes its release
-        assert await asyncio.to_thread(woken.wait, 30)
+        assert await asyncio.to_thread(woken.wait, 10)
     finally:
         again.set()
         over.set()
