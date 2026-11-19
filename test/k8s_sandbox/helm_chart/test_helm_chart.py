@@ -1119,7 +1119,7 @@ def test_a_pod_with_a_network_card_may_still_mount_coredns_config(
     chart_dir: pathlib.Path,
 ) -> None:
     # The refusal is for a pod with no DNS sidecar alone: main renders this mount.
-    _render_mount(chart_dir, "services.default", "coredns-config", _EGRESS_PROXY)
+    _render_mount(chart_dir, "services.default", "coredns-config")
 
 
 @pytest.mark.parametrize(
