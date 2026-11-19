@@ -1925,13 +1925,14 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
+@pytest.mark.parametrize("phase", ["Succeeded", "Failed"])
 async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_deleted(
-    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+    phase: str, monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
 ) -> None:
-    # Woken as a pod being deleted completed, it read before a DaemonSet replaced it.
+    # Woken as a pod being deleted stopped, it read before a DaemonSet replaced it.
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default", "other"})
-    release._namespace = "going"  # where no other test's watch runs
+    release._namespace = f"going-{phase}"  # where no other test's watch runs
     polled, judged, woken = threading.Event(), threading.Event(), threading.Event()
     again, over = threading.Event(), threading.Event()
     labels = {"app.kubernetes.io/instance": release.release_name}
@@ -1946,7 +1947,7 @@ async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_d
 
     def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
         polled.wait(30)
-        yield snapshot._parse_pod({"metadata": going, "status": completed})
+        yield snapshot._parse_pod({"metadata": going, "status": {"phase": phase}})
         judged.set()
         again.wait(30)
         yield snapshot._parse_pod({"metadata": done, "status": completed})
