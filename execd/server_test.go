@@ -2191,6 +2191,19 @@ func answered(call uintptr, answer syscall.Errno) syscall.Errno {
 	return errno
 }
 
+// startedWith is what this process was handed besides its stdio, and hands every child in turn: a CI runner's own pipes.
+var startedWith = func() (links []string) {
+	fds, _ := os.ReadDir("/proc/self/fd")
+	for _, fd := range fds {
+		n, _ := strconv.Atoi(fd.Name())
+		if flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(n), syscall.F_GETFD, 0); n > 2 && errno == 0 && flags&syscall.FD_CLOEXEC == 0 {
+			link, _ := os.Readlink("/proc/self/fd/" + fd.Name())
+			links = append(links, link)
+		}
+	}
+	return links
+}()
+
 func TestACommandGetsNoDescriptorOfExecdsOwn(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
@@ -2208,7 +2221,13 @@ func TestACommandGetsNoDescriptorOfExecdsOwn(t *testing.T) {
 			open += string(f.payload)
 		}
 	}
-	if has := strings.Fields(open); len(has) != 3 || has[0] != os.DevNull || !strings.HasPrefix(has[1], "pipe:") || !strings.HasPrefix(has[2], "pipe:") {
+	has := strings.Fields(open)
+	for _, link := range startedWith { // past its stdin, which is listed first
+		if i := slices.Index(has[min(1, len(has)):], link); i >= 0 {
+			has = slices.Delete(has, i+1, i+2)
+		}
+	}
+	if len(has) != 3 || has[0] != os.DevNull || !strings.HasPrefix(has[1], "pipe:") || !strings.HasPrefix(has[2], "pipe:") {
 		t.Fatalf("a command has %q open, want its stdin and its two pipes: with a kept pipe it reads what another call's process writes, and with the keeper's epoll it has execd close what it names", has)
 	}
 }
