@@ -138,7 +138,7 @@ func become(cwd string, ids, argv []string) {
 			env[i] = string(kv)
 		}
 		var files syscall.Rlimit
-		if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) == nil && files.Max >= 1024 { // as runuser leaves it (util-linux 2.38 on): a soft limit of FD_SETSIZE
+		if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) == nil && files.Max >= 1024 { // as runuser leaves it since util-linux 2.38
 			files.Cur = 1024
 			syscall.Setrlimit(syscall.RLIMIT_NOFILE, &files)
 		}
@@ -237,6 +237,7 @@ func run(network, address, keyHash string, replace bool) {
 	}
 	startReaper()
 	startSearcher()
+	startKeeper()
 	report("ok " + fingerprint)
 	s.serve(l)
 }

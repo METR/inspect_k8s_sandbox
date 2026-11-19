@@ -84,7 +84,11 @@ class Pod:
         self._restart_lock = threading.Lock()
         # Operations go to execd, if the pod has it: at its address, or through an exec.
         self._execd = (
-            ExecdClient(self._start_execd, lambda: self._info.uid)
+            ExecdClient(
+                self._start_execd,
+                # No pod once "raise" mode has kept a restart: nothing starts in it.
+                lambda: "" if self._restart_error else self._info.uid,
+            )
             if execd in TRANSPORTS
             else None
         )
@@ -175,10 +179,11 @@ class Pod:
           raise it again on every later check, without reading the pod: the pod or
           container the sample had is gone.
         """
-        found = await self._run_async(self._check_for_pod_restart_sync)
-        if self._execd is not None:  # "warn" mode refreshes a replaced pod's UID
-            await self._execd.leave_replaced()
-        return found
+        try:
+            return await self._run_async(self._check_for_pod_restart_sync)
+        finally:  # also where it raises: "raise" mode leaves a pod found replaced too
+            if self._execd is not None:
+                await self._execd.leave_replaced()
 
     def _check_for_pod_restart_sync(
         self,
@@ -254,9 +259,10 @@ class Pod:
             execd needs no runuser).
           timeout (int | None): The optional timeout for cmd to complete in. Defaults to
             no timeout. If provided, SIGTERM will be sent to cmd once the timeout has
-            elapsed. This is enforced by the `timeout` command on the pod. This will not
-            terminate background processes started by cmd. On a pod with execd, cmd and
-            its background processes get SIGKILL instead.
+            elapsed. This is enforced by the `timeout` command on the pod: processes
+            that cmd started can survive it. On a pod with execd, cmd and the processes
+            it started that execd finds and may signal get SIGKILL instead; one that
+            has detached from cmd can survive.
         """
         if (execd := self._execd) is not None:
             return await self._over_execd(

@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from inspect_ai.util._sandbox.self_check import *  # noqa: F401, F403
 
+from k8s_sandbox import _sandbox_environment
 from k8s_sandbox._sandbox_environment import K8sSandboxEnvironment
 from test.k8s_sandbox.utils import install_sandbox_environments
 
@@ -113,7 +114,9 @@ async def test_a_command_is_found_on_the_path_as_its_user(
 
 @pytest.mark.parametrize("service", ["default", "runc"])  # on gVisor, and on Linux
 async def test_a_kill_reaches_what_another_users_command_detached(
-    transport: str, sandboxes: dict[str, K8sSandboxEnvironment], service: str
+    transport: str,
+    sandboxes: dict[str, _sandbox_environment.K8sSandboxEnvironment],
+    service: str,
 ) -> None:
     if transport == "exec":
         pytest.skip("Kubernetes exec leaves what a command started running")
