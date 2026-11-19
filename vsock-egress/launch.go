@@ -232,6 +232,7 @@ type launcher struct {
 	tried    map[string]time.Time // when each sandbox's worker was last started
 	reported map[string]time.Time // when each sandbox without a worker was first seen so, or last in the log
 	had      map[string]bool      // sandboxes whose VM directory has been there
+	sees     bool                 // a record's network namespace has been there: only then does a missing one tell of a sandbox that has gone
 	started  map[string]bool      // sandboxes that have had a worker
 }
 
@@ -266,8 +267,12 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	wanted, present, vms := map[string]sandbox{}, map[string]bool{}, map[uint32]int{}
 	for _, r := range records {
-		if sb, err := l.sandbox(r); err == nil {
+		sb, err := l.sandbox(r)
+		if err == nil {
 			vms[sb.uid]++
+		}
+		if fi, err := os.Stat(sb.netns); err == nil && !fi.IsDir() { // a record that names no namespace names their directory
+			l.sees = true
 		}
 	}
 	for _, r := range records {
@@ -289,7 +294,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		case err == nil:
 			wanted[r.ContainerID] = sb
 		case gone && l.had[r.ContainerID]: // its sandbox is being deleted: the directory goes before the record does
-		case gone && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
+		case gone && l.sees && errors.Is(bound, os.ErrNotExist): // with no network namespace either, the record outlived its sandbox
 		default:
 			l.fault(r.ContainerID, sb.pod, err)
 		}
