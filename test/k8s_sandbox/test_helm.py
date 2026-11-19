@@ -1515,9 +1515,8 @@ def _services(stdout: str) -> frozenset[str]:
         ),
         pytest.param(
             _manifest(
-                "apiVersion: v1\nkind: !!binary UG9kTGlzdA==\nitems: [{metadata: "
-                "{annotations: {a: !!binary /w==}, "
-                f"labels: {{{_SERVICE_LABEL}: a}}}}}}]"
+                "kind: !!binary UG9kTGlzdA==\nitems: [{metadata: {annotations: "
+                f"{{a: !!binary /w==}}, labels: {{{_SERVICE_LABEL}: a}}}}}}]"
             ),
             {"a"},
             id="list-kind-tagged-binary",
@@ -1937,7 +1936,7 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
 
 @pytest.mark.parametrize(
     ("phase", "deleted"),
-    # A pod that fails with no deletion, as one evicted does, is replaced after it too.
+    # A pod that fails with no deletion is replaced after it too.
     [("Succeeded", True), ("Failed", True), ("Failed", False)],
 )
 async def test_wait_until_ready_is_woken_by_a_completed_pod_not_a_failed_or_deleted_one(
@@ -1959,7 +1958,8 @@ async def test_wait_until_ready_is_woken_by_a_completed_pod_not_a_failed_or_dele
         going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
     completed = {"phase": "Succeeded"}
     # Kubernetes' pod GC marks a lost node's pod Failed and leaves its Ready condition.
-    stopped = {"phase": phase, "conditions": [{"type": "Ready", "status": "True"}]}
+    ready = {"type": "Ready", "status": str(phase == "Failed")}
+    stopped = {"phase": phase, "conditions": [ready]}
 
     def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
         (woken if polled.is_set() else polled).set()
