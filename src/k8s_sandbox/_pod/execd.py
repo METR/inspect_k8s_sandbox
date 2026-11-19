@@ -436,15 +436,16 @@ class Link:
         # Only a START or STDIN waits its turn: any other frame has one ahead at most.
         turn = self.bulk if kind in (START, STDIN) else contextlib.nullcontext()
         async with turn, self._wlock:
-            if kind == START and self.daemon.pod != self._pod():  # replaced meanwhile
-                await self.close()
             if self.pipe._writer.transport.is_closing():  # close() aborts it too
                 raise NotSent("execd connection closed")
             data = HEADER.pack(kind, call_id, len(payload)) + payload
 
             async def write() -> bool:
                 if kind == START:
-                    # Read in the write's own step: wait_for may run it a turn on.
+                    # In the write's own step: wait_for may run it a turn on.
+                    if self.daemon.pod != self._pod():  # replaced meanwhile
+                        await self.close()
+                        raise NotSent("execd connection closed")
                     now = time.monotonic()
                     if by is not None and now >= by:
                         return False
@@ -631,8 +632,8 @@ class ExecdClient:
                         return old
                     if grace <= 0:
                         break
-                    # Turns of 10 ms, the last what is left: a loop's timer has a ms.
-                    await asyncio.sleep(min(grace, 0.01))
+                    # Whole ms, 10 a turn: a loop's timer takes up to the next ms.
+                    await asyncio.sleep(min(int(grace * 1000), 10) / 1000)
                     grace -= 0.01
                 link = Link(
                     pipe, daemon, self._strays, self._pace, self._owed, self._pod
@@ -817,8 +818,7 @@ class ExecdClient:
                                 self._opens(RECONNECT_FOR, asked, end)
                         continue
                     if isinstance(item, Dropped):
-                        # One the call has left; or execd's word is here: it needs none.
-                        if item.args != (link,) or call.words:
+                        if item.args != (link,):  # a connection the call has left since
                             continue
                         sender.cancel()
                         link.calls.pop(call.id, None)
@@ -827,10 +827,6 @@ class ExecdClient:
                             link = await asyncio.wait_for(self._get(stale=link), left())
                             self._resume(link, call)
                         except Exception as e:
-                            # Come meanwhile: taken, the call back on its connection.
-                            if call.words:
-                                link.calls[call.id] = call
-                                continue
                             if end < never:  # execd out of reach: our timer's word
                                 break
                             if not isinstance(e, asyncio.TimeoutError):

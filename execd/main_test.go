@@ -167,7 +167,7 @@ func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 
 // refused runs execd where the kernel refuses PR_SET_DUMPABLE, a thread its way back to root, or the keeper a call, and says how execd ran on.
 func refused(at string) {
-	if at == "kept" { // every thread under the filter: execd keeps a pipe, and is written a byte more than it takes of one
+	if at == "kept" || at == "ended" { // every thread under the filter: execd keeps a pipe, and is written a byte more than it takes of one, or its writer goes
 		var looks atomic.Int32
 		look := func(bool) { looks.Add(1) }
 		afterTaken.Store(&look)
@@ -182,13 +182,26 @@ func refused(at string) {
 				syscall.Tgkill(os.Getpid(), tid, syscall.SIGURG)
 			}
 		}
-		w.Write(make([]byte, leftOutput+1))
-		for len(held) > 0 {
+		if at == "ended" {
+			w.Close()
+		} else {
+			w.Write(make([]byte, leftOutput+1))
+		}
+		for deadline := time.Now().Add(10 * time.Second); len(held) > 0; time.Sleep(time.Millisecond) {
 			if looks.Load() > 2 {
 				os.Stdout.WriteString("looked again")
 				return
 			}
-			time.Sleep(time.Millisecond)
+			if time.Now().After(deadline) {
+				os.Stdout.WriteString("kept its place")
+				return
+			}
+		}
+		if at == "kept" { // its place given back, a pipe is closed too
+			if _, err := syscall.Write(int(w.Fd()), []byte{0}); err != syscall.EPIPE {
+				os.Stdout.WriteString("still open")
+				return
+			}
 		}
 		os.Stdout.WriteString("let go")
 		return
@@ -205,6 +218,8 @@ func refused(at string) {
 			call, argument, value = syscall.SYS_EPOLL_CTL, 24, syscall.EPOLL_CTL_MOD
 		} else if at == "wait" { // epoll_pwait's third, the events the keeper takes at once: the runtime's poller takes 128
 			call, argument, value = syscall.SYS_EPOLL_PWAIT, 32, 64
+		} else if at == "removal" { // epoll_ctl's second again: the runtime's poller takes no word from its own removals
+			call, argument, value = syscall.SYS_EPOLL_CTL, 24, syscall.EPOLL_CTL_DEL
 		}
 		filter := []syscall.SockFilter{
 			{Code: 0x20, K: 0},                               // the call's number
@@ -225,6 +240,9 @@ func refused(at string) {
 		}
 		if at == "no event" || at == "wait" { // the keeper's thread is another
 			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "kept"}, os.Environ())
+		}
+		if at == "removal" {
+			syscall.Exec("/proc/self/exe", []string{os.Args[0], "refused", "ended"}, os.Environ())
 		}
 		if strings.HasSuffix(at, " back") { // of no process: only the user's identity is taken, and given back
 			killAs(1<<30, &syscall.Credential{Uid: 65534, Gid: 65534})
@@ -260,7 +278,7 @@ func TestAKeptPipeExecdCannotAskForNoEventIsLetGo(t *testing.T) {
 	ran, _ := child.Output() // its exit status may go to the tests' reaper
 
 	if string(ran) != "let go" {
-		t.Fatalf("with its megabyte taken of a pipe, execd said %q, then %q (%v): each write to the pipe would wake it, and with more to read, for ever", said.String(), ran, ctx.Err())
+		t.Fatalf("with its megabyte taken of a pipe, execd said %q, then %q (%v), want it let go: looked at again, each write to the pipe would wake execd, and with more to read, for ever", said.String(), ran, ctx.Err())
 	}
 }
 
@@ -275,6 +293,20 @@ func TestExecdEndsWhereItsKeepersWaitIsRefused(t *testing.T) {
 
 	if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "epoll_pwait: operation not permitted") {
 		t.Fatalf("execd said %q, then %q (%v): it would make the call again and again, and let no kept pipe go", said.String(), ran, ctx.Err())
+	}
+}
+
+func TestExecdEndsWhereItCannotTakeAPipeOutOfItsKeeper(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "refused", "removal")
+	var said strings.Builder
+	child.Stderr = &said
+
+	ran, _ := child.Output() // its exit status may go to the tests' reaper
+
+	if ctx.Err() != nil || len(ran) > 0 || !strings.Contains(said.String(), "epoll_ctl: operation not permitted") {
+		t.Fatalf("execd said %q, then %q (%v): a pipe it has closed is told of again while a child not yet exec'd holds it, each time for a place it does not hold", said.String(), ran, ctx.Err())
 	}
 }
 

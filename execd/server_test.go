@@ -2146,16 +2146,23 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 			t.Fatalf("its write of %d bytes has not gone through, %s", n, why)
 		}
 	}
-	// A byte over: what execd takes then ends inside one of its reads, with more to read behind it.
-	write(136<<10+1, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
-	write(leftOutput-136<<10-1+4096, "which is the rest of what execd takes, and a page more")
+	unread := func() (n int32) {
+		syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&n)))
+		return
+	}
+	// All but a byte of what execd takes, and all of it read: the two bytes that follow come in one read, which may take one.
+	write(leftOutput-1, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
+	for deadline := time.Now().Add(30 * time.Second); unread() > 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d bytes wait unread of what execd takes of a pipe", unread())
+		}
+	}
+	write(2, "which the pipe has room for")
 	// Read without end, a writer that never stops would have the sandbox's CPU; over Kubernetes exec it waits.
 	looked(0, "execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go")
 
-	var unread int32
-	syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&unread)))
-	if unread != 4096 {
-		t.Fatalf("%d bytes wait unread, want the page written past what execd takes: execd has read on, or has let the pipe go", unread)
+	if n := unread(); n != 1 {
+		t.Fatalf("%d bytes wait unread, want the one written past what execd takes: execd has read on, or has let the pipe go", n)
 	}
 	// What execd's epoll is asked to tell of each pipe: of this one, that its writers have gone, and not that it holds more to read.
 	asked, _ := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(keeper))
@@ -2593,7 +2600,8 @@ func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t 
 	afterFunc = func(_ time.Duration, f func()) *time.Timer { timers = append(timers, f); return nil }
 	t.Cleanup(func() { afterFunc = time.AfterFunc })
 	s, _ := newServer(strings.Repeat("00", 32))
-	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "both", Timeout: 60})
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: tag, Timeout: 60})
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 25, payload: req})
 	cl, deadline := s.get(25), time.Now().Add(30*time.Second)

@@ -57,11 +57,12 @@
   running, execd sends SIGKILL to the command, to its process group and to the other
   processes it started that it can find, as far as it may signal each; one that has
   detached from the command can survive. Those of a command that has ended are left
-  running. A command that ends execd, by killing every process or taking the pod's last
-  PID, makes each running `exec()`, `read_file()` and `write_file()` raise
-  `ExecResultUnknownError`; an `exec()` whose timeout passes first raises
-  `TimeoutError`. Commands still running lose their timeout and get end-of-file on
-  `stdin`. Make execd mode 111; where a container runs on gVisor as a
+  running. A command that ends execd, by
+  killing every process or taking the pod's last PID, makes each running `exec()`,
+  `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
+  timeout passes first raises `TimeoutError`. Commands still running lose their
+  timeout and get end-of-file on `stdin`.
+  Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
   neither `CAP_DAC_OVERRIDE` nor `CAP_DAC_READ_SEARCH`. execd's memory counts against
