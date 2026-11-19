@@ -97,8 +97,8 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
-# scan RE THEN: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, PID 1's among them: a /proc that hides other users' processes shows none of it.
-scan() { peek 'for p in /proc/[0-9]*; do { tr "\0\n" "  " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p ] || exit; [ $p = /proc/1 ] && init=1; done; [ -n "$init" ] && { '"$2"'; }' | tr '\n' ' '; }
+# scan RE THEN: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, and PID 1's was read: a /proc that hides other users' processes gives none of it.
+scan() { peek 'for p in /proc/[0-9]*; do { tr "\0\n" "  " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" && { [ $p != /proc/1 ] || init=1; } || [ ! -e $p ] || exit; done; [ -n "$init" ] && { '"$2"'; }' | tr '\n' ' '; }
 workers() { scan "^/vsock-egress work .*$NS/$SANDBOX" "$@"; }
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
