@@ -2515,6 +2515,7 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
+	t.Cleanup(func() { killTagged(tag) })
 	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: tag})
 	c, frames := recordedConn(t)
 	s.authenticated(c)

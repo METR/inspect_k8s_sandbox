@@ -297,6 +297,8 @@ func TestExecdEndsWhereItCannotTakeAPipeOutOfItsKeeper(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // only bounds a hang
 	defer cancel()
 	child := exec.CommandContext(ctx, os.Args[0], "refused", "removal")
+	child.Cancel = func() error { return child.Process.Signal(syscall.SIGQUIT) } // a hang leaves its goroutines in what it said
+	child.WaitDelay = time.Second
 	var said strings.Builder
 	child.Stderr = &said
 
