@@ -592,13 +592,13 @@ func (cl *call) run(req startRequest) error {
 // leftOutput is how much execd takes of what a process left running writes to its command's pipe.
 const leftOutput = 1 << 20
 
-// held has a place for each pipe kept open for what a command left running: half of execd's descriptors.
+// held has a place for each pipe kept open for what a command left running: half of execd's descriptors, and fewer where that would leave it under 24 (its own nine, and a command's start beside one that runs).
 var held = func() chan struct{} {
 	var files syscall.Rlimit
 	if syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files) != nil {
 		files.Cur = 0 // a limit execd cannot read: it keeps no pipe
 	}
-	return make(chan struct{}, files.Cur/2)
+	return make(chan struct{}, min(files.Cur/2, max(files.Cur, 24)-24))
 }()
 
 // keep hands the pipe to the keeper, out of the runtime's own poller, which a pipe wakes at every write to it.
