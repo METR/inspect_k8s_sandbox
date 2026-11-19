@@ -16,7 +16,7 @@ usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
                inspect-k8s-sandbox/gate:NoSchedule while the sandbox is deleted
   LISTED, UNLISTED  a URL the proxy allows and one it refuses (defaults: pypi.org's and example.com's)
   LABELS       labels for the release and the gate's own pod, as a JSON object (default {})
-  KEEP=1       leave the release installed when a step fails: the gate then ends before it deletes anything more
+  KEEP=1       when a step fails, end before deleting anything more, and leave what is still there
 It needs helm, kubectl, python3 and RBAC to patch nodes, and leaves nothing behind: one helm release, and one pod
 with the node's process list and a read-only mount of its VM directories. A run killed in step 7 leaves the taint,
 and no launcher comes to NODE until `kubectl taint node NODE inspect-k8s-sandbox/gate-`. Exit 0: every step passed.
@@ -50,7 +50,7 @@ wait_for() { # wait_for SECONDS COMMAND...: until the command succeeds
 }
 cleanup() {
   [ -n "${canary:-}" ] && kill "$canary" 2> /dev/null
-  [ -n "${tainted:-}" ] && k taint node "$node" "$TAINT-" > /dev/null 2>&1
+  [ -n "${tainted:-}" ] && { k taint node "$node" "$TAINT-" > /dev/null 2>&1 || echo "   the taint $TAINT is still on $node: kubectl --context $CONTEXT taint node $node $TAINT-"; }
   [ "$failed" = 1 ] && [ "${KEEP:-}" = 1 ] && { echo "   kept: what is left of helm release $REL and pod $REL-peek in $NS"; return; }
   h uninstall "$REL" --ignore-not-found --wait --timeout 120s > /dev/null 2>&1
   k -n "$NS" delete pod "$REL-peek" --ignore-not-found --wait=false > /dev/null 2>&1
@@ -100,7 +100,7 @@ workers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
   && pass "one worker for the pod on its node: pid $worker, uid $uid, CapEff $caps" \
-  || fail "expected one worker for $NS/$SANDBOX on $node, not root and with no capability: the node named workers '$seen', uid '$uid', CapEff '$caps'; the launcher says: $(k -n "$LNS" logs "$(launcher)" --tail=5 2>&1 | tr '\n' '|')"
+  || fail "expected $node to name one worker for $NS/$SANDBOX, not root and with no capability, and then say looked: it said '$seen', uid '$uid', CapEff '$caps'; the launcher says: $(k -n "$LNS" logs "$(launcher)" --tail=5 2>&1 | tr '\n' '|')"
 
 say "2. a listed host answers"
 code=$(in_sandbox curl -sS -o /dev/null -m 60 -w '%{http_code} in %{time_total}s' "$LISTED" 2>&1)
@@ -210,9 +210,9 @@ print(*said)
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 pod=$(launcher)
-contract=$(k -n "$LNS" exec "$pod" -c "$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}')" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
+contract=$(k -n "$LNS" exec "$pod" -c "$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none)" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
-case "$contract" in *"ok: "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
+case "$contract" in *"ok: $NS/$SANDBOX runs as uid "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
 
 keep "step 6a deletes the sandbox's pod"
@@ -223,8 +223,8 @@ was=$(echo $(workers)); before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS"
 # The StatefulSet makes the pod again under its name: Ready there says its forwarder has met a new worker.
 reborn() { local now; now=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}') && [ "${now% *}" != "$uid" ] && [ "${now#* }" = True ]; }
 dir_gone() { [ "$(peek "[ -e /vms/. ] && { [ -e /vms/$1 ] || echo gone; }")" = gone ]; } # not where the VM directories cannot be read at all
-moved() { # one new worker and no other, nor the old one unreaped, which has a process entry and no command line: the node says `looked` after naming them all, as an answer cut short could hide the old one
-  seen=$(echo $(workers "awk '/^State/{print \"$was:\" \$2}' /proc/$was/status 2>/dev/null; echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
+moved() { # one new worker and no other, nor the old one unreaped: that has a process entry and no command line
+  seen=$(echo $(workers "awk '/^State/ && \$2 == \"Z\" {print \"$was:\" \$2}' /proc/$was/status 2>/dev/null; echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
   [ "$seen" != "$now" ] && [ -n "$new" ] && [ "$new" != "$before" ]
 }
 if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
@@ -232,7 +232,7 @@ if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod 
   # A launcher that ended instead would have taken every worker on the node with it, and its successor would start this one too.
   wait_for 60 moved && vm=$new && dir_gone "$before" && [ "$(by "$now")" = "$from" ] \
     && pass "worker $was and VM directory $before went with the pod; the pod that followed has worker $now and VM directory $vm, from the same launcher (pid $from)" \
-    || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was') at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
+    || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was', named again as '$was:Z' if it ended and was not reaped) at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
 else
   fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
 fi
@@ -240,18 +240,16 @@ fi
 keep "step 7"
 say "7. the sandbox is deleted while its node's launcher is stopped: nothing of it is left on the node"
 peek "ls -d /vms/${vm:-none}" > /dev/null 2>&1 || fail "the pod's VM directory was not found before the delete: '${vm:-}'"
-# The node names each launcher's process, then says `looked`: the worker's parent is one before the delete, and none is left once the launcher is down.
-launchers() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline; } 2>/dev/null | grep -q "^[^ ]*vsock-egress launch" && echo ${p#/proc/}; done; echo looked' | tr '\n' ' '; }
-named=$(launchers); case " $named" in *" ${from:-none} "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete, and the parent of the pod's worker, '${from:-}', is none of them" ;; esac
+launchers() { peek "pgrep -f '^[^ ]*vsock-egress launch'; echo looked" | tr '\n' ' '; }
+named=$(launchers); [ -z "${from:-}" ] || case " $named" in *" $from "*looked*) ;; *) fail "the node names the launcher processes '$named' before the delete, and the parent of the pod's worker, '$from', is none of them" ;; esac
 keep "step 7 deletes the launcher and uninstalls the release"
 old=$(launcher)
 owner=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{.metadata.uid}')
-[ -n "$owner" ] && [ "$(k -n "$LNS" get pod "$old" -o jsonpath='{.metadata.ownerReferences[0].uid}')" = "$owner" ] \
+[ -n "$owner" ] && [ "$(k -n "$LNS" get pod "$old" -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')" = "$owner" ] \
   || { fail "the pod '$old' is not one of DaemonSet $LAUNCHERS: it is left alone"; exit 1; }
 # The taint keeps the DaemonSet from putting a launcher back on the node before the sandbox has gone.
 k taint node "$node" "$TAINT:NoSchedule" > /dev/null && tainted=1 || { fail "the node was not tainted $TAINT"; exit 1; }
 k -n "$LNS" delete pod "$old" --wait=false > /dev/null
-# A pod can leave the API before its node has stopped it: that no launcher's process is left is the node's own word.
 down() { [ "$(launchers)" = "looked " ]; }
 wait_for 60 sh -c "kubectl --context '$CONTEXT' --request-timeout=60s -n '$LNS' get pod '$old' 2>&1 | grep -q '(NotFound)'" && wait_for 30 down \
   || fail "the launcher $old is still there, or the node still names a launcher's process: '$(launchers)'"
@@ -265,8 +263,8 @@ else
   fail "the sandbox pod, or its VM directory $vm, is still there"
 fi
 k taint node "$node" "$TAINT-" > /dev/null && tainted= || fail "the taint $TAINT was not taken off $node"
-# Running is also the phase of a launcher that keeps ending: this one is the DaemonSet's, not the old one nor being deleted, and Ready since one moment with no restart, now and ten seconds on.
-judged() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[0].uid} {.metadata.deletionTimestamp} {range .status.conditions[?(@.type=="Ready")]}{.status} {.lastTransitionTime}{end} {.status.containerStatuses[*].restartCount}{"\n"}{end}'; }
+# Running is also the phase of a launcher that keeps ending.
+judged() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$node" -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.ownerReferences[?(@.controller==true)].uid} {.metadata.deletionTimestamp} {range .status.conditions[?(@.type=="Ready")]}{.status} {.lastTransitionTime}{end} {.status.containerStatuses[*].restartCount}{"\n"}{end}'; }
 steady() { judged | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
 stays() { first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
 wait_for 120 stays && pass "a new launcher runs on the node, Ready with no restart for 10 s: ${first%% *} (the old one was $old)" \
