@@ -1866,6 +1866,9 @@ func TestAKillsSearchReadsAgainOnlyAProcessThatMayYetShowItsEnvironment(t *testi
 			if environ == ended { // as the kernels that open a zombie's show it: empty (this one may refuse the open)
 				return os.Open(os.DevNull)
 			}
+			if environ != running { // another's process with no environment would keep a search with no bound going
+				return nil, os.ErrNotExist
+			}
 		}
 		return os.Open(environ)
 	}
@@ -2107,13 +2110,6 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	note := func(bool) { looks.Add(1) }
 	afterTaken.Store(&note)
 	t.Cleanup(func() { afterTaken.Store(nil) })
-	looked := func(since int32, or string) {
-		for deadline := time.Now().Add(30 * time.Second); looks.Load() == since; time.Sleep(time.Millisecond) {
-			if time.Now().After(deadline) {
-				t.Fatal(or)
-			}
-		}
-	}
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -2150,7 +2146,7 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 		syscall.Syscall(syscall.SYS_IOCTL, held, syscall.TIOCINQ, uintptr(unsafe.Pointer(&n)))
 		return
 	}
-	write(136<<10, "which over Kubernetes exec does: a server left running that has logged as much goes on answering")
+	write(136<<10, "which over Kubernetes exec does on runc and gVisor: a server left running that has logged as much goes on answering")
 	// All but a byte of what execd takes, and all of it read: the two bytes that follow come in one read, which may take one.
 	write(1<<20-136<<10-1, "which is the rest of the megabyte execd takes, but a byte")
 	for deadline := time.Now().Add(30 * time.Second); unread() > 0; time.Sleep(time.Millisecond) {
@@ -2160,7 +2156,11 @@ func TestWhatACommandLeftRunningMayWriteBeforeItWaits(t *testing.T) {
 	}
 	write(2, "which the pipe has room for")
 	// Read without end, a writer that never stops would have the sandbox's CPU; over Kubernetes exec it waits.
-	looked(0, "execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go")
+	for deadline := time.Now().Add(30 * time.Second); looks.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("execd does not wait on the pipe once it has what it takes: it reads on, or has let the pipe go")
+		}
+	}
 
 	if n := unread(); n != 1 {
 		t.Fatalf("%d bytes wait unread, want the one written past what execd takes: execd has read on, or has let the pipe go", n)

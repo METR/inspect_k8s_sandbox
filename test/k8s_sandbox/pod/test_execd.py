@@ -150,32 +150,36 @@ async def no_spin(
         yield
         return
     spun: list[str] = []
+    told: list[str] = []  # since the loop's last turn
     capture = request.config.pluginmanager.getplugin("capturemanager")
     with capture.global_and_fixture_disabled() if capture else contextlib.nullcontext():
         shown = os.dup(2)  # the run's own stderr: what pytest captures, an exit loses
 
     def end(*_: object) -> None:
         spun.append("the event loop gave this test's own timeouts no turn in 30 s")
+        if told:  # nor since it failed for that: what the spin queued has the loop
+            said = f"{request.node.nodeid}: {spun[0]}, nor in the 15 s since\n"
+            os.write(shown, said.encode())
+            faulthandler.dump_traceback(file=shown)
+            os._exit(1)
+        told.append(spun[0])
         pytest.fail(spun[0])  # in the task that spins: the test's end says it too
 
     async def beat() -> None:
         # Ours until another takes it: put off each second the loop turns, due in 30 s.
         while signal.getsignal(signal.SIGALRM) is end:
-            signal.setitimer(signal.ITIMER_REAL, 30, 30)
-            # Ends the run where what a spin queued leaves the loop no turn after it.
-            faulthandler.dump_traceback_later(45, exit=True, file=shown)
+            signal.setitimer(signal.ITIMER_REAL, 30, 15)
+            told.clear()
             await asyncio.sleep(1)
-        faulthandler.cancel_dump_traceback_later()
 
     was = signal.signal(signal.SIGALRM, end)
     beating = asyncio.ensure_future(beat())
     yield
     beating.cancel()
-    faulthandler.cancel_dump_traceback_later()
-    os.close(shown)
     if signal.getsignal(signal.SIGALRM) is end:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, was)
+    os.close(shown)
     assert not spun, spun[0]
 
 
@@ -1799,10 +1803,8 @@ async def test_a_command_execd_still_gives_time_is_not_killed_at_our_timer(
     argv = ["sh", "-c", "sleep 8; exit 7"]
     call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, 9))
     await until(lambda: starts_written(client) == 1)
-    link = client._link
-    assert link is not None
     clock.now += 2000  # past our timer: the wait for execd's word begins
-    await until(lambda: link._last_rx == clock.now)  # the PONG is read
+    await until(lambda: bool(asked))  # execd has our timer's PING
     w, call_id = asked[0]
     w.write(frame(execd.EXIT, call_id, b'{"code": 7}'))  # the command ends by itself
 

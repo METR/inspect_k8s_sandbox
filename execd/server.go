@@ -613,7 +613,7 @@ func keep(r *os.File, keeper int, places chan struct{}) {
 	}
 	r.Close()
 	if syscall.EpollCtl(keeper, syscall.EPOLL_CTL_ADD, fd, &syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}) != nil {
-		syscall.Close(fd) // no descriptor for it, or no keeper: let go, and the next write to it fails
+		syscall.Close(fd) // no descriptor for it, or no keeper: let go
 		<-places
 	}
 }
