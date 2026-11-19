@@ -1072,6 +1072,7 @@ def _render_mount(
         "services.default.initContainers[0].name=setup,"
         "services.default.initContainers[0].image=busybox,"
         "extraContainers[0].name=relay,extraContainers[0].image=relay:1,"
+        "services.default.volumes[0].name=scratch,"  # which lifts no refusal
         f"{container}.volumeMounts[0].name={mount},"
         f"{container}.volumeMounts[0].mountPath=/mnt",
         set_string=",".join(its + annotation for annotation in annotations),
@@ -1120,6 +1121,20 @@ def test_a_pod_with_a_network_card_may_still_mount_coredns_config(
 ) -> None:
     # The refusal is for a pod with no DNS sidecar alone: main renders this mount.
     _render_mount(chart_dir, "services.default", "coredns-config")
+
+
+def test_a_pod_with_no_network_card_may_mount_a_coredns_config_volume_of_its_own(
+    chart_dir: pathlib.Path,
+) -> None:
+    # The volume is one the service declares itself: main renders this mount.
+    _run_helm_template(
+        chart_dir,
+        set_str="services.default.volumes[0].name=coredns-config,"
+        "services.default.volumes[0].emptyDir.medium=Memory,"
+        "services.default.volumeMounts[0].name=coredns-config,"
+        "services.default.volumeMounts[0].mountPath=/mnt",
+        set_string=f"services.default.podAnnotations.{_NO_CARD}",
+    )
 
 
 @pytest.mark.parametrize(
