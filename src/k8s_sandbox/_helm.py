@@ -865,7 +865,8 @@ def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -
                 label_selector=_INSTANCE_LABEL,
                 timeout_seconds=_READY_WATCH_SECONDS,
             ):
-                if _pod_ready(pod):
+                # Not as a pod being deleted completes: its replacement may not exist.
+                if _pod_ready(pod) and not pod.deleting:
                     with _ready_waits_lock:
                         wait = waits.get(pod.labels[_INSTANCE_LABEL])
                     if wait is not None:

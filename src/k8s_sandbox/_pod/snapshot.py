@@ -60,6 +60,8 @@ class PodSnapshot:
     """``status.phase``: Pending, Running, Succeeded, Failed or Unknown."""
     ready: bool = False
     """``status.conditions[type=Ready]`` is True and the pod is not being deleted."""
+    deleting: bool = False
+    """``metadata.deletionTimestamp`` is set."""
     ip: str | None = None
     """``status.podIP``."""
     annotations: dict[str, str] = field(default_factory=dict)
@@ -174,6 +176,7 @@ def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:
         and any(
             c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
         ),
+        deleting=bool(metadata.get("deletionTimestamp")),
         ip=status.get("podIP"),
         annotations=metadata.get("annotations") or {},
         shares_pids=bool(spec.get("shareProcessNamespace") or spec.get("hostPID")),

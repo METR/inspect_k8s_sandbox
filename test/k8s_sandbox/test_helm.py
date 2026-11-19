@@ -1907,6 +1907,42 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
+async def test_wait_until_ready_is_not_woken_as_a_pod_being_deleted_completes(
+    monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+) -> None:
+    # Woken then, it read before a DaemonSet had made that pod's replacement.
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default", "other"})
+    release._namespace = "going"  # where no other test's watch runs
+    polled, judged, over = threading.Event(), threading.Event(), threading.Event()
+    labels = {"app.kubernetes.io/instance": release.release_name}
+    going = {"name": "h", "uid": "h", "labels": labels, "deletionTimestamp": "2026"}
+
+    def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
+        polled.set()
+        return [_pod()]
+
+    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+        polled.wait(30)
+        yield snapshot._parse_pod({"metadata": going, "status": {"phase": "Succeeded"}})
+        judged.set()
+        over.wait(30)
+
+    _mock_release_pods.side_effect = list_pods
+    monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        assert await asyncio.to_thread(judged.wait, 30)
+        # Time for a wake-up to bring a second read; a stalled machine only hides one.
+        await asyncio.sleep(0.2)
+        assert _mock_release_pods.call_count == 1
+    finally:
+        over.set()
+        wait.cancel()
+
+
 async def test_wait_until_ready_ends_for_a_cancel_that_comes_with_a_wake(
     monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
 ) -> None:
