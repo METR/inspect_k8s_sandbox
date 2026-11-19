@@ -150,40 +150,42 @@ async def no_spin(
         yield
         return
     spun: list[str] = []
-    told: list[str] = []  # since our last beat
+    seen = [time.monotonic(), 0.0]  # the last beat or prompt, and our failure since
+    debuggers = ("pdb", "bdb", "pydevd")  # where a prompt waits; pydevd is an IDE's
     capture = request.config.pluginmanager.getplugin("capturemanager")
     with capture.global_and_fixture_disabled() if capture else contextlib.nullcontext():
         shown = os.dup(2)  # the run's own stderr: what pytest captures, an exit loses
 
-    def end(*_: object) -> None:
-        spun.append("the event loop gave this test's own timeouts no turn in 30 s")
-        if told:  # nor since it failed for that: what the spin queued has the loop
+    def end(_: int, frame: types.FrameType | None) -> None:
+        now = time.monotonic()
+        while frame and frame.f_globals.get("__name__") not in debuggers:
+            frame = frame.f_back
+        if frame:  # a debugger's prompt is no spin
+            seen[:] = now, 0.0
+        elif seen[1] and now - seen[1] >= 15:  # what the spin queued has the loop
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)  # ends us if a write blocks
+            signal.alarm(5)
             try:
                 said = f"{request.node.nodeid}: {spun[0]}, nor in the 15 s since\n"
                 os.write(shown, said.encode())
                 faulthandler.dump_traceback(file=shown)
             finally:  # also where nothing reads the run's stderr any more
                 os._exit(1)
-        told.append(spun[0])
-        pytest.fail(spun[0])  # in the task that spins: the test's end says it too
+        elif not seen[1] and now - seen[0] >= 30:
+            seen[1] = now
+            spun.append("the event loop gave this test's own timeouts no turn in 30 s")
+            pytest.fail(spun[0])  # in the task that spins: the test's end says it too
 
     async def beat() -> None:
-        # Ours until another takes it: put off each second the loop turns, due in 30 s.
+        # Ours until another takes it: looked at each second, and put off by each turn.
         while signal.getsignal(signal.SIGALRM) is end:
-            signal.setitimer(signal.ITIMER_REAL, 30, 15)
-            told.clear()
+            seen[:] = time.monotonic(), 0.0
             await asyncio.sleep(1)
 
-    class Prompt:
-        def pytest_enter_pdb(self) -> None:  # a debugger's prompt is no spin
-            if signal.getsignal(signal.SIGALRM) is end:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-
     was = signal.signal(signal.SIGALRM, end)
+    signal.setitimer(signal.ITIMER_REAL, 1, 1)
     beating = asyncio.ensure_future(beat())
-    request.config.pluginmanager.register(prompt := Prompt())
     yield
-    request.config.pluginmanager.unregister(prompt)
     beating.cancel()
     if signal.getsignal(signal.SIGALRM) is end:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -254,10 +256,12 @@ def interval(
     """Have a connection's ping intervals end at the test's word, on its clock."""
     told = asyncio.Event()
     sleep = execd.asyncio.sleep
+    clock.sleeps = 0  # the intervals begun, for a test to wait on one
 
     async def until_told(seconds: float) -> None:
         if seconds < execd.PING_EVERY:
             return await sleep(seconds)
+        clock.sleeps += 1
         await told.wait()
         told.clear()
         clock.now += seconds
@@ -2338,7 +2342,7 @@ async def test_an_exit_read_with_the_end_of_execds_session_is_kept(
 
 @pytest.mark.parametrize(
     ("waits", "late", "kept"),
-    [(0, 0.015, 2), (17, 0, 0), (0, 2 * execd.DEAD_AFTER, 3)],
+    [(0, 0.015, 2), (17, 0, 1), (0, 16, 3)],
     ids=["a PONG", "its PING waits", "our loop held"],
 )
 async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
@@ -2350,11 +2354,13 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     kept: int,
 ) -> None:
     """Only this fails where the keepalive never gives a silent connection up."""
-    connections, pings, answer = [0], [0], asyncio.Event()
+    connections, pings = [0], [0]
+    started: list[tuple[asyncio.StreamWriter, int]] = []
 
     async def falls_silent(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         connections[0] += 1
         kind, call_id, _ = await read_frame(r)  # START, then its RESUME
+        started.append((w, call_id))
         if kind == execd.RESUME:
             resumed = b'{"stdin": 0, "eof": false, "put": 0}'
             w.write(frame(execd.RESUMED, call_id, resumed))
@@ -2362,14 +2368,11 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
         while True:
             if (await read_frame(r))[0] == execd.PING:
                 pings[0] += 1
-                if pings[0] == 1 and not waits:  # its last frame on this connection
-                    await answer.wait()
-                    w.write(frame(execd.PONG, 0))
 
     await daemons.serve(falls_silent)
     client = daemons.client()
     call = asyncio.ensure_future(client.exec(["true"], None, None, {}, None, None))
-    await until(lambda: starts_written(client) == 1)
+    await until(lambda: len(started) == 1)  # execd has its START
     link = client._link
     assert link is not None
     ended = [0]
@@ -2377,26 +2380,38 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
     def pinged() -> bool:  # execd has the interval's ping
         return link.closed or pings[0] == ended[0]
 
+    async def hold() -> None:
+        await until(lambda: link.closed or clock.sleeps > ended[0])  # it sleeps
+        clock.now += late  # that sleep ends 15 ms late, or 16 s: our loop held
+
     async def intervals(more: int) -> None:
         for _ in range(more):
+            await hold()
             ended[0] += 1
             interval()
             await until(pinged)
-            clock.now += late  # its sleep ends 15 ms late, or 90 s: our loop held
+
+    async def comes(sent: bytes) -> None:  # a frame of execd's, read at once
+        started[0][0].write(sent)
+        await until(lambda: link._last_rx == clock.now)
 
     if waits:  # Regression: a PING's 17 s behind another call's write were no silence.
         await link._wlock.acquire()
         ended[0] += 1
         interval()
         await until(lambda: clock.now == execd.PING_EVERY)  # looked: its PING waits
+        await comes(frame(execd.STDOUT, started[0][1], b"x"))
         clock.now += waits
         link._wlock.release()
         await until(pinged)
-    else:  # Regression: held, it was closed unread; counted by intervals, kept on.
+    else:  # Regression: our loop held, it was given up; counted by intervals, kept on.
         await asyncio.wait_for(intervals(1), 30)
-        answer.set()  # read as our loop runs again, where it was held
-        await until(lambda: link._last_rx == clock.now)
+        await comes(frame(execd.PONG, 0))  # before a hold: the earlier silence is over
         await asyncio.wait_for(intervals(kept), 30)
+        assert not link.closed
+        await hold()
+        await comes(frame(execd.PONG, 0))  # between two: only the second is taken off
+    await asyncio.wait_for(intervals(kept), 30)
     assert not link.closed
     await asyncio.wait_for(intervals(1), 30)  # the first look with over 45 s counted
 

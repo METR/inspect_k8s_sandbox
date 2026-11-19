@@ -291,7 +291,7 @@ async def test_a_command_for_another_user_does_not_run_with_groups_it_cannot_tak
     assert (result.returncode, result.stdout) == (126, "")
 
 
-@pytest.mark.parametrize(("limit", "left"), [(64, 32), (32, 12)])
+@pytest.mark.parametrize(("limit", "left", "beside"), [(64, 32, 6), (32, 12, 2)])
 async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
     sandbox: Sandbox,
     relay: Relay,
@@ -299,6 +299,7 @@ async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
     monkeypatch: pytest.MonkeyPatch,
     limit: int,
     left: int,
+    beside: int,
 ) -> None:
     """Regression: in a Kata guest, with 1,024, the 506th such command failed."""
     name = f"{sandbox.name}-nofile"
@@ -322,9 +323,16 @@ async def test_commands_that_each_leave_a_process_do_not_take_every_descriptor(
         monkeypatch.setattr(sandbox, "name", name)
         ip = docker("inspect", "-f", address, name).stdout.strip()
         monkeypatch.setattr(relay, "ip", ip)
-        # All kept, their pipes were every descriptor of 64; half of 32 kept left none.
+        # All kept, their pipes were every descriptor of 64; half of 32 left too few.
         for _ in range(left):
             assert await leave(held) == 0
+        # With all but 24 of 64 kept, four of these ran; with all but 18 of 32, one.
+        sleeps = (
+            client.exec(["sleep", "1"], None, None, {}, None, None)
+            for _ in range(beside)
+        )
+        ran = await asyncio.wait_for(asyncio.gather(*sleeps), 30)  # only bounds a hang
+        assert [r.returncode for r in ran] == [0] * beside
         sandbox.sh(f"touch {gate}")
         await sandbox.until(f'[ "$(wc -l <{gate}.gone)" = {left} ]')
         assert await leave(late) == 0
