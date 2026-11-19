@@ -1573,6 +1573,27 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
     await _wait(release, polls, monkeypatch)
 
 
+def test_a_pod_being_deleted_holds_its_release_back() -> None:
+    # Until its containers stop, a deleted pod is Running and still reports Ready.
+    ready = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+    sandbox = {"name": "p", "uid": "p", "labels": {_SERVICE_LABEL: "default"}}
+    helper = {"name": "h", "uid": "h", "deletionTimestamp": "2026-11-18T00:00:00Z"}
+    items = [{"metadata": metadata, "status": ready} for metadata in (sandbox, helper)]
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+
+    with (
+        patch("k8s_sandbox._helm.list_pods", snapshot.list_pods),
+        patch("k8s_sandbox._helm.k8s_client") as client,
+    ):
+        listed = client.return_value.list_namespaced_pod.return_value
+        listed.data = json.dumps({"items": items})
+        pods = release._list_release_pods()
+
+    # Left out, it is waited for no longer: its replacement may not yet be listed.
+    assert not release._is_ready(pods)
+
+
 def _helper(release: Release, spec: str = "") -> str:
     labels = f'{{app.kubernetes.io/instance: "{release.release_name}"}}'
     return (

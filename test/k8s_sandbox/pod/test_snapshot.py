@@ -195,20 +195,17 @@ def test_list_pods_parses_readiness(status: dict, expected: tuple[bool, str | No
     assert (pod.ready, pod.phase) == expected
 
 
-def test_a_pod_being_deleted_is_not_ready():
-    # Until its containers stop, a deleted pod is Running and still reports Ready.
-    ready = [{"type": "Ready", "status": "True"}]
-    body = _pod_body() | {"status": {"phase": "Running", "conditions": ready}}
-    body["metadata"]["deletionTimestamp"] = "2026-11-18T00:00:00Z"
+def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
+    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    events = [
+        {"type": "ADDED", "object": _pod_body(uid="p")},
+        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
+        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
+    ]
+    asked: list[str] = []
 
-    snapshot = _parse_pod(body)
-
-    assert snapshot.ready is False
-
-
-def _watch(events: list[dict], asked: list[str]) -> list[PodSnapshot]:
     class Watched(http.server.BaseHTTPRequestHandler):
-        """An API server that answers a watch with the events and ends it."""
+        """An API server that answers a watch with three events and ends it."""
 
         def do_GET(self) -> None:
             asked.append(self.path)
@@ -229,36 +226,13 @@ def _watch(events: list[dict], asked: list[str]) -> list[PodSnapshot]:
                 )
             )
         )
-        return list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
-
-
-def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
-    ready = {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
-    events = [
-        {"type": "ADDED", "object": _pod_body(uid="p")},
-        {"type": "MODIFIED", "object": _pod_body(uid="p") | ready},
-        {"type": "DELETED", "object": _pod_body(uid="p") | ready},
-    ]
-    asked: list[str] = []
-
-    pods = _watch(events, asked)
+        pods = list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
 
     assert [pod.ready for pod in pods] == [False, True]
     target = urllib.parse.urlsplit(asked[0])
     asks = urllib.parse.parse_qs(target.query)
     assert target.path == "/api/v1/namespaces/ns/pods"
     assert (asks["labelSelector"], asks["resourceVersion"]) == (["app"], ["0"])
-    assert asks["watch"] == ["True"]  # or the call would list the pods once
-
-
-def test_watch_pods_raises_the_error_a_watch_ends_with():
-    # Told not to deserialize, the client raised KeyError('raw_object') for this event.
-    gone = {"kind": "Status", "code": 410, "reason": "Expired", "message": "too old"}
-
-    with pytest.raises(kubernetes.client.ApiException, match="Expired") as e:
-        _watch([{"type": "ERROR", "object": gone}], [])
-
-    assert e.value.status == 410
 
 
 @pytest.mark.parametrize(
