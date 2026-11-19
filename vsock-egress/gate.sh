@@ -97,8 +97,8 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
   "volumes":[{"name":"vms","hostPath":{"path":"/var/lib/nitro-sandbox/firecracker"}}]}}
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
-# scan RE [THEN]: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, and the scan met its own shell.
-scan() { peek 'for p in /proc/[0-9]*; do { tr "\0\n" "  " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p ] || exit; [ $p = /proc/$$ ] && me=1; done; [ -n "$me" ] && { '"${2:-true}"'; }' | tr '\n' ' '; }
+# scan RE THEN: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, PID 1's among them: a /proc that hides other users' processes shows none of it.
+scan() { peek 'for p in /proc/[0-9]*; do { tr "\0\n" "  " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p ] || exit; [ $p = /proc/1 ] && init=1; done; [ -n "$init" ] && { '"$2"'; }' | tr '\n' ' '; }
 workers() { scan "^/vsock-egress work .*$NS/$SANDBOX" "$@"; }
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
@@ -237,7 +237,7 @@ if [ "$seen" != "$was" ] && [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] 
     && pass "worker $was and VM directory $before went with the pod; the pod that followed has worker $now and VM directory $vm, from the same launcher (pid $from)" \
     || fail "after the pod was deleted under a running launcher: the node named workers '$seen' (it was '$was', named again as '$was:Z' if it ended and was not reaped; with no looked, a read of the node did not end) at VM directory '$new' (it was '$before', which is $(peek "[ -e /vms/$before ] && echo still there || echo gone")), started by pid '$(by "$now")' (it was '$from')"
 else
-  fail "the pod $SANDBOX or its worker was not read (VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
+  fail "the pod $SANDBOX or its worker was not read (the node said '$seen', VM directory '$before', started by pid '$from'), the pod was not deleted, or no new one became Ready"
 fi
 
 keep "step 7"
