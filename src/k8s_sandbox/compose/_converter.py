@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -45,7 +46,15 @@ def convert_compose_to_helm_values(compose_file: Path) -> dict[str, Any]:
         A dictionary representing the generated Helm values.
     """
     compose = yaml.safe_load(compose_file.read_text())
-    _validate_compose(compose, compose_file)
+    try:
+        _validate_compose(compose, compose_file)
+    except TypeError as e:
+        # jsonschema matches each key against the schema's patterns, as a string.
+        raise ComposeConverterError(
+            f"A key of the Compose file is not a string. Quote it: YAML reads an "
+            f"unquoted on, off, yes, no, true, false, null, number or date as another "
+            f"type. Compose file: '{compose_file}'."
+        ) from e
     result: dict[str, Any] = dict()
     services = compose.pop("services", None)
     if services is None:
@@ -104,7 +113,8 @@ def _convert_services(src: dict[str, Any], compose_file: Path) -> dict[str, Any]
         )
         service_converter = _ServiceConverter(
             service_name,
-            service_value,
+            # Services that share a YAML alias share mappings, which converting empties.
+            copy.deepcopy(service_value),
             compose_file,
             is_default=output_service_name == "default",
         )
@@ -181,7 +191,8 @@ def _pop_extension(src: dict[str, Any], context: str) -> Any:
 
     Both the canonical 'x-inspect_k8s_sandbox' key and the shorter 'x-k8s' alias are
     accepted. Returns the extension value, or None if neither key is present. Raises
-    if both keys are present, since which one would win is ambiguous.
+    if both keys are present, since which one would win is ambiguous, or if the value
+    is a list or a plain value.
     """
     present = [key for key in _EXTENSION_KEYS if key in src]
     if len(present) > 1:
@@ -189,7 +200,13 @@ def _pop_extension(src: dict[str, Any], context: str) -> Any:
             f"Specify only one of {present}; 'x-k8s' is an alias for "
             f"'x-inspect_k8s_sandbox'. {context}"
         )
-    return src.pop(present[0]) if present else None
+    extension = src.pop(present[0]) if present else None
+    if extension is not None and not isinstance(extension, dict):
+        raise ComposeConverterError(
+            f"Invalid 'x-inspect_k8s_sandbox' type: {type(extension)}. Expected dict. "
+            f"{context}"
+        )
+    return extension
 
 
 def _convert_extensions(
@@ -303,7 +320,8 @@ class _ServiceConverter:
         # Resource limits can be specified in deploy.resources or as shortcuts.
         mem_limit = src.pop("mem_limit", None)
         cpus = src.pop("cpus", None)
-        result.update(self._convert_deploy(src.pop("deploy", {}), mem_limit, cpus))
+        deploy = src.pop("deploy", None) or {}
+        result.update(self._convert_deploy(deploy, mem_limit, cpus))
         _transform(
             src, "user", result, "securityContext", self._user_to_security_context
         )
@@ -469,8 +487,19 @@ class _ServiceConverter:
     def _healthcheck_to_readiness_probe(self, src: dict[str, Any]) -> dict[str, Any]:
         """Assume that healthchecks are to be mapped to readiness probes."""
         result: dict[str, Any] = {}
-        # Allow KeyError to be raised if test is not present.
-        result["exec"] = self._convert_healthcheck_test_to_exec(src.pop("test"))
+        test = src.pop("test", None)
+        disable = str(src.pop("disable", False))
+        # Compose reads these words as booleans, in any case and quoted or not.
+        disabled = disable.lower() in ("true", "y", "yes", "on")
+        if not disabled and disable.lower() not in ("false", "n", "no", "off"):
+            raise ComposeConverterError(
+                f"Invalid 'healthcheck.disable' value: '{disable}'. Expected a "
+                f"boolean. {self.context}"
+            )
+        # With no test Docker runs the image's own health check, which K8s never runs.
+        if disabled or not test or test[0] == "NONE":
+            return result
+        result["exec"] = self._convert_healthcheck_test_to_exec(test)
         _transform(
             src,
             "start_period",
@@ -480,8 +509,7 @@ class _ServiceConverter:
         )
         _transform(src, "interval", result, "periodSeconds", self._duration_to_seconds)
         _transform(src, "timeout", result, "timeoutSeconds", self._duration_to_seconds)
-        # N retries is equivalent to a failureThreshold of N+1.
-        _transform(src, "retries", result, "failureThreshold", lambda x: x + 1)
+        _transform(src, "retries", result, "failureThreshold", self._failure_threshold)
         if src.pop("start_interval", None):
             logger.info(
                 f"Ignoring 'start_interval' in 'healthcheck': not supported in K8s. "
@@ -493,11 +521,22 @@ class _ServiceConverter:
             )
         return result
 
+    def _failure_threshold(self, retries: float | str) -> int:
+        if isinstance(retries, str) and re.fullmatch(r"[0-9]{1,9}", retries):
+            retries = int(retries)
+        if isinstance(retries, str) or not 0 <= retries < float("inf"):
+            raise ComposeConverterError(
+                f"Invalid 'healthcheck.retries' value: '{retries}'. Expected a whole "
+                f"number of 0 or more. {self.context}"
+            )
+        # N retries is equivalent to a failureThreshold of N+1.
+        return int(retries) + 1
+
     def _convert_healthcheck_test_to_exec(self, test: list[str]) -> dict[str, Any]:
         if test[0] == "CMD":
             return {"command": test[1:]}
         if test[0] == "CMD-SHELL":
-            return {"command": ["sh", "-c", test[1]]}
+            return {"command": ["sh", "-c", *test[1:]]}
         raise ComposeConverterError(
             f"Unsupported 'healthcheck.test': '{test}'. Only CMD and CMD-SHELL "
             f"are supported. {self.context}"
@@ -506,7 +545,7 @@ class _ServiceConverter:
     def _convert_deploy(
         self,
         src: dict[str, Any],
-        mem_limit: str | None,
+        mem_limit: int | str | None,
         cpus: float | str | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = dict()
@@ -563,7 +602,7 @@ class _ServiceConverter:
             )
         return result
 
-    def _convert_byte_value(self, value: str) -> str:
+    def _convert_byte_value(self, value: int | str) -> str:
         """Convert Docker compose byte values (memory quantity) to Ki/Mi/Gi.
 
         https://docs.docker.com/reference/compose-file/extension/#specifying-byte-values
@@ -585,9 +624,11 @@ class _ServiceConverter:
                         f"{self.context}"
                     )
 
+        # Compose reads a whole number as bytes.
+        text = f"{value}b" if isinstance(value, int) else str(value)
         # Despite not being documented, Docker Compose allows uppercase units.
         match = re.match(
-            r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>gb?|mb?|kb?|b)$", value, re.IGNORECASE
+            r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>gb?|mb?|kb?|b)$", text, re.IGNORECASE
         )
         if not match:
             raise ComposeConverterError(
@@ -611,11 +652,6 @@ class _ServiceConverter:
         request-only resources such as 'ephemeral-storage'. Currently only a
         'resources' block is supported.
         """
-        if not isinstance(extensions, dict):
-            raise ComposeConverterError(
-                f"Invalid 'x-inspect_k8s_sandbox' type: {type(extensions)}. Expected "
-                f"dict. {self.context}"
-            )
         if (resources := extensions.pop("resources", None)) is not None:
             self._merge_extension_resources(resources, result)
         if extensions:
