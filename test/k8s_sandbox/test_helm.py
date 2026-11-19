@@ -1515,8 +1515,9 @@ def _services(stdout: str) -> frozenset[str]:
         ),
         pytest.param(
             _manifest(
-                "kind: !!binary UG9kTGlzdA==\nitems: [{metadata: {annotations: "
-                f"{{a: !!binary /w==}}, labels: {{{_SERVICE_LABEL}: a}}}}}}]"
+                "apiVersion: v1\nkind: !!binary UG9kTGlzdA==\nitems: [{metadata: "
+                "{annotations: {a: !!binary /w==}, "
+                f"labels: {{{_SERVICE_LABEL}: a}}}}}}]"
             ),
             {"a"},
             id="list-kind-tagged-binary",
