@@ -23,8 +23,9 @@ Each node needs:
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
   `SETGID` and no other, under the launcher's profile, with the node's `/var/lib/nitro-sandbox/firecracker` and
-  `/run/netns` mounted with `HostToContainer` propagation and `/var/lib/cni/results` read-only. Every sandbox's worker
-  runs in that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
+  `/run/netns` mounted with `HostToContainer` propagation and `/var/lib/cni/results` read-only. Keep its pod off the
+  host network, or a sandbox deleted before the launcher started can raise `no_worker`. Every sandbox's worker runs in
+  that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
   downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
   as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
   Past the limit the kernel kills every process in the container unless the kubelet's `singleProcessOOMKill` is on.
@@ -33,8 +34,7 @@ Each node needs:
   sandbox filled the socket buffers, so one sandbox can cost another its worker. That holds only while a thousandth
   of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
   resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
-  the node's memory. Its pod is not on the host network, or a sandbox deleted before the launcher started can raise
-  `no_worker`.
+  the node's memory.
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
