@@ -221,11 +221,16 @@ def test_names_a_pod_that_is_being_deleted() -> None:
     # It can hold the readiness wait with no container of its own at fault.
     going = V1ObjectMeta(name="rel-default", deletion_timestamp=datetime(2026, 11, 18))
     pod = V1Pod(metadata=going, status=V1PodStatus(phase="Running"))
+    # Stopped, a StatefulSet's pod that a finalizer keeps listed holds the wait still.
+    kept = V1ObjectMeta(name="rel-helper-0", deletion_timestamp=datetime(2026, 11, 18))
+    stopped = V1Pod(metadata=kept, status=V1PodStatus(phase="Failed"))
 
-    with _patch_client([pod]):
+    with _patch_client([pod, stopped]):
         summary = describe_release_pods(None, "default", "rel")
 
-    assert summary == "pod 'rel-default': being deleted"
+    assert summary == (
+        "pod 'rel-default': being deleted\npod 'rel-helper-0': being deleted"
+    )
 
 
 def test_returns_none_and_does_not_raise_when_api_call_fails() -> None:
