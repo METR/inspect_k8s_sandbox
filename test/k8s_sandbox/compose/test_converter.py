@@ -114,6 +114,9 @@ def test_converting_again_does_not_check_compose_schema(
 
     _converter.convert_compose_to_helm_values(compose_path)
 
+    # A loader that parses kept text again gets this far, and returns the file's title.
+    assert _converter._checked_compose_schema()["title"] == 12
+
 
 ### Top level elements
 
