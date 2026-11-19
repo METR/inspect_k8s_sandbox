@@ -269,7 +269,7 @@ judged() { k -n "$LNS" get pods -l "$selector" --field-selector "spec.nodeName=$
 steady() { judged | grep -v "^$old " | grep -E "^[^ ]+ $owner  True [^ ]+( 0)+$"; }
 stays() { first=$(steady) && sleep 10 && [ "$(steady)" = "$first" ]; }
 wait_for 120 stays && pass "a new launcher runs on the node, Ready with no restart for 10 s: ${first%% *} (the old one was $old)" \
-  || fail "no new launcher of DaemonSet $owner stays up on $node (name, owner, deleted at, Ready, since, restarts): $(judged 2>&1 | tr '\n' '|')"
+  || fail "no new launcher of DaemonSet $LAUNCHERS ($owner) stays up on $node (name, owner, deleted at, Ready, since, restarts): $(judged 2>&1 | tr '\n' '|')"
 # The node names each worker and the VM directory it finds, then says `looked`: an exec that fails, or is cut short, does not.
 left() { echo $(workers "[ -e /vms/$vm ] && echo /vms/$vm; [ -e /vms/. ] && echo looked"); }
 gone() { found=$(left); [ "$found" = looked ]; }
