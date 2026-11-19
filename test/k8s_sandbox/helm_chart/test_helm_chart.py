@@ -1150,6 +1150,9 @@ def test_a_pod_with_no_network_card_may_mount_a_coredns_config_volume_of_its_own
         pytest.param("volumeMounts[0].mountPath=/mnt", "mounts a volume with no name"),
         pytest.param("volumes[0].name=123", "has a volume named 123: quote the name"),
         pytest.param("volumes[0].emptyDir.medium=Memory", "has a volume with no name"),
+        # On one line, as JSON: the client reads Helm's error for whole lines of Helm's.
+        pytest.param("volumeMounts[0].name={a\nb}", r'mounts a volume named ["a\nb"]:'),
+        pytest.param("volumes[0].name={a\nb}", r'has a volume named ["a\nb"]: quote'),
     ],
 )
 def test_a_volume_or_a_mount_whose_name_is_no_text_is_refused(
