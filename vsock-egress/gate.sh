@@ -98,7 +98,7 @@ cat <<EOF | k -n "$NS" apply -f - > /dev/null
 EOF
 wait_for 120 k -n "$NS" wait --for=condition=Ready "pod/$REL-peek" --timeout=5s || { fail "the peek pod did not start"; exit 1; }
 # scan RE [THEN]: the node's processes whose command line matches RE. THEN, which says `looked`, runs only if each command line was read or its process had gone, and the scan met its own shell.
-scan() { peek 'for p in /proc/[0-9]*; do { tr "\0" " " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p/cmdline ] || exit; [ $p = /proc/$$ ] && me=1; done; [ -n "$me" ] && { '"${2:-true}"'; }' | tr '\n' ' '; }
+scan() { peek 'for p in /proc/[0-9]*; do { tr "\0\n" "  " < $p/cmdline && echo; } 2>/dev/null | sed -n "s|'"$1"'.*|${p#/proc/}|p" || [ ! -e $p ] || exit; [ $p = /proc/$$ ] && me=1; done; [ -n "$me" ] && { '"${2:-true}"'; }' | tr '\n' ' '; }
 workers() { scan "^/vsock-egress work .*$NS/$SANDBOX" "$@"; }
 seen=$(echo $(workers 'echo looked')); worker=${seen%looked}; worker=${worker% }; uid=$(peek "awk '/^Uid/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null); caps=$(peek "awk '/^CapEff/{print \$2}' /proc/${worker%% *}/status" 2> /dev/null)
 [ "$seen" != "$worker" ] && [ "$(echo $worker | wc -w)" -eq 1 ] && [ "${uid:-0}" != 0 ] && [ "$caps" = 0000000000000000 ] \
@@ -222,15 +222,15 @@ keep "step 6a deletes the sandbox's pod"
 say "6a. the sandbox's pod is deleted while its node's launcher runs: its worker and VM directory go, and the pod that follows gets a worker from that launcher"
 at() { peek "tr '\\0' ' ' < /proc/${1:-none}/cmdline" 2> /dev/null | sed -n 's|.* -vsock [^ ]*/\([0-9a-f]\{12\}\)/root/vm.vsock .*|\1|p'; } # a worker's VM directory
 by() { peek "awk '/^PPid/{print \$2}' /proc/${1:-none}/status" 2> /dev/null; } # and the process that started it: its launcher
-was=$(echo $(workers)); before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid}')
+seen=$(echo $(workers 'echo looked')); was=${seen%looked}; was=${was% }; before=$(at "$was"); from=$(by "$was"); uid=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid}')
 # The StatefulSet makes the pod again under its name: Ready there says its forwarder has met a new worker.
 reborn() { local now; now=$(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.uid} {.status.conditions[?(@.type=="Ready")].status}') && [ "${now% *}" != "$uid" ] && [ "${now#* }" = True ]; }
 dir_gone() { [ "$(peek "[ -e /vms/. ] && { [ -e /vms/$1 ] || echo gone; }")" = gone ]; } # not where the VM directories cannot be read at all
 moved() { # one new worker and no other, nor the old one unreaped: that has a process entry and no command line
-  seen=$(echo $(workers "awk '/^State/ && \$2 == \"Z\" {print \"$was:\" \$2}' /proc/$was/status 2>/dev/null || [ ! -e /proc/$was/status ] && echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
+  seen=$(echo $(workers "awk '/^State/ && \$2 == \"Z\" {print \"$was:\" \$2}' /proc/$was/status 2>/dev/null || [ ! -e /proc/$was ] && echo looked")); now=${seen%looked}; now=${now% }; new=$(at "$now")
   [ "$seen" != "$now" ] && [ -n "$new" ] && [ "$new" != "$before" ]
 }
-if [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
+if [ "$seen" != "$was" ] && [ -n "$uid" ] && [ -n "$before" ] && [ -n "$from" ] && k -n "$NS" delete pod "$SANDBOX" --wait=false > /dev/null && wait_for 300 reborn; then
   wait_for 120 dir_gone "$before" # the node can stop the old VM after the new pod is up: its directory goes then, and its worker at the launcher's next pass
   # A launcher that ended instead would have taken every worker on the node with it, and its successor would start this one too.
   wait_for 60 moved && vm=$new && dir_gone "$before" && [ "$(by "$now")" = "$from" ] \
