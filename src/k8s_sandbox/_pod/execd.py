@@ -548,12 +548,15 @@ class Link:
             await self.close()
 
     async def _ping(self) -> None:
-        # Intervals with no frame, not seconds: while our own loop is held, none passes.
-        quiet, last = 0, self._last_rx
+        since = self._last_rx  # the last frame, or later by what a held loop took
         while not self.closed:
+            slept = time.monotonic()
             await asyncio.sleep(PING_EVERY)
-            quiet, last = (quiet + 1 if self._last_rx == last else 0), self._last_rx
-            if quiet * PING_EVERY >= DEAD_AFTER:
+            now = time.monotonic()
+            since = max(since, self._last_rx)
+            if now - slept > 2 * PING_EVERY:  # our loop was held: one interval counts
+                since += max(0.0, now - max(since, slept) - PING_EVERY)
+            if now - since > DEAD_AFTER:
                 await self.close()
                 return
             try:
@@ -561,8 +564,6 @@ class Link:
             except OSError:
                 await self.close()
                 return
-            if self._last_rx != last:  # read as the PING waited its turn: not the next
-                quiet, last = 0, self._last_rx
 
     async def close(self) -> None:
         if self.closed:
