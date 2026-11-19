@@ -7,6 +7,7 @@ from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
 from websocket import WebSocketException
 
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.execute import _file_command
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
@@ -19,14 +20,16 @@ from k8s_sandbox._pod.op import (
 
 
 class WriteFileOperation(PodOperation):
-    def write_file(self, data: bytes, dst: Path) -> None:
-        with self._start_write_command(dst, len(data)) as ws_client:
+    def write_file(
+        self, data: bytes, dst: Path, user: str | None = None, switch: bool = False
+    ) -> None:
+        with self._start_write_command(dst, len(data), user, switch) as ws_client:
             self._write_stdin_chunked(ws_client, data)
             self._handle_stream_output(ws_client)
 
     @contextmanager
     def _start_write_command(
-        self, dst: Path, file_size: int
+        self, dst: Path, file_size: int, user: str | None = None, switch: bool = False
     ) -> Generator[WSClient, None, None]:
         mkdir_command = f"mkdir -p -- {shlex.quote(dst.parent.as_posix())}"
         # Use `head` with `-c <file size>` because we have no way of closing the stdin
@@ -48,7 +51,8 @@ class WriteFileOperation(PodOperation):
             f"{mkdir_command} && {head_command} > {dst_quoted}",
         ]
         yield from self.create_websocket_client_for_exec(
-            command=command,
+            # As `user`, switched to as exec() does: directories and file are theirs.
+            command=_file_command(user, switch, command),
             stderr=True,
             stdin=True,
             stdout=True,

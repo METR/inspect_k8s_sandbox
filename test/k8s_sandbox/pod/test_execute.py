@@ -1445,10 +1445,10 @@ class TestProbeSwitch:
         assert not ran.exists()
 
     @pytest.mark.parametrize(
-        ("returncode", "switch"), [(0, False), (1, True), (2, False)]
+        ("returncode", "switch"), [(0, False), (1, True), (2, None)]
     )
     def test_answer_comes_from_the_exit_status(
-        self, returncode: int, switch: bool
+        self, returncode: int, switch: bool | None
     ) -> None:
         op = ExecuteOperation(MagicMock())
 

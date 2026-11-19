@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from typing import IO, Callable, Literal, TypeVar
 
-from inspect_ai.util import ExecResult
+from inspect_ai.util import ExecResult, SandboxUserUnsupportedError
 
 from k8s_sandbox._kubernetes_api import k8s_client
 from k8s_sandbox._pod.error import (
@@ -28,7 +28,12 @@ from k8s_sandbox._pod.execd import (
     ExecdClient,
     ExecdStream,
 )
-from k8s_sandbox._pod.execute import ROOT_USERS, ExecuteOperation, PodStdio
+from k8s_sandbox._pod.execute import (
+    EXEC_USER_URL,
+    ROOT_USERS,
+    ExecuteOperation,
+    PodStdio,
+)
 from k8s_sandbox._pod.executor import PodOpExecutor
 from k8s_sandbox._pod.op import API_TIMEOUT, PodInfo, check_for_pod_restart
 from k8s_sandbox._pod.read import ReadFileOperation
@@ -72,7 +77,7 @@ class Pod:
         )
         # Whether exec() can start runuser directly to run as a user, per pod,
         # container start and user (see exec()).
-        self._switch: dict[tuple[str, int, str], bool] = {}
+        self._switch: dict[tuple[str, int, str], bool | None] = {}
         # What a check in "raise" mode detected, which every later operation raises.
         self._restart_error: PodReplacedError | ContainerRestartedError | None = None
         self._restart_lock = threading.Lock()
@@ -234,7 +239,7 @@ class Pod:
             # A probe answers for the container it ran in: if this one was replaced or
             # restarted meanwhile, let its shell check for itself this time.
             switch = (
-                self._switch.get(key, False) if user and self._info == info else False
+                bool(self._switch.get(key)) if user and self._info == info else False
             )
             result = await self._run_async(
                 lambda: executor.exec(cmd, stdin, cwd, env, user, timeout, switch)
@@ -303,7 +308,7 @@ class Pod:
         if restart is not None:
             raise restart
 
-    async def write_file(self, data: bytes, dst: Path) -> None:
+    async def write_file(self, data: bytes, dst: Path, user: str | None = None) -> None:
         """
         Write ``data`` from the client to a path on the pod (dst).
 
@@ -313,15 +318,23 @@ class Pod:
           data (bytes): The contents to write to the pod.
           dst (Path): The path to write the file to on the pod. Relative paths will be
             resolved relative to the pod's default working directory.
+          user (str | None): The user to write the file, and make its directories, as.
+            If None, the container's user. Raises SandboxUserUnsupportedError, before
+            anything is written, if the container cannot run as them (see exec()).
         """
         if self._execd is not None:
-            return await self._execd.write_file(data, dst)
+            return await self._execd.write_file(data, dst, user)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
+        switch = await self._file_user_switch(user)
         writer = WriteFileOperation(self._info)
-        await self._after_failure_check(lambda: writer.write_file(data, dst))
+        await self._after_failure_check(
+            lambda: writer.write_file(data, dst, user, switch)
+        )
 
-    async def read_file(self, src: Path, dst: IO[bytes]) -> None:
+    async def read_file(
+        self, src: Path, dst: IO[bytes], user: str | None = None
+    ) -> None:
         """
         Copy a file from the pod (src) to a file-like object (dst) on the client.
 
@@ -332,13 +345,42 @@ class Pod:
           src (Path): The path to the file on the pod. Relative paths will be resolved
             relative to the pod's default working directory.
           dst (IO[bytes]): A file-like object to write the file to on the client system.
+          user (str | None): The user to read the file as, as for write_file().
         """
         if self._execd is not None:
-            return await self._execd.read_file(src, dst)
+            return await self._execd.read_file(src, dst, user)
         if _file_op_restart_check_enabled():
             await self.check_for_pod_restart()
+        switch = await self._file_user_switch(user)
         reader = ReadFileOperation(self._info)
-        await self._after_failure_check(lambda: reader.read_file(src, dst))
+        await self._after_failure_check(
+            lambda: reader.read_file(src, dst, user, switch)
+        )
+
+    async def _file_user_switch(self, user: str | None) -> bool:
+        """Whether a file operation as `user` starts `runuser` directly (see exec()).
+
+        Probed once per container and user, as for exec(), but before the operation
+        rather than by its shell: a file operation as a user the container cannot run
+        as must not start. A user it could not run as is probed again each time: the
+        sample may have created them since.
+        """
+        if user is None:
+            return False
+        info = self._info
+        key = (info.uid, info.initial_restart_count, user)
+        switch = self._switch.get(key)
+        if switch is None:
+            switch = self._switch[key] = await self._run_async(
+                lambda: ExecuteOperation(info).probe_switch(user)
+            )
+        if switch is None:
+            raise SandboxUserUnsupportedError(
+                f"The container cannot read or write files as user '{user}': it does "
+                "not run as them, and cannot switch to them (that needs root, "
+                f"/sbin/runuser and a user that exists). Docs: {EXEC_USER_URL}"
+            )
+        return switch
 
     async def _after_failure_check(self, callable: Callable[[], None]) -> None:
         """Run a file operation, and in "raise" mode check for a restart if it fails.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `read_file()` and `write_file()` take a keyword-only `user`, as Inspect 0.3.286 asks
+  of a sandbox provider: the file is read or written, and a write's directories made, as
+  that user, through `runuser` over Kubernetes exec and by execd on a pod with execd.
+  `root` and `0` mean uid 0, as for `exec()`. A user the container cannot run as raises
+  `SandboxUserUnsupportedError` before anything is read or written. With no `user`, file
+  operations run as the container's user, as before. Requires Inspect 0.3.275, the first
+  with that error, and Python 3.11. See
+  [limitations](https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user).
 - Add a per-service `terminationGracePeriodSeconds` value (default `0`, as before), for a
   runtime whose node must stop a deleted Pod before another Pod takes its room.
 - A pod annotated `inspect-k8s-sandbox/execd: "true"`, with execd (built from `execd/`)
