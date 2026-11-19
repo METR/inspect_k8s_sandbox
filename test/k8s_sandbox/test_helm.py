@@ -92,6 +92,15 @@ def _list_item(service: str) -> str:
     return f"{{kind: Pod, metadata: {{labels: {{{_SERVICE_LABEL}: {service}}}}}}}"
 
 
+def _pod_list(tag: str = "", kind: str = "PodList", more: str = "") -> str:
+    """A `v1` PodList of one Pod of sandbox `a`, whole enough for Helm to install."""
+    pod = (
+        f"{{metadata: {{name: p, labels: {{{_SERVICE_LABEL}: a}}{more}}}, "
+        "spec: {containers: [{name: c, image: i}]}}"
+    )
+    return f"apiVersion: v1\nkind: {kind}\nitems: {tag}[{pod}]"
+
+
 _BARE_POD = f"""
 kind: Pod
 metadata:
@@ -1338,41 +1347,92 @@ def test_pod_ready(pod: PodSnapshot, expected: bool) -> None:
     assert _pod_ready(pod) is expected
 
 
-def test_declared_object_names_covers_every_kind_including_nested_lists() -> None:
+def test_declared_object_names_covers_every_kind_including_lists() -> None:
     # These are what a Warning event on a non-pod object is matched against, so a kind
     # missed here is a failure the diagnostics cannot explain.
     stdout = _manifest(
         "kind: ConfigMap\nmetadata: {name: cm}\n",
         _stateful_set("default"),
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
+        "apiVersion: v1\nkind: ConfigMapList\nitems: [{metadata: {name: helper}}]\n",
+        # Helm installs nothing for a null document, nor for one whose `items` is null.
+        "# a template that rendered this comment alone\n",
+        "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: unmade}\nitems:\n",
     )
 
     names = frozenset(_declared_object_names(_rendered_docs(stdout, "abcdefgh")))
 
-    assert names == {"cm", "default", "svc"}
+    assert names == {"cm", "default", "svc", "helper"}
 
 
 @pytest.mark.parametrize(
-    ("replicas", "ordinals"),
+    ("replicas", "number"),
     [
-        pytest.param("10", list(range(2, 12)), id="decimal"),
         # Helm reads a leading zero as octal, so Kubernetes runs 8 pods.
-        pytest.param("010", list(range(2, 10)), id="leading-zero"),
+        pytest.param("010", 8, id="leading-zero"),
         # Helm drops every `_` and reads the `0b` as binary.
-        pytest.param("0b1__010", list(range(2, 12)), id="binary-underscores"),
+        pytest.param("0b1__010", 10, id="binary-underscores"),
+        # After a leading `.` Helm takes a `_` between digits: as text, ValueError.
+        pytest.param(".2_0e0_1", 2, id="underscores-after-a-dot"),
+        # Helm takes a sign after `0b`: read as text, it raised ValueError.
+        pytest.param("0b+10", 2, id="binary-with-a-sign"),
+        # Tagged, a number is read as untagged: as 10 here, two pods never came.
+        pytest.param("!!float 010", 8, id="tagged-a-float"),
+        # PyYAML takes no `0X` under `!!int`: the manifest could not be read.
+        pytest.param("!!int 0X10", 16, id="tagged-an-int"),
     ],
 )
-def test_a_stateful_sets_counts_read_as_numbers(
-    replicas: str, ordinals: list[int]
-) -> None:
-    # A reader that names a StatefulSet's pods counts them up from `ordinals.start`.
-    stdout = _manifest(
-        f"kind: StatefulSet\nspec: {{replicas: {replicas}, ordinals: {{start: 2}}}}\n"
-    )
+def test_a_stateful_sets_counts_read_as_numbers(replicas: str, number: int) -> None:
+    stdout = _manifest(f"kind: StatefulSet\nspec: {{replicas: {replicas}}}\n")
 
     spec = _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"]
 
-    assert [spec["ordinals"]["start"] + n for n in range(spec["replicas"])] == ordinals
+    assert spec["replicas"] == number
+
+
+@pytest.mark.parametrize(
+    ("spec", "read"),
+    [
+        # PyYAML puts a `<<` under every other key: the sandbox read as scaled to none.
+        pytest.param(
+            "{replicas: 0, <<: {replicas: 1}}", {"replicas": 1}, id="after-the-key"
+        ),
+        # Nor does it win over the keys after it: a sandbox at 0 would be waited for.
+        pytest.param(
+            "{<<: {replicas: 1}, replicas: 0}", {"replicas": 0}, id="before-the-key"
+        ),
+        # Helm merges no alias to a `<<`: it is a key of that name, and no sandbox at 0.
+        pytest.param(
+            "{replicas: *one, *key : {replicas: 0}}",
+            {"replicas": 1, "<<": {"replicas": 0}},
+            id="an-alias-to-the-key",
+        ),
+        # Nor a key of another name tagged `!!merge`: PyYAML merges on the tag alone.
+        pytest.param(
+            "{replicas: 1, !!merge standby: {replicas: 0}}",
+            {"replicas": 1, "standby": {"replicas": 0}},
+            id="another-key-tagged-a-merge",
+        ),
+        # A `<<` tagged `!!merge` still merges: as text, a sandbox at 0 is waited for.
+        pytest.param(
+            "{replicas: 1, !!merge <<: {replicas: 0}}",
+            {"replicas": 0},
+            id="a-tagged-key",
+        ),
+        # The first mapping of a list wins, as in Helm: PyYAML's main reads the last.
+        pytest.param(
+            "{<<: [{replicas: 1}, {replicas: 0}]}", {"replicas": 1}, id="a-list"
+        ),
+    ],
+)
+def test_a_merge_key_is_read_where_it_stands(spec: str, read: dict[str, Any]) -> None:
+    stdout = _manifest(
+        "kind: StatefulSet\n"
+        "metadata: {annotations: {key: &key <<}, generation: &one 1}\n"
+        f"spec: {spec}\n"
+    )
+
+    assert _helm._rendered_docs(stdout, "abcdefgh")[0]["spec"] == read
 
 
 def _services(stdout: str) -> frozenset[str]:
@@ -1389,6 +1449,18 @@ def _services(stdout: str) -> frozenset[str]:
         ),
         # The documented custom-chart shape.
         pytest.param(_manifest(_BARE_POD), {"default"}, id="bare-pod"),
+        # Helm 3 installs a kind that has no `replicas` with a stray one: its pod runs.
+        pytest.param(
+            _manifest(_stateful_set(replicas=0).replace("StatefulSet", "DaemonSet")),
+            {"default"},
+            id="daemon-set-with-replicas",
+        ),
+        # A kind the reader does not know is waited for: it may not scale by `replicas`.
+        pytest.param(
+            _manifest(_stateful_set(replicas=0).replace("StatefulSet", "BroadcastJob")),
+            {"default"},
+            id="custom-kind-with-replicas",
+        ),
         # Replicas do not add sandboxes: get_sandbox_pods() keys one entry per label.
         pytest.param(
             _manifest(_stateful_set("default", replicas=3)), {"default"}, id="replicas"
@@ -1429,6 +1501,21 @@ def _services(stdout: str) -> frozenset[str]:
             {"a", "b"},
             id="list-wrapping-pods",
         ),
+        # main found no sandbox in a typed list: it refused this chart as having none.
+        pytest.param(_manifest(_pod_list()), {"a"}, id="typed-list-wrapping-pods"),
+        # Helm reads these three tags so: a list that held one failed the install.
+        pytest.param(_manifest(_pod_list("!!omap ")), {"a"}, id="list-tagged-omap"),
+        pytest.param(_manifest(_pod_list("!!pairs ")), {"a"}, id="list-tagged-pairs"),
+        pytest.param(
+            _manifest(
+                _pod_list(
+                    kind="!!binary UG9kTGlzdA==",
+                    more=", annotations: {a: !!binary /w==}",
+                )
+            ),
+            {"a"},
+            id="list-kind-tagged-binary",
+        ),
         # Helm writes each of these strings bare, and PyYAML's own loader builds none.
         pytest.param(
             _manifest(
@@ -1445,6 +1532,16 @@ def _services(stdout: str) -> frozenset[str]:
             _manifest(_stateful_set("1e400"), _stateful_set(hex(2**64))),
             {"1e400", hex(2**64)},
             id="numbers-too-large",
+        ),
+        # Helm lets an anchor be defined again, and the later one wins: PyYAML refused.
+        pytest.param(
+            _manifest(
+                "kind: Pod\nmetadata:\n"
+                "  annotations: {a: &name first, b: &name default}\n"
+                f"  labels: {{{_SERVICE_LABEL}: *name}}\n"
+            ),
+            {"default"},
+            id="an-anchor-defined-twice",
         ),
         # A bare null is no name; quoted, `null` is a name like any other.
         pytest.param(
@@ -1487,6 +1584,18 @@ def test_expected_services(stdout: str, expected: set[str]) -> None:
 )
 def test_expected_services_fails_closed(stdout: str) -> None:
     with pytest.raises(RuntimeError, match="manifest|declares no Pod"):
+        _services(stdout)
+
+
+def test_a_sandbox_scaled_to_none_is_refused_by_name() -> None:
+    # Only `victim` has a replica: left out, Inspect would make it the default sandbox.
+    idle = _stateful_set(replicas=0).replace("StatefulSet", "Deployment")
+    served = [idle.replace("default", "victim"), _stateful_set("victim")]
+    # Another group's StatefulSet makes no pod at 0 either: OpenKruise's, PingCAP's.
+    other = _stateful_set("other", replicas=0) + "apiVersion: apps.kruise.io/v1beta1\n"
+    stdout = _manifest(idle, *served, other)
+
+    with pytest.raises(RuntimeError, match="the sandbox default, other only under"):
         _services(stdout)
 
 
@@ -1545,6 +1654,34 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
     ]
 
     await _wait(release, polls, monkeypatch)
+
+
+@pytest.mark.parametrize("stopped", [None, "Succeeded", "Failed"])
+def test_a_pod_being_deleted_holds_its_release_back_until_it_stops(
+    stopped: str | None,
+) -> None:
+    # Until its containers stop, a deleted pod is Running and still reports Ready.
+    ready = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+    sandbox = {"name": "p", "uid": "p", "labels": {_SERVICE_LABEL: "default"}}
+    helper = {"name": "h", "uid": "h", "deletionTimestamp": "2026-11-18T00:00:00Z"}
+    gone = {"phase": stopped, "conditions": [{"type": "Ready", "status": "False"}]}
+    items = [
+        {"metadata": sandbox, "status": ready},
+        {"metadata": helper, "status": gone if stopped else ready},
+    ]
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+
+    with (
+        patch("k8s_sandbox._helm.list_pods", snapshot.list_pods),
+        patch("k8s_sandbox._helm.k8s_client") as client,
+    ):
+        listed = client.return_value.list_namespaced_pod.return_value
+        listed.data = json.dumps({"items": items})
+        pods = release._list_release_pods()
+
+    # Left out, it is waited for no longer: its replacement may not yet be listed.
+    assert release._is_ready(pods) is bool(stopped)
 
 
 def _helper(release: Release, spec: str = "") -> str:
@@ -1793,6 +1930,63 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
+@pytest.mark.parametrize(
+    ("phase", "deleted"),
+    # A pod that fails with no deletion is replaced after it too.
+    [("Succeeded", True), ("Failed", True), ("Failed", False)],
+)
+async def test_wait_until_ready_is_woken_by_a_completed_pod_not_a_failed_or_deleted_one(
+    phase: str,
+    deleted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    _mock_release_pods: MagicMock,
+) -> None:
+    # Woken as a pod being deleted stopped, it read before a DaemonSet replaced it.
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default", "other"})
+    release._namespace = f"going-{phase}-{deleted}"  # where no other test's watch runs
+    polled, judged, woken = threading.Event(), threading.Event(), threading.Event()
+    again, over = threading.Event(), threading.Event()
+    labels = {"app.kubernetes.io/instance": release.release_name}
+    done = {"name": "j", "uid": "j", "labels": labels}
+    going = {"name": "h", "uid": "h", "labels": labels}
+    if deleted:
+        going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
+    completed = {"phase": "Succeeded"}
+    # Kubernetes' pod GC marks a lost node's pod Failed and leaves its Ready condition.
+    ready = {"type": "Ready", "status": str(phase == "Failed")}
+    stopped = {"phase": phase, "conditions": [ready]}
+
+    def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
+        (woken if polled.is_set() else polled).set()
+        return [_pod()]
+
+    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+        polled.wait(30)
+        yield snapshot._parse_pod({"metadata": going, "status": stopped})
+        judged.set()
+        again.wait(30)
+        yield snapshot._parse_pod({"metadata": done, "status": completed})
+        over.wait(30)
+
+    _mock_release_pods.side_effect = list_pods
+    monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    wait = asyncio.create_task(release._wait_until_ready(time.monotonic() + 60))
+    try:
+        assert await asyncio.to_thread(judged.wait, 10)
+        # Time for a wake-up to bring a second read; a stalled machine only hides one.
+        await asyncio.sleep(0.2)
+        assert _mock_release_pods.call_count == 1
+        again.set()  # another pod, completed with no deletion, wakes its release
+        assert await asyncio.to_thread(woken.wait, 10)
+    finally:
+        again.set()
+        over.set()
+        wait.cancel()
+
+
 async def test_wait_until_ready_ends_for_a_cancel_that_comes_with_a_wake(
     monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
 ) -> None:
@@ -1889,11 +2083,14 @@ async def test_wait_until_ready_times_out_with_diagnostics(
         "k8s_sandbox._helm.describe_release_pods", lambda *_: "ImagePullBackOff"
     )
     release = Release(__file__, None, ValuesSource.none(), None)
+    reads = itertools.chain([ConnectionError()], itertools.repeat([_pod(ready=False)]))
 
-    with pytest.raises(RuntimeError, match="did not become ready within 1s"):
-        await _wait(release, itertools.repeat([_pod(ready=False)]), monkeypatch)
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, reads, monkeypatch)
 
     assert "ImagePullBackOff" in log_err.text
+    # A read that failed before a good one is no cause of this timeout.
+    assert excinfo.value.__cause__ is None
 
 
 async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
@@ -1914,6 +2111,45 @@ async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
     assert "missing_sandboxes" in str(excinfo.value)
     # The sandbox which did arrive is not a thing to go looking at.
     assert "default" not in str(excinfo.value).split("missing_sandboxes")[1]
+
+
+async def test_wait_until_ready_names_what_its_confirming_read_found_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The timeout named what the cached read found missing: nothing, where this is.
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._expected_pods = frozenset({"helper-0"})
+    reads = [[_pod(name="helper-0")], [_pod(name="helper-0", ready=False)]]
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, itertools.cycle(reads), monkeypatch)
+
+    assert "default" in str(excinfo.value).split("missing_sandboxes")[1]
+    assert "helper-0" in str(excinfo.value).split("missing_pods")[1]
+
+
+async def test_wait_until_ready_names_the_error_its_last_read_failed_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # main gave this timeout no cause: it kept the error only where no pod was seen.
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+
+    def reads() -> Iterator[Any]:
+        # The cached read finds the release ready each time, and no read confirms it.
+        for failed in itertools.chain(["first"], itertools.repeat("last")):
+            yield [_pod()]
+            yield ConnectionError(failed)
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, reads(), monkeypatch)
+
+    assert str(excinfo.value.__cause__) == "last"
 
 
 async def test_wait_until_ready_names_the_stateful_set_pod_which_never_arrived(
