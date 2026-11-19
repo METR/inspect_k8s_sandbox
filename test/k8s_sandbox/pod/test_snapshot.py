@@ -228,11 +228,7 @@ def test_watch_pods_yields_each_pod_as_it_is_and_as_it_changes():
         )
         pods = list(watch_pods(api, "ns", label_selector="app", timeout_seconds=300))
 
-    assert [(event, pod.ready) for event, pod in pods] == [
-        ("ADDED", False),
-        ("MODIFIED", True),
-        ("DELETED", True),
-    ]
+    assert [pod.ready for pod in pods] == [False, True]
     target = urllib.parse.urlsplit(asked[0])
     asks = urllib.parse.parse_qs(target.query)
     assert target.path == "/api/v1/namespaces/ns/pods"

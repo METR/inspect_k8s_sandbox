@@ -621,7 +621,7 @@ class Release:
                     await self._raise_not_ready_error(
                         saw_a_pod, poll_error, missing, absent
                     )
-                # Woken by the watch; wait_for or a cancel scope can swallow a cancel.
+                # Woken by a Ready pod; wait_for or a cancel scope can swallow a cancel.
                 wake = asyncio.ensure_future(woken.wait())
                 try:
                     await asyncio.wait({wake}, timeout=_READINESS_POLL_INTERVAL)
@@ -852,21 +852,20 @@ def _woken_when_ready(
 
 
 def _watch_ready(context_name: str | None, namespace: str, waits: _ReadyWaits) -> None:
-    """Wake a namespace's releases as pods turn Ready, fail or go, while any waits."""
+    """Wake a namespace's waiting releases as their pods turn Ready, while any waits."""
     while True:
         with _ready_waits_lock:
             if not waits:
                 del _ready_waits[context_name, namespace]
                 return
         try:
-            for event, pod in watch_pods(
+            for pod in watch_pods(
                 k8s_client(context_name),
                 namespace,
                 label_selector=_INSTANCE_LABEL,
                 timeout_seconds=_READY_WATCH_SECONDS,
             ):
-                # A pod that has failed or gone is in no release's way either.
-                if event == "DELETED" or pod.phase == "Failed" or _pod_ready(pod):
+                if _pod_ready(pod):
                     with _ready_waits_lock:
                         wait = waits.get(pod.labels[_INSTANCE_LABEL])
                     if wait is not None:
