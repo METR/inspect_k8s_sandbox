@@ -1492,7 +1492,7 @@ def _services(stdout: str) -> frozenset[str]:
             {"a", "b"},
             id="list-wrapping-pods",
         ),
-        # Helm installs an item that names no kind as the kind its list names.
+        # main found no sandbox in a typed list: it refused this chart as having none.
         pytest.param(
             _manifest(
                 "apiVersion: v1\nkind: PodList\n"
