@@ -2088,6 +2088,22 @@ async def test_wait_until_ready_names_what_its_confirming_read_found_missing(
     assert "helper-0" in str(excinfo.value).split("missing_pods")[1]
 
 
+async def test_wait_until_ready_names_the_error_its_last_read_failed_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cached read finds the release ready each time, and no read confirms it.
+    monkeypatch.setenv(INSPECT_HELM_TIMEOUT, "1")
+    monkeypatch.setattr("k8s_sandbox._helm.describe_release_pods", lambda *_: None)
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    refused = ConnectionError("refused")
+
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, itertools.cycle([[_pod()], refused]), monkeypatch)
+
+    assert excinfo.value.__cause__ is refused
+
+
 async def test_wait_until_ready_names_the_stateful_set_pod_which_never_arrived(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

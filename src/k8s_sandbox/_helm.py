@@ -672,6 +672,7 @@ class Release:
             f"increasing the timeout by setting the {INSPECT_HELM_TIMEOUT} "
             f"environment variable.",
             release=self.release_name,
+            from_exception=poll_error,
             **extra,
         )
 
