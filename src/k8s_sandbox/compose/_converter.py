@@ -1,7 +1,6 @@
 import json
 import logging
 import re
-import threading
 from functools import cache, cached_property
 from pathlib import Path
 from typing import Any, Callable
@@ -72,10 +71,7 @@ def convert_compose_to_helm_values(compose_file: Path) -> dict[str, Any]:
     return result
 
 
-# Threads converting at once would otherwise each check the schema.
-_compose_schema_lock = threading.Lock()
-
-
+# shortcut: threads converting at once may each check it once, lock if that costs.
 @cache
 def _checked_compose_schema() -> dict[str, Any]:
     schema = json.loads(COMPOSE_SCHEMA_PATH.read_text())
@@ -84,8 +80,7 @@ def _checked_compose_schema() -> dict[str, Any]:
 
 
 def _validate_compose(compose: dict[str, Any], compose_file: Path) -> None:
-    with _compose_schema_lock:
-        schema = _checked_compose_schema()
+    schema = _checked_compose_schema()
     # A validator per conversion: jsonschema does not promise threads can share one.
     validator = jsonschema.validators.validator_for(schema)(schema)
     # jsonschema.validate() raises this same best match, not the first error.
