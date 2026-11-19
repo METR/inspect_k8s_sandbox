@@ -92,6 +92,15 @@ def _list_item(service: str) -> str:
     return f"{{kind: Pod, metadata: {{labels: {{{_SERVICE_LABEL}: {service}}}}}}}"
 
 
+def _pod_list(tag: str = "", kind: str = "PodList", more: str = "") -> str:
+    """A `v1` PodList of one Pod of sandbox `a`, whole enough for Helm to install."""
+    pod = (
+        f"{{metadata: {{name: p, labels: {{{_SERVICE_LABEL}: a}}{more}}}, "
+        "spec: {containers: [{name: c, image: i}]}}"
+    )
+    return f"apiVersion: v1\nkind: {kind}\nitems: {tag}[{pod}]"
+
+
 _BARE_POD = f"""
 kind: Pod
 metadata:
@@ -1494,29 +1503,16 @@ def _services(stdout: str) -> frozenset[str]:
             id="list-wrapping-pods",
         ),
         # main found no sandbox in a typed list: it refused this chart as having none.
-        pytest.param(
-            _manifest(
-                "apiVersion: v1\nkind: PodList\n"
-                f"items: [{{metadata: {{labels: {{{_SERVICE_LABEL}: a}}}}}}]"
-            ),
-            {"a"},
-            id="typed-list-wrapping-pods",
-        ),
+        pytest.param(_manifest(_pod_list()), {"a"}, id="typed-list-wrapping-pods"),
         # Helm reads these three tags so: a list that held one failed the install.
-        pytest.param(
-            _manifest("kind: List\nitems: !!omap [" + _list_item("a") + "]"),
-            {"a"},
-            id="list-tagged-omap",
-        ),
-        pytest.param(
-            _manifest("kind: List\nitems: !!pairs [" + _list_item("a") + "]"),
-            {"a"},
-            id="list-tagged-pairs",
-        ),
+        pytest.param(_manifest(_pod_list("!!omap ")), {"a"}, id="list-tagged-omap"),
+        pytest.param(_manifest(_pod_list("!!pairs ")), {"a"}, id="list-tagged-pairs"),
         pytest.param(
             _manifest(
-                "kind: !!binary UG9kTGlzdA==\nitems: [{metadata: {annotations: "
-                f"{{a: !!binary /w==}}, labels: {{{_SERVICE_LABEL}: a}}}}}}]"
+                _pod_list(
+                    kind="!!binary UG9kTGlzdA==",
+                    more=", annotations: {a: !!binary /w==}",
+                )
             ),
             {"a"},
             id="list-kind-tagged-binary",
@@ -1671,7 +1667,7 @@ def test_a_pod_being_deleted_holds_its_release_back_until_it_stops(
     helper = {"name": "h", "uid": "h", "deletionTimestamp": "2026-11-18T00:00:00Z"}
     items = [
         {"metadata": sandbox, "status": ready},
-        {"metadata": helper, "status": ready | {"phase": stopped or "Running"}},
+        {"metadata": helper, "status": {"phase": stopped} if stopped else ready},
     ]
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default"})
