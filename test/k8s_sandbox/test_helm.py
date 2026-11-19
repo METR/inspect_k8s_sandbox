@@ -2039,11 +2039,14 @@ async def test_wait_until_ready_times_out_with_diagnostics(
         "k8s_sandbox._helm.describe_release_pods", lambda *_: "ImagePullBackOff"
     )
     release = Release(__file__, None, ValuesSource.none(), None)
+    reads = itertools.chain([ConnectionError()], itertools.repeat([_pod(ready=False)]))
 
-    with pytest.raises(RuntimeError, match="did not become ready within 1s"):
-        await _wait(release, itertools.repeat([_pod(ready=False)]), monkeypatch)
+    with pytest.raises(RuntimeError, match="did not become ready within 1s") as excinfo:
+        await _wait(release, reads, monkeypatch)
 
     assert "ImagePullBackOff" in log_err.text
+    # A read that failed before a good one is no cause of this timeout.
+    assert excinfo.value.__cause__ is None
 
 
 async def test_wait_until_ready_names_the_sandbox_which_never_arrived(
