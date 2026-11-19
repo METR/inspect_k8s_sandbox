@@ -1,6 +1,6 @@
 #!/bin/bash
 # The gate for egress over the vsock: real traffic from a sandbox with no network card to its egress proxy, under the seccomp profiles the nodes hold.
-# Its rule: every scan fails closed. It says `looked` only after every read in it ended, so a read that fails, is killed or is cut short fails the step.
+# Its rule: every scan fails closed: a step takes a scan's answer only if it ends in `looked`, which the scan says last.
 usage() {
   cat >&2 <<'EOF'
 usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
