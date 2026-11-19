@@ -963,7 +963,7 @@ def _kubeconfig_context_args(context_name: str | None) -> list[str]:
 
 
 def _pod_ready(pod: PodSnapshot) -> bool:
-    """Helm's `isPodReady` less a pod being deleted, plus a pod that completed."""
+    """A pod that completed, or Helm's `isPodReady` less a pod being deleted."""
     # A pod that ran to completion reports Ready=False with reason PodCompleted, so
     # Helm blocks on it until the timeout. The Ready condition rather than
     # containerStatuses[].ready, because it also accounts for readiness gates.

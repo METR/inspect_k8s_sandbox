@@ -1661,12 +1661,18 @@ async def test_wait_until_ready_keeps_waiting_for_a_pod_that_does_not_exist_yet(
     await _wait(release, polls, monkeypatch)
 
 
-def test_a_pod_being_deleted_holds_its_release_back() -> None:
+@pytest.mark.parametrize("stopped", [None, "Succeeded", "Failed"])
+def test_a_pod_being_deleted_holds_its_release_back_until_it_stops(
+    stopped: str | None,
+) -> None:
     # Until its containers stop, a deleted pod is Running and still reports Ready.
     ready = {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
     sandbox = {"name": "p", "uid": "p", "labels": {_SERVICE_LABEL: "default"}}
     helper = {"name": "h", "uid": "h", "deletionTimestamp": "2026-11-18T00:00:00Z"}
-    items = [{"metadata": metadata, "status": ready} for metadata in (sandbox, helper)]
+    items = [
+        {"metadata": sandbox, "status": ready},
+        {"metadata": helper, "status": ready | {"phase": stopped or "Running"}},
+    ]
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default"})
 
@@ -1679,7 +1685,7 @@ def test_a_pod_being_deleted_holds_its_release_back() -> None:
         pods = release._list_release_pods()
 
     # Left out, it is waited for no longer: its replacement may not yet be listed.
-    assert not release._is_ready(pods)
+    assert release._is_ready(pods) is bool(stopped)
 
 
 def _helper(release: Release, spec: str = "") -> str:
@@ -1928,20 +1934,28 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         wait.cancel()
 
 
-@pytest.mark.parametrize("phase", ["Succeeded", "Failed"])
+@pytest.mark.parametrize(
+    ("phase", "deleted"),
+    # A pod that fails with no deletion, as one evicted does, is replaced after it too.
+    [("Succeeded", True), ("Failed", True), ("Failed", False)],
+)
 async def test_wait_until_ready_is_woken_as_a_pod_completes_unless_it_is_being_deleted(
-    phase: str, monkeypatch: pytest.MonkeyPatch, _mock_release_pods: MagicMock
+    phase: str,
+    deleted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    _mock_release_pods: MagicMock,
 ) -> None:
     # Woken as a pod being deleted stopped, it read before a DaemonSet replaced it.
     release = Release(__file__, None, ValuesSource.none(), None)
     release._expected_services = frozenset({"default", "other"})
-    release._namespace = f"going-{phase}"  # where no other test's watch runs
+    release._namespace = f"going-{phase}-{deleted}"  # where no other test's watch runs
     polled, judged, woken = threading.Event(), threading.Event(), threading.Event()
     again, over = threading.Event(), threading.Event()
     labels = {"app.kubernetes.io/instance": release.release_name}
     done = {"name": "j", "uid": "j", "labels": labels}
     going = {"name": "h", "uid": "h", "labels": labels}
-    going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
+    if deleted:
+        going["deletionTimestamp"] = "2026-11-18T00:00:00Z"
     completed = {"phase": "Succeeded"}
 
     def list_pods(*_: Any, **__: Any) -> list[PodSnapshot]:
