@@ -271,7 +271,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 		if err == nil {
 			vms[sb.uid]++
 		}
-		if _, err := os.Stat(sb.netns); err == nil {
+		if fi, err := os.Stat(sb.netns); err == nil && !fi.IsDir() { // a record that names no namespace names their directory
 			l.sees = true
 		}
 	}

@@ -120,13 +120,18 @@ func TestSandboxWhoseUidAnotherVMHasGetsNoWorker(t *testing.T) {
 }
 
 func TestVMDirectoryThatNeverComesIsAFaultAndOneThatFollowsItsRecordIsNot(t *testing.T) {
-	for name, tc := range map[string]struct{ comes, unseen bool }{"never": {}, "never, where the launcher sees no namespace": {unseen: true}, "after its record": {comes: true}, "after its record, where the launcher sees no namespace": {comes: true, unseen: true}} {
+	for name, tc := range map[string]struct{ comes, unseen, unnamed bool }{"never": {}, "never, where the launcher sees no namespace": {unseen: true}, "never, where it sees none and a record names none": {unseen: true, unnamed: true}, "after its record": {comes: true}, "after its record, where the launcher sees no namespace": {comes: true, unseen: true}} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				out := capture(t)
 				l := fakeNode(t)
 				if tc.unseen {
 					l.netns = l.cni // a directory that is there and holds no pod's namespace: a mount of the wrong place
+				}
+				if tc.unnamed { // as libcni wrote its records before 1.2.0
+					if err := os.WriteFile(filepath.Join(l.cni, "aws-cni-"+id("b")+"-eth0"), []byte(`{"containerId":"`+id("b")+`","ifName":"eth0"}`), 0o600); err != nil {
+						t.Fatal(err)
+					}
 				}
 				proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128"}
 				addSandbox(t, l, id("a"), "eth0", proxied, vmUID)
