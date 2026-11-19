@@ -133,8 +133,8 @@ def list_pods(
 
 def watch_pods(
     api: client.CoreV1Api, namespace: str, *, label_selector: str, timeout_seconds: int
-) -> Iterator[PodSnapshot]:
-    """Each pod as it is and then as it changes, until the server ends the watch."""
+) -> Iterator[tuple[str, PodSnapshot]]:
+    """Each pod as it is, changes and goes, with its event, until the watch ends."""
     for event in watch.Watch().stream(
         api.list_namespaced_pod,
         namespace,
@@ -144,8 +144,8 @@ def watch_pods(
         _request_timeout=(5, timeout_seconds + 30),
         deserialize=False,  # as list_pods does: see the module's docstring
     ):
-        if event["type"] in ("ADDED", "MODIFIED"):
-            yield _parse_pod(event["object"])
+        if event["type"] in ("ADDED", "MODIFIED", "DELETED"):
+            yield event["type"], _parse_pod(event["object"])
 
 
 def _parse_pod(pod: dict[str, Any]) -> PodSnapshot:

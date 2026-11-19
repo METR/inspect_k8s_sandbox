@@ -1853,13 +1853,12 @@ async def test_wait_until_ready_ends_when_a_watch_sees_the_pod_ready(
         polled.set()
         return pods
 
-    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+    def watch_pods(*_: Any, **__: Any) -> Iterator[tuple[str, PodSnapshot]]:
         # The pod turns Ready once the wait's first poll has found it not.
         polled.wait(30)
         ready.set()
-        yield dataclasses.replace(
-            _pod(), labels={"app.kubernetes.io/instance": release.release_name}
-        )
+        labels = {"app.kubernetes.io/instance": release.release_name}
+        yield "MODIFIED", dataclasses.replace(_pod(), labels=labels)
 
     _mock_release_pods.side_effect = list_pods
     monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
@@ -1869,6 +1868,49 @@ async def test_wait_until_ready_ends_when_a_watch_sees_the_pod_ready(
     pods = await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 60), 30)
 
     assert [pod.ready for pod in pods] == [True]
+
+
+@pytest.mark.parametrize(
+    ("event", "phase"),
+    [
+        pytest.param("MODIFIED", "Failed", id="fails"),
+        pytest.param("DELETED", "Running", id="goes"),
+    ],
+)
+async def test_wait_until_ready_ends_when_a_watch_sees_a_pod_in_its_way_fail_or_go(
+    event: str,
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _mock_release_pods: MagicMock,
+) -> None:
+    release = Release(__file__, None, ValuesSource.none(), None)
+    release._expected_services = frozenset({"default"})
+    release._namespace = f"cleared-{event}"  # where no other test's watch runs
+    polled, cleared = threading.Event(), threading.Event()
+    # A helper being deleted is not Ready, so its release is not, until it has gone.
+    going = _pod(name="helper", service=None, ready=False)
+
+    def list_pods(
+        *_: Any, resource_version: str | None, **__: Any
+    ) -> list[PodSnapshot]:
+        gone = cleared.is_set() and resource_version is None
+        polled.set()
+        return [_pod()] if gone else [_pod(), going]
+
+    def watch_pods(*_: Any, **__: Any) -> Iterator[tuple[str, PodSnapshot]]:
+        polled.wait(30)
+        cleared.set()
+        labels = {"app.kubernetes.io/instance": release.release_name}
+        yield event, dataclasses.replace(going, phase=phase, labels=labels)
+
+    _mock_release_pods.side_effect = list_pods
+    monkeypatch.setattr("k8s_sandbox._helm.watch_pods", watch_pods)
+    # No second poll comes in time to end the wait.
+    monkeypatch.setattr("k8s_sandbox._helm._READINESS_POLL_INTERVAL", 60)
+
+    pods = await asyncio.wait_for(release._wait_until_ready(time.monotonic() + 60), 30)
+
+    assert [pod.name for pod in pods] == ["p"]
 
 
 async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
@@ -1883,12 +1925,11 @@ async def test_wait_until_ready_reads_once_for_each_time_a_watch_wakes_it(
         (woken if polled.is_set() else polled).set()
         return [_pod()]
 
-    def watch_pods(*_: Any, **__: Any) -> Iterator[PodSnapshot]:
+    def watch_pods(*_: Any, **__: Any) -> Iterator[tuple[str, PodSnapshot]]:
         # One of the release's two pods is Ready; the other never comes.
         polled.wait(30)
-        yield dataclasses.replace(
-            _pod(), labels={"app.kubernetes.io/instance": release.release_name}
-        )
+        labels = {"app.kubernetes.io/instance": release.release_name}
+        yield "MODIFIED", dataclasses.replace(_pod(), labels=labels)
         over.wait(30)
 
     _mock_release_pods.side_effect = list_pods
