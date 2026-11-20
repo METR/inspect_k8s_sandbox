@@ -1429,6 +1429,7 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
     )
 
     for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        assert policy["metadata"].get("namespace", "home") == "home", policy
         spec = policy["spec"]
         ends = [spec["endpointSelector"]]
         # The default deny's empty rule selects its pods and admits no one.
