@@ -1407,6 +1407,34 @@ def test_network_isolated_service_joining_a_global_network(
     assert normal_ingress_policies[0]["spec"]["ingress"] != []
 
 
+@pytest.mark.parametrize(
+    "values",
+    ["network-isolated", "network-isolated-with-global-network", "egress-proxy"],
+)
+def test_policies_select_and_admit_only_the_releases_pods(
+    chart_dir: Path, test_resources_dir: Path, values: str
+) -> None:
+    # A policy layered on the chart can deny a port to the release's pods alone only
+    # while no rule admits another pod, or admits the release's pods to another's.
+    own = {
+        "io.kubernetes.pod.namespace": "default",
+        "app.kubernetes.io/name": "agent-env",
+        "app.kubernetes.io/instance": "my-release",
+    }
+
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / f"{values}-values.yaml"
+    )
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        ends = [policy["spec"]["endpointSelector"]]
+        # The default deny's empty rule selects its pods and admits no one.
+        for rule in filter(None, policy["spec"].get("ingress", [])):
+            ends += rule.get("fromEndpoints", [{}])
+        for end in ends:
+            assert own.items() <= end.get("matchLabels", {}).items(), policy
+
+
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
