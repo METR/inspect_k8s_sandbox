@@ -186,6 +186,22 @@ services:
     assert services["last"] == services["later"] == services["default"]
 
 
+def test_keys_of_a_service_sharing_a_yaml_alias_each_keep_their_settings(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: my-image
+    deploy: {resources: {reservations: &memory {memory: 1G}}}
+    x-inspect_k8s_sandbox: {resources: {limits: *memory}}
+""")
+
+    services = _converter.convert_compose_to_helm_values(compose_path)["services"]
+
+    assert services["default"]["resources"]["limits"] == {"memory": "1G"}
+
+
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
     tmp_compose: TmpComposeFixture,
 ) -> None:

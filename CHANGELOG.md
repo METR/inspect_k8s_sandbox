@@ -22,16 +22,21 @@
 - A compose file given as `values` in `K8sSandboxEnvironmentConfig`, or to
   `convert_compose_to_helm_values`, now converts with `healthcheck.disable`, a quoted
   `healthcheck.retries`, `mem_limit` as a number of bytes, `deploy:` with no value, and
-  services that share a YAML alias (the later one lost settings). An unquoted key
-  such as `on`, `yes` or `1` fails with a message asking to quote it.
+  services, or keys of one service, that share a YAML alias (one of them lost
+  settings). An unquoted key such as `on`, `yes` or `1` fails with a message asking to
+  quote it.
 - A `CMD-SHELL` healthcheck `test` passes every item after `CMD-SHELL` to `sh -c`,
   where only the first was kept.
 - **BREAKING CHANGE**: A negative `healthcheck.retries`, and a top-level
   `x-inspect_k8s_sandbox` that is a list or a plain value, now fail the conversion. So
-  does a file that converted only because a YAML alias between two services, or between
-  a service and the top level, hid an error: it fails as it does with the alias written
-  out. Where a service reuses the top-level `x-inspect_k8s_sandbox` as its own, move the
-  anchor into the first service that uses it.
+  does a file that converted only because a YAML alias between two services, between two
+  keys of one service, or between a service and the top level, hid an error: it fails as
+  it does with the alias written out. Where a service reuses the top-level
+  `x-inspect_k8s_sandbox` as its own, move the anchor into the first service that uses
+  it. Where `deploy` and a service's `x-inspect_k8s_sandbox` share a mapping of
+  resources: after a conflict at conversion, leave that setting out of the extension;
+  after a Pod refused for a request above its limit, write Compose's `1G` as `1Gi` in
+  the extension.
 - A pod annotated
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at
