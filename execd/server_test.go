@@ -1334,7 +1334,8 @@ func endAsNobody(pids ...int) {
 	}
 }
 
-func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil) } // what a test left carrying a tag
+func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil) }                            // what a test left carrying a tag
+func gone(pid int) bool     { f := stat(pid); return len(f) == 0 || strings.Contains("ZX", f[0]) } // ended: a zombie, or one being reaped
 
 // graced has each kill's grace, timeout(1)'s -k 5s over Kubernetes exec, last until the test ends it; end ends them, and says how many.
 func graced(t *testing.T) (end func() int) {
@@ -1427,7 +1428,7 @@ func TestAKillsSearchByTagSendsSigtermOnceAndWhenItsGraceIsUpSigkill(t *testing.
 	}
 	end()
 	exitStatus(t, frames)
-	until(t, "what only the call's tag leads to outlived the kill's grace", func() bool { f := stat(pid); return len(f) == 0 || strings.Contains("ZX", f[0]) }) // ended: a zombie, or one being reaped
+	until(t, "what only the call's tag leads to outlived the kill's grace", func() bool { return gone(pid) })
 }
 
 func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *testing.T) {
@@ -1457,7 +1458,7 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 				end()
 			}
 			exitStatus(t, frames) // with no grace to wait out where nothing that had a SIGTERM is left
-			until(t, "what ran on outlived the kill", func() bool { f := stat(straggler); return len(f) == 0 || strings.Contains("ZX", f[0]) })
+			until(t, "what ran on outlived the kill", func() bool { return gone(straggler) })
 		})
 	}
 }
@@ -1468,21 +1469,20 @@ func TestAKillsSearchSlowerThanItsGraceStillKillsWhatItSignals(t *testing.T) {
 	out += said(t, frames, func(more string) bool { return strings.Count(out+more, "\n") == 2 })
 	id, _ := strconv.Atoi(strings.TrimSpace(out))
 	of := "/proc/" + strconv.Itoa(id)
-	gone := func() bool { f := stat(id); return len(f) == 0 || strings.Contains("ZX", f[0]) }
 	var asked atomic.Bool
 	held := func(tagged, environ string) (*os.File, error) {
 		if tagged == tag && environ == of+"/environ" && asked.CompareAndSwap(false, true) { // the search for the SIGTERMs: on once the grace is up and the call has ended without its word
 			end()
 			exitStatus(t, frames)
 		} else if tagged == tag && environ == of+"/environ" { // the search for the SIGKILLs that follows: on once the process has dropped its tag, so that only its id leads there
-			until(t, "what only the tag led to had no SIGTERM", func() bool { now, _ := os.ReadFile(of + "/cmdline"); return gone() || bytes.HasPrefix(now, []byte("sleep")) })
+			until(t, "what only the tag led to had no SIGTERM", func() bool { c, _ := os.ReadFile(of + "/comm"); return gone(id) || string(c) == "sleep\n" })
 		}
 		return os.Open(environ)
 	}
 	openEnviron.Store(&held)
 	t.Cleanup(func() { openEnviron.Store(nil) })
 	s.dispatch(c, frame{kind: fKill, id: 80})
-	until(t, "what a search slower than the grace signalled outlived the kill", gone)
+	until(t, "what a search slower than the grace signalled outlived the kill", func() bool { return gone(id) })
 }
 
 func TestAKillsLastSigkillSparesAProcessGivenASurvivorsId(t *testing.T) {
@@ -2702,7 +2702,7 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 	if status := exitStatus(t, frames); status["code"] != 143.0 {
 		t.Fatalf("EXIT %v: the command ended by itself after the kill's last look, and the kill went on to end what it left running", status)
 	}
-	until(t, "what the command started out of its group outlived its SIGTERM", func() bool { f := stat(child); return len(f) == 0 || strings.Contains("ZX", f[0]) })
+	until(t, "what the command started out of its group outlived its SIGTERM", func() bool { return gone(child) })
 }
 
 func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
@@ -2728,8 +2728,7 @@ func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	if end(); exitStatus(t, frames)["code"] != 137.0 {
 		t.Fatal("the kill of a command slow to stop did not go ahead when its grace was up")
 	}
-	id, _ := strconv.Atoi(strings.TrimSpace(child))
-	until(t, "the child of a command slow to stop outlived its kill", func() bool { f := stat(id); return len(f) == 0 || strings.Contains("ZX", f[0]) })
+	until(t, "the child of a command slow to stop outlived its kill", func() bool { id, _ := strconv.Atoi(strings.TrimSpace(child)); return gone(id) })
 }
 
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {

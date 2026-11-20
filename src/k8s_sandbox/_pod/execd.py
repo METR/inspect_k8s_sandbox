@@ -906,6 +906,7 @@ class ExecdClient:
                 )
             log_warn("execd was killed: started again", pod=old.ip)
             # Killed with it, or left: it ends as Kubernetes exec ends a killed command.
+            call.words += 1  # come in time, it is taken though our wait ends meanwhile
             call.queue.put_nowait((EXIT, b'{"code": 137}'))
             return
         link.calls[call.id] = call

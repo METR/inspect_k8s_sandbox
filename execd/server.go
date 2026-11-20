@@ -986,12 +986,9 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		return running
 	}
 	kill := func(reached map[int]string, helper int) {
-		reaper.mu.Lock() // nothing is reaped meanwhile: a helper that has not ended still has its id
-		if helper != 0 && !ended(helper, reached[helper]) && syscall.Kill(helper, syscall.SIGTERM) != nil {
-			signalAs(as, helper, syscall.SIGTERM)
+		if helper != 0 { // at its SIGTERM the helper kills what it signalled, as their user, by their ids: it has a second for it
+			signalIf(as, helper, reached[helper], syscall.SIGTERM)
 		}
-		reaper.mu.Unlock()
-		// At its SIGTERM the helper kills what it signalled, as their user, by their ids: it has a second for it.
 		for until := time.Now().Add(time.Second); helper != 0 && !ended(helper, reached[helper]) && time.Now().Before(until); {
 			time.Sleep(time.Millisecond)
 		}
@@ -1022,13 +1019,12 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 	}
 	kill(reached, helper)
 	// By its pidfd, what a reaped command left in its group: the number may be another group's by now. shortcut: gVisor and kernels before 6.9 signal no group so, and there it runs on unless it carries the tag.
-	refused := func() bool {
+	last := func() bool {
 		_, _, err := syscall.Syscall6(sysPidfdSendSignal, group, uintptr(syscall.SIGKILL), 0, pidfdSignalProcessGroup, 0, 0)
-		return err != 0
+		return err == 0
 	}
-	if refused() {
-		asUser(as, refused) // another user's, which root may not signal without CAP_KILL
-	}
+	last()
+	asUser(as, last) // as its user too: without CAP_KILL root's signal reaches only its own in the group, and succeeds on those
 }
 
 // signalAs sends another user's process, or its group, that user's own signal, and says whether it was sent: root's reaches neither without CAP_KILL.
@@ -1061,11 +1057,11 @@ func stat(pid int) []string {
 // signalTree stops lead's group, if any, and what runs under roots (found by listing the pod's processes, if list), sends them sigs in turn, and gives those reached, all listed, and whether it was slow: stopped, each takes one SIGTERM however many reach it. A root other than lead, whose id the reaper holds, comes with its start time.
 func signalTree(as *syscall.Credential, lead int, roots map[int]string, list bool, sigs ...syscall.Signal) (reached, listed map[int]string, slow bool) {
 	began := time.Now()
-	signal := func(sig syscall.Signal) { // as their user too: root's signal reaches neither a process nor a group of another's without CAP_KILL
-		for _, target := range []int{-lead, lead} {
-			if target != 0 {
-				syscall.Kill(target, sig)
-				signalAs(as, target, sig)
+	signal := func(sig syscall.Signal) { // as their user where root's is refused: without CAP_KILL it reaches neither a process nor a group of another's; with it, a second send would be a second SIGTERM to one not yet stopped
+		if lead != 0 {
+			if syscall.Kill(-lead, sig); syscall.Kill(lead, sig) != nil {
+				signalAs(as, -lead, sig)
+				signalAs(as, lead, sig)
 			}
 		}
 	}

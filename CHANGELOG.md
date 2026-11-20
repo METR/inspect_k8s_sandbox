@@ -92,11 +92,14 @@
   SIGKILL: 16 seconds after its timeout at most. What they start after their SIGTERM
   gets SIGKILL as soon as they have ended: a handler must wait for the cleanup it
   starts. (On gVisor, and on kernels before 6.9, such a process left in the command's
-  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) Where execd takes
-  over half a second to stop the command and list its processes, as on a pod short of
-  memory or CPU, what the survivors of a SIGTERM start in those 5 seconds outside the
-  command's group, without `HAWK_NEXT_EXEC` in its environment, is not found for the
-  SIGKILL. The processes of a command that has ended by itself are left running. Once
+  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) The 5 seconds run
+  from the start of the kill: on a pod short of memory or CPU, where execd is slow to
+  stop the command and list its processes, the SIGTERM comes later and the grace is
+  shorter by that much. Where that takes over half a second (to stop the command, or
+  to stop its processes and list the pod's at 10 ms for each process, where that is
+  longer), what the survivors of a SIGTERM start during the grace outside the command's
+  group, without `HAWK_NEXT_EXEC` in its environment, is not found for the SIGKILL. The
+  processes of a command that has ended by itself are left running. Once
   execd has stopped reading a command's output, 100 ms after the command ended at the
   earliest, what it left running may write 1 MiB more in total to each of
   the command's stdout and stderr, plus that pipe's free space; past that a write to

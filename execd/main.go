@@ -226,7 +226,7 @@ func start() {
 // container names the container execd is in: a client that finds another has seen a restart, whatever Kubernetes shows.
 func container() string {
 	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if f := stat(1); len(f) > 19 { // the kernel's boot, and when the container's first process started
+	if f := stat(1); len(f) > 19 && strings.TrimSpace(string(boot)) != "" { // the kernel's boot, and when the container's first process started: without either it names none
 		return strings.TrimSpace(string(boot)) + ":" + f[19]
 	}
 	return "unknown"
