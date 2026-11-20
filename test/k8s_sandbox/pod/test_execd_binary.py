@@ -200,7 +200,7 @@ def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at[:2], stdio=execs.connect)
+        return execd.Daemon("", *at[:2], stdio=execs.connect, container=at[2])
 
     return execd.ExecdClient(start)
 
@@ -533,20 +533,16 @@ async def test_a_timed_out_command_is_killed(
 
 
 async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs(
-    sandbox: Sandbox, execs: Execs
+    stdio_client: execd.ExecdClient,
 ) -> None:
-    async def start(replace: bool) -> execd.Daemon:
-        at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at[:2], stdio=execs.connect, container=at[2])
-
-    client, ran = execd.ExecdClient(start), f"/tmp/{uuid.uuid4().hex}"
+    ran = f"/tmp/{uuid.uuid4().hex}"
     argv = ["sh", "-c", 'echo ran >> "$0"; kill -9 -1', ran]
 
     with anyio.fail_after(30):  # only bounds a hang
-        killed = await client.exec(argv, None, None, {}, None, None)
-        after = await client.exec(["cat", ran], None, None, {}, None, None)
+        killed = await stdio_client.exec(argv, None, None, {}, None, None)
+        after = await stdio_client.exec(["cat", ran], None, None, {}, None, None)
 
-    assert (killed.returncode, after.stdout) == (137, "ran\n")  # once: none sent again
+    assert (killed.returncode, after.returncode, after.stdout) == (137, 0, "ran\n")
 
 
 async def test_a_streams_command_is_killed_when_its_connection_drops(

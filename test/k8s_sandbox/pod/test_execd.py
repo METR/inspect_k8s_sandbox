@@ -56,9 +56,7 @@ class Daemons:
         self.ports: dict[execd.Daemon, int] = {}
         self.unstarted: list[execd.Daemon] = []
 
-    async def serve(
-        self, handler: Handler, pod: str = "", container: bytes = b""
-    ) -> asyncio.Server:
+    async def serve(self, handler: Handler, **named: typing.Any) -> asyncio.Server:
         """One that answers AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -69,8 +67,7 @@ class Daemons:
                 await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)
-        name = f"cert-{len(self.ports)}"
-        daemon = execd.Daemon("127.0.0.1", name, b"key", pod, container=container)
+        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", **named)
         self.ports[daemon] = server.sockets[0].getsockname()[1]
         self.unstarted.append(daemon)
         return server
@@ -2246,11 +2243,9 @@ KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
 async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     daemons: Daemons, clock: types.SimpleNamespace, timers: None, case: typing.Any
 ) -> None:
-    """As over Kubernetes exec, where it is in its container: else none can say."""
     was, again, ends = case
     first: asyncio.Server
-    killed, back = asyncio.Event(), asyncio.Event()
-    starts, later = [0], list[int]()
+    killed, back, starts, later = asyncio.Event(), asyncio.Event(), [0], list[int]()
 
     async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
@@ -2267,6 +2262,7 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
         starts[0] += 1
         if ends == 137 and starts[0] == 2:  # as where a start takes seconds
             await back.wait()
+            clock.now += execd.KILL_WAIT  # past our wait for execd's word too
         return daemons.unstarted.pop(0)
 
     first = await daemons.serve(is_killed, container=was)

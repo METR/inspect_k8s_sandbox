@@ -56,7 +56,7 @@ func main() {
 			select {
 			case <-over:
 				for p, started := range sent {
-					signalIf(p, started, syscall.SIGKILL)
+					signalIf(nil, p, started, syscall.SIGKILL)
 				}
 				return
 			case <-time.After(10 * time.Millisecond):
