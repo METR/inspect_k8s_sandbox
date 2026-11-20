@@ -1407,6 +1407,46 @@ def test_network_isolated_service_joining_a_global_network(
     assert normal_ingress_policies[0]["spec"]["ingress"] != []
 
 
+@pytest.mark.parametrize(
+    "values", ["network-isolated-with-global-network", "egress-proxy"]
+)
+def test_policies_select_admit_and_reach_no_other_releases_pods(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, values: str
+) -> None:
+    # Releases share a namespace: only these labels keep a rule off another's pods.
+    home = {"io.kubernetes.pod.namespace": "home"}
+    own = home | {
+        "app.kubernetes.io/name": "agent-env",
+        "app.kubernetes.io/instance": "my-release",
+    }
+    dns = [
+        {"matchLabels": {"io.kubernetes.pod.namespace": "kube-system", "k8s-app": app}}
+        for app in ("kube-dns", "node-local-dns")
+    ]
+
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="home"
+    )
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        assert policy["metadata"].get("namespace", "home") == "home", policy
+        spec = policy["spec"]
+        ends = [spec["endpointSelector"]]
+        # The default deny's empty rule selects its pods and admits no one.
+        for rule in filter(None, spec.get("ingress", [])):
+            # Cilium drops the whole policy for a rule that mixes kinds of peer.
+            assert rule.keys() <= {"fromEndpoints", "toPorts", "icmps"}, policy
+            ends += rule.get("fromEndpoints") or [{}]
+        for rule in spec.get("egress", []):  # The cluster's DNS is the one other.
+            assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
+            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in dns]
+        for end in ends:  # Cilium reads one that names no namespace as the policy's.
+            labels = end.get("matchLabels", {})
+            # Any other key that names a namespace, or its labels, ends that default.
+            assert str(end).count("namespace") <= len(labels.keys() & home), policy
+            assert own.items() <= (home | labels).items(), policy
+
+
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:

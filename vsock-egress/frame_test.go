@@ -86,49 +86,38 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 
 func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 	client, inSandbox := tcpPair(t)
-	read := unreset{inSandbox, new(atomic.Bool)}
+	onNode, proxy := tcpPair(t)
+	guest, node := vsockPair(t)
+	go join(guest, inSandbox, nil, 0)
+	go join(node, onNode, nil, 0)
 	raw, err := inSandbox.SyscallConn()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
-	atOnce := func() (quick int) {
-		if controlled := raw.Control(func(fd uintptr) {
-			quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
-		}); controlled != nil || err != nil {
-			t.Fatal(controlled, err)
-		}
-		return quick
-	}
-	one := make([]byte, 1)
-	// Requests and their replies, as through a proxy: the kernel then holds acknowledgements back. The first is read as the last will be: asking once a connection would not do.
-	receive := read.Read
-	for range 8 {
-		for _, step := range []func([]byte) (int, error){client.Write, receive, inSandbox.Write, client.Read} {
-			if _, err := step(one); err != nil {
-				t.Fatal(err)
+	one, quick := make([]byte, 1), 0
+
+	// A request, then acknowledgements held back, as the kernel holds them once replies flow, and a second request.
+	for i, step := range []func([]byte) (int, error){client.Write, proxy.Read, client.Write, proxy.Read} {
+		if i == 2 {
+			if controlled := raw.Control(func(fd uintptr) {
+				err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 0)
+			}); controlled != nil || err != nil {
+				t.Fatal(controlled, err)
 			}
 		}
-		receive = inSandbox.Read
+		if _, err := step(one); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if atOnce() != 0 {
-		t.Skip("this kernel holds no acknowledgement back here, so a read has nothing to change")
-	}
-	sent := time.Now()
-
-	if _, err := client.Write(one); err != nil {
-		t.Fatal(err)
-	}
-	// Into the room a stream's reads have, more than the peer fills.
-	if _, err := read.Read(make([]byte, maxFrame)); err != nil {
-		t.Fatal(err)
+	// Whether the kernel acknowledges what the sandbox's side receives at once, or holds that back for a reply to carry.
+	if controlled := raw.Control(func(fd uintptr) {
+		quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
+	}); controlled != nil || err != nil {
+		t.Fatal(controlled, err)
 	}
 
-	if atOnce() != 1 {
+	if quick != 1 {
 		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
-	}
-	if time.Since(sent) > 20*time.Millisecond {
-		t.Skip("too slow to tell: 40 ms after bytes arrive the kernel acknowledges them whatever was asked")
 	}
 }
 
