@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
+  when `helm list` fails: it now fails with Helm's error.
 - Once a process has converted one Docker Compose file to Helm values, each further
   conversion takes about 60 to 100 ms less.
 - Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
