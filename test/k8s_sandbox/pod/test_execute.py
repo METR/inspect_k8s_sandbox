@@ -2793,6 +2793,23 @@ class TestExecStdio:
 
         assert b"".join(received) == b"a reply\n"
 
+    @pytest.mark.parametrize("size", [1, 1024**2, 64 * 1024**2])
+    async def test_a_ping_is_answered_and_never_inside_a_frame_of_a_send(
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], size: int
+    ) -> None:
+        client, server = tls_sockets
+        stream, reader, abnf = _stdio(client), _reader(server), websocket.ABNF
+        sending = asyncio.create_task(stream.send(bytes(size)))
+        await anyio.wait_all_tasks_blocked()  # It has ended, or is stuck in a frame.
+        ping = abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, b"a ping").format()
+        server.sendall(ping + _frame(STDOUT, b"ready\n"))
+
+        await asyncio.wait_for(stream.receive(), 30)  # only bounds a hang
+        sent = [await asyncio.to_thread(reader.recv_frame) for _ in range(2)]
+        sending.cancel()
+
+        assert (sent[1].opcode, sent[1].data) == (abnf.OPCODE_PONG, b"a ping")
+
 
 async def _receiving(stream: PodStdio, max_bytes: int) -> AsyncIterator[bytes]:
     while True:
