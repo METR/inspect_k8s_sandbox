@@ -1411,26 +1411,29 @@ def test_network_isolated_service_joining_a_global_network(
     "values",
     ["network-isolated", "network-isolated-with-global-network", "egress-proxy"],
 )
-def test_policies_select_and_admit_only_the_releases_pods(
+def test_policies_select_admit_and_reach_no_other_releases_pods(
     chart_dir: Path, test_resources_dir: Path, values: str
 ) -> None:
-    # A policy layered on the chart can deny a port to the release's pods alone only
-    # while no rule admits another pod, or admits the release's pods to another's.
+    # A layered policy that denies a port to the release's pods alone relies on this.
     own = {
-        "io.kubernetes.pod.namespace": "default",
+        "io.kubernetes.pod.namespace": "a-namespace",
         "app.kubernetes.io/name": "agent-env",
         "app.kubernetes.io/instance": "my-release",
     }
 
     documents = _run_helm_template(
-        chart_dir, test_resources_dir / f"{values}-values.yaml"
+        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="a-namespace"
     )
 
     for policy in _get_documents(documents, "CiliumNetworkPolicy"):
-        ends = [policy["spec"]["endpointSelector"]]
+        spec = policy["spec"]
+        ends = [spec["endpointSelector"]]
         # The default deny's empty rule selects its pods and admits no one.
-        for rule in filter(None, policy["spec"].get("ingress", [])):
-            ends += rule.get("fromEndpoints", [{}])
+        for rule in filter(None, spec.get("ingress", [])):
+            ends += rule.get("fromEndpoints") or [{}]
+        for rule in spec.get("egress", []):
+            peers = rule.get("toEndpoints", [])  # The cluster's DNS is the one other.
+            ends += [peer for peer in peers if "k8s-app" not in peer["matchLabels"]]
         for end in ends:
             assert own.items() <= end.get("matchLabels", {}).items(), policy
 
