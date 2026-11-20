@@ -1411,11 +1411,11 @@ def test_network_isolated_service_joining_a_global_network(
     "values", ["network-isolated-with-global-network", "egress-proxy"]
 )
 def test_policies_select_admit_and_reach_no_other_releases_pods(
-    chart_dir: Path, test_resources_dir: Path, values: str
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, values: str
 ) -> None:
-    # A layered policy that denies a port to the release's pods alone relies on this.
-    own = {
-        "io.kubernetes.pod.namespace": "a-namespace",
+    # Releases share a namespace: only these labels keep a rule off another's pods.
+    home = {"io.kubernetes.pod.namespace": "a-namespace"}
+    own = home | {
         "app.kubernetes.io/name": "agent-env",
         "app.kubernetes.io/instance": "my-release",
     }
@@ -1433,11 +1433,14 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
         ends = [spec["endpointSelector"]]
         # The default deny's empty rule selects its pods and admits no one.
         for rule in filter(None, spec.get("ingress", [])):
+            # Cilium drops the whole policy for a rule that mixes kinds of peer.
+            assert rule.keys() <= {"fromEndpoints", "toPorts", "icmps"}, policy
             ends += rule.get("fromEndpoints") or [{}]
         for rule in spec.get("egress", []):  # The cluster's DNS is the one other.
+            assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
             ends += [to for to in rule.get("toEndpoints") or [{}] if to not in dns]
-        for end in ends:
-            assert own.items() <= end.get("matchLabels", {}).items(), policy
+        for end in ends:  # Cilium reads one that names no namespace as the policy's.
+            assert own.items() <= (home | end.get("matchLabels", {})).items(), policy
 
 
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
