@@ -453,6 +453,17 @@ async def test_helm_cleanup_fails_where_helm_cannot_say_whose_a_release_is(
         await release.uninstall(quiet=True)
 
 
+async def test_helm_s_error_is_reported_where_its_output_is_not_utf_8(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    (tmp_path / "does").write_text("printf '\\377'; printf 'no \\377' >&2; exit 1\n")
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+
+    with pytest.raises(RuntimeError, match="Helm list failed.*no "):
+        await release.uninstall(quiet=True)
+
+
 async def test_helm_cleanup_gives_up_on_a_helm_that_does_not_answer(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

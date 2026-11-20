@@ -809,8 +809,8 @@ async def _run_subprocess(
     return ExecResult(
         success=proc.returncode == 0,
         returncode=proc.returncode or 1,
-        stdout=stdout.decode() if stdout else "",
-        stderr=stderr.decode() if stderr else "",
+        stdout=stdout.decode(errors="replace") if stdout else "",
+        stderr=stderr.decode(errors="replace") if stderr else "",
     )
 
 
