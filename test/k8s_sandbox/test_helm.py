@@ -451,6 +451,12 @@ async def test_helm_cleanup_fails_where_helm_cannot_say_whose_a_release_is(
 
     with pytest.raises(RuntimeError, match="Helm list failed"):
         await release.uninstall(quiet=True)
+    with pytest.raises(RuntimeError, match="Helm list failed"):  # so does listing all
+        await _helm.get_all_release_names("a-namespace", None)
+
+
+async def test_a_command_that_succeeds_returns_zero() -> None:
+    assert (await _run_subprocess("true", [], capture_output=True)).returncode == 0
 
 
 async def test_helm_cleanup_gives_up_on_a_helm_that_does_not_answer(
