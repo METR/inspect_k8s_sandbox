@@ -1431,6 +1431,7 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 		"left in its group by a handler":     {map[bool]string{true: "65534"}[os.Getuid() == 0], "env", "-i", "/bin/sh", "-c", `trap 'sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                // at its SIGTERM it starts one, says its id and ends: no SIGTERM went to that one, and with no tag only the command's group leads there
 		"left out of its group by a handler": {"", "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                                         // the same in a session of its own: only the tag leads there
 		"found by its tag":                   {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "echo $$; exec env -i sh -c \"while :; do :; done\" >/dev/null 2>&1" TERM; echo ready; while :; do :; done' &); while :; do sleep 0.01; done`}, // in a session of its own, its parent gone, one says its id at its SIGTERM and runs on with no output and no tag: only the tag led there, for another user's the search's helper, and only its id leads the SIGKILL there
+		"found in its group":                 {"", "sh", "-c", `trap exit TERM; env -i sh -c 'trap "echo $$" TERM; echo ready; while :; do :; done' & while :; do sleep 0.01; done`},                                                                                                             // in its group with no tag, one says its id at its SIGTERM and runs on
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); name == "left in its group by a handler" && err != syscall.EBADF {
@@ -1447,7 +1448,7 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 			s.dispatch(c, frame{kind: fKill, id: 80})
 			straggler, _ := strconv.Atoi(strings.TrimSpace(said(t, frames, func(out string) bool { return strings.HasSuffix(out, "\n") })))
 			wait(true)
-			if name == "found by its tag" { // it had a SIGTERM: another call runs from its START to its EXIT meanwhile, three of the sweep's looks, and an exit that did not wait would have come by then
+			if strings.HasPrefix(name, "found") { // it had a SIGTERM: another call runs from its START to its EXIT meanwhile, three of the sweep's looks, and an exit that did not wait would have come by then
 				other, _ := json.Marshal(startRequest{Argv: []string{"sleep", "0.3"}, Env: map[string]string{}, Tag: "other"})
 				s.dispatch(c, frame{kind: fStart, id: 81, payload: other})
 				if f := awaited(t, frames, fExit, time.Now().Add(30*time.Second)); f.id != 81 {
@@ -1618,7 +1619,7 @@ func TestAKillThatComesBeforeAnotherUsersCommandHasStartedReachesItThoughItCarri
 	cl := &call{id: 82, tag: "early"}
 	cl.room = sync.NewCond(&cl.mu)
 	pid := filepath.Join(open, "pid")
-	req := startRequest{Argv: []string{"env", "-i", "sh", "-c", `echo $$ >"$0"; exec sleep 600`, pid}, Env: map[string]string{}, User: "65534", Tag: "early"}
+	req := startRequest{Argv: []string{"env", "-i", "sh", "-c", `trap "" TERM; echo $$ >"$0"; exec sleep 600`, pid}, Env: map[string]string{}, User: "65534", Tag: "early"}
 
 	cl.kill()     // from another connection, while this one's START is still at work
 	cl.kmu.Lock() // and stays at work until the command runs as its user, whom root's signal does not reach without CAP_KILL
@@ -2658,6 +2659,7 @@ func TestAKillThatFindsItsCommandRunningLeavesWhatItLeftRunningIfItEndsFirst(t *
 }
 
 func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
+	graced(t)                                                // no SIGKILL of a grace's end: what the command started is ended by its SIGTERM
 	user := map[bool]string{true: "65534"}[os.Getuid() == 0] // as one root's own SIGSTOP does not reach without CAP_KILL, as in CI's second job
 	s, _ := newServer(strings.Repeat("00", 32))
 	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching

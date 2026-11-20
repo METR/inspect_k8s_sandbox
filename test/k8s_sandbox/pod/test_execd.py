@@ -42,8 +42,6 @@ TlsDaemon = collections.abc.Callable[
 
 async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     kind, call_id, n = execd.HEADER.unpack(await reader.readexactly(execd.HEADER.size))
-    while kind == execd.PING and call_id >= execd.BEGUN:  # behind each START: no test's
-        kind, call_id, n = execd.HEADER.unpack(await reader.readexactly(13))
     return kind, call_id, await reader.readexactly(n)
 
 
@@ -2001,12 +1999,13 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
 ) -> None:
     async def times_out(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        w.write(frame(execd.STDERR, call_id, b"its last\n"))
+        w.write(frame(execd.STDOUT, call_id, b"its "))
+        w.write(frame(execd.STDERR, call_id, b"last\n"))
         w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
         await r.read()
 
     sandbox = await tls_daemon(times_out)
-    with pytest.raises(TimeoutError, match="Command timed out after 60s") as timed:
+    with pytest.raises(TimeoutError, match=r"^Command timed out after 60s\.$") as timed:
         await asyncio.wait_for(
             sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
@@ -2240,7 +2239,6 @@ KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
     "restarted": (b"c", b"d", error.ExecdStoppedError),
     "unnamed": (b"unknown", b"unknown", error.ExecdStoppedError),
     "no boot id": (b":5", b":5", error.ExecdStoppedError),
-    "never read": (b"c", b"c", error.ExecdStoppedError),
 }
 
 
@@ -2253,8 +2251,7 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
 
     async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
-        said = frame(execd.PONG, call_id | execd.BEGUN) * (case != KILLED["never read"])
-        w.write(said + frame(execd.STDOUT, call_id, b"so far\n"))
+        w.write(frame(execd.STDOUT, call_id, b"so far\n"))
         await killed.wait()
         first.close()  # execd is gone, and the next start makes another
         w.close()
@@ -4933,7 +4930,7 @@ async def test_a_daemon_with_no_reachable_address_is_reached_through_its_stdio(
         w.write(frame(execd.STDOUT, call_id, b"ran"))
         w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
         w.write(execd.HEADER.pack(execd.STDOUT, call_id, execd.MAX_FRAME + 1))
-        if not (await r.read())[13:]:  # only its START's PING: the client is gone
+        if not await r.read():  # no frame of execd's: the client ends the connection
             closed.set()
 
     server = await asyncio.start_server(exits, "127.0.0.1", 0, ssl=context)

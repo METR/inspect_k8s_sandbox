@@ -953,9 +953,9 @@ func (cl *call) stop(timeout bool) {
 		cl.ending = make(chan struct{})
 		cl.kmu.Unlock()
 		group, _, _ = syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0) // while its id is its own: what it leaves in its group is signalled through this
-		afterFunc(termGrace, func() { close(up) })                      // from here, not from the SIGTERMs: a kill slow to list a loaded pod's processes ends no later for it
 		var late bool
 		reached, listed, late = signalTree(as, pid, map[int]string{pid: ""}, true, syscall.SIGTERM, syscall.SIGCONT)
+		afterFunc(termGrace, func() { close(up) }) // from the SIGTERMs, as timeout(1) counts it: a pod slow to list its processes leaves them the whole of it
 		slow = slow || late
 	}
 	reaper.mu.Unlock()
@@ -1016,8 +1016,13 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 	select { // no look at what is left before the search's word, and its helper's
 	case more := <-found:
 		maps.Copy(reached, more)
-	case <-up: // a search slower than the grace: what it signals is killed when it says so, behind the call's exit
-		go func() { kill(<-found) }()
+	case <-up:
+		select {
+		case more := <-found: // there by now, as where both came at once
+			maps.Copy(reached, more)
+		default: // a search slower than the grace: what it signals is killed when it says so, behind the call's exit
+			go func() { kill(<-found) }()
+		}
 	}
 	for wait, over := time.Millisecond, false; !over && left(); wait = min(2*wait, 100*time.Millisecond) {
 		select {

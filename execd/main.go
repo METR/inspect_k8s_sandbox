@@ -36,6 +36,7 @@ func main() {
 		if err := take(os.Args[2:5]); err != nil {
 			fail(err.Error())
 		}
+		undumpable() // the change of identity reset it: traced by its user, it would say what execd is to kill
 		sig, _ := strconv.Atoi(os.Args[6])
 		var among map[int]string // the only processes to signal: every one where none is given
 		for _, p := range os.Args[7:] {
