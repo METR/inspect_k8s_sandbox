@@ -186,6 +186,22 @@ services:
     assert services["last"] == services["later"] == services["default"]
 
 
+def test_keys_of_a_service_sharing_a_yaml_alias_each_keep_their_settings(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    image: my-image
+    deploy: {resources: {limits: &memory {memory: 1G}, reservations: {cpus: 1}}}
+    x-inspect_k8s_sandbox: {resources: {requests: *memory}}
+""")
+
+    services = _converter.convert_compose_to_helm_values(compose_path)["services"]
+
+    assert services["default"]["resources"]["requests"] == {"cpu": 1, "memory": "1G"}
+
+
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
     tmp_compose: TmpComposeFixture,
 ) -> None:
@@ -1022,14 +1038,16 @@ services:
 def test_rejects_service_extension_resource_conflict(
     tmp_compose: TmpComposeFixture,
 ) -> None:
+    # mem_limit populates requests.memory, so the extension may not also set it.
     compose_path = tmp_compose("""
 services:
   my-service:
     image: my-image
-    deploy: {resources: {limits: &memory {memory: 1G}}}
+    mem_limit: 32g
     x-inspect_k8s_sandbox:
       resources:
-        requests: *memory
+        requests:
+          memory: 16Gi
 """)
 
     with pytest.raises(ComposeConverterError) as exc_info:
