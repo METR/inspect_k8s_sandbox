@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -84,51 +83,31 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	}
 }
 
-func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
+func TestNagleClientIsNotHeldBack(t *testing.T) {
 	client, inSandbox := tcpPair(t)
-	read := unreset{inSandbox, new(atomic.Bool)}
-	raw, err := inSandbox.SyscallConn()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
-	atOnce := func() (quick int) {
-		if controlled := raw.Control(func(fd uintptr) {
-			quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
-		}); controlled != nil || err != nil {
-			t.Fatal(controlled, err)
-		}
-		return quick
-	}
-	one := make([]byte, 1)
-	// Requests and their replies, as through a proxy: the kernel then holds acknowledgements back. The first is read as the last will be: asking once a connection would not do.
-	receive := read.Read
-	for range 8 {
-		for _, step := range []func([]byte) (int, error){client.Write, receive, inSandbox.Write, client.Read} {
-			if _, err := step(one); err != nil {
-				t.Fatal(err)
-			}
-		}
-		receive = inSandbox.Read
-	}
-	if atOnce() != 0 {
-		t.Skip("this kernel holds no acknowledgement back here, so a read has nothing to change")
-	}
-	sent := time.Now()
+	onNode, proxy := tcpPair(t)
+	guest, node := vsockPair(t)
+	go join(guest, inSandbox, nil, 0)
+	go join(node, onNode, nil, 0)
+	client.SetNoDelay(false)
+	fastest := time.Hour
 
-	if _, err := client.Write(one); err != nil {
-		t.Fatal(err)
-	}
-	// Into the room a stream's reads have, more than the peer fills.
-	if _, err := read.Read(make([]byte, maxFrame)); err != nil {
-		t.Fatal(err)
+	for i := range 10 {
+		start := time.Now()
+		client.Write([]byte("a"))
+		client.Write([]byte("b")) // Nagle holds this until "a" is acknowledged
+		io.ReadFull(proxy, make([]byte, 2))
+		proxy.Write([]byte("c"))
+		if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 { // the first reply puts the connection's acknowledgements on hold
+			fastest = min(fastest, time.Since(start))
+		}
 	}
 
-	if atOnce() != 1 {
-		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
-	}
-	if time.Since(sent) > 20*time.Millisecond {
-		t.Skip("too slow to tell: 40 ms after bytes arrive the kernel acknowledges them whatever was asked")
+	if fastest > 20*time.Millisecond {
+		t.Fatalf("each request of two small writes took %v or more: its second waited for an acknowledgement", fastest)
 	}
 }
 

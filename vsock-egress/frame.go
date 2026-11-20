@@ -88,7 +88,7 @@ type unreset struct {
 
 func (u unreset) Read(p []byte) (int, error) {
 	n, err := u.TCPConn.Read(p)
-	// A peer that left Nagle on holds its next small write until these bytes are acknowledged, which the kernel puts off 40 ms once replies flow back; asked after each read, since the option does not last.
+	// Asked after each read, since the option does not last: a peer that left Nagle on holds its next small write until these bytes are acknowledged.
 	if raw, failed := u.SyscallConn(); failed == nil {
 		raw.Control(func(fd uintptr) { syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 1) })
 	}
