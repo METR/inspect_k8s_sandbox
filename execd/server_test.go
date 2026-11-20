@@ -2728,7 +2728,7 @@ func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the kill waits for ever to hear that its command has stopped, and never kills it")
 	}
-	if status := exitStatus(t, frames); status["code"] != 143.0 {
+	if status := exitStatus(t, frames); status["code"] != 137.0 {
 		t.Fatalf("EXIT %v: the kill did not go ahead", status)
 	}
 }
