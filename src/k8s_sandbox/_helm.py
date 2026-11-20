@@ -751,7 +751,10 @@ async def get_all_release_names(namespace: str, context_name: str | None) -> lis
     )
     if not result.success:  # not "none": a cleanup would find nothing to uninstall
         _raise_runtime_error(
-            "Helm list failed.", namespace=namespace, stderr=result.stderr
+            "Helm list failed.",
+            namespace=namespace,
+            returncode=result.returncode,
+            stderr=result.stderr,
         )
     return result.stdout.splitlines()
 
@@ -810,10 +813,9 @@ async def _run_subprocess(
         except ProcessLookupError:
             pass
         raise
-    assert proc.returncode is not None  # communicate() returns once it has ended
     return ExecResult(
         success=proc.returncode == 0,
-        returncode=proc.returncode,
+        returncode=await proc.wait(),
         stdout=stdout.decode() if stdout else "",
         stderr=stderr.decode() if stderr else "",
     )
