@@ -602,6 +602,7 @@ class PodStdio(ByteStream):
             except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
                 return  # No room: receive() tries again, with the same bytes for TLS.
             except OSError:
+                _clear_tls_errors()  # As _end() does: the stream stays open.
                 rest = b""  # The peer has gone: what it sent first is still read.
             self._pongs[:1] = [rest] if rest else []
 
@@ -617,8 +618,6 @@ class PodStdio(ByteStream):
                     while self._pongs:
                         await self._write(memoryview(self._pongs.pop(0)))
                     await self._write(memoryview(frame))
-                while self._pongs and not self._ended:  # A ping came in the last frame.
-                    await self._write(memoryview(self._pongs.pop(0)))
             except OSError as e:
                 self._end(e)
                 raise anyio.BrokenResourceError(repr(e)) from e
@@ -626,6 +625,7 @@ class PodStdio(ByteStream):
                 # A frame cut short would corrupt any later one.
                 self._close()
                 raise
+        self._write_pongs()  # A ping came in the last frame.
 
     async def _write(self, data: memoryview) -> None:
         while data:
