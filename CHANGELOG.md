@@ -82,15 +82,15 @@
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
   status 1 once that directory is gone. On a timed-out or cancelled `exec()` whose
-  command is still running, execd sends SIGTERM, and 5 seconds later SIGKILL to what
-  has not ended: to the command, to its process group and to the other processes it
-  started that it can find, as far as it may signal each; one that has detached from
-  the command can survive, and so can one the command was starting as its SIGTERM
-  came. A timed-out `exec()` raises `TimeoutError`, with what the command wrote, once
-  the command, its process group and the processes under it have ended, up to about
-  6 seconds after its timeout. Those of a command that has ended are left
-  running. Once execd has stopped reading a command's output, 100 ms after the command
-  ended at the earliest, what it left running may write 1 MiB more in total to each of
+  command is still running, execd sends SIGTERM, and 5 seconds later SIGKILL to what has
+  not ended: to the command, to its process group and to the other processes it started
+  that it can find, as far as it may signal each; one that has detached from the command
+  can survive. A timed-out `exec()` raises `TimeoutError`, with what the command wrote,
+  once the command and the processes execd signalled have ended: at its timeout where
+  they end at SIGTERM, 5 seconds later where one does not, and 16 seconds later at most.
+  The processes of a command that has ended by itself are left running. Once execd has
+  stopped reading a command's output, 100 ms after the command ended at the earliest,
+  what it left running may write 1 MiB more in total to each of
   the command's stdout and stderr, plus that pipe's free space; past that a write to
   it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
   for at most half of its open-file limit (512 in a Kata guest), and past that it closes
@@ -99,9 +99,10 @@
   that ends execd, by killing every process or taking the pod's last PID, ends each
   running `exec()` as a killed command, with status 137 and the output so far, or with
   `TimeoutError` if its timeout had passed; a running `read_file()` or `write_file()`
-  is run again. Where the pod sets `shareProcessNamespace` or `hostPID`, they raise
-  `ExecResultUnknownError` instead. Commands still running lose their timeout and get
-  end-of-file on `stdin`.
+  is run again. Where execd cannot be started again in the same container, or the pod
+  sets `shareProcessNamespace` or `hostPID`, they raise `ExecResultUnknownError`
+  instead. A command still running, as where execd alone was killed, goes on without
+  its timeout and with end-of-file on `stdin`, though its call has ended.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
@@ -171,7 +172,7 @@
   `ExecResultUnknownError` (a `GetReturncodeError`, as the cause of a `K8sError`). They
   are not retried once the container has restarted or been replaced. A pod with execd
   resumes the command instead and never runs it a second time; if it can't resume, it
-  raises `ExecResultUnknownError`.
+  raises `ExecResultUnknownError`, or returns 137 where execd itself was killed.
 - Images no longer need `sync`, and need `printf` (a shell builtin in dash, bash and
   busybox).
 - Add a per-service `podAnnotations` value: annotations for that service's Pod

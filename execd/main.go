@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/big"
 	"net"
@@ -49,7 +50,11 @@ func main() {
 				skip[pid] = ""
 			}
 		}
-		signalTagged(os.Args[5], syscall.Signal(sig), skip, among)
+		sent := signalTagged(os.Args[5], syscall.Signal(sig), skip, among)
+		// The daemon waits for this process in place of those it signalled, which only their user may read of.
+		for until := time.Now().Add(2 * termGrace); len(sent) > 0 && time.Now().Before(until); time.Sleep(10 * time.Millisecond) {
+			maps.DeleteFunc(sent, ended)
+		}
 		return
 	}
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket

@@ -112,6 +112,10 @@ class Daemon:
 class Dropped(Exception):
     """The connection carrying a call ended before the call did."""
 
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+        self.at = time.monotonic()  # a restart's seconds are not the call's own
+
 
 class NotSent(ConnectionError):
     """Nothing of a frame was written: its connection had closed."""
@@ -750,8 +754,8 @@ class ExecdClient:
             ours = end if end < never else call.started + timeout + TIMER_LAG
             return max(0.0, ours - time.monotonic())
 
-        def due() -> bool:  # its time is up as execd counts it: our timer follows
-            return timeout is not None and time.monotonic() >= call.started + timeout
+        def due(at: float) -> bool:  # its time was up then, as execd counts it
+            return timeout is not None and at >= call.started + timeout
 
         def ask() -> None:  # our timer has passed: execd's word is waited for
             nonlocal end
@@ -787,24 +791,21 @@ class ExecdClient:
                             break  # with a word that came, once more to take it
                         continue
                     if isinstance(item, Dropped):
-                        if item.args[:1] != (link,):  # one the call has left since
+                        if item.args != (link,):  # a connection the call has left since
                             continue
                         sender.cancel()
                         link.calls.pop(call.id, None)
-                        # Up as it dropped, or not: a restart's seconds are not its own.
-                        up = item.args[1:] or (due(),)
                         # No shield: _get waits without cancelling the shared reopen.
                         try:
                             link = await asyncio.wait_for(self._get(stale=link), left())
-                            if self._resume(link, call, *up):
+                            if self._resume(link, call, due(item.at)):
                                 break  # out of time when its execd was killed
                         except Exception as e:
                             if end < never:  # execd out of reach: our timer's word
                                 break
                             if not isinstance(e, asyncio.TimeoutError):
                                 raise
-                            # Asked again past our timer.
-                            call.queue.put_nowait(Dropped(link, *up))
+                            call.queue.put_nowait(item)  # asked again past our timer
                         continue
                     assert isinstance(item, tuple)
                     kind, payload = item

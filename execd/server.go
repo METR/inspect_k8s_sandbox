@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"os/signal"
@@ -948,33 +949,48 @@ func (cl *call) stop(timeout bool) {
 	}
 	reaper.mu.Unlock()
 	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
-		up := make(chan struct{})
-		afterFunc(termGrace, func() { close(up) })
-		go cl.sweep(pid, as, status, reached, up)
-		// Not to reached again: a second SIGTERM would cut short what the first began. Nor to what a SIGTERM has its process start, which was not listed before it.
-		cl.search(as, syscall.SIGTERM, reached, listed)
+		up, found, lag, began := make(chan struct{}), make(chan map[int]string, 1), make(chan time.Duration, 1), time.Now()
+		afterFunc(termGrace, func() { // counted from the search's SIGTERMs, sent that much later: a search not yet done has as long again, and no more
+			select {
+			case late := <-lag:
+				time.Sleep(late)
+			case <-time.After(termGrace):
+			}
+			close(up)
+		})
+		go cl.sweep(pid, as, status, reached, found, up)
+		// Not to reached again, which would cut short what the first SIGTERM began, nor to what a SIGTERM has its process start, which was not listed before it.
+		found <- cl.search(as, syscall.SIGTERM, reached, listed)
+		lag <- time.Since(began)
 	}
 }
 
-// sweep gives what a kill's SIGTERM reached until its grace is up to end, and SIGKILL to what has not. The call's exit waits for it.
-func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, up <-chan struct{}) {
+// sweep gives what a kill's SIGTERM reached until its grace is up to end, then SIGKILL to what has not: the call's exit waits for it.
+func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, found <-chan map[int]string, up <-chan struct{}) {
 	defer close(cl.ending)
-	defer func() { // when the grace is up and the tree is killed, what only the tag leads to: off the exit's path, as each read of an environment may wait behind its process's memory
+	defer func() { // when its grace is up, whatever else carries the tag: off the exit's path, as each read of an environment may wait behind its process's memory
 		go func() {
 			<-up
 			cl.search(as, syscall.SIGKILL, nil, nil)
 		}()
 	}()
-	left := func() bool { // a process the SIGTERM reached, the command, or one in the command's group
+	group := true         // the command's, with a process in it at every look since it was reaped: its number is no other group's
+	left := func() bool { // the command, one in its group, or a process the SIGTERM reached
+		reaper.mu.Lock()
+		running := reaper.waiting[pid] == status
+		reaper.mu.Unlock()
+		group = group && (running || syscall.Kill(-pid, 0) != syscall.ESRCH)
 		for p, started := range reached {
 			if !ended(p, started) {
 				return true
 			}
 		}
-		reaper.mu.Lock()
-		running := reaper.waiting[pid] == status
-		reaper.mu.Unlock()
-		return running || syscall.Kill(-pid, 0) != syscall.ESRCH
+		return group
+	}
+	select { // no look at what is left before the search's word: what it signalled is waited for too, and killed with the rest
+	case sent := <-found:
+		maps.Copy(reached, sent)
+	case <-up:
 	}
 	for wait, over := time.Millisecond, false; !over; wait = min(2*wait, 100*time.Millisecond) {
 		if !left() {
@@ -994,18 +1010,14 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		}
 	}
 	reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own, and so is its group's
-	group := 0
+	lead := 0
 	if reaper.waiting[pid] == status {
-		group, survivors = pid, append(survivors, pid)
-	} else if syscall.Kill(-pid, 0) != syscall.ESRCH { // shortcut: a group with a process in it at each look has kept its number; hold the number if a pod's ids could go round between two looks
-		group = pid
+		lead, survivors = pid, append(survivors, pid)
+	} else if group && syscall.Kill(-pid, 0) != syscall.ESRCH { // shortcut: no pod's ids go round between two looks, a search or 100 ms apart; hold the number if one's could
+		lead = pid
 	}
-	signalTree(as, group, survivors, syscall.SIGKILL)
+	signalTree(as, lead, survivors, syscall.SIGKILL)
 	reaper.mu.Unlock()
-	// A SIGKILL sent is not yet a process ended: the exit waits for each, a second at most for one the kernel holds.
-	for until := time.Now().Add(time.Second); left() && time.Now().Before(until); {
-		time.Sleep(time.Millisecond)
-	}
 }
 
 // signalAs sends another user's process, or its group, that user's own signal, and says whether it was sent: root's reaches neither without CAP_KILL.
@@ -1030,7 +1042,7 @@ func stat(pid int) []string {
 	return strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
 }
 
-// signalTree stops lead's group, if any, and what runs under roots, and sends them sigs in turn: stopped, each takes one SIGTERM however many reach it. It gives those reached and all listed.
+// signalTree stops lead's group, if any, and what runs under roots, sends them sigs in turn, and gives those reached and all listed: stopped, each takes one SIGTERM however many reach it.
 func signalTree(as *syscall.Credential, lead int, roots []int, sigs ...syscall.Signal) (reached, listed map[int]string) {
 	for _, target := range append([]int{-lead}, roots...) { // the group at once: stopped, a process starts no other, and its children stay its own; the command by its own id too: it may have left its group for another
 		if target != 0 {
@@ -1107,27 +1119,23 @@ func stopping(pid int) bool {
 func signalIf(pid int, started string, sig syscall.Signal) bool {
 	handle, _ := os.FindProcess(pid)
 	defer handle.Release()
-	f := stat(pid)
-	return len(f) > 19 && f[19] == started && !zombie(f) && handle.Signal(sig) == nil
-}
-
-// ended says the process pid that started then is no more, or is a zombie. One execd cannot read of, out of descriptors, has not ended.
-func ended(pid int, started string) bool {
-	if f := stat(pid); len(f) > 19 {
-		return f[19] != started || zombie(f)
+	if f := stat(pid); len(f) <= 19 || f[19] != started {
+		return false
 	}
-	_, err := os.Stat("/proc/" + strconv.Itoa(pid)) // which takes no descriptor
-	return errors.Is(err, os.ErrNotExist)
+	return handle.Signal(sig) == nil
 }
 
-// zombie says a stat is of a process that has ended: one whose first thread alone has ended shows state Z too, with its other threads counted.
-func zombie(f []string) bool { return f[0] == "Z" && f[17] == "1" }
+// ended says the process pid that started then is no more, or is a zombie: one whose first thread alone has ended shows state Z too, with its other threads counted.
+func ended(pid int, started string) bool {
+	f := stat(pid)
+	return len(f) <= 19 || f[19] != started || f[0] == "Z" && f[17] == "1"
+}
 
-// search signals whatever carries the call's tag, as signalTagged does: as execd, and for another user's command as that user.
-func (cl *call) search(as *syscall.Credential, sig syscall.Signal, skip, among map[int]string) {
-	signalTagged(cl.tag, sig, skip, among)
+// search signals whatever carries the call's tag, as signalTagged does: as execd, and for another user's command as that user. It gives what it signalled, and for that user's its helper, which runs until they have ended.
+func (cl *call) search(as *syscall.Credential, sig syscall.Signal, skip, among map[int]string) (sent map[int]string) {
+	sent = signalTagged(cl.tag, sig, skip, among)
 	if as == nil {
-		return
+		return sent
 	}
 	// Without CAP_SYS_PTRACE only the command's user may read its processes' environments.
 	if sig == syscall.SIGKILL { // a pod out of PIDs starts no child: what is left is killed at least
@@ -1135,8 +1143,10 @@ func (cl *call) search(as *syscall.Credential, sig syscall.Signal, skip, among m
 	}
 	// gVisor lets them be read only with the user's real ids, which let the user signal their holder: a child holds them, not execd.
 	argv := []string{"/proc/self/exe", "search", fmt.Sprint(as.Uid), fmt.Sprint(as.Gid), strings.Trim(fmt.Sprint(as.Groups), "[]"), cl.tag, strconv.Itoa(int(sig))}
-	for p := range skip {
-		argv = append(argv, strconv.Itoa(p))
+	for _, signalled := range []map[int]string{skip, sent} { // execd's own search too, where it may read another user's processes: one SIGTERM each
+		for p := range signalled {
+			argv = append(argv, strconv.Itoa(p))
+		}
 	}
 	if among != nil {
 		argv = append(argv, "+")
@@ -1144,9 +1154,15 @@ func (cl *call) search(as *syscall.Credential, sig syscall.Signal, skip, among m
 			argv = append(argv, strconv.Itoa(p)+":"+started)
 		}
 	}
+	reaper.mu.Lock() // nothing is reaped meanwhile: the id read is the helper's own
 	if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}}); err == nil {
+		if f := stat(child.Pid); len(f) > 19 {
+			sent[child.Pid] = f[19]
+		}
 		child.Release()
 	}
+	reaper.mu.Unlock()
+	return sent
 }
 
 type search struct {
@@ -1305,7 +1321,8 @@ func tagged(open func(string) (*os.File, error), environ string, needle []byte, 
 }
 
 // signalTagged signals every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid: none in skip, and only those among, each while it is the process started then, if that is given.
-func signalTagged(tag string, sig syscall.Signal, skip, among map[int]string) {
+func signalTagged(tag string, sig syscall.Signal, skip, among map[int]string) (sent map[int]string) {
+	sent = map[int]string{}
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
 	open := os.Open
 	if stand := openEnviron.Load(); stand != nil {
@@ -1324,6 +1341,11 @@ func signalTagged(tag string, sig syscall.Signal, skip, among map[int]string) {
 			if err != nil || pid == os.Getpid() || read[pid] {
 				continue
 			}
+			started, listed := among[pid]
+			if _, skipped := skip[pid]; skipped || among != nil && (!listed || ended(pid, started)) { // none of the search's to signal: its environment, which may wait behind its memory, is not read
+				read[pid] = true
+				continue
+			}
 			more = true
 			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle, &room)
 			if none {
@@ -1333,12 +1355,14 @@ func signalTagged(tag string, sig syscall.Signal, skip, among map[int]string) {
 				}
 			}
 			read[pid] = true
-			started, listed := among[pid]
-			if _, skipped := skip[pid]; is && !skipped && (among == nil || listed && !ended(pid, started)) {
+			if is {
 				syscall.Kill(pid, sig)
+				syscall.Kill(pid, syscall.SIGCONT) // as timeout(1) sends it: stopped, it would take no SIGTERM
+				sent[pid] = among[pid]
 			}
 		}
 	}
+	return sent
 }
 
 // The reaper reaps every child under mu, so an id is never reused before its status is sent.

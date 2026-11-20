@@ -56,9 +56,7 @@ class Daemons:
         self.ports: dict[execd.Daemon, int] = {}
         self.unstarted: list[execd.Daemon] = []
 
-    async def serve(
-        self, handler: Handler, pod: str = "", container: bytes = b""
-    ) -> asyncio.Server:
+    async def serve(self, handler: Handler, **named: typing.Any) -> asyncio.Server:
         """One that answers AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -69,8 +67,7 @@ class Daemons:
                 await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)
-        cert = f"cert-{len(self.ports)}"
-        daemon = execd.Daemon("127.0.0.1", cert, b"key", pod, None, container)
+        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", **named)
         self.ports[daemon] = server.sockets[0].getsockname()[1]
         self.unstarted.append(daemon)
         return server
@@ -321,6 +318,7 @@ class Cluster:
 
     restarts = reads = 0
     uid, ip = "u", "10.0.0.1"
+    shares_pids = False
     unavailable = False  # its next read fails
     held: threading.Event | None = None  # its reads wait for it
 
@@ -338,6 +336,7 @@ class Cluster:
         }
         pod = {
             "metadata": {"name": "p", "uid": self.uid},
+            "spec": {"shareProcessNamespace": self.shares_pids},
             "status": {"podIP": self.ip, "containerStatuses": [container]},
         }
         return types.SimpleNamespace(data=json.dumps(pod))
@@ -2005,7 +2004,7 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
         await r.read()
 
     sandbox = await tls_daemon(times_out)
-    with pytest.raises(TimeoutError, match=r"after 60s\. .*stderr='its last\\n'"):
+    with pytest.raises(TimeoutError, match=r"after 60s\. .*returncode=124.*its last"):
         await asyncio.wait_for(
             sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
@@ -2240,6 +2239,7 @@ KILLED: dict[str, tuple[bytes, tuple[str, bytes], float, bool, typing.Any]] = {
     "restarted": (b"c", ("u", b"d"), 0, False, error.ExecdStoppedError),
     "replaced": (b"c", ("v", b"c"), 0, False, error.ExecdStoppedError),
     "unnamed": (b"unknown", ("u", b"unknown"), 0, False, error.ExecdStoppedError),
+    "shared": (b"", ("u", b""), 0, False, error.ExecdStoppedError),
 }
 
 
@@ -2271,8 +2271,8 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
             await back.wait()
         return daemons.unstarted.pop(0)
 
-    first = await daemons.serve(is_killed, "u", was)
-    await daemons.serve(started_again, *again)
+    first = await daemons.serve(is_killed, pod="u", container=was)
+    await daemons.serve(started_again, pod=again[0], container=again[1])
     client = execd.ExecdClient(start, lambda: pod[0])
     call = asyncio.ensure_future(client.exec(["sh"], None, None, {}, None, 9))
     await until(lambda: starts_written(client) == 1)
@@ -3700,6 +3700,8 @@ async def test_only_one_fingerprint_line_starts_execd(
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
     started = await pod._start_execd(False)
     assert (started.fingerprint, started.container) == ("0" * 64, b"c")
+    cluster.shares_pids = True  # the container execd names is the pod's then
+    assert (await pod._start_execd(False)).container == b""
 
     printed = b"1" * 64 + b" " + b"c" * 4031  # both, but cut at run_argv's 4 KiB
     with pytest.raises(error.PodError, match="execd did not start"):

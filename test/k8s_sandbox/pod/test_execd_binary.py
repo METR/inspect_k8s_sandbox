@@ -529,6 +529,21 @@ async def test_a_timed_out_command_is_killed(
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
+async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs(
+    sandbox: Sandbox, execs: Execs
+) -> None:
+    async def start(replace: bool) -> execd.Daemon:
+        at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
+        return execd.Daemon("", *at, stdio=execs.connect, container=b"its own")
+
+    client, ran = execd.ExecdClient(start), f"/tmp/{uuid.uuid4().hex}"
+    argv = ["sh", "-c", 'echo ran >> "$0"; kill -9 -1', ran]
+    with anyio.fail_after(60):  # only bounds a hang
+        killed = await client.exec(argv, None, None, {}, None, 9)
+        after = await client.exec(["cat", ran], None, None, {}, None, 9)
+    assert (killed.returncode, after.stdout) == (137, "ran\n")  # once: none sent again
+
+
 async def test_a_streams_command_is_killed_when_its_connection_drops(
     sandbox: Sandbox, relay: Relay, client: execd.ExecdClient
 ) -> None:
