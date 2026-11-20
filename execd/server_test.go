@@ -1489,7 +1489,7 @@ func TestAKillsLastSigkillSparesAProcessGivenASurvivorsId(t *testing.T) {
 	reaper.mu.Lock()
 	other, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{})
 	status := reaper.watch(other.Pid)
-	signalTree(nil, 0, map[int]string{other.Pid: "0"}, syscall.SIGKILL) // as the sweep's for a survivor whose id is another process's by now: not the one that started then
+	signalTree(nil, 0, map[int]string{other.Pid: "0"}, true, syscall.SIGKILL) // as the sweep's for a survivor whose id is another process's by now: not the one that started then
 	reaper.mu.Unlock()
 	other.Signal(syscall.SIGTERM)
 	until(t, "a process given a survivor's id was stopped by the kill: no SIGTERM ends it", func() bool { return len(stat(other.Pid)) == 0 })
@@ -2706,22 +2706,16 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 }
 
 func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
-	s, _ := newServer(strings.Repeat("00", 32))
-	tag := strconv.FormatInt(time.Now().UnixNano(), 36) // its own: the last run's kill may still be searching
-	t.Cleanup(func() { killTagged(tag) })
-	req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: tag})
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	s.dispatch(c, frame{kind: fStart, id: 39, payload: req})
+	end := graced(t)
+	s, c, frames, _, child := ready(t, "", "sh", "-c", `trap 'echo t' TERM; env -i setsid sh -c 'trap "" TERM; echo $$; while :; do sleep 0.01; done' & while :; do sleep 0.01; done`) // it says its SIGTERM and runs on, as does its child, out of its group with no tag: only its id leads the SIGKILL there
 	killed := make(chan syscall.Errno, 1)
 	go func() {
 		errno := answered(syscall.SYS_WAITID, 0) // it returns, and has told nothing
 		if errno == 0 {
-			s.dispatch(c, frame{kind: fKill, id: 39}) // as a client sends for a call it gives up; a command a debugger holds reports no stop either
+			s.dispatch(c, frame{kind: fKill, id: 80}) // as a client sends for a call it gives up; a command a debugger holds reports no stop either
 		}
 		killed <- errno
 	}()
-
 	select {
 	case errno := <-killed:
 		if errno != 0 {
@@ -2730,9 +2724,12 @@ func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the kill waits for ever to hear that its command has stopped, and never kills it")
 	}
-	if status := exitStatus(t, frames); status["code"] != 137.0 {
-		t.Fatalf("EXIT %v: the kill did not go ahead", status)
+	said(t, frames, func(out string) bool { return strings.Contains(out, "t") }) // slow to stop, as on a loaded pod, it has its SIGTERM all the same
+	if end(); exitStatus(t, frames)["code"] != 137.0 {
+		t.Fatal("the kill of a command slow to stop did not go ahead when its grace was up")
 	}
+	id, _ := strconv.Atoi(strings.TrimSpace(child))
+	until(t, "the child of a command slow to stop outlived its kill", func() bool { f := stat(id); return len(f) == 0 || strings.Contains("ZX", f[0]) })
 }
 
 func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {

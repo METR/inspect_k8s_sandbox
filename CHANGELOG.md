@@ -92,11 +92,11 @@
   SIGKILL: 16 seconds after its timeout at most. What they start after their SIGTERM
   gets SIGKILL as soon as they have ended: a handler must wait for the cleanup it
   starts. (On gVisor, and on kernels before 6.9, such a process left in the command's
-  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) On a pod so short
-  of memory or CPU that execd takes over half a second to stop the command, or to stop
-  its processes and list the pod's (10 ms for each process, where that is longer), it
-  sends SIGKILL at once. The processes of a command that has ended by itself are left
-  running. Once
+  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) Where execd takes
+  over half a second to stop the command and list its processes, as on a pod short of
+  memory or CPU, what the survivors of a SIGTERM start in those 5 seconds outside the
+  command's group, without `HAWK_NEXT_EXEC` in its environment, is not found for the
+  SIGKILL. The processes of a command that has ended by itself are left running. Once
   execd has stopped reading a command's output, 100 ms after the command ended at the
   earliest, what it left running may write 1 MiB more in total to each of
   the command's stdout and stderr, plus that pipe's free space; past that a write to
@@ -108,9 +108,9 @@
   running `exec()` as a killed command, with status 137 and the output so far; a
   running `read_file()` or `write_file()` is run again. Where execd cannot be started
   again in the same container, or the pod sets `shareProcessNamespace` or `hostPID`,
-  they raise `ExecResultUnknownError` instead. A command still running, as where execd
-  alone was killed, goes on without its timeout and with end-of-file on `stdin`, though
-  its call has ended.
+  they raise `ExecResultUnknownError` instead, and an `exec()` whose timeout had passed
+  `TimeoutError`. A command still running, as where execd alone was killed, goes on
+  without its timeout and with end-of-file on `stdin`, though its call has ended.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
