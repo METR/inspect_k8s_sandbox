@@ -166,8 +166,10 @@ async def execs(sandbox: Sandbox) -> collections.abc.AsyncIterator[Execs]:
         await process.aclose()
 
 
-async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, bytes]:
-    """`docker exec` starts execd, as an exec into a pod does: its fingerprint, key."""
+async def start_execd(
+    sandbox: Sandbox, replace: bool, *at: str
+) -> tuple[str, bytes, bytes]:
+    """`docker exec` starts execd, as an exec into a pod does: what it says, its key."""
     key = os.urandom(32)
     listen = [execd.EXECD_PATH, "listen", *at]
     listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
@@ -177,7 +179,8 @@ async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, b
     if "address already in use" in started.stderr:
         raise execd.DaemonRunning(started.stderr)
     assert started.returncode == 0, started.stderr
-    return started.stdout.split()[0], key
+    fingerprint, container = started.stdout.split()
+    return fingerprint, key, container.encode()
 
 
 @pytest.fixture
@@ -186,7 +189,7 @@ def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--port", str(PORT))
-        return execd.Daemon("127.0.0.1", *at)
+        return execd.Daemon("127.0.0.1", *at[:2])
 
     return execd.ExecdClient(start)
 
@@ -197,7 +200,7 @@ def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at, stdio=execs.connect)
+        return execd.Daemon("", *at[:2], stdio=execs.connect)
 
     return execd.ExecdClient(start)
 
@@ -534,13 +537,15 @@ async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs
 ) -> None:
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at, stdio=execs.connect, container=b"its own")
+        return execd.Daemon("", *at[:2], stdio=execs.connect, container=at[2])
 
     client, ran = execd.ExecdClient(start), f"/tmp/{uuid.uuid4().hex}"
     argv = ["sh", "-c", 'echo ran >> "$0"; kill -9 -1', ran]
-    with anyio.fail_after(60):  # only bounds a hang
-        killed = await client.exec(argv, None, None, {}, None, 9)
-        after = await client.exec(["cat", ran], None, None, {}, None, 9)
+
+    with anyio.fail_after(30):  # only bounds a hang
+        killed = await client.exec(argv, None, None, {}, None, None)
+        after = await client.exec(["cat", ran], None, None, {}, None, None)
+
     assert (killed.returncode, after.stdout) == (137, "ran\n")  # once: none sent again
 
 

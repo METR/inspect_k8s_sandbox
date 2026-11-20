@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -38,22 +39,28 @@ func main() {
 			fail(err.Error())
 		}
 		sig, _ := strconv.Atoi(os.Args[6])
-		skip := map[int]string{}
-		var among map[int]string // after a "+": the only processes to signal, each as id:start time
+		var among map[int]string // the only processes to signal, each as id:start time: every one where none is given
 		for _, p := range os.Args[7:] {
-			id, started, _ := strings.Cut(p, ":")
-			if pid, _ := strconv.Atoi(id); p == "+" {
+			if among == nil {
 				among = map[int]string{}
-			} else if among != nil {
-				among[pid] = started
-			} else {
-				skip[pid] = ""
 			}
+			id, started, _ := strings.Cut(p, ":")
+			pid, _ := strconv.Atoi(id)
+			among[pid] = started
 		}
-		sent := signalTagged(os.Args[5], syscall.Signal(sig), skip, among)
-		// The daemon waits for this process in place of those it signalled, which only their user may read of.
-		for until := time.Now().Add(2 * termGrace); len(sent) > 0 && time.Now().Before(until); time.Sleep(10 * time.Millisecond) {
-			maps.DeleteFunc(sent, ended)
+		over := make(chan os.Signal, 1)
+		signal.Notify(over, syscall.SIGTERM)
+		sent := signalTagged(os.Args[5], syscall.Signal(sig), among)
+		// The daemon waits for this process in place of those it signalled, which only their user may read of, and at its SIGTERM this kills them by their ids.
+		for until := time.Now().Add(2 * termGrace); len(sent) > 0 && time.Now().Before(until); maps.DeleteFunc(sent, ended) {
+			select {
+			case <-over:
+				for p, started := range sent {
+					signalIf(p, started, syscall.SIGKILL)
+				}
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
 		}
 		return
 	}

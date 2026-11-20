@@ -112,10 +112,6 @@ class Daemon:
 class Dropped(Exception):
     """The connection carrying a call ended before the call did."""
 
-    def __init__(self, *args: object) -> None:
-        super().__init__(*args)
-        self.at = time.monotonic()  # a restart's seconds are not the call's own
-
 
 class NotSent(ConnectionError):
     """Nothing of a frame was written: its connection had closed."""
@@ -754,9 +750,6 @@ class ExecdClient:
             ours = end if end < never else call.started + timeout + TIMER_LAG
             return max(0.0, ours - time.monotonic())
 
-        def due(at: float) -> bool:  # its time was up then, as execd counts it
-            return timeout is not None and at >= call.started + timeout
-
         def ask() -> None:  # our timer has passed: execd's word is waited for
             nonlocal end
             end = time.monotonic() + KILL_WAIT
@@ -798,8 +791,7 @@ class ExecdClient:
                         # No shield: _get waits without cancelling the shared reopen.
                         try:
                             link = await asyncio.wait_for(self._get(stale=link), left())
-                            if self._resume(link, call, due(item.at)):
-                                break  # out of time when its execd was killed
+                            self._resume(link, call)
                         except Exception as e:
                             if end < never:  # execd out of reach: our timer's word
                                 break
@@ -903,20 +895,20 @@ class ExecdClient:
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
-    def _resume(self, link: Link, call: Call, late: bool) -> bool:
-        """Resume the call on a new connection; True if late and execd was killed."""
+    def _resume(self, link: Link, call: Call) -> None:
+        """Ask execd, over a new connection, to send the call on from what we have."""
         new, old = link.daemon, call.daemon
         if new is not old:
-            here = (new.pod, new.container) == (old.pod, old.container)
-            named = old.container not in (b"", b"unknown")  # execd's word for none
-            if not named or not here:
+            # In another container, or in none execd names: "unknown" is its word.
+            if new.container != old.container or old.container in (b"", b"unknown"):
                 raise ExecdStoppedError(
                     "execd stopped while it ran the command", pod=old.ip
                 )
             log_warn("execd was killed: started again", pod=old.ip)
-            # Killed with it, or left: as Kubernetes exec ends one, unless out of time.
+            # Killed with it, or left: it ends as Kubernetes exec ends a killed command.
+            call.words += 1
             call.queue.put_nowait((EXIT, b'{"code": 137}'))
-            return late
+            return
         link.calls[call.id] = call
         at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
         call.resuming = True  # before the RESUMED can arrive
@@ -932,7 +924,6 @@ class ExecdClient:
         link._last.add(task)
         task.add_done_callback(link._last.discard)
         log_warn("execd connection lost: resuming", pod=call.daemon.ip)
-        return False
 
     async def exec(
         self,
