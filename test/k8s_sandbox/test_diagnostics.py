@@ -207,7 +207,7 @@ def test_ignores_events_for_objects_outside_the_release() -> None:
             message="not this release's problem",
             type="Warning",
         )
-        for kind, name in [("StatefulSet", "another"), ("Service", "rel-busybox-runc")]
+        for kind, name in [("StatefulSet", "another"), ("Service", "rel-default")]
     ]
 
     with _patch_client(pods, events):

@@ -270,7 +270,7 @@ class Release:
         self._expected_services: frozenset[str] = frozenset()
         # The pods the rendered chart's StatefulSets make; set by _install().
         self._expected_pods: frozenset[str] = frozenset()
-        # The names of everything the chart rendered; set by _install(). A sandbox
+        # Everything the chart rendered, as `Kind/name`; set by _install(). A sandbox
         # whose controller cannot create a pod is only explained by an event on that
         # controller, which carries no pod name to be found by.
         self._object_names: frozenset[str] = frozenset()
