@@ -22,23 +22,16 @@
 - A compose file given as `values` in `K8sSandboxEnvironmentConfig`, or to
   `convert_compose_to_helm_values`, now converts with `healthcheck.disable`, a quoted
   `healthcheck.retries`, `mem_limit` as a number of bytes, `deploy:` with no value, and
-  services that share a YAML alias (the later one lost settings). An unquoted key
-  such as `on`, `yes` or `1` fails with a message asking to quote it.
-- **BREAKING CHANGE**: Two keys of one Compose service that share a mapping through a
-  YAML alias each keep it, where the second lost its settings: with
-  `deploy.resources.limits` aliased as the `requests` of
-  `x-inspect_k8s_sandbox.resources`, the request is now set. A file whose alias gives a
-  setting twice now fails to convert, and one whose alias puts a request above its limit
-  (`1G` is 1 GiB under `deploy` and 10^9 bytes under the extension) fails to install:
-  write the two mappings out.
+  services, or keys of one, that share a YAML alias (the later one lost settings).
+  An unquoted key such as `on`, `yes` or `1` fails with a message asking to quote it.
 - A `CMD-SHELL` healthcheck `test` passes every item after `CMD-SHELL` to `sh -c`,
   where only the first was kept.
 - **BREAKING CHANGE**: A negative `healthcheck.retries`, and a top-level
   `x-inspect_k8s_sandbox` that is a list or a plain value, now fail the conversion. So
-  does a file that converted only because a YAML alias between two services, or between
-  a service and the top level, hid an error: it fails as it does with the alias written
-  out. Where a service reuses the top-level `x-inspect_k8s_sandbox` as its own, move the
-  anchor into the first service that uses it.
+  does a file that converted only because a YAML alias between two services, two keys of
+  one, or a service and the top level, hid an error: it fails as it does with the alias
+  written out. Where a service reuses the top-level `x-inspect_k8s_sandbox` as its own,
+  move the anchor into the first service that uses it.
 - A pod annotated
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at

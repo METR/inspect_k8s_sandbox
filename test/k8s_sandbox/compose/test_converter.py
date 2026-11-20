@@ -174,8 +174,9 @@ services:
   default: &service
     image: my-image
     deploy:
-      resources: {{limits: &memory {{memory: 1G}}, reservations: {{cpus: 1}}}}
-    x-k8s: {{resources: {{requests: *memory}}}}
+      resources:
+        limits:
+          memory: 1G
   later: {later}
   last: {later}
 """)
@@ -183,7 +184,6 @@ services:
     services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
     assert services["last"] == services["later"] == services["default"]
-    assert services["default"]["resources"]["requests"] == {"cpu": 1, "memory": "1G"}
 
 
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
@@ -1022,16 +1022,14 @@ services:
 def test_rejects_service_extension_resource_conflict(
     tmp_compose: TmpComposeFixture,
 ) -> None:
-    # mem_limit populates requests.memory, so the extension may not also set it.
     compose_path = tmp_compose("""
 services:
   my-service:
     image: my-image
-    mem_limit: 32g
+    deploy: {resources: {limits: &memory {memory: 1G}}}
     x-inspect_k8s_sandbox:
       resources:
-        requests:
-          memory: 16Gi
+        requests: *memory
 """)
 
     with pytest.raises(ComposeConverterError) as exc_info:
