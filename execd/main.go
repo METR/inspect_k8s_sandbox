@@ -14,12 +14,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"math/big"
 	"net"
 	"os"
-	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -39,28 +37,16 @@ func main() {
 			fail(err.Error())
 		}
 		sig, _ := strconv.Atoi(os.Args[6])
-		var among map[int]string // the only processes to signal, each as id:start time: every one where none is given
+		var among map[int]string // the only processes to signal: every one where none is given
 		for _, p := range os.Args[7:] {
 			if among == nil {
 				among = map[int]string{}
 			}
-			id, started, _ := strings.Cut(p, ":")
-			pid, _ := strconv.Atoi(id)
-			among[pid] = started
+			pid, _ := strconv.Atoi(p)
+			among[pid] = ""
 		}
-		over := make(chan os.Signal, 1)
-		signal.Notify(over, syscall.SIGTERM)
-		sent := signalTagged(os.Args[5], syscall.Signal(sig), among)
-		// The daemon waits for this process in place of those it signalled, which only their user may read of, and at its SIGTERM this kills them by their ids.
-		for until := time.Now().Add(2 * termGrace); len(sent) > 0 && time.Now().Before(until); maps.DeleteFunc(sent, ended) {
-			select {
-			case <-over:
-				for p, started := range sent {
-					signalIf(nil, p, started, syscall.SIGKILL)
-				}
-				return
-			case <-time.After(10 * time.Millisecond):
-			}
+		for p, started := range signalTagged(os.Args[5], syscall.Signal(sig), among) { // the daemon waits for those, and kills each by its id when the grace is up
+			fmt.Println(p, started)
 		}
 		return
 	}
@@ -226,7 +212,7 @@ func start() {
 // container names the container execd is in: a client that finds another has seen a restart, whatever Kubernetes shows.
 func container() string {
 	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if f := stat(1); len(f) > 19 && strings.TrimSpace(string(boot)) != "" { // the kernel's boot, and when the container's first process started: without either it names none
+	if f := stat(1); len(f) > 19 { // the kernel's boot, and when the container's first process started
 		return strings.TrimSpace(string(boot)) + ":" + f[19]
 	}
 	return "unknown"

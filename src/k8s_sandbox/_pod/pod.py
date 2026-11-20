@@ -140,7 +140,7 @@ class Pod:
         self._execd_started = time.monotonic()
         stdio = self._execd_stdio if self._execd_by_stdio else None
         # Where PIDs are shared, the container execd names is the pod's: none is named.
-        container = b"" if pod.shares_pids else said[2]
+        container = b"unknown" if pod.shares_pids else said[2]
         return Daemon(pod.ip, said[1].decode(), key, pod.uid, stdio, container)
 
     async def _execd_stdio(self) -> PodStdio:

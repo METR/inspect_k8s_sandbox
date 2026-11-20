@@ -537,11 +537,9 @@ async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs
 ) -> None:
     ran = f"/tmp/{uuid.uuid4().hex}"
     argv = ["sh", "-c", 'echo ran >> "$0"; kill -9 -1', ran]
-
     with anyio.fail_after(30):  # only bounds a hang
         killed = await stdio_client.exec(argv, None, None, {}, None, None)
         after = await stdio_client.exec(["cat", ran], None, None, {}, None, None)
-
     assert (killed.returncode, after.returncode, after.stdout) == (137, 0, "ran\n")
 
 

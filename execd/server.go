@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -959,7 +960,7 @@ func (cl *call) stop(timeout bool) {
 	}
 	reaper.mu.Unlock()
 	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
-		found := make(chan hits, 1)
+		found := make(chan map[int]string, 1)
 		go cl.sweep(pid, as, status, reached, found, up, group, slow)
 		// Only what was listed, started since the command and had no SIGTERM may carry its tag and take one: no other's environment is read.
 		since, _ := strconv.ParseUint(listed[pid], 10, 64)
@@ -967,12 +968,27 @@ func (cl *call) stop(timeout bool) {
 			at, _ := strconv.ParseUint(started, 10, 64)
 			return reached[p] != "" || at < since
 		})
-		found <- cl.search(as, syscall.SIGTERM, listed)
+		t := cl.search(as, syscall.SIGTERM, listed)
+		if t.more == nil {
+			found <- t.sent // at once: a grace that is up as the search ends still finds its word there
+			return
+		}
+		go func() { // its helper's word too: what that signalled is waited for, and killed with the rest
+			t.more.SetReadDeadline(time.Now().Add(2 * termGrace)) // a helper its user has stopped says no more: its word is not waited for past this
+			for p, started := 0, ""; ; t.sent[p] = started {
+				if _, err := fmt.Fscanln(t.more, &p, &started); err != nil {
+					break
+				}
+			}
+			t.more.Close()
+			found <- t.sent
+		}()
 	}
 }
 
 // sweep gives what a kill's SIGTERM reached its grace to end, then SIGKILL to what has not, and to what they left in the command's group or carrying its tag: the call's exit waits for it.
-func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, found <-chan hits, up <-chan struct{}, group uintptr, slow bool) {
+func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, found <-chan map[int]string, up <-chan struct{}, group uintptr, slow bool) {
+	defer debug.FreeOSMemory() // a kill's listings leave garbage that a pod at its memory limit has no room for
 	defer close(cl.ending)
 	defer syscall.Close(int(group))
 	defer func() { go cl.search(as, syscall.SIGKILL, nil) }() // off the exit's path: each read of an environment may wait behind its process's memory
@@ -987,30 +1003,21 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		}
 		return running
 	}
-	kill := func(reached map[int]string, helper int) {
-		if helper != 0 { // at its SIGTERM the helper kills what it signalled, as their user, by their ids: it has a second for it
-			signalIf(as, helper, reached[helper], syscall.SIGTERM)
-		}
-		for until := time.Now().Add(time.Second); helper != 0 && !ended(helper, reached[helper]) && time.Now().Before(until); {
-			time.Sleep(time.Millisecond)
-		}
+	kill := func(reached map[int]string) {
 		reaper.mu.Lock() // nothing is reaped meanwhile: an id the reaper still holds for the command is its own, and so is its group's
 		defer reaper.mu.Unlock()
-		// Each process a SIGTERM reached is killed while it is still the one that started then, with what it has started since: but the helper, which kills what it signalled whenever it next runs.
+		// Each process a SIGTERM reached is killed while it is still the one that started then, with what it has started since.
 		roots, lead := maps.Clone(reached), 0
-		delete(roots, helper)
 		if delete(roots, pid); reaper.waiting[pid] == status {
 			lead, roots[pid] = pid, ""
 		}
 		signalTree(as, lead, roots, !slow, syscall.SIGKILL) // on a pod that slow with no listing: what they have started since is the group's SIGKILL's, or the tag's
 	}
-	helper := 0
-	select { // no look at what is left before the search's word: what it signalled is waited for too, and killed with the rest
-	case t := <-found:
-		maps.Copy(reached, t.sent)
-		helper = t.helper
+	select { // no look at what is left before the search's word, and its helper's
+	case more := <-found:
+		maps.Copy(reached, more)
 	case <-up: // a search slower than the grace: what it signals is killed when it says so, behind the call's exit
-		go func() { t := <-found; kill(t.sent, t.helper) }()
+		go func() { kill(<-found) }()
 	}
 	for wait, over := time.Millisecond, false; !over && left(); wait = min(2*wait, 100*time.Millisecond) {
 		select {
@@ -1019,7 +1026,7 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		case <-time.After(wait):
 		}
 	}
-	kill(reached, helper)
+	kill(reached)
 	// By its pidfd, what a reaped command left in its group: the number may be another group's by now. shortcut: gVisor and kernels before 6.9 signal no group so, and there it runs on unless it carries the tag.
 	last := func() bool {
 		_, _, err := syscall.Syscall6(sysPidfdSendSignal, group, uintptr(syscall.SIGKILL), 0, pidfdSignalProcessGroup, 0, 0)
@@ -1163,10 +1170,10 @@ func ended(pid int, started string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// hits is what a search by tag signalled, and its helper, which holds another user's: it runs until they have ended, and kills them at its SIGTERM.
+// hits is what a search by tag signalled, and where its helper says what it signalled as another user.
 type hits struct {
-	sent   map[int]string
-	helper int
+	sent map[int]string
+	more *os.File
 }
 
 // search signals whatever carries the call's tag, as signalTagged does: as execd, and for another user's command as that user.
@@ -1182,23 +1189,26 @@ func (cl *call) search(as *syscall.Credential, sig syscall.Signal, among map[int
 	// gVisor lets them be read only with the user's real ids, which let the user signal their holder: a child holds them, not execd.
 	argv := []string{"/proc/self/exe", "search", fmt.Sprint(as.Uid), fmt.Sprint(as.Gid), strings.Trim(fmt.Sprint(as.Groups), "[]"), cl.tag, strconv.Itoa(int(sig))}
 	var rest []string
-	for p, started := range among { // with its start time: an id given again since is another process's
+	for p := range among {
 		if _, did := found.sent[p]; !did { // execd's own search signalled it, where it may read another user's processes: one SIGTERM each
-			rest = append(rest, strconv.Itoa(p)+":"+started)
+			rest = append(rest, strconv.Itoa(p))
 		}
 	}
 	if among != nil && rest == nil {
 		return found // none is left for the helper, which signals every process when given none
 	}
 	argv = append(argv, rest...)
-	reaper.mu.Lock() // nothing is reaped meanwhile: the id read is the helper's own
-	if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}}); err == nil {
-		if f := stat(child.Pid); len(f) > 19 {
-			found.sent[child.Pid], found.helper = f[19], child.Pid
-		}
-		child.Release()
+	var r, w *os.File
+	if among != nil { // its SIGTERMs are waited for: it says which it sent
+		r, w, _ = os.Pipe()
 	}
-	reaper.mu.Unlock()
+	if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}, Files: []*os.File{nil, w}}); err == nil {
+		child.Release()
+		found.more = r
+	} else {
+		r.Close()
+	}
+	w.Close()
 	return found
 }
 
@@ -1383,21 +1393,19 @@ func signalTagged(tag string, sig syscall.Signal, among map[int]string) (sent ma
 				continue
 			}
 			more = true
-			handle, _ := os.FindProcess(pid) // before its environment is read: a signal through it reaches no process given the id since
+			was := stat(pid) // before its environment is read: a signal reaches only the process that started then, not one given the id since
 			is, none := tagged(open, "/proc/"+e.Name()+"/environ", needle, &room)
 			if none {
 				if f := stat(pid); len(f) > 0 && f[0] != "Z" { // its execve may be under way, its environment not yet in place: read again
 					starting = true
-					handle.Release()
 					continue
 				}
 			}
 			read[pid] = true
-			if is && handle.Signal(sig) == nil { // one execd may not signal is its helper's, as its user
-				handle.Signal(syscall.SIGCONT) // as timeout(1) sends it: stopped, it would take no SIGTERM
-				sent[pid] = among[pid]
+			if is && len(was) > 19 && signalIf(nil, pid, was[19], sig) { // one execd may not signal is its helper's, as its user
+				signalIf(nil, pid, was[19], syscall.SIGCONT) // as timeout(1) sends it: stopped, it would take no SIGTERM
+				sent[pid] = was[19]
 			}
-			handle.Release()
 		}
 	}
 	return sent

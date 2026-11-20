@@ -71,6 +71,7 @@ MAX_QUEUED = 4096  # frames, of any kind
 MAX_STRAY = 1 << 16  # frames that report nothing new, per ping interval
 MAX_STRAY_BYTES = 256 << 20  # their payload: output still in flight for calls given up
 MAX_OWED = 1024  # calls over whose RELEASE no PONG has followed: a PING asks at half
+BEGUN = 1 << 63  # in the id of the PING behind a START: its PONG says execd read that
 STREAM_WINDOW = 1 << 20  # execd's unacked output per stream for exec_stdio
 # What a pod delivers a second; past any, reading waits: no stand-in holds the loop.
 PACE_FRAMES = 4096
@@ -106,7 +107,7 @@ class Daemon:
     pod: str = ""  # the pod's UID
     # Opens an exec joined to the daemon's socket, for a pod with no network card.
     stdio: Callable[[], Awaitable[ByteStream]] | None = None
-    container: bytes = b""  # execd's name for the container it started in
+    container: bytes = b"unknown"  # execd's name for the container it started in
 
 
 class Dropped(Exception):
@@ -350,6 +351,7 @@ class Call:
     closed: bool = False  # left by its caller
     exited: bool = False
     words: int = 0  # EXIT and ERROR frames queued that its loop has yet to take
+    begun: bool = False  # execd has read its START
     resuming: bool = False  # a RESUME awaits its one RESUMED
     ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
     hold: int = HOLD
@@ -465,7 +467,7 @@ class Link:
                 raise asyncio.TimeoutError
             if kind == RELEASE:
                 self._released.append(call_id)
-            elif kind == PING:
+            elif kind == PING and call_id < BEGUN:
                 self._pinged.append(self._released)
                 self._released = []
 
@@ -499,6 +501,10 @@ class Link:
                     return
                 payload = await reader.readexactly(n)
                 self._last_rx = time.monotonic()
+                if kind == PONG and call_id >= BEGUN:  # to the PING behind a START
+                    if (c := self.calls.get(call_id - BEGUN)) is not None:
+                        c.begun = True
+                    continue
                 c = self.calls.get(call_id)
                 if kind == EXIT and c is not None:
                     c.exited = True
@@ -770,6 +776,7 @@ class ExecdClient:
                         raise
                 except OSError:  # it may have left: the resume asks execd
                     call.queue.put_nowait(Dropped(link))
+                link.send_last(call.id | BEGUN, PING)
                 sender = asyncio.create_task(self._upload(link, call, stdin, 0))
                 while True:
                     try:
@@ -899,8 +906,10 @@ class ExecdClient:
         """Ask execd, over a new connection, to send the call on from what we have."""
         new, old = link.daemon, call.daemon
         if new is not old:
-            # In another container, or in none execd names: "unknown" is its word.
-            if new.container != old.container or old.container in (b"", b"unknown"):
+            # In another container, or in none execd names ("unknown", or no boot id),
+            # or a call execd never said it had read: its command may not have run.
+            unnamed = old.container == b"unknown" or old.container[:1] == b":"
+            if new.container != old.container or unnamed or not call.begun:
                 raise ExecdStoppedError(
                     "execd stopped while it ran the command", pod=old.ip
                 )
@@ -961,15 +970,17 @@ class ExecdClient:
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(out[STDOUT]) + str(out[STDERR]),
             )
-        code = 124 if status is None or timed_out else status["code"]  # `timeout`'s
+        if status is None or timed_out:  # its output where Inspect's tools look for it
+            error = TimeoutError(f"Command timed out after {timeout}s.")
+            setattr(error, "truncated_output", str(out[STDOUT]) + str(out[STDERR]))
+            raise error
+        code = status["code"]
         result = ExecResult(
             success=code == 0,
             returncode=code,
             stdout=str(out[STDOUT]),
             stderr=str(out[STDERR]),
         )
-        if status is None or timed_out:  # with what it wrote, as over Kubernetes exec
-            raise TimeoutError(f"Command timed out after {timeout}s. {result}")
         if code == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
         error = status.get("error", "")  # execd's, only if the command never started

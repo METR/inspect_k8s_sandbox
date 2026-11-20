@@ -86,34 +86,33 @@
   not ended: to the command, to its process group and to the other processes it started
   that it can find, as far as it may signal each; one that has detached from the command
   can survive. So can a process the command was starting at the instant of the kill, if
-  it then leaves the command's group and drops its environment; Kubernetes exec stops no
-  such process either. A timed-out `exec()` raises `TimeoutError`, with what the command
-  wrote, once the command and the processes execd signalled have ended or been sent
-  SIGKILL: 16 seconds after its timeout at most. What they start after their SIGTERM
-  gets SIGKILL as soon as they have ended: a handler must wait for the cleanup it
-  starts. (On gVisor, and on kernels before 6.9, such a process left in the command's
-  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) The 5 seconds run
-  from the start of the kill: on a pod short of memory or CPU, where execd is slow to
-  stop the command and list its processes, the SIGTERM comes later and the grace is
-  shorter by that much. Where that takes over half a second (to stop the command, or
-  to stop its processes and list the pod's at 10 ms for each process, where that is
-  longer), what the survivors of a SIGTERM start during the grace outside the command's
-  group, without `HAWK_NEXT_EXEC` in its environment, is not found for the SIGKILL. The
-  processes of a command that has ended by itself are left running. Once
-  execd has stopped reading a command's output, 100 ms after the command ended at the
-  earliest, what it left running may write 1 MiB more in total to each of
+  it then leaves the command's group and drops its environment. A timed-out `exec()`
+  raises `TimeoutError`, whose `truncated_output` holds what the command wrote, once the
+  command and the processes execd signalled have ended or been sent SIGKILL: 16 seconds
+  after its timeout at most. What they start after their SIGTERM gets SIGKILL as soon as
+  they have ended: a handler must wait for the cleanup it starts. (On gVisor, on kernels
+  before 6.9 and where `pidfd_open` is refused, such a process left in the command's
+  group runs on unless its environment still holds `HAWK_NEXT_EXEC`.) On a pod short of
+  memory or CPU the SIGTERM can come later and leave less than the 5 seconds, and what
+  the survivors of a SIGTERM start meanwhile outside the command's group, without
+  `HAWK_NEXT_EXEC` in its environment, can survive. The processes of a command that has
+  ended by itself are left running. Once execd has stopped reading a command's output,
+  100 ms after the command ended at the earliest, what it left running may write 1 MiB
+  more in total to each of
   the command's stdout and stderr, plus that pipe's free space; past that a write to
   it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
   for at most half of its open-file limit (512 in a Kata guest), and past that it closes
   a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
   signal is ignored. Both hold where execd holds the pipe's only read end. A command
   that ends execd, by killing every process or taking the pod's last PID, ends each
-  running `exec()` as a killed command, with status 137 and the output so far; a
-  running `read_file()` or `write_file()` is run again. Where execd cannot be started
-  again in the same container, or the pod sets `shareProcessNamespace` or `hostPID`,
-  they raise `ExecResultUnknownError` instead, and an `exec()` whose timeout had passed
-  raises `TimeoutError`. A command still running, as where execd alone was killed, goes
-  on without its timeout and with end-of-file on `stdin`, though its call has ended.
+  running `exec()` as a killed command, with status 137 and the output so far; a running
+  `read_file()` or `write_file()` is run again. Where execd cannot be started again in
+  the same container, the pod sets `shareProcessNamespace` or `hostPID`, or execd had
+  not yet said that it read the call (one that ends execd within a millisecond of its
+  start can be such a call), they raise `ExecResultUnknownError` instead, and an
+  `exec()` whose timeout had passed raises `TimeoutError`. A command still running, as
+  where execd alone was killed, goes on without its timeout and with end-of-file on
+  `stdin`, though its call has ended.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
