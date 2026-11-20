@@ -2802,44 +2802,53 @@ class TestExecStdio:
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], size: int
     ) -> None:
         client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)  # Not the host's.
         stream, reader, abnf = _stdio(client), _reader(server), websocket.ABNF
         pings = (b"", bytes(range(125)))  # The least and the most a ping may carry.
         sending = asyncio.create_task(stream.send(bytes(size)))
-        await anyio.wait_all_tasks_blocked()  # The send ended or is in a frame.
-        server.sendall(_frame(STDOUT, b"ready\n"))  # The pings come behind output.
-        for ping in pings:
-            server.sendall(abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, ping).format())
 
         with anyio.fail_after(30):  # only bounds a hang
+            await anyio.wait_all_tasks_blocked()  # The send ended or is in a frame.
+            server.sendall(_frame(STDOUT, b"ready\n"))  # The pings come behind output.
+            for ping in pings:
+                server.sendall(abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, ping).format())
             await stream.receive()
             got = [await asyncio.to_thread(reader.recv_frame) for _ in range(3)]
             await sending
         await stream.aclose()
 
+        assert all(f.mask_value for f in got)  # A server closes on a frame without one.
         assert [f.data for f in got if f.opcode == abnf.OPCODE_PONG] == list(pings)
 
+    @pytest.mark.parametrize("size", [1, 65536])  # Stdout is left to read, or none is.
     async def test_a_pong_the_socket_has_no_room_for_follows_once_it_has(
-        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket]
+        self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], size: int
     ) -> None:
         client, server = tls_sockets
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         stream, reader, abnf = _stdio(client), _reader(server), websocket.ABNF
         pings = [i.to_bytes(125, "big") for i in range(2000)]  # More pongs than fit.
         frames = [abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, p).format() for p in pings]
-        flood = b"".join(frames) + _frame(STDOUT, b"output\n")
+        flood = b"".join(frames) + _frame(STDOUT, bytes(len(pings)))
         pongs: list[bytes] = []
 
         with anyio.fail_after(30):  # only bounds a hang
             sent = asyncio.ensure_future(asyncio.to_thread(server.sendall, flood))
-            output = await stream.receive()  # It reads on with no room to write.
+            assert await stream.receive(size)  # It reads on with no room to write.
             await sent
-            receiving = asyncio.ensure_future(stream.receive())  # It tries again.
+            receiving = asyncio.ensure_future(stream.receive(size))
             await anyio.wait_all_tasks_blocked()
+            server.sendall(_frame(STDOUT, b"more"))  # A wait for room would miss it.
+            assert await receiving
+            receiving = asyncio.ensure_future(stream.receive(size))
+            await anyio.wait_all_tasks_blocked()  # It read or waits before any room.
             while pongs[-1:] != pings[-1:]:
                 pongs.append((await asyncio.to_thread(reader.recv_frame)).data)
+                if receiving.done():  # It tries again at each read, and as one waits.
+                    receiving = asyncio.ensure_future(stream.receive(size))
         receiving.cancel()
         await stream.aclose()
 
-        assert output == b"output\n"
         assert pongs == sorted(pongs) and len(pongs) < len(pings)  # First and latest.
 
 

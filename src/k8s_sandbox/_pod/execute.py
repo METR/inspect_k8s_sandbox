@@ -508,6 +508,7 @@ class PodStdio(ByteStream):
         await _land_pending_cancel()
         self._drop_if_restarted()
         await self._turn()
+        self._write_pongs()  # Any still due: each call tries, with stdout here or not.
         while not self._stdout or self._closed:
             if self._closed:
                 raise anyio.ClosedResourceError
@@ -599,11 +600,9 @@ class PodStdio(ByteStream):
         while self._pongs and not self._send_lock.locked():  # Its send() is in one.
             try:
                 rest = self._pongs[0][self._sock.send(self._pongs[0]) :]
-            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
-                return  # No room: receive() tries again, with the same bytes for TLS.
-            except OSError:
+            except OSError:  # No room, or it failed: still due, as TLS holds its bytes.
                 _clear_tls_errors()  # As _end() does: the stream stays open.
-                return  # Still due: TLS holds what failed, and sends it first.
+                return
             self._pongs[:1] = [rest] if rest else []
 
     async def send(self, item: bytes) -> None:
