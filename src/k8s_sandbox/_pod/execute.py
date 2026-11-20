@@ -493,7 +493,7 @@ class PodStdio(ByteStream):
         self._stdout = bytearray()
         self._message = b""  # A message's frames so far, until its last.
         self._stderr = b""
-        self._pong = b""  # What is left to write of a pong: it goes before any frame.
+        self._pongs: list[bytes] = []  # Due: each a write of its own, before any frame.
         self._status: bytes | None = None
         self._wrote = False
         self._ended = False
@@ -516,10 +516,13 @@ class PodStdio(ByteStream):
                     raise anyio.BrokenResourceError(repr(self._error)) from self._error
                 raise anyio.EndOfStream
             try:
+                self._write_pongs()
                 # websocket-client keeps a frame read in part for the next call.
                 self._take(self._ws.sock.recv_frame())
             except (ssl.SSLWantReadError, BlockingIOError):
-                await self._wait(anyio.wait_readable)
+                # A pong still due is tried again as often as TLS is.
+                with anyio.move_on_after(_TLS_RETRY_SECONDS if self._pongs else None):
+                    await self._wait(anyio.wait_readable)
                 self._unyielded = 0
             except ssl.SSLWantWriteError:
                 await anyio.sleep(_TLS_RETRY_SECONDS)  # See send().
@@ -569,8 +572,10 @@ class PodStdio(ByteStream):
         elif frame.opcode in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
             message = payload
         else:
-            if frame.opcode == ABNF.OPCODE_PING:
-                self._answer(payload)
+            # A ping too long for a control frame gets no pong, which could not be one.
+            if frame.opcode == ABNF.OPCODE_PING and len(payload) < ABNF.LENGTH_7:
+                pong = ABNF.create_frame(payload, ABNF.OPCODE_PONG).format()
+                self._pongs.append(pong)
             return
         self._message = b"" if frame.fin else message
         if not frame.fin or len(message) < 2:
@@ -588,15 +593,14 @@ class PodStdio(ByteStream):
                 self._restarted = None  # its own restart: the stream ends as usual
             self._end(None)
 
-    def _answer(self, ping: bytes) -> None:
-        """Write a ping's pong now, unless it would land inside a send()'s frame."""
-        self._pong = self._pong or ABNF.create_frame(ping, ABNF.OPCODE_PONG).format()
-        if self._send_lock.locked():
-            return  # That send() writes it, between its frames or after them.
-        try:
-            self._pong = self._pong[self._sock.send(self._pong) :]
-        except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
-            pass  # The socket has no room: the next ping or send() writes it.
+    def _write_pongs(self) -> None:
+        """Write what the socket takes of the pongs due, but never inside a frame."""
+        while self._pongs and not self._send_lock.locked():  # Its send() is in one.
+            try:
+                rest = self._pongs[0][self._sock.send(self._pongs[0]) :]
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                return  # No room: receive() tries again, with the same bytes for TLS.
+            self._pongs[:1] = [rest] if rest else []
 
     async def send(self, item: bytes) -> None:
         async with self._send_lock:
@@ -607,9 +611,9 @@ class PodStdio(ByteStream):
                 for i in range(0, len(item), STDIN_CHUNK_SIZE):
                     chunk = b"\0" + item[i : i + STDIN_CHUNK_SIZE]  # Stdin's channel.
                     frame = ABNF.create_frame(chunk, ABNF.OPCODE_BINARY).format()
+                    while self._pongs:
+                        await self._write(memoryview(self._pongs.pop(0)))
                     await self._write(memoryview(frame))
-                while self._pong and not self._ended:  # A ping came during the send.
-                    await self._write(memoryview(b""))
             except OSError as e:
                 self._end(e)
                 raise anyio.BrokenResourceError(repr(e)) from e
@@ -619,8 +623,6 @@ class PodStdio(ByteStream):
                 raise
 
     async def _write(self, data: memoryview) -> None:
-        if self._pong:
-            data, self._pong = memoryview(self._pong + data), b""
         while data:
             if self._closed:
                 raise anyio.ClosedResourceError

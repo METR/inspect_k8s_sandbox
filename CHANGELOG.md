@@ -185,7 +185,7 @@
   as usual and every later operation fails as after a detected restart. The command
   must not exit 255 itself once it has written.
 - Fix an `exec_stdio()` stream over Kubernetes exec being closed by a proxy that pings
-  its WebSocket clients: a Ping now gets its Pong.
+  its WebSocket clients: `receive()` now answers a Ping with a Pong.
 - `exec(user="root")` no longer needs `id` or `runuser` in the image. In a container
   that is not root, `exec(user="0")` now fails as `exec(user="root")` does, with a
   warning, rather than raising a `RuntimeError` that says the user does not exist.
