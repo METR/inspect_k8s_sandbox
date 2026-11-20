@@ -1071,7 +1071,7 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sigs ...
 	}
 	signal(syscall.SIGSTOP) // the group at once: stopped, a process starts no other, and its children stay its own; the command by its own id too: it may have left its group for another
 	var stopped []int
-	seen, waits := map[int]bool{}, 0
+	seen, grouped, waits := map[int]bool{}, map[int]bool{}, 0
 	reached = map[int]string{}
 	for _, root := range slices.Sorted(maps.Keys(roots)) { // the oldest first, which started the rest; each only while it is the process that started then: its id may be another's by now
 		if root != lead && signalIf(as, root, roots[root], syscall.SIGSTOP) {
@@ -1100,7 +1100,7 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sigs ...
 				ppid, _ := strconv.Atoi(f[1])
 				children[ppid], started[p] = append(children[ppid], p), f[19]
 				if p == lead || lead != 0 && f[2] == strconv.Itoa(lead) { // in the command's group: its signals are the group's
-					reached[p] = f[19]
+					reached[p], grouped[p] = f[19], true
 				}
 			}
 		}
@@ -1127,7 +1127,9 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sigs ...
 	for _, sig := range sigs {
 		// Each before its parent: a parent that ended first would leave one still stopped, in a group of its own, to the kernel's SIGHUP for an orphaned group.
 		for _, p := range slices.Backward(stopped) { // while it is the process stopped: one that is not stopped may have killed and reaped it since
-			signalIf(as, p, reached[p], sig)
+			if sig != syscall.SIGTERM || !grouped[p] { // the group's SIGTERM is its one: asleep and not yet stopped, it would take a second as a second
+				signalIf(as, p, reached[p], sig)
+			}
 		}
 		signal(sig)
 	}

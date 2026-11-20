@@ -1464,23 +1464,25 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 
 func TestAKillsSearchSlowerThanItsGraceStillKillsWhatItSignals(t *testing.T) {
 	end := graced(t)
-	s, c, frames, tag, pid := ready(t, "", "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "exec env -i sleep 600" TERM; echo $$; while :; do sleep 0.01; done' &); while :; do sleep 0.01; done`) // in a session of its own, its parent gone, one says its id and at its SIGTERM runs on with no tag
-	id, _ := strconv.Atoi(strings.TrimSpace(pid))
+	s, c, frames, tag, out := ready(t, "", "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "exec env -i sleep 600" TERM; echo $$; while :; do sleep 0.01; done' &); echo; while :; do sleep 0.01; done`) // in a session of its own, one says its id and at its SIGTERM runs on with no tag; the command's empty line says its parent is gone
+	out += said(t, frames, func(more string) bool { return strings.Count(out+more, "\n") == 2 })
+	id, _ := strconv.Atoi(strings.TrimSpace(out))
 	of := "/proc/" + strconv.Itoa(id)
+	gone := func() bool { f := stat(id); return len(f) == 0 || strings.Contains("ZX", f[0]) }
 	var asked atomic.Bool
 	held := func(tagged, environ string) (*os.File, error) {
 		if tagged == tag && environ == of+"/environ" && asked.CompareAndSwap(false, true) { // the search for the SIGTERMs: on once the grace is up and the call has ended without its word
 			end()
 			exitStatus(t, frames)
 		} else if tagged == tag && environ == of+"/environ" { // the search for the SIGKILLs that follows: on once the process has dropped its tag, so that only its id leads there
-			until(t, "what only the tag led to had no SIGTERM", func() bool { now, _ := os.ReadFile(of + "/cmdline"); return !bytes.HasPrefix(now, []byte("sh")) })
+			until(t, "what only the tag led to had no SIGTERM", func() bool { now, _ := os.ReadFile(of + "/cmdline"); return gone() || bytes.HasPrefix(now, []byte("sleep")) })
 		}
 		return os.Open(environ)
 	}
 	openEnviron.Store(&held)
 	t.Cleanup(func() { openEnviron.Store(nil) })
 	s.dispatch(c, frame{kind: fKill, id: 80})
-	until(t, "what a search slower than the grace signalled outlived the kill", func() bool { f := stat(id); return len(f) == 0 || strings.Contains("ZX", f[0]) })
+	until(t, "what a search slower than the grace signalled outlived the kill", gone)
 }
 
 func TestAKillsLastSigkillSparesAProcessGivenASurvivorsId(t *testing.T) {

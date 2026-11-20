@@ -2262,7 +2262,6 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
         starts[0] += 1
         if ends == 137 and starts[0] == 2:  # as where a start takes seconds
             await back.wait()
-            clock.now += execd.KILL_WAIT  # past our wait for execd's word too
         return daemons.unstarted.pop(0)
 
     first = await daemons.serve(is_killed, container=was)
