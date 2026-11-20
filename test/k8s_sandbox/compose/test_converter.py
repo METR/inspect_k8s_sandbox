@@ -175,8 +175,9 @@ services:
     image: my-image
     deploy:
       resources:
-        limits:
+        reservations: &memory
           memory: 1G
+    x-k8s: {{resources: {{limits: *memory}}}}
   later: {later}
   last: {later}
 """)
@@ -184,6 +185,7 @@ services:
     services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
     assert services["last"] == services["later"] == services["default"]
+    assert services["default"]["resources"]["limits"] == {"memory": "1G"}
 
 
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(

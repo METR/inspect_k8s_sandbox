@@ -24,6 +24,11 @@
   `healthcheck.retries`, `mem_limit` as a number of bytes, `deploy:` with no value, and
   services that share a YAML alias (the later one lost settings). An unquoted key
   such as `on`, `yes` or `1` fails with a message asking to quote it.
+- **BREAKING CHANGE**: Two keys of one Compose service that share a mapping through a
+  YAML alias, such as `deploy.resources.reservations` and the `limits` of
+  `x-inspect_k8s_sandbox.resources`, each keep it, where the second lost its settings. A
+  file that converted only because the alias hid an error, such as a memory request set
+  under both keys, now fails as it does with the alias written out.
 - A `CMD-SHELL` healthcheck `test` passes every item after `CMD-SHELL` to `sh -c`,
   where only the first was kept.
 - **BREAKING CHANGE**: A negative `healthcheck.retries`, and a top-level
