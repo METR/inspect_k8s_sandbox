@@ -460,7 +460,7 @@ async def test_helm_s_error_is_reported_where_its_output_is_not_utf_8(
     (tmp_path / "does").write_text("printf '\\377'; printf 'no \\377' >&2; exit 1\n")
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
 
-    with pytest.raises(RuntimeError, match="Helm list failed.*no "):
+    with pytest.raises(RuntimeError, match="Helm list failed.*no \ufffd"):
         await release.uninstall(quiet=True)
 
 
