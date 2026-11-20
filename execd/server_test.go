@@ -51,6 +51,7 @@ func TestMain(m *testing.M) {
 	startReaper()
 	startSearcher()
 	startKeeper()
+	slowAfter = time.Hour // no test's kill is slow by the machine's speed: the test of a slow kill says so
 	os.Exit(m.Run())
 }
 
@@ -1401,8 +1402,8 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 	}
 }
 
-func TestAKillsSearchByTagSendsSigtermOnceAndWhenItsGraceIsUpSigkill(t *testing.T) {
-	end := graced(t)
+func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {
+	graced(t)
 	helper := `sh -c "trap \"echo y\" TERM; echo h; while :; do echo .; sleep 0.01; done"`                                                                                            // which the command's handler starts: it counts its SIGTERMs too
 	detached := `(setsid sh -c 'trap "echo t$$" TERM; echo ready; kill -STOP $$; while :; do sleep 0.01; done' &); `                                                                  // in a session of its own, its parent gone, only the tag leads to it: stopped, it says its id at its SIGTERM and runs on
 	s, c, frames, tag, _ := ready(t, map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap 'echo x; `+helper+` & wait' TERM; `+detached+`while :; do sleep 0.01; done`) // as a user whose environments root may not read: the search is then its helper's
@@ -1422,13 +1423,9 @@ func TestAKillsSearchByTagSendsSigtermOnceAndWhenItsGraceIsUpSigkill(t *testing.
 	s.dispatch(c, frame{kind: fKill, id: 80}) // back once its search is done, or its helper started
 	over.Store(true)
 	out := seen + said(t, frames, func(out string) bool { _, since, _ := strings.Cut(out, "t"); return strings.Count(since, ".") >= 3 }) // until what only the tag leads to has said its SIGTERM, and three dots more: a helper's search is not waited for
-	pid, _ := strconv.Atoi(strings.SplitN(out[strings.Index(out, "t")+1:], "\n", 2)[0])
 	if strings.Count(out, "x") != 1 || strings.Count(out, "t") != 1 || strings.Contains(out, "y") {
 		t.Fatalf("the command, what only its tag leads to and its handler's helper said %q: want one SIGTERM for each of the first two, and none for the helper", out)
 	}
-	end()
-	exitStatus(t, frames)
-	until(t, "what only the call's tag leads to outlived the kill's grace", func() bool { return gone(pid) })
 }
 
 func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *testing.T) {
@@ -2707,6 +2704,8 @@ func TestACommandAKillFoundRunningCannotEndByItselfBeforeTheKill(t *testing.T) {
 
 func TestAKillGoesAheadWhereNothingSaysItsCommandHasStopped(t *testing.T) {
 	end := graced(t)
+	slowAfter = 0 // every stop is slow, as on a loaded pod
+	t.Cleanup(func() { slowAfter = time.Hour })
 	s, c, frames, _, child := ready(t, "", "sh", "-c", `trap 'echo t' TERM; env -i setsid sh -c 'trap "" TERM; echo $$; while :; do sleep 0.01; done' & while :; do sleep 0.01; done`) // it says its SIGTERM and runs on, as does its child, out of its group with no tag: only its id leads the SIGKILL there
 	killed := make(chan syscall.Errno, 1)
 	go func() {

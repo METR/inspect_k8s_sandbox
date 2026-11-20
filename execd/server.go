@@ -66,6 +66,8 @@ var afterFunc = time.AfterFunc // tests fire the abandon timers themselves, stan
 // termGrace is how long what a kill's SIGTERM reached has to end before its SIGKILL: timeout(1)'s -k 5s, as over Kubernetes exec.
 const termGrace = 5 * time.Second
 
+var slowAfter = termGrace / 10 // a kill that takes longer to stop its command is on a loaded pod; tests set it, so that none turns on their machine's speed
+
 const sysPidfdOpen, sysPidfdSendSignal, pidfdSignalProcessGroup = 434, 424, 4 // not in package syscall
 
 var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
@@ -936,7 +938,7 @@ func (cl *call) stop(timeout bool) {
 				}
 			}
 			signal.Stop(told)
-			slow = time.Since(began) > termGrace/10 // too loaded to stop in a tenth of the grace: its kill lists the pod's processes once, where twice would hold every start as long again
+			slow = time.Since(began) > slowAfter // too loaded to stop in a tenth of the grace: its kill lists the pod's processes once, where twice would hold every start as long again
 			reaper.mu.Lock()
 		}
 		running = its() && !seen(syscall.WEXITED) // reaped meanwhile, its id may be another's
@@ -1126,7 +1128,7 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, list boo
 		}
 		signal(sig)
 	}
-	return reached, listed, time.Since(began) > max(termGrace/10, time.Duration(len(listed))*10*time.Millisecond) // as a kill too slow to stop its command: one too slow to stop and list the rest, at 10 ms a process in the pod
+	return reached, listed, time.Since(began) > max(slowAfter, time.Duration(len(listed))*10*time.Millisecond) // as a kill too slow to stop its command: one too slow to stop and list the rest, at 10 ms a process in the pod
 }
 
 // stopping reports whether a thread of pid still runs or sleeps: any of them may be the one starting a process.

@@ -112,8 +112,8 @@
   running `read_file()` or `write_file()` is run again. Where execd cannot be started
   again in the same container, or the pod sets `shareProcessNamespace` or `hostPID`,
   they raise `ExecResultUnknownError` instead, and an `exec()` whose timeout had passed
-  `TimeoutError`. A command still running, as where execd alone was killed, goes on
-  without its timeout and with end-of-file on `stdin`, though its call has ended.
+  raises `TimeoutError`. A command still running, as where execd alone was killed, goes
+  on without its timeout and with end-of-file on `stdin`, though its call has ended.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
