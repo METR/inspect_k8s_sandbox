@@ -28,6 +28,15 @@ _NON_ROOT_XFAILS = {
     "test_exec_as_nonexistent_user": "k8s raises for a nonexistent user",
     # In k8s the container must run as root to exec as a different user.
     "test_exec_as_user": "container must run as root to exec as a different user",
+    # The same goes for a file operation as one: the checks create a user first.
+    "test_read_file_as_user": "container must run as root to read as another user",
+    "test_write_file_as_user": "container must run as root to write as another user",
+}
+# On the Kubernetes exec transport only: execd reports the command's own status.
+_EXEC_XFAILS = {
+    "test_exec_timeout_not_raised_on_command_exit_124": (
+        "exec() with a timeout raises TimeoutError for a command's own exit 124"
+    ),
 }
 # Non-strict: the drop is environment-dependent (fails on one minikube at
 # ~40-44 MiB, passes on another at 50 MiB), so an XPASS is not a signal.
@@ -66,6 +75,8 @@ async def sandbox_env(
 ) -> K8sSandboxEnvironment:
     key, xfails = request.param
     reason = xfails.get(request.node.originalname)
+    if reason is None and transport == "exec":
+        reason = _EXEC_XFAILS.get(request.node.originalname)
     if reason is not None:
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
     nonstrict_reason = _NONSTRICT_XFAILS.get(request.node.originalname)

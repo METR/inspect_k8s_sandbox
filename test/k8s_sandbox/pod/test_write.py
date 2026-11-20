@@ -40,7 +40,7 @@ def test_write_file_writes_data_via_chunked_helper(
 
     @contextmanager
     def fake_start_write_command(
-        dst: Path, file_size: int
+        dst: Path, file_size: int, user: str | None, switch: bool
     ) -> Generator[MagicMock, None, None]:
         captured["file_size"] = file_size
         yield ws
