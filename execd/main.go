@@ -32,11 +32,23 @@ func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
-	if len(os.Args) == 6 && os.Args[1] == "search" { // how the daemon kills what carries a tag as another user, with every id of theirs
+	if len(os.Args) > 6 && os.Args[1] == "search" { // how the daemon signals what carries a tag as another user, with every id of theirs
 		if err := take(os.Args[2:5]); err != nil {
 			fail(err.Error())
 		}
-		killTagged(os.Args[5])
+		undumpable() // the change of identity reset it: traced by its user, it would say what execd is to kill
+		sig, _ := strconv.Atoi(os.Args[6])
+		var among map[int]string // the only processes to signal: every one where none is given
+		for _, p := range os.Args[7:] {
+			if among == nil {
+				among = map[int]string{}
+			}
+			pid, _ := strconv.Atoi(p)
+			among[pid] = ""
+		}
+		for p, started := range signalTagged(os.Args[5], syscall.Signal(sig), among) { // the daemon waits for those, and kills each by its id when the grace is up
+			fmt.Println(p, started)
+		}
 		return
 	}
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import types
+import typing
 import urllib.parse
 
 import anyio
@@ -55,7 +56,7 @@ class Daemons:
         self.ports: dict[execd.Daemon, int] = {}
         self.unstarted: list[execd.Daemon] = []
 
-    async def serve(self, handler: Handler, pod: str = "") -> asyncio.Server:
+    async def serve(self, handler: Handler, **named: typing.Any) -> asyncio.Server:
         """One that answers AUTH, then hands the connection to handler."""
 
         async def connection(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -66,7 +67,7 @@ class Daemons:
                 await handler(r, w)
 
         server = await asyncio.start_server(connection, "127.0.0.1", 0)
-        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", pod)
+        daemon = execd.Daemon("127.0.0.1", f"cert-{len(self.ports)}", b"key", **named)
         self.ports[daemon] = server.sockets[0].getsockname()[1]
         self.unstarted.append(daemon)
         return server
@@ -317,6 +318,7 @@ class Cluster:
 
     restarts = reads = 0
     uid, ip = "u", "10.0.0.1"
+    shares_pids = False
     unavailable = False  # its next read fails
     held: threading.Event | None = None  # its reads wait for it
 
@@ -334,6 +336,7 @@ class Cluster:
         }
         pod = {
             "metadata": {"name": "p", "uid": self.uid},
+            "spec": {"shareProcessNamespace": self.shares_pids},
             "status": {"podIP": self.ip, "containerStatuses": [container]},
         }
         return types.SimpleNamespace(data=json.dumps(pod))
@@ -1996,14 +1999,17 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
 ) -> None:
     async def times_out(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"its "))
+        w.write(frame(execd.STDERR, call_id, b"last\n"))
         w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
         await r.read()
 
     sandbox = await tls_daemon(times_out)
-    with pytest.raises(TimeoutError, match="Command timed out after 60s"):
+    with pytest.raises(TimeoutError, match=r"^Command timed out after 60s\.$") as timed:
         await asyncio.wait_for(
             sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
+    assert getattr(timed.value, "truncated_output") == "its last\n"
 
 
 async def test_a_command_that_ended_by_itself_before_our_kill_keeps_its_result(
@@ -2226,6 +2232,59 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
     # Its timeout passed first: the daemon's end is not what it reports.
     with pytest.raises(TimeoutError, match="Command timed out"):
         await asyncio.wait_for(call, 30)  # only bounds a hang
+
+
+KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
+    "back late": (b"c", b"c", 137),
+    "restarted": (b"c", b"d", error.ExecdStoppedError),
+    "unnamed": (b"unknown", b"unknown", error.ExecdStoppedError),
+    "no boot id": (b":5", b":5", error.ExecdStoppedError),
+}
+
+
+@pytest.mark.parametrize("case", KILLED.values(), ids=KILLED)
+async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
+    daemons: Daemons, clock: types.SimpleNamespace, timers: None, case: typing.Any
+) -> None:
+    was, again, ends = case
+    killed, back, starts, later = asyncio.Event(), asyncio.Event(), [0], list[int]()
+
+    async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        _, call_id, _ = await read_frame(r)  # START
+        w.write(frame(execd.STDOUT, call_id, b"so far\n"))
+        await killed.wait()
+        first.close()  # execd is gone, and the next start makes another
+        w.close()
+
+    async def started_again(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            later.append((await read_frame(r))[0])
+
+    async def start(replace: bool) -> execd.Daemon:
+        starts[0] += 1
+        if ends == 137 and starts[0] == 2:  # as where a start takes seconds
+            await back.wait()
+        return daemons.unstarted.pop(0)
+
+    first = await daemons.serve(is_killed, container=was)
+    await daemons.serve(started_again, container=again)
+    client = execd.ExecdClient(start)
+    call = asyncio.ensure_future(client.exec(["sh"], None, None, {}, None, 9))
+    await until(lambda: starts_written(client) == 1)
+    killed.set()
+    if ends == 137:  # our timer passes while execd starts again: it is asked again
+        await until(lambda: starts[0] == 2)
+        clock.now += 10
+        await until(lambda: clock.expired == 1)
+        back.set()
+    if not isinstance(ends, int):
+        with pytest.raises(ends):
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+        return
+    result = await asyncio.wait_for(call, 30)  # only bounds a hang
+    await until(lambda: execd.RELEASE in later)  # the call's last frame
+    resent = {execd.START, execd.RESUME} & set(later)  # nothing is sent again
+    assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
 async def test_a_call_started_again_ends_with_our_wait_where_no_word_comes(
@@ -3633,7 +3692,10 @@ async def test_only_one_fingerprint_line_starts_execd(
 
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
     pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
-    assert (await pod._start_execd(False)).fingerprint == "0" * 64
+    started = await pod._start_execd(False)
+    assert (started.fingerprint, started.container) == ("0" * 64, b"c")
+    cluster.shares_pids = True  # the container execd names is the pod's then
+    assert (await pod._start_execd(False)).container == b"unknown"
 
     printed = b"1" * 64 + b" " + b"c" * 4031  # both, but cut at run_argv's 4 KiB
     with pytest.raises(error.PodError, match="execd did not start"):

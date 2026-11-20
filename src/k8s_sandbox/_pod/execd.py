@@ -91,7 +91,8 @@ RECONNECT_FOR = 300.0
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
-KILL_WAIT = 10.0  # for execd's word on a call our timer has passed: then we kill
+# For execd's word on a call past our timer, its SIGTERM's 5 s with it: then we kill.
+KILL_WAIT = 15.0
 TIMER_LAG = 1.0  # ours follows execd's own, which counts from the command's start
 
 
@@ -105,6 +106,7 @@ class Daemon:
     pod: str = ""  # the pod's UID
     # Opens an exec joined to the daemon's socket, for a pod with no network card.
     stdio: Callable[[], Awaitable[ByteStream]] | None = None
+    container: bytes = b"unknown"  # execd's name for the container it started in
 
 
 class Dropped(Exception):
@@ -895,10 +897,19 @@ class ExecdClient:
 
     def _resume(self, link: Link, call: Call) -> None:
         """Ask execd, over a new connection, to send the call on from what we have."""
-        if link.daemon is not call.daemon:
-            raise ExecdStoppedError(
-                "execd stopped while it ran the command", pod=call.daemon.ip
-            )
+        new, old = link.daemon, call.daemon
+        if new is not old:
+            # Another container, or none execd names: its command may not have run.
+            unnamed = old.container == b"unknown" or old.container[:1] == b":"
+            if new.container != old.container or unnamed:
+                raise ExecdStoppedError(
+                    "execd stopped while it ran the command", pod=old.ip
+                )
+            log_warn("execd was killed: started again", pod=old.ip)
+            # Killed with it, or left: it ends as Kubernetes exec ends a killed command.
+            call.words += 1  # come in time, it is taken though our wait ends meanwhile
+            call.queue.put_nowait((EXIT, b'{"code": 137}'))
+            return
         link.calls[call.id] = call
         at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
         call.resuming = True  # before the RESUMED can arrive
@@ -951,8 +962,10 @@ class ExecdClient:
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(out[STDOUT]) + str(out[STDERR]),
             )
-        if status is None or timed_out:
-            raise TimeoutError(f"Command timed out after {timeout}s.")
+        if status is None or timed_out:  # its output where Inspect's tools look for it
+            error = TimeoutError(f"Command timed out after {timeout}s.")
+            setattr(error, "truncated_output", str(out[STDOUT]) + str(out[STDERR]))
+            raise error
         code = status["code"]
         result = ExecResult(
             success=code == 0,
