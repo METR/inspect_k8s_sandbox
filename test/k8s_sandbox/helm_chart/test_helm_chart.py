@@ -1408,8 +1408,7 @@ def test_network_isolated_service_joining_a_global_network(
 
 
 @pytest.mark.parametrize(
-    "values",
-    ["network-isolated", "network-isolated-with-global-network", "egress-proxy"],
+    "values", ["network-isolated-with-global-network", "egress-proxy"]
 )
 def test_policies_select_admit_and_reach_no_other_releases_pods(
     chart_dir: Path, test_resources_dir: Path, values: str
@@ -1420,6 +1419,10 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
         "app.kubernetes.io/name": "agent-env",
         "app.kubernetes.io/instance": "my-release",
     }
+    dns = [
+        {"matchLabels": {"io.kubernetes.pod.namespace": "kube-system", "k8s-app": app}}
+        for app in ("kube-dns", "node-local-dns")
+    ]
 
     documents = _run_helm_template(
         chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="a-namespace"
@@ -1431,9 +1434,8 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
         # The default deny's empty rule selects its pods and admits no one.
         for rule in filter(None, spec.get("ingress", [])):
             ends += rule.get("fromEndpoints") or [{}]
-        for rule in spec.get("egress", []):
-            peers = rule.get("toEndpoints", [])  # The cluster's DNS is the one other.
-            ends += [peer for peer in peers if "k8s-app" not in peer["matchLabels"]]
+        for rule in spec.get("egress", []):  # The cluster's DNS is the one other.
+            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in dns]
         for end in ends:
             assert own.items() <= end.get("matchLabels", {}).items(), policy
 

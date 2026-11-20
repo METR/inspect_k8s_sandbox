@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -83,31 +84,34 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	}
 }
 
-func TestNagleClientIsNotHeldBack(t *testing.T) {
+func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 	client, inSandbox := tcpPair(t)
 	onNode, proxy := tcpPair(t)
 	guest, node := vsockPair(t)
 	go join(guest, inSandbox, nil, 0)
 	go join(node, onNode, nil, 0)
-	client.SetNoDelay(false)
-	fastest := time.Hour
+	raw, err := inSandbox.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, quick := make([]byte, 1), 0
 
-	for i := range 10 {
-		start := time.Now()
-		client.Write([]byte("a"))
-		client.Write([]byte("b")) // Nagle holds this until "a" is acknowledged
-		io.ReadFull(proxy, make([]byte, 2))
-		proxy.Write([]byte("c"))
-		if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+	// Requests and their replies, as through a proxy: the kernel then holds acknowledgements back. The last request has no reply yet.
+	steps := []func([]byte) (int, error){client.Write, proxy.Read, proxy.Write, client.Read}
+	for i := range 4*9 + 2 {
+		if _, err := steps[i%4](one); err != nil {
 			t.Fatal(err)
 		}
-		if i > 0 { // the first reply puts the connection's acknowledgements on hold
-			fastest = min(fastest, time.Since(start))
-		}
+	}
+	// Whether the kernel acknowledges what the sandbox's side receives at once, or holds that back for a reply to carry.
+	if controlled := raw.Control(func(fd uintptr) {
+		quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
+	}); controlled != nil || err != nil {
+		t.Fatal(controlled, err)
 	}
 
-	if fastest > 20*time.Millisecond {
-		t.Fatalf("each request of two small writes took %v or more: its second waited for an acknowledgement", fastest)
+	if quick != 1 {
+		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
 	}
 }
 
