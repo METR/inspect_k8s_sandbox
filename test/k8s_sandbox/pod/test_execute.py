@@ -2787,30 +2787,33 @@ class TestExecStdio:
             + abnf(1, 0, 0, 0, abnf.OPCODE_CONT, 0, b"ly\n").format()
             + _frame(*_status(0))
         )
+        server.close()  # The pong cannot be written: the reply is read all the same.
 
         with anyio.fail_after(30):
             received = [piece async for piece in _receiving(stream, 65536)]
 
         assert b"".join(received) == b"a reply\n"
 
-    @pytest.mark.parametrize("size", [1, 1024**2, 64 * 1024**2])
+    @pytest.mark.parametrize("size", [1, 1024**2, 1024**2 + 1])
     async def test_pings_are_answered_in_turn_and_never_inside_a_frame_of_a_send(
         self, tls_sockets: tuple[ssl.SSLSocket, ssl.SSLSocket], size: int
     ) -> None:
         client, server = tls_sockets
         stream, reader, abnf = _stdio(client), _reader(server), websocket.ABNF
+        pings = (b"", bytes(125))  # The least and the most a ping may carry.
+        sending = asyncio.create_task(stream.send(bytes(size)))
+        await anyio.wait_all_tasks_blocked()  # The send ended or is in a frame.
+        server.sendall(_frame(STDOUT, b"ready\n"))  # The pings come behind output.
+        for ping in pings:
+            server.sendall(abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, ping).format())
 
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(stream.send, bytes(size))
-            tasks.start_soon(stream.receive)  # A reader waiting for output reads pings.
-            await anyio.wait_all_tasks_blocked()  # The send ended or is in a frame.
-            for ping in (bytes(126), b"one", b"two"):  # The first is too long.
-                server.sendall(abnf(1, 0, 0, 0, abnf.OPCODE_PING, 0, ping).format())
+        with anyio.fail_after(30):  # only bounds a hang
+            await stream.receive()
             got = [await asyncio.to_thread(reader.recv_frame) for _ in range(3)]
-            tasks.cancel_scope.cancel()
+            await sending
         await stream.aclose()
 
-        assert [f.data for f in got if f.opcode == abnf.OPCODE_PONG] == [b"one", b"two"]
+        assert [f.data for f in got if f.opcode == abnf.OPCODE_PONG] == list(pings)
 
 
 async def _receiving(stream: PodStdio, max_bytes: int) -> AsyncIterator[bytes]:

@@ -183,9 +183,8 @@
   found. In that mode, when its stream ends with exit code 255 after the
   command wrote stdout (Kata's status for a command whose VM stopped), the stream ends
   as usual and every later operation fails as after a detected restart. The command
-  must not exit 255 itself once it has written.
-- Fix an `exec_stdio()` stream over Kubernetes exec being closed by a proxy that pings
-  its WebSocket clients: `receive()` now answers a Ping with a Pong.
+  must not exit 255 itself once it has written. Over Kubernetes exec, the stream stays
+  open behind a proxy that pings its WebSocket connections.
 - `exec(user="root")` no longer needs `id` or `runuser` in the image. In a container
   that is not root, `exec(user="0")` now fails as `exec(user="root")` does, with a
   warning, rather than raising a `RuntimeError` that says the user does not exist.

@@ -520,8 +520,9 @@ class PodStdio(ByteStream):
                 # websocket-client keeps a frame read in part for the next call.
                 self._take(self._ws.sock.recv_frame())
             except (ssl.SSLWantReadError, BlockingIOError):
-                # A pong still due is tried again as often as TLS is.
-                with anyio.move_on_after(_TLS_RETRY_SECONDS if self._pongs else None):
+                if self._pongs:  # Still due: tried again as often as TLS is.
+                    await anyio.sleep(_TLS_RETRY_SECONDS)
+                else:
                     await self._wait(anyio.wait_readable)
                 self._unyielded = 0
             except ssl.SSLWantWriteError:
@@ -572,10 +573,10 @@ class PodStdio(ByteStream):
         elif frame.opcode in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT):
             message = payload
         else:
-            # A ping too long for a control frame gets no pong, which could not be one.
-            if frame.opcode == ABNF.OPCODE_PING and len(payload) < ABNF.LENGTH_7:
+            if frame.opcode == ABNF.OPCODE_PING:
                 pong = ABNF.create_frame(payload, ABNF.OPCODE_PONG).format()
-                self._pongs.append(pong)
+                self._pongs[1:] = [pong]  # The first may be part written: it stays.
+                self._write_pongs()
             return
         self._message = b"" if frame.fin else message
         if not frame.fin or len(message) < 2:
@@ -600,6 +601,8 @@ class PodStdio(ByteStream):
                 rest = self._pongs[0][self._sock.send(self._pongs[0]) :]
             except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
                 return  # No room: receive() tries again, with the same bytes for TLS.
+            except OSError:
+                rest = b""  # The peer has gone: what it sent first is still read.
             self._pongs[:1] = [rest] if rest else []
 
     async def send(self, item: bytes) -> None:
@@ -614,6 +617,8 @@ class PodStdio(ByteStream):
                     while self._pongs:
                         await self._write(memoryview(self._pongs.pop(0)))
                     await self._write(memoryview(frame))
+                while self._pongs and not self._ended:  # A ping came in the last frame.
+                    await self._write(memoryview(self._pongs.pop(0)))
             except OSError as e:
                 self._end(e)
                 raise anyio.BrokenResourceError(repr(e)) from e
