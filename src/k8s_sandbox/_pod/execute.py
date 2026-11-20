@@ -603,7 +603,7 @@ class PodStdio(ByteStream):
                 return  # No room: receive() tries again, with the same bytes for TLS.
             except OSError:
                 _clear_tls_errors()  # As _end() does: the stream stays open.
-                rest = b""  # The peer has gone: what it sent first is still read.
+                return  # Still due: TLS holds what failed, and sends it first.
             self._pongs[:1] = [rest] if rest else []
 
     async def send(self, item: bytes) -> None:
