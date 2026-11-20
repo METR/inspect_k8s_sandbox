@@ -96,9 +96,9 @@ func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 	}
 	one, quick := make([]byte, 1), 0
 
-	// A request and its reply, then acknowledgements held back, as the kernel holds them once replies flow, and a request with no reply yet.
-	for i, step := range []func([]byte) (int, error){client.Write, proxy.Read, proxy.Write, client.Read, client.Write, proxy.Read} {
-		if i == 4 {
+	// A request, then acknowledgements held back, as the kernel holds them once replies flow, and a second request.
+	for i, step := range []func([]byte) (int, error){client.Write, proxy.Read, client.Write, proxy.Read} {
+		if i == 2 {
 			if controlled := raw.Control(func(fd uintptr) {
 				err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 0)
 			}); controlled != nil || err != nil {

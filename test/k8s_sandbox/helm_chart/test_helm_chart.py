@@ -1414,7 +1414,7 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, values: str
 ) -> None:
     # Releases share a namespace: only these labels keep a rule off another's pods.
-    home = {"io.kubernetes.pod.namespace": "a-namespace"}
+    home = {"io.kubernetes.pod.namespace": "home"}
     own = home | {
         "app.kubernetes.io/name": "agent-env",
         "app.kubernetes.io/instance": "my-release",
@@ -1425,7 +1425,7 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
     ]
 
     documents = _run_helm_template(
-        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="a-namespace"
+        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="home"
     )
 
     for policy in _get_documents(documents, "CiliumNetworkPolicy"):
@@ -1440,7 +1440,10 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
             assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
             ends += [to for to in rule.get("toEndpoints") or [{}] if to not in dns]
         for end in ends:  # Cilium reads one that names no namespace as the policy's.
-            assert own.items() <= (home | end.get("matchLabels", {})).items(), policy
+            labels = end.get("matchLabels", {})
+            # Any other key that names a namespace, or its labels, ends that default.
+            assert str(end).count("namespace") <= len(labels.keys() & home), policy
+            assert own.items() <= (home | labels).items(), policy
 
 
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
