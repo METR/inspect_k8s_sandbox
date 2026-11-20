@@ -193,13 +193,13 @@ def test_keys_of_a_service_sharing_a_yaml_alias_each_keep_their_settings(
 services:
   default:
     image: my-image
-    deploy: {resources: {limits: &memory {memory: 1G}, reservations: {cpus: 1}}}
-    x-inspect_k8s_sandbox: {resources: {requests: *memory}}
+    deploy: {resources: {reservations: &memory {memory: 1G}}}
+    x-inspect_k8s_sandbox: {resources: {limits: *memory}}
 """)
 
     services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
-    assert services["default"]["resources"]["requests"] == {"cpu": 1, "memory": "1G"}
+    assert services["default"]["resources"]["limits"] == {"memory": "1G"}
 
 
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
