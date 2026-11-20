@@ -1172,11 +1172,11 @@ def _stateful_set_pods(
 
 
 def _declared_object_names(docs: Iterable[Any]) -> Iterator[str]:
-    """Every name a rendered manifest gives an object, whatever its kind."""
+    """Every object a rendered manifest names, as `Kind/name`."""
     for doc in docs:
         name = _dig(doc, "metadata", "name")
         if name is not None:
-            yield str(name)
+            yield f"{_dig(doc, 'kind')}/{name}"
 
 
 def _service_name(metadata: Any) -> Iterator[str]:

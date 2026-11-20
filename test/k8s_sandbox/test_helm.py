@@ -1352,7 +1352,7 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
     # missed here is a failure the diagnostics cannot explain.
     stdout = _manifest(
         "kind: ConfigMap\nmetadata: {name: cm}\n",
-        _stateful_set("default"),
+        _stateful_set("a"),
         "kind: List\nitems: [{kind: Service, metadata: {name: svc}}]\n",
         "apiVersion: v1\nkind: ConfigMapList\nitems: [{metadata: {name: helper}}]\n",
         # Helm installs nothing for a null document, nor for one whose `items` is null.
@@ -1362,7 +1362,7 @@ def test_declared_object_names_covers_every_kind_including_lists() -> None:
 
     names = frozenset(_declared_object_names(_rendered_docs(stdout, "abcdefgh")))
 
-    assert names == {"cm", "default", "svc", "helper"}
+    assert names == {"ConfigMap/cm", "StatefulSet/a", "Service/svc", "ConfigMap/helper"}
 
 
 @pytest.mark.parametrize(

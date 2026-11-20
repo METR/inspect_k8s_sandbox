@@ -37,9 +37,9 @@ def describe_release_pods(
         context_name: The kubeconfig context name, or None for the current context.
         namespace: The namespace the release was installed into.
         release_name: The Helm release name (used to select its pods).
-        object_names: Names of the release's other objects, whose Warning events are
-            reported too. A controller which cannot create its pod at all (a missing
-            RuntimeClass, say) is only explained by the event on the controller.
+        object_names: The release's other objects, each as `Kind/name`, whose Warning
+            events are reported too. A controller which cannot create its pod at all (a
+            missing RuntimeClass, say) is only explained by the event on the controller.
 
     Returns:
         A human-readable, multi-line summary, or None if no useful diagnostics could be
@@ -71,7 +71,7 @@ def _collect_diagnostics(
     for pod in pods.items:
         if pod.metadata is None or pod.metadata.name is None:
             continue
-        pod_names.add(pod.metadata.name)
+        pod_names.add(f"Pod/{pod.metadata.name}")
         if pod.metadata.deletion_timestamp:  # stopped or not, it can hold the wait
             lines.append(f"pod '{pod.metadata.name}': being deleted")
         if pod.status is None:
@@ -98,7 +98,7 @@ def _collect_diagnostics(
 def _describe_warning_events(
     client: CoreV1Api, namespace: str, names: set[str]
 ) -> list[str]:
-    """Return formatted Warning events that involve any of the named objects."""
+    """Return formatted Warning events that involve any of the `Kind/name` objects."""
     events = client.list_namespaced_event(  # type: ignore[call-arg]
         namespace,
         field_selector="type=Warning",
@@ -108,7 +108,7 @@ def _describe_warning_events(
     lines: list[str] = []
     for event in events.items:
         involved = event.involved_object
-        if involved is None or involved.name not in names:
+        if involved is None or f"{involved.kind}/{involved.name}" not in names:
             continue
         lines.append(f"event ({event.reason}): {event.message}")
     return lines

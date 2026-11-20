@@ -150,7 +150,7 @@ def test_surfaces_failed_scheduling_event_when_pod_has_no_container_statuses() -
     events = [
         CoreV1Event(
             metadata=V1ObjectMeta(name="evt-1"),
-            involved_object=V1ObjectReference(name="rel-default"),
+            involved_object=V1ObjectReference(kind="Pod", name="rel-default"),
             reason="FailedScheduling",
             message="0/1 nodes available: 1 Insufficient cpu",
             type="Warning",
@@ -180,7 +180,7 @@ def test_surfaces_a_controller_event_when_it_cannot_create_its_pod() -> None:
     events = [
         CoreV1Event(
             metadata=V1ObjectMeta(name="evt-1"),
-            involved_object=V1ObjectReference(name="rel-busybox-runc"),
+            involved_object=V1ObjectReference(kind="StatefulSet", name="rel-runc"),
             reason="FailedCreate",
             message='pod rejected: RuntimeClass "runc" not found',
             type="Warning",
@@ -189,7 +189,7 @@ def test_surfaces_a_controller_event_when_it_cannot_create_its_pod() -> None:
 
     with _patch_client(pods, events):
         summary = describe_release_pods(
-            None, "default", "rel", frozenset({"rel-busybox-runc"})
+            None, "default", "rel", frozenset({"StatefulSet/rel-runc"})
         )
 
     assert summary is not None
@@ -202,16 +202,17 @@ def test_ignores_events_for_objects_outside_the_release() -> None:
     events = [
         CoreV1Event(
             metadata=V1ObjectMeta(name="evt-1"),
-            involved_object=V1ObjectReference(name="someone-elses-statefulset"),
+            involved_object=V1ObjectReference(kind=kind, name=name),
             reason="FailedCreate",
             message="not this release's problem",
             type="Warning",
         )
+        for kind, name in [("StatefulSet", "another"), ("Service", "rel-busybox-runc")]
     ]
 
     with _patch_client(pods, events):
         summary = describe_release_pods(
-            None, "default", "rel", frozenset({"rel-busybox-runc"})
+            None, "default", "rel", frozenset({"StatefulSet/rel-busybox-runc"})
         )
 
     assert summary is None
