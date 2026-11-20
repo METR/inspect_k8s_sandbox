@@ -918,9 +918,10 @@ func (cl *call) stop(timeout bool) {
 		defer cl.kmu.Unlock()
 		return cl.ending == nil && reaper.waiting[pid] == status
 	}
-	running, up := its(), make(chan struct{})
+	running, up, sig := its(), make(chan struct{}), syscall.SIGTERM
 	if running {
 		hook(&beforeKill, false)
+		began := time.Now()
 		if syscall.Kill(pid, syscall.SIGSTOP) == nil || signalAs(as, pid, syscall.SIGSTOP) { // stopped, it cannot end by itself between the look that follows and its kill
 			// Unlocked for the wait: other commands start, end and are killed meanwhile.
 			reaper.mu.Unlock()
@@ -936,11 +937,13 @@ func (cl *call) stop(timeout bool) {
 			signal.Stop(told)
 			reaper.mu.Lock()
 		}
+		if time.Since(began) > termGrace/10 { // too loaded to stop in a tenth of the grace, it gets none: the SIGKILL of old, at once
+			sig = syscall.SIGKILL
+		}
 		running = its() && !seen(syscall.WEXITED) // reaped meanwhile, its id may be another's
 	}
 	var reached, listed map[int]string
 	var group uintptr
-	sig := syscall.SIGTERM
 	if running {
 		hook(&beforeKill, true)
 		cl.kmu.Lock()
@@ -1099,7 +1102,7 @@ func signalTree(as *syscall.Credential, lead int, roots []int, sigs ...syscall.S
 			}
 		}
 	}
-	if time.Since(began) > max(termGrace/10, time.Duration(len(listed))*10*time.Millisecond) { // a pod too loaded to stop and list them in a tenth of the grace, or 10 ms each, gives none: the SIGKILL of old, at once
+	if time.Since(began) > max(termGrace/10, time.Duration(len(listed))*10*time.Millisecond) { // as a kill too slow to stop its command: one too slow to stop and list the rest, or over 10 ms each, gives no grace
 		sigs = []syscall.Signal{syscall.SIGKILL}
 	}
 	for _, sig := range sigs {
