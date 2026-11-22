@@ -86,30 +86,29 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 
 func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 	client, inSandbox := tcpPair(t)
-	onNode, proxy := tcpPair(t)
-	guest, node := vsockPair(t)
-	go join(guest, inSandbox, nil, 0)
-	go join(node, onNode, nil, 0)
+	read := unreset{inSandbox, new(atomic.Bool)}
 	raw, err := inSandbox.SyscallConn()
 	if err != nil {
 		t.Fatal(err)
 	}
-	one, quick := make([]byte, 1), 0
+	quick := 0
 
-	// A request, then acknowledgements held back, as the kernel holds them once replies flow, and a second request.
-	for i, step := range []func([]byte) (int, error){client.Write, proxy.Read, client.Write, proxy.Read} {
-		if i == 2 {
-			if controlled := raw.Control(func(fd uintptr) {
-				err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 0)
-			}); controlled != nil || err != nil {
-				t.Fatal(controlled, err)
-			}
+	// Before each request, acknowledgements are held back, as the kernel holds them once replies flow. Two requests: asking once a connection would not do.
+	for range 2 {
+		if controlled := raw.Control(func(fd uintptr) {
+			err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 0)
+		}); controlled != nil || err != nil {
+			t.Fatal(controlled, err)
 		}
-		if _, err := step(one); err != nil {
+		if _, err := client.Write(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		// Into the room a stream's reads have, more than the peer fills.
+		if _, err := read.Read(make([]byte, maxFrame)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Whether the kernel acknowledges what the sandbox's side receives at once, or holds that back for a reply to carry.
+	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
 	if controlled := raw.Control(func(fd uintptr) {
 		quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
 	}); controlled != nil || err != nil {

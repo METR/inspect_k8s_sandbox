@@ -10,3 +10,4 @@ services:
     image: my-normal-image:1.0.0
     networks:
       - tasknet
+    ports: [{protocol: TCP, port: 80}]
