@@ -30,9 +30,17 @@ func install(args []string) error {
 		if err != nil {
 			return err
 		}
-		// Written beside its place, then renamed: the runtime never reads half a profile.
+		// Made anew beside its place, then renamed: the runtime never reads half a profile, and nothing left there is written through.
 		beside := filepath.Join(to, "."+entry.Name())
-		if err := os.WriteFile(beside, profile, 0o644); err != nil {
+		if err := os.Remove(beside); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		file, err := os.OpenFile(beside, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return err
+		}
+		_, err = file.Write(profile)
+		if err = errors.Join(err, file.Close()); err != nil {
 			return err
 		}
 		if err := os.Rename(beside, filepath.Join(to, entry.Name())); err != nil {
