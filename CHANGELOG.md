@@ -34,9 +34,9 @@
   it does with the alias written out. Where a service reuses the top-level
   `x-inspect_k8s_sandbox` as its own, move the anchor into the first service that uses
   it. Where `deploy` and a service's `x-inspect_k8s_sandbox` share a mapping of
-  resources: after a conflict at conversion, leave that setting out of the extension;
-  after a Pod refused for a request above its limit, write Compose's `1G` as `1Gi` in
-  the extension.
+  resources and the conversion or the install now fails, give the extension its own:
+  leave out what `deploy` sets, and write the rest as Kubernetes reads it (`cpu`; `1Gi`
+  for Compose's `1G`).
 - A pod annotated
   `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`
   (a template there can name a Service of the release) gets an HTTP proxy at
