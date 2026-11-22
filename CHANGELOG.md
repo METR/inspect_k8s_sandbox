@@ -22,9 +22,8 @@
 - A compose file given as `values` in `K8sSandboxEnvironmentConfig`, or to
   `convert_compose_to_helm_values`, now converts with `healthcheck.disable`, a quoted
   `healthcheck.retries`, `mem_limit` as a number of bytes, `deploy:` with no value, and
-  services, or keys of one service, that share a YAML alias (one of them lost
-  settings). An unquoted key such as `on`, `yes` or `1` fails with a message asking to
-  quote it.
+  services that share a YAML alias (the later one lost settings). An unquoted key
+  such as `on`, `yes` or `1` fails with a message asking to quote it.
 - A `CMD-SHELL` healthcheck `test` passes every item after `CMD-SHELL` to `sh -c`,
   where only the first was kept.
 - **BREAKING CHANGE**: A negative `healthcheck.retries`, and a top-level
