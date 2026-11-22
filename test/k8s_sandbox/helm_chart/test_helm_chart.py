@@ -1438,12 +1438,12 @@ def test_policies_select_admit_and_reach_no_other_releases_pods(
         ends = [spec["endpointSelector"]]
         # The default deny's empty rule selects its pods and admits no one.
         for rule in filter(None, spec.get("ingress", [])):
-            # Cilium drops the whole policy for a rule that mixes kinds of peer.
             assert rule.keys() <= {"fromEndpoints", "toPorts", "icmps"}, policy
             ends += rule.get("fromEndpoints") or [{}]
-        for rule in spec.get("egress", []):  # The cluster's DNS is the one other.
+        for rule in spec.get("egress", []):
             assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
-            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in dns]
+            others = dns if "toPorts" in rule else []  # The cluster's DNS, on ports.
+            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in others]
         for end in ends:  # Cilium requires every term: no other key widens these.
             assert own.items() <= end.get("matchLabels", {}).items(), policy
 
