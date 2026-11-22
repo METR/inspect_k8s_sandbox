@@ -1335,7 +1335,7 @@ func endAsNobody(pids ...int) {
 	}
 }
 
-func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil) }                            // what a test left carrying a tag
+func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil, nil) }                       // what a test left carrying a tag
 func gone(pid int) bool     { f := stat(pid); return len(f) == 0 || strings.Contains("ZX", f[0]) } // ended: a zombie, or one being reaped
 
 // graced has each kill's grace, timeout(1)'s -k 5s over Kubernetes exec, last until the test ends it; end ends them, and says how many.
@@ -1390,6 +1390,9 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 	end := graced(t)
 	s, c, frames, _, _ := ready(t, map[bool]string{true: "65534"}[os.Getuid() == 0], "/bin/sh", "-c", `trap 'echo x' TERM; echo ready; i=0; while :; do i=$((i+1)); [ $((i % 2000)) -ne 0 ] || echo .; done`) // as another user where execd is root, its tag kept: it says each SIGTERM it takes at once, the kill's and any that user's helper sends behind it, and runs on
 	on := func(out string) bool { return strings.Count(out[strings.LastIndex(out, "x")+1:], ".") >= 30 }
+	if os.Getuid() == 0 && s.get(80).search(&syscall.Credential{Uid: 65534, Gid: 65534}, syscall.SIGTERM, map[int]string{}).more != nil {
+		t.Fatal("a search with no process left for it started its helper, which signals every process when given none")
+	}
 	s.get(80).stop(true) // as its deadline does
 	out := said(t, frames, func(out string) bool { return strings.Contains(out, "x") && on(out) })
 	s.dispatch(c, frame{kind: fKill, id: 80}) // as its client's, behind its timeout's
@@ -1399,6 +1402,13 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 	if n, status := end(), exitStatus(t, frames); n != 1 || status["code"] != 137.0 {
 		t.Fatalf("%d timers of 5 s, EXIT %v: want the first kill's alone, and the SIGKILL of a command that ran on to its grace's end", n, status)
 	}
+}
+
+func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
+	graced(t)                                                                                                                                  // no SIGKILL of a grace's end ends it
+	s, c, frames, _, _ := ready(t, "", "sh", "-c", `sleep 600 & trap '' TERM; trap 'trap - CONT; kill -STOP $$; exit' CONT; echo ready; wait`) // as su and runuser at their child's stop: continued, it stops itself once, and ends when continued again
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	exitStatus(t, frames)
 }
 
 func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {

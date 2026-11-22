@@ -46,9 +46,7 @@ func main() {
 			pid, _ := strconv.Atoi(p)
 			among[pid] = ""
 		}
-		for p, started := range signalTagged(os.Args[5], syscall.Signal(sig), among) { // the daemon waits for those, and kills each by its id when the grace is up
-			fmt.Println(p, started)
-		}
+		signalTagged(os.Args[5], syscall.Signal(sig), among, os.Stdout) // the daemon waits for what it says, and kills each by its id when the grace is up
 		return
 	}
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket

@@ -2001,7 +2001,7 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
         _, call_id, _ = await read_frame(r)  # START
         w.write(frame(execd.STDOUT, call_id, b"its "))
         w.write(frame(execd.STDERR, call_id, b"last\n"))
-        w.write(frame(execd.EXIT, call_id, b'{"code": 137, "timeout": true}'))
+        w.write(frame(execd.EXIT, call_id, b'{"code": 0, "timeout": true}'))
         await r.read()
 
     sandbox = await tls_daemon(times_out)
@@ -2010,6 +2010,7 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
             sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
     assert getattr(timed.value, "truncated_output") == "its last\n"
+    assert timed.value not in timed.traceback[-1].frame.f_locals.values()  # no cycle
 
 
 async def test_a_command_that_ended_by_itself_before_our_kill_keeps_its_result(
@@ -2237,7 +2238,6 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
 KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
     "back late": (b"c", b"c", 137),
     "restarted": (b"c", b"d", error.ExecdStoppedError),
-    "unnamed": (b"unknown", b"unknown", error.ExecdStoppedError),
     "no boot id": (b":5", b":5", error.ExecdStoppedError),
 }
 

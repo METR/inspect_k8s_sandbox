@@ -945,6 +945,7 @@ func (cl *call) stop(timeout bool) {
 		running = its() && !seen(syscall.WEXITED) // reaped meanwhile, its id may be another's
 	}
 	var reached, listed map[int]string
+	var parents map[int]bool
 	var group uintptr
 	if running {
 		hook(&beforeKill, true)
@@ -954,14 +955,14 @@ func (cl *call) stop(timeout bool) {
 		cl.kmu.Unlock()
 		group, _, _ = syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0) // while its id is its own: what it leaves in its group is signalled through this
 		var late bool
-		reached, listed, late = signalTree(as, pid, map[int]string{pid: ""}, true, syscall.SIGTERM, syscall.SIGCONT)
+		reached, listed, parents, late = signalTree(as, pid, map[int]string{pid: ""}, true, syscall.SIGTERM, syscall.SIGCONT)
 		afterFunc(termGrace, func() { close(up) }) // from the SIGTERMs, as timeout(1) counts it: a pod slow to list its processes leaves them the whole of it
 		slow = slow || late
 	}
 	reaper.mu.Unlock()
 	if running { // else ended or reaped: what it left running is not the call's to kill, and its id may be another's
 		found := make(chan map[int]string, 1)
-		go cl.sweep(pid, as, status, reached, found, up, group, slow)
+		go cl.sweep(pid, as, status, reached, parents, found, up, group, slow)
 		// Only what was listed, started since the command and had no SIGTERM may carry its tag and take one: no other's environment is read.
 		since, _ := strconv.ParseUint(listed[pid], 10, 64)
 		maps.DeleteFunc(listed, func(p int, started string) bool {
@@ -987,7 +988,7 @@ func (cl *call) stop(timeout bool) {
 }
 
 // sweep gives what a kill's SIGTERM reached its grace to end, then SIGKILL to what has not, and to what they left in the command's group or carrying its tag: the call's exit waits for it.
-func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, found <-chan map[int]string, up <-chan struct{}, group uintptr, slow bool) {
+func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitStatus, reached map[int]string, parents map[int]bool, found <-chan map[int]string, up <-chan struct{}, group uintptr, slow bool) {
 	defer debug.FreeOSMemory() // a kill's listings leave garbage that a pod at its memory limit has no room for
 	defer close(cl.ending)
 	defer syscall.Close(int(group))
@@ -996,6 +997,11 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		reaper.mu.Lock()
 		running := reaper.waiting[pid] == status
 		reaper.mu.Unlock()
+		for p := range parents { // as su and runuser, one stops itself at its child's stop: left so, it would sit out the grace
+			if f := stat(p); len(f) > 0 && f[0] == "T" {
+				signalIf(as, p, reached[p], syscall.SIGCONT)
+			}
+		}
 		for p, started := range reached {
 			if !ended(p, started) {
 				return true
@@ -1068,8 +1074,8 @@ func stat(pid int) []string {
 	return strings.Fields(string(data[bytes.LastIndexByte(data, ')')+1:]))
 }
 
-// signalTree stops lead's group, if any, and what runs under roots (found by listing the pod's processes, if list), sends them sigs in turn, and gives those reached, all listed, and whether it was slow: stopped, each takes one SIGTERM however many reach it. A root other than lead, whose id the reaper holds, comes with its start time.
-func signalTree(as *syscall.Credential, lead int, roots map[int]string, list bool, sigs ...syscall.Signal) (reached, listed map[int]string, slow bool) {
+// signalTree stops lead's group, if any, and what runs under roots (found by listing the pod's processes, if list), sends them sigs in turn, and gives those reached, all listed, the parents among those reached, and whether it was slow: stopped, each takes one SIGTERM however many reach it. A root other than lead, whose id the reaper holds, comes with its start time.
+func signalTree(as *syscall.Credential, lead int, roots map[int]string, list bool, sigs ...syscall.Signal) (reached, listed map[int]string, parents map[int]bool, slow bool) {
 	began := time.Now()
 	signal := func(sig syscall.Signal) { // as their user where root's is refused: without CAP_KILL it reaches neither a process nor a group of another's; with it, a second send would be a second SIGTERM to one not yet stopped
 		if lead != 0 {
@@ -1082,14 +1088,14 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, list boo
 	signal(syscall.SIGSTOP) // the group at once: stopped, a process starts no other, and its children stay its own; the command by its own id too: it may have left its group for another
 	var stopped []int
 	seen, grouped, waits := map[int]bool{}, map[int]bool{}, 0
-	reached = map[int]string{}
+	reached, parents = map[int]string{}, map[int]bool{}
 	for _, root := range slices.Sorted(maps.Keys(roots)) { // the oldest first, which started the rest; each only while it is the process that started then: its id may be another's by now
 		if root != lead && signalIf(as, root, roots[root], syscall.SIGSTOP) {
 			stopped, seen[root], reached[root] = append(stopped, root), true, roots[root]
 		}
 	}
 	if lead == 0 && len(stopped) == 0 {
-		return reached, nil, false // none of them is left
+		return reached, nil, nil, false // none of them is left
 	}
 	for until := time.Now().Add(time.Second); list && lead != 0 && stopping(lead) && time.Now().Before(until); { // the command as what is found under it: one signalled while it starts a process still starts it; a second at most, as its kill waited
 		time.Sleep(time.Millisecond)
@@ -1108,7 +1114,7 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, list boo
 			p, _ := strconv.Atoi(e.Name())
 			if f := stat(p); len(f) > 19 {
 				ppid, _ := strconv.Atoi(f[1])
-				children[ppid], started[p] = append(children[ppid], p), f[19]
+				children[ppid], started[p], parents[ppid] = append(children[ppid], p), f[19], true
 				if p == lead || lead != 0 && f[2] == strconv.Itoa(lead) { // in the command's group: its signals are the group's
 					reached[p], grouped[p] = f[19], true
 				}
@@ -1140,7 +1146,8 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, list boo
 		}
 		signal(sig)
 	}
-	return reached, listed, time.Since(began) > max(slowAfter, time.Duration(len(listed))*10*time.Millisecond) // as a kill too slow to stop its command: one too slow to stop and list the rest, at 10 ms a process in the pod
+	maps.DeleteFunc(parents, func(p int, _ bool) bool { return reached[p] == "" })
+	return reached, listed, parents, time.Since(began) > max(slowAfter, time.Duration(len(listed))*10*time.Millisecond) // as a kill too slow to stop its command: one too slow to stop and list the rest, at 10 ms a process in the pod
 }
 
 // stopping reports whether a thread of pid still runs or sleeps: any of them may be the one starting a process.
@@ -1183,7 +1190,7 @@ type hits struct {
 
 // search signals whatever carries the call's tag, as signalTagged does: as execd, and for another user's command as that user.
 func (cl *call) search(as *syscall.Credential, sig syscall.Signal, among map[int]string) (found hits) {
-	found.sent = signalTagged(cl.tag, sig, among)
+	found.sent = signalTagged(cl.tag, sig, among, nil)
 	if as == nil {
 		return found
 	}
@@ -1204,8 +1211,10 @@ func (cl *call) search(as *syscall.Credential, sig syscall.Signal, among map[int
 	}
 	argv = append(argv, rest...)
 	var r, w *os.File
-	if among != nil { // its SIGTERMs are waited for: it says which it sent
-		r, w, _ = os.Pipe()
+	if among != nil { // its SIGTERMs are waited for: it says which it sends
+		if r, w, _ = os.Pipe(); w == nil { // no helper that could not say so: unsignalled, what carries the tag keeps it for the last search
+			return found
+		}
 	}
 	if child, err := os.StartProcess(argv[0], argv, &os.ProcAttr{Env: []string{"GOMAXPROCS=1"}, Files: []*os.File{nil, w}}); err == nil {
 		child.Release()
@@ -1230,7 +1239,7 @@ var startSearcher = sync.OnceFunc(func() {
 		runtime.LockOSThread() // the identities it takes are this thread's alone
 		for s := range searches {
 			setids(s.as.Uid, s.as.Gid) // its kills are then the user's own: root may lack CAP_KILL
-			signalTagged(s.tag, syscall.SIGKILL, nil)
+			signalTagged(s.tag, syscall.SIGKILL, nil, nil)
 			setids(uint32(os.Getuid()), uint32(os.Getgid()))
 		}
 	}()
@@ -1372,8 +1381,8 @@ func tagged(open func(string) (*os.File, error), environ string, needle []byte, 
 	}
 }
 
-// signalTagged signals every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid: only those among, if that is given.
-func signalTagged(tag string, sig syscall.Signal, among map[int]string) (sent map[int]string) {
+// signalTagged signals every process whose environment holds HAWK_NEXT_EXEC=<tag>, even after setsid: only those among, if that is given. It says each to say first, if that is given.
+func signalTagged(tag string, sig syscall.Signal, among map[int]string, say *os.File) (sent map[int]string) {
 	sent = map[int]string{}
 	needle := []byte("HAWK_NEXT_EXEC=" + tag + "\x00")
 	open := os.Open
@@ -1407,9 +1416,12 @@ func signalTagged(tag string, sig syscall.Signal, among map[int]string) (sent ma
 				}
 			}
 			read[pid] = true
-			if is && len(was) > 19 && signalIf(nil, pid, was[19], sig) { // one execd may not signal is its helper's, as its user
-				signalIf(nil, pid, was[19], syscall.SIGCONT) // as timeout(1) sends it: stopped, it would take no SIGTERM
-				sent[pid] = was[19]
+			if is && len(was) > 19 {
+				fmt.Fprintln(say, pid, was[19])       // before its signal: a helper that then stalls, or is stopped, has said all it signalled
+				if signalIf(nil, pid, was[19], sig) { // one execd may not signal is its helper's, as its user
+					signalIf(nil, pid, was[19], syscall.SIGCONT) // as timeout(1) sends it: stopped, it would take no SIGTERM
+					sent[pid] = was[19]
+				}
 			}
 		}
 	}
