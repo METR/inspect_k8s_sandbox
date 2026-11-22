@@ -13,7 +13,7 @@ the pod on that port, and reach only what the release's egress grants and their 
 Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
 has not completed in five minutes.
 
-Each node needs:
+Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
   containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)` and less the one
