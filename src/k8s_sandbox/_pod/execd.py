@@ -965,10 +965,8 @@ class ExecdClient:
         if status is None or timed_out:  # its output where Inspect's tools look for it
             error = TimeoutError(f"Command timed out after {timeout}s.")
             setattr(error, "truncated_output", str(out[STDOUT]) + str(out[STDERR]))
-            try:
-                raise error
-            finally:
-                del error  # in this frame it would hold the output until a collection
+            out.clear()  # its traceback keeps this frame: the output is held once
+            raise error
         code = status["code"]
         result = ExecResult(
             success=code == 0,
