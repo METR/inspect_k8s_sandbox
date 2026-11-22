@@ -107,16 +107,15 @@ func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 		if _, err := read.Read(make([]byte, maxFrame)); err != nil {
 			t.Fatal(err)
 		}
-	}
-	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
-	if controlled := raw.Control(func(fd uintptr) {
-		quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
-	}); controlled != nil || err != nil {
-		t.Fatal(controlled, err)
-	}
-
-	if quick != 1 {
-		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
+		// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
+		if controlled := raw.Control(func(fd uintptr) {
+			quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
+		}); controlled != nil || err != nil {
+			t.Fatal(controlled, err)
+		}
+		if quick != 1 {
+			t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
+		}
 	}
 }
 
