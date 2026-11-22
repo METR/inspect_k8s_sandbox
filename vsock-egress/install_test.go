@@ -73,8 +73,22 @@ func TestInstallFailsWhereAProfileIsCutShort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer syscall.Setrlimit(syscall.RLIMIT_FSIZE, &whole)
+	dir := t.TempDir()
 
-	if err := install([]string{t.TempDir()}); err == nil {
-		t.Fatal("install passed with a profile cut short in its place: the runtime refuses it, and with it every pod that names it")
+	err := install([]string{dir})
+
+	if _, placed := os.Stat(filepath.Join(dir, "profiles", "vsock-egress-launcher.json")); err == nil || placed == nil {
+		t.Fatalf("install gave %v, and a profile cut short in its place gave %v: the runtime refuses it, and with it every pod that names it", err, placed)
+	}
+}
+
+func TestInstallTakesNoOptionForItsDirectory(t *testing.T) {
+	help := exec.Command(os.Args[0], "install", "-h")
+	help.Dir = t.TempDir()
+
+	out, err := help.CombinedOutput()
+
+	if err == nil || !strings.Contains(string(out), "install_failed: usage") {
+		t.Fatalf("got %v and %q: want the usage line for -h, not profiles installed into a directory of that name", err, out)
 	}
 }
