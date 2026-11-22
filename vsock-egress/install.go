@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 //go:embed profiles
@@ -14,7 +15,7 @@ var profiles embed.FS
 
 // install writes this build's two seccomp profiles into profiles/ of the kubelet's seccomp directory, so the image that installs them needs no shell.
 func install(args []string) error {
-	if len(args) != 1 {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return errors.New("usage: vsock-egress install <the kubelet's seccomp directory>")
 	}
 	from, to := path.Join("profiles", runtime.GOARCH), filepath.Join(args[0], "profiles")
