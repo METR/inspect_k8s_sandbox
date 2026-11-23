@@ -115,7 +115,7 @@ func line(c io.Reader) (string, error) {
 	return bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
 }
 
-// canaryLife ends a canary, which nothing else in its container can: past the 60 s that gate.sh has check wait for it.
+// canaryLife ends a canary, which outlives the kubectl exec that started it: check must start within it.
 const canaryLife = 90 * time.Second
 
 // canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
