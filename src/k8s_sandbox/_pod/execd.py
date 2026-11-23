@@ -964,7 +964,9 @@ class ExecdClient:
             )
         if status is None or timed_out:  # its output where Inspect's tools look for it
             error = TimeoutError(f"Command timed out after {timeout}s.")
-            text = str(out.pop(STDOUT)) + str(out.pop(STDERR))  # freed as it is decoded
+            text = ""
+            for stream in (STDOUT, STDERR):
+                text += str(out.pop(stream))  # freed as decoded, appended in place
             setattr(error, "truncated_output", text)  # its traceback keeps this frame
             raise error
         code = status["code"]
