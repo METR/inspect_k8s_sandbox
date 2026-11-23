@@ -1415,8 +1415,8 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
 	for name, slow := range map[string]bool{"its search by tag answers at once": false, "its search by tag is slow": true} { // Regression, the second: stopped while the search's word was awaited, it sat out its grace
 		t.Run(name, func(t *testing.T) {
-			graced(t)                                                                                                                                                                                 // no SIGKILL of a grace's end ends it
-			s, c, frames, _, _ := ready(t, "", "sh", "-c", `sh -c 'sleep 600 & trap "" TERM; trap "trap - CONT; kill -STOP \$\$; kill -STOP \$\$; echo resumed; exit" CONT; echo ready; wait'; true`) // under the command, as su and runuser at their child's stop: continued, it stops itself, twice, and ends when continued again
+			graced(t)                                                                                                                                                                                     // no SIGKILL of a grace's end ends it
+			s, c, frames, _, _ := ready(t, "", "sh", "-c", `sh -c 'sleep 600 & trap "" TERM HUP; trap "trap - CONT; kill -STOP \$\$; kill -STOP \$\$; echo resumed; exit" CONT; echo ready; wait'; true`) // under the command, as su and runuser at their child's stop: continued, it stops itself, twice, and ends when continued again; no SIGHUP ends it, which the kernel sends where the command's end orphans its group, as on a bare host
 			resumed := make(chan struct{})
 			if slow {
 				other := exec.Command("sleep", "600") // started since the command: the search reads its environment, and is held there
