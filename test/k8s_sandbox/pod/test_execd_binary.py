@@ -532,6 +532,34 @@ async def test_a_timed_out_command_is_killed(
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
+@pytest.mark.parametrize("cpus", [("--cpus", "2"), ()])  # a pod's, and a large node's
+async def test_a_timed_out_command_holding_every_pid_does_not_end_execd(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    monkeypatch: pytest.MonkeyPatch,
+    cpus: tuple[str, ...],
+) -> None:
+    """Regression: with no PID left for a thread, Go ended execd in the kill's grace."""
+    name = f"{sandbox.name}-pids"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    run = ["run", "-d", "--name", name, "--pids-limit", "1024", *cpus, sandbox.name]
+    hold = "import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    hold += "try:\n    while os.fork(): pass\nexcept OSError: pass\ntime.sleep(99)"
+    try:
+        assert docker(*run, "sleep", "3600").returncode == 0
+        monkeypatch.setattr(sandbox, "name", name)
+        relay.ip = docker("inspect", "-f", address, name).stdout.strip()
+        pid = await client.exec(["sh", "-c", "echo $PPID"], None, None, {}, None, None)
+        with pytest.raises(TimeoutError):
+            await client.exec(["python3", "-c", hold], None, None, {}, None, 3)
+        await sandbox.until("true")  # else the sandbox is still full, or Docker stuck
+        after = sandbox.sh(f"cat /proc/{pid.stdout.strip()}/cmdline 2>/dev/null")
+        assert "serve" in after.stdout, after.stderr or "execd ended"
+    finally:
+        docker("rm", "-f", name)
+
+
 async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs(
     stdio_client: execd.ExecdClient,
 ) -> None:

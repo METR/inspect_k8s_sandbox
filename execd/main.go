@@ -18,9 +18,11 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -224,6 +226,8 @@ func run(network, address, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
+	runtime.GOMAXPROCS(min(4, runtime.GOMAXPROCS(0))) // on more CPUs Go starts more threads than execd keeps spare
+	spare(16)
 	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
@@ -250,6 +254,18 @@ func run(network, address, keyHash string, replace bool) {
 	startKeeper()
 	report("ok " + fingerprint)
 	s.serve(l)
+}
+
+// spare starts the threads a kill may need while the pod still has PIDs: Go keeps an idle thread, and ends execd where it cannot start one.
+func spare(n int) {
+	var held sync.WaitGroup
+	free := make(chan struct{})
+	for range n {
+		held.Add(1)
+		go func() { runtime.LockOSThread(); held.Done(); <-free; runtime.UnlockOSThread() }()
+	}
+	held.Wait()
+	close(free)
 }
 
 // stopOthers kills every other process running this binary as the daemon.

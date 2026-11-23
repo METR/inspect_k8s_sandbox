@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -43,6 +44,13 @@ func TestMain(m *testing.M) {
 		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
 		syscall.Exec(os.Args[2], os.Args[2:], nil)
 		os.Exit(1) // not on into the tests, as the command
+	}
+	if len(os.Args) > 1 && os.Args[1] == "joined" { // as a setuid binary leaves the one who ran it: of user 65534 with root's effective user; it ignores SIGTERM until its stdin ends
+		syscall.Setreuid(65534, 0)
+		signal.Ignore(syscall.SIGTERM)
+		os.Stdout.WriteString("ready\n")
+		io.Copy(io.Discard, os.Stdin)
+		return
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
 		main()
@@ -1405,8 +1413,43 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 }
 
 func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
-	graced(t)                                                                                                                                  // no SIGKILL of a grace's end ends it
-	s, c, frames, _, _ := ready(t, "", "sh", "-c", `sleep 600 & trap '' TERM; trap 'trap - CONT; kill -STOP $$; exit' CONT; echo ready; wait`) // as su and runuser at their child's stop: continued, it stops itself once, and ends when continued again
+	for name, slow := range map[string]bool{"its search by tag answers at once": false, "its search by tag is slow": true} { // Regression, the second: stopped while the search's word was awaited, it sat out its grace
+		t.Run(name, func(t *testing.T) {
+			graced(t)                                                                                                                                                                                 // no SIGKILL of a grace's end ends it
+			s, c, frames, _, _ := ready(t, "", "sh", "-c", `sh -c 'sleep 600 & trap "" TERM; trap "trap - CONT; kill -STOP \$\$; kill -STOP \$\$; echo resumed; exit" CONT; echo ready; wait'; true`) // under the command, as su and runuser at their child's stop: continued, it stops itself, twice, and ends when continued again
+			resumed := make(chan struct{})
+			if slow {
+				other := exec.Command("sleep", "600") // started since the command: the search reads its environment, and is held there
+				other.Start()
+				held := func(_, environ string) (*os.File, error) { <-resumed; return os.Open(environ) }
+				openEnviron.Store(&held)
+				t.Cleanup(func() { openEnviron.Store(nil); other.Process.Kill(); other.Wait() })
+			}
+			go s.dispatch(c, frame{kind: fKill, id: 80})                                       // the kill's own search is the one held
+			said(t, frames, func(out string) bool { return strings.Contains(out, "resumed") }) // continued, not killed
+			close(resumed)
+			exitStatus(t, frames)
+		})
+	}
+}
+
+// Regression: joined to its group, another user's process held a timed-out call's exit for the grace.
+func TestAKilledCallsExitDoesNotWaitForAnotherUsersProcessThatJoinedItsGroup(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs a process of another user")
+	}
+	graced(t) // no grace's end lets the exit go: it comes without one
+	s, c, frames, _, group := ready(t, "", "sh", "-c", "echo $$; exec sleep 600")
+	joiner := exec.Command(os.Args[0], "joined") // root's only in its effective user: by that one alone it would pass for the command's
+	joiner.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	joiner.SysProcAttr.Pgid, _ = strconv.Atoi(strings.TrimSpace(group))
+	stdin, _ := joiner.StdinPipe()
+	stdout, _ := joiner.StdoutPipe()
+	if err := joiner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close(); joiner.Wait() })
+	stdout.Read(make([]byte, 6)) // "ready": it ignores SIGTERM by now
 	s.dispatch(c, frame{kind: fKill, id: 80})
 	exitStatus(t, frames)
 }
@@ -1438,10 +1481,10 @@ func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {
 
 func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *testing.T) {
 	for name, argv := range map[string][]string{
-		"left in its group by a handler":     {map[bool]string{true: "65534"}[os.Getuid() == 0], "env", "-i", "/bin/sh", "-c", `trap 'sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                // at its SIGTERM it starts one, says its id and ends: no SIGTERM went to that one, and with no tag only the command's group leads there
-		"left out of its group by a handler": {"", "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                                         // the same in a session of its own: only the tag leads there
-		"found by its tag":                   {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "echo $$; exec env -i sh -c \"while :; do :; done\" >/dev/null 2>&1" TERM; echo ready; while :; do :; done' &); while :; do sleep 0.01; done`}, // in a session of its own, its parent gone, one says its id at its SIGTERM and runs on with no output and no tag: only the tag led there, for another user's the search's helper, and only its id leads the SIGKILL there
-		"found in its group":                 {"", "sh", "-c", `trap exit TERM; env -i sh -c 'trap "echo $$" TERM; echo ready; while :; do :; done' & while :; do sleep 0.01; done`},                                                                                                             // in its group with no tag, one says its id at its SIGTERM and runs on
+		"left in its group by a handler":     {map[bool]string{true: "65534"}[os.Getuid() == 0], "env", "-i", "/bin/sh", "-c", `trap 'sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                                                                            // at its SIGTERM it starts one, says its id and ends: no SIGTERM went to that one, and with no tag only the command's group leads there
+		"left out of its group by a handler": {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & until [ "$(cut -d" " -f5 /proc/$!/stat)" != $$ ]; do :; done; echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                         // the same in a session of its own, which the handler waits for: only the tag leads there, in an environment root may not read
+		"found by its tag":                   {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "echo $$; exec env -i sh -c \"while :; do :; done\" >/dev/null 2>&1" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`}, // in a session of its own, its parent gone, one says its id at its SIGTERM and runs on with no output and no tag: only the tag led there, for another user's the search's helper, and only its id leads the SIGKILL there
+		"found in its group":                 {"", "sh", "-c", `trap exit TERM; (env -i sh -c 'trap "echo $$" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`},                                                                                                          // in its group with no tag, its parent gone, one says its id at its SIGTERM and runs on
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); name == "left in its group by a handler" && err != syscall.EBADF {
@@ -1569,6 +1612,7 @@ func TestAKillReachesAnotherUsersCommandAndItsGroupThoughTheyCarryNoTag(t *testi
 	}
 	prctl(prSetChildSubreaper, 1) // as execd: the command's child is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
+	graced(t) // no SIGKILL ends them: the group's SIGTERM is sent as their user
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -2101,8 +2145,8 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 	cl := &call{id: 33, tag: "ended"}
 	cl.room = sync.NewCond(&cl.mu)
 	pids := filepath.Join(t.TempDir(), "pids")
-	// It leaves two processes: one in its group with no tag, one with its tag in a session of its own.
-	leave := `env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
+	// It leaves two processes that no SIGTERM ends: one in its group with no tag, one with its tag in a session of its own.
+	leave := `trap "" TERM; env -i sleep 600 >/dev/null 2>&1 & grouped=$!; setsid sleep 600 >/dev/null 2>&1 & echo $$ $grouped $! >"$0"`
 	req := startRequest{Argv: []string{"sh", "-c", leave, pids}, Env: map[string]string{}, Tag: "ended"}
 
 	cl.kill()     // from another connection, while this one's START is still at work

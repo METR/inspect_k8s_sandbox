@@ -2010,7 +2010,8 @@ async def test_a_command_execd_killed_at_its_timeout_raises(
             sandbox.exec(["sleep", "99"], None, None, {}, None, 60), 30
         )
     assert getattr(timed.value, "truncated_output") == "its last\n"
-    assert not timed.traceback[-1].frame.f_locals["out"]  # its buffers are let go
+    held = gc.get_referents(*timed.traceback[-1].frame.f_locals.values())
+    assert not any(isinstance(o, execd.LimitedBuffer) for o in held)  # held once
 
 
 async def test_a_command_that_ended_by_itself_before_our_kill_keeps_its_result(
