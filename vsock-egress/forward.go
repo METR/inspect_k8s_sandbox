@@ -136,8 +136,12 @@ func (f *forwarder) serve(l net.Listener) error {
 	}
 }
 
+// clientBuffer caps a stream's socket to its client each way, and the kernel accounts twice it: it bounds what the streams a guest stalls hold, under the forwarder's memory limit in the chart, and is smaller than the worker's proxyBuffer because loopback needs no more.
+const clientBuffer = 128 << 10
+
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
 func (f *forwarder) stream(c *net.TCPConn) {
+	c.SetReadBuffer(clientBuffer / 2) // what the kernel starts it with, now held: left alone, a client's small segments grow it to the kernel's maximum while it waits
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:
@@ -147,6 +151,9 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
+	// Only now the whole of it: the 448 that wait hold half as much.
+	c.SetReadBuffer(clientBuffer)
+	c.SetWriteBuffer(clientBuffer)
 	up, err := f.dial()
 	if err != nil {
 		log.Print(err)
@@ -161,7 +168,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		up.Close()
 		return
 	}
-	join(up, c, nil, 0)
+	join(up, c, nil, stallWait)
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.

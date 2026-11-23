@@ -315,6 +315,69 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 	}
 }
 
+func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
+	_, placed := tcpPair(t)
+	_, waiting := tcpPair(t)
+	kept, err := waiting.File() // the socket, past the stream's close of it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+	f := newForwarder(0, 0)
+	f.wait = budget // a stalled runner must not time out the stream that has a place free
+	var held [2]int
+	f.connect = func(uint32, uint32) (*os.File, error) { // a stream dials the node once it has its place and its caps
+		held = buffers(t, placed)
+		return nil, errors.New("the test has seen the socket")
+	}
+
+	f.stream(placed)
+	for range maxStreams { // every place is taken
+		f.slots <- struct{}{}
+	}
+	f.wait = 0
+	f.stream(waiting)
+
+	if want := capped(t, 128<<10); held != want { // the size itself: a change to it must be measured against the forwarder's memory limit in the chart
+		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
+	}
+	locked, err := unix.GetsockoptInt(int(kept.Fd()), unix.SOL_SOCKET, unix.SO_BUF_LOCK)
+	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked != unix.SOCK_RCVBUF_LOCK {
+		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, and that buffer alone locked (%d): unlocked, small segments grow it", got, locked, err, want, unix.SOCK_RCVBUF_LOCK)
+	}
+}
+
+func TestStreamWhoseClientHasNotTakenItsReplyKeepsItsPlace(t *testing.T) {
+	client, inSandbox := unreadPair(t)
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, node := os.NewFile(uintptr(pair[0]), "vsock"), os.NewFile(uintptr(pair[1]), "node")
+	defer node.Close()
+	f := keyedForwarder(0, 0)
+	f.connect = func(uint32, uint32) (*os.File, error) { return guest, nil }
+	ended := make(chan struct{})
+	go func() {
+		f.stream(inSandbox)
+		close(ended)
+	}()
+	reply := strings.Repeat("r", 100<<10) // all of it fits the socket's buffer: the stream ends cleanly with most of it unsent
+	client.CloseWrite()
+	if err := toFrames(node, strings.NewReader(reply), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	node.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) // a wait for nothing: a stalled runner can hide a stream that ends early, and fails none that does not
+	if _, err := io.Copy(io.Discard, node); !errors.Is(err, os.ErrDeadlineExceeded) || len(f.slots) != 1 {
+		t.Fatalf("the stream ended (%v, %d places taken) with its reply not yet taken: want it to keep its place, for the kernel holds what is unsent", err, len(f.slots))
+	}
+	if got, err := io.ReadAll(client); string(got) != reply || err != nil {
+		t.Fatalf("the client read %d bytes, %v: want the whole reply of %d and then a clean end", len(got), err, len(reply))
+	}
+	within(t, ended, "end of a stream whose client has taken its reply")
+}
+
 func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
 	f := keyedForwarder(0, 0)
 	for range maxStreams + maxWaiting { // it holds back all it may, with a place free for the next it takes
