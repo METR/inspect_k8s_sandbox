@@ -72,6 +72,14 @@ func TestInstallFailsWhereAProfileCannotTakeItsPlace(t *testing.T) {
 	}
 }
 
+func TestInstallFailsWhereHelpIsAsked(t *testing.T) {
+	out, err := exec.Command(os.Args[0], "install", "-h", t.TempDir()).CombinedOutput()
+
+	if err == nil || !strings.Contains(string(out), "install_failed: ") {
+		t.Fatalf("got %v and %q: want install_failed, as exit status 0 would tell the kubelet the profiles are in place", err, out)
+	}
+}
+
 func TestInstallFailsWhereAProfileIsCutShort(t *testing.T) {
 	dir := t.TempDir()
 	short := exec.Command(os.Args[0], "install", dir)

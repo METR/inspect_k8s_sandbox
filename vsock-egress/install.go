@@ -16,9 +16,8 @@ var profiles embed.FS
 
 // install writes this build's two seccomp profiles into profiles/ of the kubelet's seccomp directory, so the image that installs them needs no shell.
 func install(args []string) error {
-	fs := flag.NewFlagSet("install", flag.ExitOnError)
-	fs.Parse(args)
-	if fs.NArg() != 1 {
+	fs := flag.NewFlagSet("install", flag.ContinueOnError) // -h fails too: exit status 0 tells the kubelet the profiles are in place
+	if fs.Parse(args) != nil || fs.NArg() != 1 {
 		return errors.New("usage: vsock-egress install <the kubelet's seccomp directory>")
 	}
 	to := filepath.Join(fs.Arg(0), "profiles")
