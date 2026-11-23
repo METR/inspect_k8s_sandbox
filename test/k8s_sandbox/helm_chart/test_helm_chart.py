@@ -1036,9 +1036,9 @@ def test_no_service_can_share_the_egress_forwarders_container_name(
 
     [stateful_set] = _get_documents(documents, "StatefulSet")
     forwarder = stateful_set["spec"]["template"]["spec"]["initContainers"][0]["name"]
-    # Kubernetes takes a StatefulSet's name of 63 characters at most: here "x-default".
+    # A StatefulSet's name ("x-default" here) and a container's: 63 characters at most.
     longest_service = 63 - len(stateful_set["metadata"]["name"]) + len("default")
-    assert len(forwarder) > longest_service
+    assert longest_service < len(forwarder) <= 63
 
 
 def test_egress_proxy_annotation_needs_the_forwarder_image(

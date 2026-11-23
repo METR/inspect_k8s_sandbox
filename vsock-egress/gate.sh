@@ -6,7 +6,8 @@ usage() {
 usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
   VALUES.yaml  chart values for one service, `default`, with no network card, that names the egress proxy of its own
                release (a pod <fullname>-egress-proxy-0 that allows LISTED's host and refuses UNLISTED's), as Hawk's
-               runner makes them for a strict sandbox that names a host
+               runner makes them for a strict sandbox that names a host. The proxy must allow
+               files.pythonhosted.org too: step 2's pip fetches its wheel there, and gets the proxy's 403 otherwise
   CONTEXT      kubectl context
   NS           namespace to install into; it must exist
   CHART        the agent-env chart's directory
