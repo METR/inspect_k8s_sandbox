@@ -13,12 +13,13 @@ the pod on that port, and reach only what the release's egress grants and their 
 Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
 has not completed in five minutes.
 
-Each node needs:
+Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
   containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)` and less the one
   `ioctl` that `/dev/nsm`, the Nitro Secure Module, takes, for the pod's forwarder. Any pod that names it can open the
-  vsock, so admit it for that container alone.
+  vsock, so admit it for that container alone. `install` writes it first as `profiles/.vsock-egress.json`: admit
+  that name for no container.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
@@ -35,6 +36,11 @@ Each node needs:
   of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
   resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
   the node's memory.
+
+A command run in the forwarder's container runs under the profile that admits the vsock, and need not be
+`/vsock-egress`: on runc, `/proc/self/exe` there is runc itself. `forward`, `ready` and `canary` take no vsock port or
+address from their caller. To bound what runs there, refuse exec into this container, admitting at most
+`/vsock-egress canary`, which `gate.sh` runs.
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
