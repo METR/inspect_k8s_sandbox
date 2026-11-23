@@ -41,12 +41,13 @@
   port; those that `additionalResources` adds need policies of their own (see
   `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
   grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
-  sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
-  yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
-  `no_proxy` for a server on the sandbox's own loopback, and the new
+  sidecar, which needs Kubernetes 1.29 or later and requests, and is limited to, 500m of
+  CPU and 256Mi of memory. Set `https_proxy` and `http_proxy` yourself (curl reads
+  `http_proxy` in lower case only), their upper-case forms, `no_proxy` for a server on
+  the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
-  seccomp profiles (see `vsock-egress/README.md`): on a node with no launcher such a pod
-  does not start.
+  seccomp profiles, which `vsock-egress install` writes (see `vsock-egress/README.md`):
+  on a node with no launcher such a pod does not start.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

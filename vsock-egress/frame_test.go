@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -80,6 +81,54 @@ func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	proxy.Close()
 	if got, err := io.ReadAll(client); string(got) != "reply" || err != nil {
 		t.Fatalf("the client read %q, %v: want the reply and then a clean end", got, err)
+	}
+}
+
+func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
+	client, inSandbox := tcpPair(t)
+	read := unreset{inSandbox, new(atomic.Bool)}
+	raw, err := inSandbox.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
+	atOnce := func() (quick int) {
+		if controlled := raw.Control(func(fd uintptr) {
+			quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
+		}); controlled != nil || err != nil {
+			t.Fatal(controlled, err)
+		}
+		return quick
+	}
+	one := make([]byte, 1)
+	// Requests and their replies, as through a proxy: the kernel then holds acknowledgements back. The first is read as the last will be: asking once a connection would not do.
+	receive := read.Read
+	for range 8 {
+		for _, step := range []func([]byte) (int, error){client.Write, receive, inSandbox.Write, client.Read} {
+			if _, err := step(one); err != nil {
+				t.Fatal(err)
+			}
+		}
+		receive = inSandbox.Read
+	}
+	if atOnce() != 0 {
+		t.Skip("this kernel holds no acknowledgement back here, so a read has nothing to change")
+	}
+	sent := time.Now()
+
+	if _, err := client.Write(one); err != nil {
+		t.Fatal(err)
+	}
+	// Into the room a stream's reads have, more than the peer fills.
+	if _, err := read.Read(make([]byte, maxFrame)); err != nil {
+		t.Fatal(err)
+	}
+
+	if atOnce() != 1 {
+		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
+	}
+	if time.Since(sent) > 20*time.Millisecond {
+		t.Skip("too slow to tell: 40 ms after bytes arrive the kernel acknowledges them whatever was asked")
 	}
 }
 

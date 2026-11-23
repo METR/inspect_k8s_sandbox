@@ -4,7 +4,8 @@ An HTTP proxy port for a pod in an AWS Nitro Sandbox that has no network device.
 
 A pod annotated `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`, in a release whose
 `egressForwarderImage` value is an image built from this directory, gets a proxy at `127.0.0.1:3128` that reaches only
-that Service of its own namespace. Its forwarder has no resource requests, so the pod is not of the Guaranteed QoS class.
+that Service of its own namespace. Its forwarder requests, and is limited to, 500m of CPU and 256Mi of memory, so the pod
+is of the Guaranteed QoS class where its other containers are.
 
 The pod's network policy admits that port on the release's own pods alone, so the Service's pods must carry the
 release's `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that port. Pods that
@@ -13,12 +14,13 @@ the pod on that port, and reach only what the release's egress grants and their 
 Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
 has not completed in five minutes.
 
-Each node needs:
+Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
   containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)` and less the one
   `ioctl` that `/dev/nsm`, the Nitro Secure Module, takes, for the pod's forwarder. Any pod that names it can open the
-  vsock, so admit it for that container alone.
+  vsock, so admit it for that container alone. `install` writes it first as `profiles/.vsock-egress.json`: admit
+  that name for no container.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
