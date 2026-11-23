@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -343,26 +344,49 @@ func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
 	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
 		t.Skip("this kernel has multipath TCP off")
 	}
-	l, err := listen("127.0.0.1:0")
+	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	addr, file := free.Addr().String(), filepath.Join(t.TempDir(), "key")
+	free.Close()
+	// The program's own forward, in a process of its own: the listener a sandbox dials is whatever that makes.
+	forwarder := exec.Command(os.Args[0], "forward", "-listen", addr, "-key", file)
+	said := new(strings.Builder)
+	forwarder.Stderr = said
+	if err := forwarder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ended := make(chan error, 1)
+	go func() { ended <- forwarder.Wait() }()
+	t.Cleanup(func() {
+		forwarder.Process.Kill()
+		<-ended
+	})
+	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(file + readySuffix); err == nil {
+			break
+		}
+		select {
+		case err := <-ended:
+			ended <- err
+			t.Skipf("forward did not come to listen: %v: %s", err, said)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("forward neither listened nor ended")
+		}
+	}
 	var guest net.Dialer
 	guest.SetMultipathTCP(true)
-	client, err := guest.Dial("tcp", l.Addr().String())
+	client, err := guest.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	got, err := l.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer got.Close()
 
-	if multipath, err := got.(*net.TCPConn).MultipathTCP(); multipath || err != nil {
-		t.Fatalf("the connection of a client that asked for multipath TCP is multipath: %v (%v): want plain TCP, the only kind whose buffers the forwarder's bounds hold", multipath, err)
+	if multipath, err := client.(*net.TCPConn).MultipathTCP(); multipath || err != nil {
+		t.Fatalf("a client that asked the forwarder for multipath TCP got it: %v (%v): want plain TCP, the only kind whose buffers the forwarder's bounds hold", multipath, err)
 	}
 }
 

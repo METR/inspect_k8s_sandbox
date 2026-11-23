@@ -759,7 +759,7 @@ const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
 const brokenReaper = "VSOCK_EGRESS_TEST_BROKEN_REAPER"
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap") { // the launcher's test starts this binary as its children
+	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap" || os.Args[1] == "forward") { // tests start this binary as these commands
 		switch how := os.Getenv(brokenReaper); {
 		case os.Args[1] == "reap" && how == "fails":
 			os.Exit(1)
