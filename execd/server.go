@@ -71,6 +71,8 @@ const sysPidfdOpen, sysPidfdSendSignal, pidfdSignalProcessGroup = 434, 424, 4 //
 
 var pidfdSignalThread uintptr = 1 // tests set one no kernel knows, as this one is before Linux 6.9
 
+var pidfdNoGroup atomic.Uintptr // tests add a flag no kernel knows: no pidfd signals a group then, as before Linux 6.9
+
 // pidfdOpen gives a handle on a process; tests make it fail.
 var pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
 	fd, _, errno := syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0)
@@ -82,7 +84,7 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold execd at these points, or hear that it has reached them.
-var afterRead, afterDrainCheck, beforeKill, afterTaken, beforeExit, beforeWait atomic.Pointer[func(late bool)]
+var afterRead, afterDrainCheck, beforeKill, afterTaken, beforeExit, beforeWait, beforeNumber atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -99,12 +101,12 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as, killed, timeoutFound, timeoutKilled and ending: a kill must not wait for mu
+	kmu sync.Mutex // guards pid, status, as, killed, timeoutFound, timeoutKilled, ending and swept: a kill must not wait for mu
 	pid int
 	// its kill, from its SIGTERM on: closed once what that reached has ended or been killed, which its exit waits for
 	ending chan struct{}
-	// its grace's timer's copy of the command's pidfd, plus one, and 0 once taken: by the timer, or by the sweep as it kills
-	end atomic.Uintptr
+	// its sweep is past its grace: the timer stops nothing from then
+	swept bool
 	// where the reaper sends its command's exit status
 	status chan syscall.WaitStatus
 	as     *syscall.Credential // who its command runs as, if not execd
@@ -971,13 +973,12 @@ func (cl *call) stop(timeout bool) {
 			sig, grace = syscall.SIGKILL, 0
 		}
 		reached, listed, parents, apart = signalTree(as, pid, map[int]string{pid: ""}, sig, until)
-		end, _, _ := syscall.Syscall(syscall.SYS_FCNTL, group, syscall.F_DUPFD_CLOEXEC, 0) // the timer's own: the sweep closes group, whose number is another's after
-		cl.end.Store(end + 1)
 		afterFunc(grace, func() {
-			if end := cl.end.Swap(0); end != 0 { // not the sweep's yet: after its SIGKILL, one that joined what is left of the group would stay stopped
-				byPidfd(as, end-1, syscall.SIGSTOP) // at once, from here: the sweep, among a thousand busy ones, waits seconds for a processor to kill them on
-				syscall.Close(int(end - 1))
+			cl.kmu.Lock() // the sweep's kill waits for this: after its SIGKILL one that joined what is left of the group would stay stopped, and group is closed
+			if !cl.swept {
+				byPidfd(as, group, syscall.SIGSTOP) // at once, from here: the sweep, among a thousand busy ones, waits seconds for a processor to kill them on
 			}
+			cl.kmu.Unlock()
 			close(up) // from the SIGTERMs, as timeout(1) counts it
 		})
 	}
@@ -998,9 +999,14 @@ func (cl *call) stop(timeout bool) {
 		}
 		go func() { // its helper's word too: what that signalled is waited for, and killed with the rest
 			t.more.SetReadDeadline(time.Now().Add(2 * termGrace)) // a helper its user has stopped says no more: its word is not waited for past this
-			for p, started := 0, ""; ; t.sent[p] = started {
+			for p, started := 0, ""; ; {
 				if _, err := fmt.Fscanln(t.more, &p, &started); err != nil {
 					break
+				}
+				status, _ := os.ReadFile("/proc/" + strconv.Itoa(p) + "/status")
+				_, ids, _ := bytes.Cut(status, []byte("\nUid:\t"))
+				if f, uid := bytes.Fields(ids), []byte(strconv.Itoa(int(as.Uid))); len(f) > 2 && (bytes.Equal(f[0], uid) || bytes.Equal(f[2], uid)) { // what its user may signal and no more: a traced helper says what its tracer likes
+					t.sent[p] = started
 				}
 			}
 			t.more.Close()
@@ -1024,6 +1030,7 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		}
 	}
 	if !byPidfd(as, group, syscall.SIGCONT) { // no group was signalled so (before Linux 6.9; a command that left its group): by number, while that is its own
+		hook(&beforeNumber, false)
 		reaper.mu.Lock()
 		if reaper.waiting[pid] == status {
 			byNumber(as, pid, syscall.SIGCONT)
@@ -1087,9 +1094,9 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		case <-time.After(wait):
 		}
 	}
-	if end := cl.end.Swap(0); end != 0 { // the timer has not fired: its copy is closed here, and it stops nothing from now
-		syscall.Close(int(end - 1))
-	}
+	cl.kmu.Lock() // behind a timer that is stopping the group: its stop never follows the kill
+	cl.swept = true
+	cl.kmu.Unlock()
 	kill(reached)
 	byPidfd(as, group, syscall.SIGKILL) // what a reaped command left in its group
 }
@@ -1097,8 +1104,10 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 // byPidfd signals a pidfd's command and group, and says if the group was reached: by number either may be another's.
 func byPidfd(as *syscall.Credential, group uintptr, sig syscall.Signal) bool {
 	send := func() bool { // shortcut: no group signal so before Linux 6.9, nor for a reaped command on gVisor: its untagged leftovers run on
-		syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, 0, 0, 0) // the command itself too: it may have left its group for another, with one of the group's still there
-		_, _, err := syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, pidfdSignalProcessGroup, 0, 0)
+		_, _, err := syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, pidfdSignalProcessGroup|pidfdNoGroup.Load(), 0, 0)
+		if err == 0 { // the command itself too, which may have left its group: behind its group's, since continued first it can be reaped before a group no pidfd signals is continued by number
+			syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, 0, 0, 0)
+		}
 		return err == 0
 	}
 	sent := send()

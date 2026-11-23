@@ -2289,6 +2289,64 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
+APART = ["a start found it running", "the look timed out", "ours", "resuming"]
+
+
+@pytest.mark.parametrize("how", APART)
+async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
+    daemons: Daemons,
+    clock: types.SimpleNamespace,
+    timers: None,
+    interval: collections.abc.Callable[[], None],
+    how: str,
+) -> None:
+    """Regression: it ended 137, though its command may have ended 0, unheard."""
+    cut, reached, starts = asyncio.Event(), [0], [0]
+
+    async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        reached[0] += 1
+        await read_frame(r)  # START; on a second connection, the call's RESUME
+        resumed = reached[0] == 2
+        if not resumed:
+            await cut.wait()
+        if how == "the look timed out":  # reached again, it says nothing
+            daemons.ports[old] = silent.sockets[0].getsockname()[1]
+        elif how != "resuming" or resumed:
+            first.close()  # execd is gone, and a start makes another
+        if how == "ours":
+            await r.read()  # the client's own timer ends this connection
+        w.close()
+
+    async def says_nothing(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        reached[0] += 1
+        await r.read()
+
+    async def start(replace: bool) -> execd.Daemon:
+        starts[0] += 1
+        if how == "a start found it running" and starts[0] == 2:
+            raise execd.DaemonRunning("address already in use")
+        return daemons.unstarted.pop(0)
+
+    first = await daemons.serve(is_killed, container=b"b:5")
+    old = daemons.unstarted[0]
+    await daemons.serve(says_nothing, container=b"b:5")
+    silent = await asyncio.start_server(says_nothing, "127.0.0.1", 0)
+    client = execd.ExecdClient(start)
+    call = asyncio.ensure_future(client.exec(["sh"], None, None, {}, None, 99))
+    await until(lambda: starts_written(client) == 1)
+    link = client._link
+    cut.set()
+    if how == "the look timed out":
+        await until(lambda: reached[0] == 2)
+        clock.now += execd.CONNECT_TIMEOUT
+    while how == "ours" and link is not None and not link.closed:
+        interval()  # no frame for 60 s: the client ends the connection itself
+        await asyncio.sleep(0.001)
+    with pytest.raises(error.ExecdStoppedError):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+    silent.close()
+
+
 async def test_a_call_started_again_ends_with_our_wait_where_no_word_comes(
     daemons: Daemons, clock: types.SimpleNamespace, timers: None
 ) -> None:

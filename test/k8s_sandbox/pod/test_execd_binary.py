@@ -536,6 +536,9 @@ async def test_a_killed_commands_handler_runs_whichever_thread_sigterm_is_for(
     sandbox: Sandbox, client: execd.ExecdClient
 ) -> None:
     """Regression: sent to a stopped process as a whole, SIGTERM went to any thread."""
+    probe = "import os, signal; signal.pidfd_send_signal(os.pidfd_open(1), 0, None, 1)"
+    if sandbox.sh(f"python3 -c '{probe}'").returncode:  # refused before Linux 6.9
+        pytest.skip("no thread is signalled through a pidfd here")
     mark = f"/tmp/{uuid.uuid4().hex}"
     head = "import os, pathlib, signal, sys, threading\nwait = threading.Event().wait\n"
     head += "mark = pathlib.Path(sys.argv[1])\n"
