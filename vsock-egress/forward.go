@@ -136,6 +136,9 @@ func (f *forwarder) serve(l net.Listener) error {
 	}
 }
 
+// clientBuffer caps a stream's socket to its client each way, and the kernel accounts twice it: it bounds what the streams a guest stalls hold, under the forwarder's memory limit in the chart, and is a quarter of the worker's proxyBuffer because loopback needs no more.
+const clientBuffer = 128 << 10
+
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
 func (f *forwarder) stream(c *net.TCPConn) {
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
@@ -147,9 +150,9 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
-	// Capped as the worker's socket to the proxy is: left to grow, the buffers of streams a guest stalls pass the forwarder's memory limit, and the kernel kills it.
-	c.SetReadBuffer(proxyBuffer)
-	c.SetWriteBuffer(proxyBuffer)
+	// Only now: a connection that waits for a place keeps the smaller buffer the kernel starts it with.
+	c.SetReadBuffer(clientBuffer)
+	c.SetWriteBuffer(clientBuffer)
 	up, err := f.dial()
 	if err != nil {
 		log.Print(err)
