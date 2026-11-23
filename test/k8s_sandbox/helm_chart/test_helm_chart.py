@@ -1024,13 +1024,14 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
 
 
+@pytest.mark.parametrize("card", [False, True])
 def test_a_pod_with_the_egress_forwarder_is_of_the_guaranteed_qos_class(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, card: bool
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
         test_resources_dir / "egress-proxy-values.yaml",
-        set_string=f"services.default.podAnnotations.{_NO_CARD}",
+        set_string=None if card else f"services.default.podAnnotations.{_NO_CARD}",
     )
 
     pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
