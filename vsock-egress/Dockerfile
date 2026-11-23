@@ -3,6 +3,7 @@ FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.26-alpine@
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum *.go ./
+COPY profiles profiles
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/vsock-egress .
 
 FROM scratch
