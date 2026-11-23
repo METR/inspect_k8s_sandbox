@@ -407,8 +407,8 @@ func (s *server) resume(c *conn, f frame) {
 		return
 	}
 	cl.sub = c
-	// Tell the client how much stdin arrived, so it can send the rest.
-	got, _ := json.Marshal(map[string]any{"stdin": cl.stdinGot, "eof": cl.stdinEOF, "put": cl.stdinPut})
+	// Tell the client how much stdin arrived, so it can send the rest, and whether the command has ended: until its EXIT has come, the client knows less than execd.
+	got, _ := json.Marshal(map[string]any{"stdin": cl.stdinGot, "eof": cl.stdinEOF, "put": cl.stdinPut, "exited": cl.exited})
 	c.send(fResumed, f.id, got)
 	cl.ackLocked(req) // the client has everything before the offsets it resumes from
 	cl.sent = [2]int{cl.base[0], cl.base[1]}
@@ -1003,6 +1003,9 @@ func (cl *call) stop(timeout bool) {
 				if _, err := fmt.Fscanln(t.more, &p, &started); err != nil {
 					break
 				}
+				if f := stat(p); len(f) <= 19 || f[19] != started { // its id is another's by now: the check below would be of that one
+					continue
+				}
 				status, _ := os.ReadFile("/proc/" + strconv.Itoa(p) + "/status")
 				_, ids, _ := bytes.Cut(status, []byte("\nUid:\t"))
 				if f, uid := bytes.Fields(ids), fmt.Append(nil, as.Uid); len(f) > 2 && (bytes.Equal(f[0], uid) || bytes.Equal(f[2], uid)) { // what its user may signal and no more: a traced helper says what its tracer likes
@@ -1105,7 +1108,7 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 func byPidfd(as *syscall.Credential, group uintptr, sig syscall.Signal) bool {
 	send := func() bool { // shortcut: no group signal so before Linux 6.9, nor for a reaped command on gVisor: its untagged leftovers run on
 		_, _, err := syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, pidfdSignalProcessGroup|pidfdNoGroup.Load(), 0, 0)
-		if err == 0 { // the command itself too, which may have left its group: behind its group's, since continued first it can be reaped before a group no pidfd signals is continued by number
+		if err == 0 || sig != syscall.SIGCONT { // the command itself too, which may have left its group: its continue only behind its group's, since continued first it can be reaped before a group no pidfd signals is continued by number
 			syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, 0, 0, 0)
 		}
 		return err == 0

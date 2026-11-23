@@ -175,7 +175,7 @@ class _Pipe:
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
             if self._ended:  # only now: the frames read with its end are execd's last
-                raise ConnectionResetError("execd ended the TLS session")
+                raise ConnectionAbortedError("execd ended the TLS session")
             raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
             for i in range(0, len(raw), SLICE):
@@ -541,13 +541,14 @@ class Link:
                         if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
                         c.got[kind - STDOUT] += n
-                    if kind == RESUMED:
-                        c.resuming = False
+                    if kind == RESUMED:  # out of reach until the EXIT of one that ended
+                        said = json.loads(payload)
+                        c.resuming = type(said) is dict and said.get("exited") is True
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
-        except OSError:
-            self.ended = True
+        except OSError as e:  # but its close_notify: a live execd closed this one
+            self.ended = not isinstance(e, ConnectionAbortedError)
         except (ValueError, LookupError, TypeError):  # not execd's frames
             pass
         finally:
@@ -617,7 +618,11 @@ class ExecdClient:
         delay = self._backoff if recent else 0.0
         while True:
             # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
-            await asyncio.sleep(delay)
+            wait, last = delay, self._link
+            # No wait where execd's side ended one: gone later, it may have outlived it.
+            at_once = last is not None and last.ended
+            if not at_once:
+                await asyncio.sleep(wait)
             delay = min(max(delay * 2, 0.2), 5.0)
             link = None
             try:
@@ -635,6 +640,8 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 if daemon.pod != self._pod():  # replaced as this opened
                     raise Dropped("the daemon's pod was replaced")
+                if at_once:  # the wait it skipped: one that drops as it opens is paced
+                    await asyncio.sleep(wait)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 async with link.bulk:  # no START or STDIN goes between what is owed
@@ -645,8 +652,8 @@ class ExecdClient:
                 if link is not None:
                     await link.close()
                 # Only the first look, and no timeout, shows execd went as it ended.
-                last, timed_out = self._link, isinstance(e, asyncio.TimeoutError)
-                first = last if last and last.ended and not timed_out else None
+                timed_out = isinstance(e, asyncio.TimeoutError)
+                first = last if at_once and not timed_out else None
                 if last is not None:
                     last.ended = False
                 if time.monotonic() > deadline:
