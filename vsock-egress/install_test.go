@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,7 +10,15 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
+
+// installing is this binary as install, started as the init container starts it and bounded as the test guide bounds a wait.
+func installing(t *testing.T, args ...string) *exec.Cmd {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	t.Cleanup(cancel)
+	return exec.CommandContext(ctx, os.Args[0], append([]string{"install"}, args...)...)
+}
 
 func TestInstallReplacesEachProfileWhole(t *testing.T) {
 	defer syscall.Umask(syscall.Umask(0)) // no mask: the modes are the ones install asks for
@@ -62,7 +71,7 @@ func TestInstallFailsWhereAProfileCannotTakeItsPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := exec.Command(os.Args[0], "install", dir).CombinedOutput()
+	out, err := installing(t, dir).CombinedOutput()
 
 	if err == nil || !strings.Contains(string(out), "install_failed: ") {
 		t.Fatalf("got %v and %q: want install_failed with a directory where a profile goes, or the node would be taken to hold it", err, out)
@@ -73,7 +82,7 @@ func TestInstallFailsWhereAProfileCannotTakeItsPlace(t *testing.T) {
 }
 
 func TestInstallFailsWhereHelpIsAsked(t *testing.T) {
-	out, err := exec.Command(os.Args[0], "install", "-h", t.TempDir()).CombinedOutput()
+	out, err := installing(t, "-h", t.TempDir()).CombinedOutput()
 
 	if err == nil || !strings.Contains(string(out), "install_failed: ") {
 		t.Fatalf("got %v and %q: want install_failed, as exit status 0 would tell the kubelet the profiles are in place", err, out)
@@ -82,7 +91,7 @@ func TestInstallFailsWhereHelpIsAsked(t *testing.T) {
 
 func TestInstallFailsWhereAProfileIsCutShort(t *testing.T) {
 	dir := t.TempDir()
-	short := exec.Command(os.Args[0], "install", dir)
+	short := installing(t, dir)
 	short.Env = append(os.Environ(), fullDisk+"=4096") // less than either profile
 
 	out, err := short.CombinedOutput()
