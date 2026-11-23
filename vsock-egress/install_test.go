@@ -12,6 +12,7 @@ import (
 )
 
 func TestInstallReplacesEachProfileWhole(t *testing.T) {
+	defer syscall.Umask(syscall.Umask(0o022)) // the init container's
 	dir := filepath.Join(t.TempDir(), "profiles")
 	place := filepath.Join(dir, "vsock-egress.json")
 	// A node's first install makes the directory; the next finds an older profile there, and a link to it under the copy's name.
@@ -42,8 +43,12 @@ func TestInstallReplacesEachProfileWhole(t *testing.T) {
 			t.Fatalf("%s holds %d bytes, %v: want this architecture's %d", name, len(got), err, len(want))
 		}
 	}
-	if newer, err := os.Stat(place); err != nil || os.SameFile(older, newer) {
+	newer, err := os.Stat(place)
+	if err != nil || os.SameFile(older, newer) {
 		t.Fatalf("the older profile was written over in place (%v): the runtime could read half a profile", err)
+	}
+	if made, err := os.Stat(dir); err != nil || made.Mode().Perm() != 0o755 || newer.Mode().Perm() != 0o644 {
+		t.Fatalf("the directory's mode is %v and the profile's %v, %v: want 0755 and 0644, as mkdir and cp gave them", made.Mode(), newer.Mode(), err)
 	}
 }
 
