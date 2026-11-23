@@ -116,7 +116,8 @@ func line(c io.Reader) (string, error) {
 }
 
 // canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
-func canary([]string) error {
+func canary(args []string) error {
+	flag.NewFlagSet("canary", flag.ExitOnError).Parse(args) // it has none: -h says so to the test that holds the sandbox's commands to their flags
 	bound := "ok"
 	if l, err := vsockListen(canaryPort); err != nil {
 		log.Print(err)
