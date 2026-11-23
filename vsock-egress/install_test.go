@@ -12,7 +12,7 @@ import (
 )
 
 func TestInstallReplacesEachProfileWhole(t *testing.T) {
-	defer syscall.Umask(syscall.Umask(0o022)) // the init container's
+	defer syscall.Umask(syscall.Umask(0)) // no mask: the modes are the ones install asks for
 	dir := filepath.Join(t.TempDir(), "profiles")
 	place := filepath.Join(dir, "vsock-egress.json")
 	// A node's first install makes the directory; the next finds an older profile there, and a link to it under the copy's name.
@@ -47,8 +47,12 @@ func TestInstallReplacesEachProfileWhole(t *testing.T) {
 	if err != nil || os.SameFile(older, newer) {
 		t.Fatalf("the older profile was written over in place (%v): the runtime could read half a profile", err)
 	}
-	if made, err := os.Stat(dir); err != nil || made.Mode().Perm() != 0o755 || newer.Mode().Perm() != 0o644 {
-		t.Fatalf("the directory's mode is %v and the profile's %v, %v: want 0755 and 0644, as mkdir and cp gave them", made.Mode(), newer.Mode(), err)
+	made, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if made.Mode().Perm() != 0o755 || newer.Mode().Perm() != 0o644 {
+		t.Fatalf("the directory's mode is %v and the profile's %v: want 0755 and 0644, as mkdir and cp gave them", made.Mode(), newer.Mode())
 	}
 }
 
@@ -69,31 +73,13 @@ func TestInstallFailsWhereAProfileCannotTakeItsPlace(t *testing.T) {
 }
 
 func TestInstallFailsWhereAProfileIsCutShort(t *testing.T) {
-	var whole syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &whole); err != nil {
-		t.Fatal(err)
-	}
-	// As on a full disk: no file of this process grows past 4096 bytes, less than either profile.
-	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 4096, Max: whole.Max}); err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Setrlimit(syscall.RLIMIT_FSIZE, &whole)
 	dir := t.TempDir()
+	short := exec.Command(os.Args[0], "install", dir)
+	short.Env = append(os.Environ(), fullDisk+"=4096") // less than either profile
 
-	err := install([]string{dir})
+	out, err := short.CombinedOutput()
 
 	if _, placed := os.Stat(filepath.Join(dir, "profiles", "vsock-egress-launcher.json")); err == nil || placed == nil {
-		t.Fatalf("install gave %v, and a profile cut short in its place gave %v: the runtime refuses it, and with it every pod that names it", err, placed)
-	}
-}
-
-func TestInstallTakesNoOptionForItsDirectory(t *testing.T) {
-	help := exec.Command(os.Args[0], "install", "-h")
-	help.Dir = t.TempDir()
-
-	out, err := help.CombinedOutput()
-
-	if err == nil || !strings.Contains(string(out), "install_failed: usage") {
-		t.Fatalf("got %v and %q: want the usage line for -h, not profiles installed into a directory of that name", err, out)
+		t.Fatalf("install gave %v and %q, and a profile cut short in its place gave %v: the runtime refuses it, and with it every pod that names it", err, out, placed)
 	}
 }

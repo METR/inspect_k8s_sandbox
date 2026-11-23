@@ -3,11 +3,11 @@ package main
 import (
 	"embed"
 	"errors"
+	"flag"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 //go:embed profiles
@@ -15,24 +15,22 @@ var profiles embed.FS
 
 // install writes this build's two seccomp profiles into profiles/ of the kubelet's seccomp directory, so the image that installs them needs no shell.
 func install(args []string) error {
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
 		return errors.New("usage: vsock-egress install <the kubelet's seccomp directory>")
 	}
-	from, to := path.Join("profiles", runtime.GOARCH), filepath.Join(args[0], "profiles")
-	entries, err := profiles.ReadDir(from)
-	if err != nil {
-		return err
-	}
+	to := filepath.Join(fs.Arg(0), "profiles")
 	if err := os.MkdirAll(to, 0o755); err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		profile, err := profiles.ReadFile(path.Join(from, entry.Name()))
+	for _, name := range []string{"vsock-egress-launcher.json", "vsock-egress.json"} {
+		profile, err := profiles.ReadFile(path.Join("profiles", runtime.GOARCH, name))
 		if err != nil {
 			return err
 		}
 		// Made anew beside its place, then renamed: the runtime never reads half a profile, and nothing left there is written through.
-		beside := filepath.Join(to, "."+entry.Name())
+		beside := filepath.Join(to, "."+name)
 		if err := os.Remove(beside); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -44,7 +42,7 @@ func install(args []string) error {
 		if err = errors.Join(err, file.Close()); err != nil {
 			return err
 		}
-		if err := os.Rename(beside, filepath.Join(to, entry.Name())); err != nil {
+		if err := os.Rename(beside, filepath.Join(to, name)); err != nil {
 			return err
 		}
 	}

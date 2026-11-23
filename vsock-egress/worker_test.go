@@ -744,6 +744,9 @@ const hostileWorker = "VSOCK_EGRESS_TEST_HOSTILE_WORKER"
 // brokenReaper, in the environment, makes this binary as a reaper stop itself ("stops") or end having done nothing ("fails").
 const brokenReaper = "VSOCK_EGRESS_TEST_BROKEN_REAPER"
 
+// fullDisk, in the environment, is the most bytes a file may hold that this binary writes, as on a disk with no more room.
+const fullDisk = "VSOCK_EGRESS_TEST_FULL_DISK"
+
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap" || os.Args[1] == "install") { // tests start this binary as these commands
 		switch how := os.Getenv(brokenReaper); {
@@ -765,6 +768,9 @@ func TestMain(m *testing.M) {
 			for {
 				syscall.Kill(-1, syscall.Signal(signal))
 			}
+		}
+		if most, err := strconv.ParseUint(os.Getenv(fullDisk), 10, 64); err == nil {
+			syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: most, Max: most})
 		}
 		main()
 		return
