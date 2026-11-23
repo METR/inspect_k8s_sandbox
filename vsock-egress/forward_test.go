@@ -314,6 +314,37 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 	}
 }
 
+func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
+	_, placed := tcpPair(t)
+	_, waiting := tcpPair(t)
+	_, untouched := tcpPair(t)
+	kept, err := waiting.File() // the socket, past the stream's close of it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+	f := newForwarder(0, 0)
+	f.wait = time.Millisecond
+	var held [2]int
+	f.connect = func(uint32, uint32) (*os.File, error) { // a stream dials the node once it has its place and its caps
+		held = buffers(t, placed)
+		return nil, errors.New("the test has seen the socket")
+	}
+
+	f.stream(placed)
+	for range maxStreams { // every place is taken
+		f.slots <- struct{}{}
+	}
+	f.stream(waiting)
+
+	if want := capped(t, clientBuffer); held != want {
+		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
+	}
+	if got, want := buffers(t, kept), buffers(t, untouched); got != want {
+		t.Errorf("a connection that got no place holds %v bytes each way: want %v, as one nothing touched: capped, the 448 that wait can hold more than the forwarder's limit", got, want)
+	}
+}
+
 func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
 	f := keyedForwarder(0, 0)
 	for range maxStreams + maxWaiting { // it holds back all it may, with a place free for the next it takes
