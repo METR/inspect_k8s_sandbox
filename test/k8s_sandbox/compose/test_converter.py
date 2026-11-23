@@ -177,6 +177,8 @@ services:
       resources:
         limits:
           memory: 1G
+    healthcheck: {{test: [CMD, "true"]}}
+    x-k8s: {{resources: {{requests: {{ephemeral-storage: 1Gi}}}}}}
   later: {later}
   last: {later}
 """)
