@@ -211,7 +211,7 @@ print(*said)
   || fail "under the forwarder's profile ioctl 0xC0200A00, the same with bit 32 set, and 0xC0200A01 on /dev/null gave '$nsm', not 'EPERM EPERM ENOTTY'"
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
-pod=$(launcher); launching=$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none) # found before the canary starts: it ends itself after 90 s, and check waits 60
+pod=$(launcher); launching=$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none) # found before the canary starts: check must start within the 90 s that the canary lasts
 k -n "$NS" exec "$SANDBOX" -c egress-forwarder -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 contract=$(k -n "$LNS" exec "$pod" -c "$launching" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
