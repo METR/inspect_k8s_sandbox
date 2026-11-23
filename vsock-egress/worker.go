@@ -26,7 +26,7 @@ type worker struct {
 	slots   chan struct{} // one for each open stream
 	unkeyed chan struct{} // one for each connection whose key has not been checked yet
 	keyWait time.Duration // how long a connection has to show its key
-	stall   time.Duration // how long the proxy may leave a write to it waiting
+	stall   time.Duration // how long the proxy may leave a write to it, or the end of them, waiting
 
 	mu      sync.Mutex
 	key     []byte // the forwarder's
@@ -59,7 +59,7 @@ type failedLookup struct {
 // endedWait is how long a stream whose dial failed is given to show that the guest had already ended it.
 const endedWait = 10 * time.Millisecond
 
-// stallWait ends a stream whose proxy has stopped reading: it would hold its slot, and the forwarder's, for as long as the proxy kept the connection.
+// stallWait ends a stream whose proxy, or whose client in the sandbox, has stopped reading: it would hold its slot and its place for as long as that peer kept the connection.
 const stallWait = 5 * time.Minute
 
 // proxyBuffer caps a stream's socket to the proxy each way, and the kernel accounts twice it, in memory every worker on the node shares; at half of it a download from another zone lost 5%.
