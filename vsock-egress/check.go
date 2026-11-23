@@ -115,9 +115,16 @@ func line(c io.Reader) (string, error) {
 	return bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
 }
 
+// canaryLife ends a canary, which outlives the kubectl exec that started it: check must start within it.
+const canaryLife = 90 * time.Second
+
 // canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
 func canary(args []string) error {
 	flag.NewFlagSet("canary", flag.ExitOnError).Parse(args) // it has none: -h says so to the test that holds the sandbox's commands to their flags
+	return canaryFor(canaryLife)
+}
+
+func canaryFor(life time.Duration) error {
 	bound := "ok"
 	if l, err := vsockListen(canaryPort); err != nil {
 		log.Print(err)
@@ -137,7 +144,7 @@ func canary(args []string) error {
 			}
 		}()
 	}
-	for last := ""; ; time.Sleep(time.Second) {
+	for last, end := "", time.Now().Add(life); time.Now().Before(end); time.Sleep(time.Second) {
 		c, err := vsockDial(hostCID, canaryPort)
 		if err != nil {
 			if last != err.Error() { // reset while no check is running: said once
@@ -149,4 +156,5 @@ func canary(args []string) error {
 		fmt.Fprintf(c, "bind: %s\n", bound)
 		c.Close()
 	}
+	return nil
 }
