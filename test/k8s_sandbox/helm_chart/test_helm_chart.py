@@ -970,6 +970,7 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
 
 
 _EGRESS_PROXY = "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local.:3128"
+_FORWARDER = "egress-forwarder-with-a-name-too-long-for-any-service-to-share"
 
 
 def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
@@ -990,7 +991,7 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     }
     # A sidecar: started before `setup` and the service, restarted if it ends.
     forwarder, setup = pods["agent-env-my-release-default"]["initContainers"]
-    assert (forwarder["name"], setup["name"]) == ("egress-forwarder", "setup")
+    assert (forwarder["name"], setup["name"]) == (_FORWARDER, "setup")
     assert forwarder["restartPolicy"] == "Always"
     # The service starts once the probe finds the key where the forwarder keeps it.
     [mount] = forwarder["volumeMounts"]
@@ -1021,7 +1022,23 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["metadata"]["annotations"]["inspect-k8s-sandbox/egress-proxy"] == (
         "agent-env-my-release-egress-proxy.default.svc.cluster.local.:3128"
     )
-    assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
+    assert pod["spec"]["initContainers"][0]["name"] == _FORWARDER
+
+
+def test_no_service_can_share_the_egress_forwarders_container_name(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "egress-proxy-values.yaml",
+        "global.fullnameOverride=x",
+    )
+
+    [stateful_set] = _get_documents(documents, "StatefulSet")
+    forwarder = stateful_set["spec"]["template"]["spec"]["initContainers"][0]["name"]
+    # A StatefulSet's name ("x-default" here) and a container's: 63 characters at most.
+    longest_service = 63 - len(stateful_set["metadata"]["name"]) + len("default")
+    assert longest_service < len(forwarder) <= 63
 
 
 def test_egress_proxy_annotation_needs_the_forwarder_image(
