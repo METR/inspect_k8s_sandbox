@@ -859,6 +859,7 @@ class ExecdClient:
                         kind == ERROR
                         and payload == b"unknown call"
                         and call.resuming
+                        and not call.ended
                         and not any(call.got)
                         and not call.stdin_put
                     ):

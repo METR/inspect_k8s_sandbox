@@ -2239,20 +2239,26 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
 
 KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
     "back late": (b"b:5", b"b:5", 137),
+    "an old connection": (b"b:5", b"b:5", 137),
     "restarted": (b"b:5", b"b:6", error.ExecdStoppedError),
     "no boot id": (b":5", b":5", error.ExecdStoppedError),
 }
 
 
-@pytest.mark.parametrize("case", KILLED.values(), ids=KILLED)
+@pytest.mark.parametrize("how", KILLED)
 async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
-    daemons: Daemons, clock: types.SimpleNamespace, timers: None, case: typing.Any
+    daemons: Daemons, clock: types.SimpleNamespace, timers: None, how: str
 ) -> None:
-    was, again, ends = case
+    (was, again, ends), old = KILLED[how], how == "an old connection"
     killed, back, starts, later = asyncio.Event(), asyncio.Event(), [0], list[int]()
 
     async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        _, call_id, _ = await read_frame(r)  # START
+        kind, call_id, _ = await read_frame(r)  # START
+        if old:  # of a call that ends, 45 s before the one whose execd is killed
+            w.write(frame(execd.EXIT, call_id, b'{"code": 0}'))
+            kind = execd.EXIT
+        while kind != execd.START:
+            kind, call_id, _ = await read_frame(r)
         w.write(frame(execd.STDOUT, call_id, b"so far\n"))
         await killed.wait()
         first.close()  # execd is gone, and the next start makes another
@@ -2271,8 +2277,11 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     first = await daemons.serve(is_killed, container=was)
     await daemons.serve(started_again, container=again)
     client = execd.ExecdClient(start)
+    if old:  # only its own frames since say that execd still heard us
+        await asyncio.wait_for(client.exec(["true"], None, None, {}, None, 9), 30)
+        clock.now += execd.DEAD_AFTER
     call = asyncio.ensure_future(client.exec(["sh"], None, None, {}, None, 9))
-    await until(lambda: starts_written(client) == 1)
+    await until(lambda: starts_written(client) == 1 + old)
     killed.set()
     if ends == 137:  # our timer passes while execd starts again: it is asked again
         await until(lambda: starts[0] == 2)
@@ -2410,9 +2419,12 @@ async def test_a_call_resumed_as_ended_is_not_started_again(daemons: Daemons) ->
             got.append(kind)
             if got == [execd.START]:
                 break  # the connection is dropped under it
+            if got == [execd.START, execd.RESUME]:  # it had ended; then, unasked, not
+                for said in (b"true", b"false"):
+                    said = b'{"stdin": 0, "eof": true, "put": 0, "exited": %s}' % said
+                    w.write(frame(execd.RESUMED, call, said))
+                break  # and dropped again
             if kind == execd.RESUME:
-                said = b'{"stdin": 0, "eof": true, "put": 0, "exited": true}'
-                w.write(frame(execd.RESUMED, call, said))
                 w.write(frame(execd.ERROR, call, b"unknown call"))
             elif kind == execd.START:  # started again: answer, so the test ends
                 w.write(frame(execd.EXIT, call, b'{"code": 0}'))
