@@ -9,6 +9,7 @@ from websocket import WebSocketException
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.execute import _shell_command
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
@@ -34,14 +35,18 @@ def read_command(src: Path) -> list[str]:
 
 
 class ReadFileOperation(PodOperation):
-    def read_file(self, src: Path, dst: IO[bytes]) -> None:
-        with self._start_read_command(src) as ws_client:
+    def read_file(
+        self, src: Path, dst: IO[bytes], user: str | None = None, switch: bool = False
+    ) -> None:
+        with self._start_read_command(src, user, switch) as ws_client:
             self._handle_stream_output(ws_client, dst)
 
     @contextmanager
-    def _start_read_command(self, src: Path) -> Generator[WSClient, None, None]:
+    def _start_read_command(
+        self, src: Path, user: str | None = None, switch: bool = False
+    ) -> Generator[WSClient, None, None]:
         yield from self.create_websocket_client_for_exec(
-            command=read_command(src),
+            command=_shell_command(user, switch, read_command(src)),
             stderr=True,
             # Without stdin, kubelet closes the exec's input as soon as the stream
             # opens, which races the stdout read in Kata Containers' Go shim and hangs
