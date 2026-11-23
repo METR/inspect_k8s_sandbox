@@ -71,10 +71,7 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer, stall time.Du
 
 // taken waits, for wait at most, until the peer has acknowledged all that tcp sent it and its end: closed sooner, the kernel keeps the socket and what is unsent for minutes after its stream's place is free.
 func taken(tcp *net.TCPConn, wait time.Duration) (all bool) {
-	raw, err := tcp.SyscallConn()
-	if err != nil {
-		return true
-	}
+	raw, _ := tcp.SyscallConn() // it fails for a nil connection alone
 	for pause, end := time.Millisecond, time.Now().Add(wait); ; pause = min(2*pause, 100*time.Millisecond) {
 		all = true // where the kernel does not say, the close is as it was
 		raw.Control(func(fd uintptr) {
