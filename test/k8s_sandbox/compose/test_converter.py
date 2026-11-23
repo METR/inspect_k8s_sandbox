@@ -1056,6 +1056,21 @@ services:
     assert "Conflicting 'requests.memory'" in str(exc_info.value)
 
 
+def test_rejects_a_deploy_limit_shared_as_the_extension_request(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    # deploy's limit populates requests.memory too, through an alias or written out.
+    compose_path = tmp_compose("""
+services:
+  default:
+    deploy: {resources: {limits: &memory {memory: 1G}}}
+    x-inspect_k8s_sandbox: {resources: {requests: *memory}}
+""")
+
+    with pytest.raises(ComposeConverterError, match="Conflicting 'requests.memory'"):
+        _converter.convert_compose_to_helm_values(compose_path)
+
+
 def test_service_extension_output_validates_against_chart_schema(
     tmp_compose: TmpComposeFixture,
 ) -> None:
