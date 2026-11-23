@@ -532,6 +532,29 @@ async def test_a_timed_out_command_is_killed(
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
+async def test_a_killed_commands_handler_runs_whichever_thread_sigterm_is_for(
+    sandbox: Sandbox, client: execd.ExecdClient
+) -> None:
+    """Regression: sent to a stopped process as a whole, SIGTERM went to any thread."""
+    mark = f"/tmp/{uuid.uuid4().hex}"
+    head = "import pathlib, signal, sys, threading\nwait = threading.Event().wait\n"
+    head += "mark = pathlib.Path(sys.argv[1])\n"
+    first = head + "signal.signal(signal.SIGTERM, lambda *_: mark.touch())\n"
+    first += "for _ in range(64): threading.Thread(target=wait, daemon=True).start()\n"
+    other = head + "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+    other += "def take(): signal.sigwait({signal.SIGTERM}); mark.touch()\n"
+    other += "threading.Thread(target=take, daemon=True).start()\n"
+    ready = "pathlib.Path(sys.argv[1] + '.ready').touch()\nwait()"
+    for script in (first, first, first, other):  # by chance the first takes it 1 in 65
+        argv = ["python3", "-c", script + ready, mark]
+        call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, None))
+        await sandbox.until(f"test -e {mark}.ready")
+        call.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await call
+        await sandbox.until(f"test -e {mark} && rm {mark} {mark}.ready")
+
+
 async def test_a_timed_out_command_holding_every_pid_does_not_end_execd(
     sandbox: Sandbox,
     relay: Relay,

@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -44,13 +43,6 @@ func TestMain(m *testing.M) {
 		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
 		syscall.Exec(os.Args[2], os.Args[2:], nil)
 		os.Exit(1) // not on into the tests, as the command
-	}
-	if len(os.Args) > 1 && os.Args[1] == "joined" { // as a setuid binary leaves the one who ran it: of user 65534 with root's effective user; it ignores SIGTERM until its stdin ends
-		syscall.Setreuid(65534, 0)
-		signal.Ignore(syscall.SIGTERM)
-		os.Stdout.WriteString("ready\n")
-		io.Copy(io.Discard, os.Stdin)
-		return
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
 		main()
@@ -1395,6 +1387,10 @@ func until(t *testing.T, what string, met func() bool) {
 
 func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) {
 	end := graced(t)
+	var group uintptr // the pidfd its kill opens
+	open := pidfdOpen
+	pidfdOpen = func(pid int) (uintptr, syscall.Errno) { fd, errno := open(pid); group = fd; return fd, errno }
+	t.Cleanup(func() { pidfdOpen = open })
 	s, c, frames, _, _ := ready(t, map[bool]string{true: "65534"}[os.Getuid() == 0], "/bin/sh", "-c", `trap 'echo x' TERM; echo ready; i=0; while :; do i=$((i+1)); [ $((i % 2000)) -ne 0 ] || echo .; done`) // as another user where execd is root, its tag kept: it says each SIGTERM it takes at once, the kill's and any that user's helper sends behind it, and runs on
 	on := func(out string) bool { return strings.Count(out[strings.LastIndex(out, "x")+1:], ".") >= 30 }
 	if os.Getuid() == 0 && s.get(80).search(&syscall.Credential{Uid: 65534, Gid: 65534}, syscall.SIGTERM, map[int]string{}).more != nil {
@@ -1409,6 +1405,10 @@ func TestAKilledCommandHasItsSigtermAndWhenTheGraceIsUpItsSigkill(t *testing.T) 
 	if n, status := end(), exitStatus(t, frames); n != 1 || status["code"] != 137.0 {
 		t.Fatalf("%d timers of 5 s, EXIT %v: want the first kill's alone, and the SIGKILL of a command that ran on to its grace's end", n, status)
 	}
+	until(t, "the kill kept its command's pidfd open once its sweep had ended", func() bool {
+		_, _, errno := syscall.Syscall6(sysPidfdSendSignal, group, 0, 0, 0, 0, 0)
+		return errno == syscall.EBADF // closed: left open, a reaped command's says ESRCH
+	})
 }
 
 func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
@@ -1432,34 +1432,21 @@ func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
 	}
 }
 
-// Regression: joined to its group, another user's process held a timed-out call's exit for the grace.
-func TestAKilledCallsExitDoesNotWaitForAnotherUsersProcessThatJoinedItsGroup(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("needs a process of another user")
-	}
-	graced(t) // no grace's end lets the exit go: it comes without one
-	s, c, frames, _, group := ready(t, "", "sh", "-c", "echo $$; exec sleep 600")
-	joiner := exec.Command(os.Args[0], "joined") // root's only in its effective user: by that one alone it would pass for the command's
-	joiner.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	joiner.SysProcAttr.Pgid, _ = strconv.Atoi(strings.TrimSpace(group))
-	stdin, _ := joiner.StdinPipe()
-	stdout, _ := joiner.StdoutPipe()
-	if err := joiner.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { stdin.Close(); joiner.Wait() })
-	stdout.Read(make([]byte, 6)) // "ready": it ignores SIGTERM by now
-	s.dispatch(c, frame{kind: fKill, id: 80})
-	exitStatus(t, frames)
-}
-
 // Regression: with no descriptor left for the pidfd that names its group, a kill still gave a grace, whose end could not reach what was left in that group.
 func TestAKillWithNoDescriptorForItsCommandsPidfdSendsSigkillAtOnce(t *testing.T) {
 	open := pidfdOpen
 	t.Cleanup(func() { pidfdOpen = open })
-	for errno, want := range map[syscall.Errno]float64{syscall.EMFILE: 137, syscall.ENOSYS: 7} { // none left: SIGKILL at once; none on this kernel: SIGTERM, and the group continued by its number, as where a pidfd signals none
-		pidfdOpen = func(int) (uintptr, syscall.Errno) { return ^uintptr(0), errno }
-		s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "" TERM; (trap "exit 7" TERM; echo ready; while :; do :; done) & wait $!`) // one of its group with no child: only the group's SIGCONT lets it take its SIGTERM
+	spare, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{}) // it leads no group: its pidfd signals none, as any pidfd before Linux 6.9
+	t.Cleanup(func() { spare.Kill() })
+	for errno, want := range map[syscall.Errno]float64{syscall.EMFILE: 137, syscall.ENFILE: 137, syscall.ENOSYS: 7, 0: 7} { // none left: SIGKILL at once; none on this kernel, or one that signals no group: SIGTERM, and the group continued by its number
+		pidfdOpen = func(int) (uintptr, syscall.Errno) {
+			if errno == 0 {
+				return open(spare.Pid)
+			}
+			return ^uintptr(0), errno
+		}
+		// One of its group with no child: only the group's SIGCONT lets it take its SIGTERM. As another user where execd is root: with no pidfd only that user's signal by number kills the command, which says 9 where its worker alone was killed.
+		s, c, frames, _, _ := ready(t, map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap "" TERM; (trap "exit 7" TERM; echo ready; while :; do :; done) & wait $!; exit $(($? % 128))`)
 		s.dispatch(c, frame{kind: fKill, id: 80})
 		if code := exitStatus(t, frames)["code"]; code != want {
 			t.Fatalf("exit %v where pidfd_open fails with %v: want %v", code, errno, want)
@@ -1556,11 +1543,13 @@ func TestAKillsLastSigkillSparesProcessesGivenItsCommandsAndASurvivorsIds(t *tes
 	survivor, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{})
 	others := map[*os.Process]chan syscall.WaitStatus{command: reaper.watch(command.Pid), survivor: reaper.watch(survivor.Pid)}
 	reaper.mu.Unlock()
+	t.Cleanup(func() { command.Kill(); survivor.Kill() })
 	up, found := make(chan struct{}), make(chan map[int]string, 1)
 	close(up)
 	found <- nil
 	// As for a command reaped in its grace whose id, and a survivor's, are other processes' by now: neither started then, and no pidfd names them.
-	(&call{ending: make(chan struct{})}).sweep(command.Pid, nil, nil, map[int]string{command.Pid: "0", survivor.Pid: "0"}, nil, nil, nil, found, up, ^uintptr(0))
+	spared := &call{tag: strconv.FormatInt(time.Now().UnixNano(), 36), ending: make(chan struct{})} // a tag of its own: its last search is by it
+	spared.sweep(command.Pid, nil, make(chan syscall.WaitStatus), map[int]string{command.Pid: "0", survivor.Pid: "0"}, nil, nil, found, up, ^uintptr(0))
 	for other, status := range others {
 		other.Signal(syscall.SIGTERM)
 		until(t, "a process given an id of the killed call's was stopped by the kill: no SIGTERM ends it", func() bool { return len(stat(other.Pid)) == 0 })
@@ -1759,7 +1748,8 @@ func TestAKillReachesACommandThatLeftItsOwnGroupAndDroppedTheTag(t *testing.T) {
 	c, frames := recordedConn(t)
 	s.authenticated(c)
 	this, _ := os.Executable()
-	req, _ := json.Marshal(startRequest{Argv: []string{this, "leave", "/bin/sleep", "600"}, Env: map[string]string{}, Tag: "left"})
+	// One of its group stays there, its parent gone: the group's signals reach that one, and say nothing of the command.
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `(sleep 600 &); exec "$0" leave /bin/sleep 600`, this}, Env: map[string]string{}, Tag: strconv.FormatInt(time.Now().UnixNano(), 36)}) // a tag of the run's own: the last run's kill still searches by its
 	s.dispatch(c, frame{kind: fStart, id: 52, payload: req})
 	printed := nextFrame(t, frames)
 	command, _ := strconv.Atoi(strings.TrimSpace(string(printed.payload)))
@@ -1774,6 +1764,9 @@ func TestAKillReachesACommandThatLeftItsOwnGroupAndDroppedTheTag(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("command %d, which left its own group and dropped its tag, outlived its kill", command)
 		}
+	}
+	if code := exitStatus(t, frames)["code"]; code != 143.0 {
+		t.Fatalf("exit %v: the command, stopped for its SIGTERM, was not continued to take it", code)
 	}
 }
 

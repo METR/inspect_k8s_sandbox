@@ -85,15 +85,15 @@
   closed `exec_stdio()` stream, whose command is still running, execd sends SIGTERM, and
   5 seconds later SIGKILL to what has not ended: to the command, to its process group
   and to the other processes it started that it can find, as far as it may signal each;
-  one that has detached from the command can survive. A process of another user in the
-  command's group that is not under the command, such as a `su` child orphaned there,
-  gets the group's SIGTERM and no grace: it is killed once the command's own processes
-  have ended. A timed-out `exec()` raises `TimeoutError`, whose `truncated_output` holds
+  one that has detached from the command can survive. A timed-out `exec()` raises
+  `TimeoutError`, whose `truncated_output` holds
   what the command wrote, once the command and the processes execd signalled have ended
   or been sent SIGKILL, or 16 seconds after its timeout where execd has not said so.
   What they start after their SIGTERM gets SIGKILL as soon as they have ended: a handler
   must wait for the cleanup it starts. (On gVisor and on kernels before 6.9, one left in
-  the command's group whose environment no longer holds `HAWK_NEXT_EXEC` can run on.)
+  the command's group whose environment no longer holds `HAWK_NEXT_EXEC` can run on. On
+  gVisor a program with several threads may take its SIGTERM on any of them, and a
+  handler that needs its first thread interrupted, as Python's does, may not run.)
   The processes of a command that has ended by itself are left
   running. Once execd has stopped reading a command's output, 100 ms after the command
   ended at the earliest, what it left running may write 1 MiB more in total to each of
@@ -112,8 +112,8 @@
   end-of-file on `stdin`, though its call has ended. Keep execd on a memory-backed
   volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up the
-  next call. execd keeps 16 idle threads, which count against the pod's PID limit. Its
-  listener takes plain TCP only, not Multipath TCP.
+  next call. execd holds 20 to 23 of the pod's PIDs, and does not start under a PID
+  limit below about 27.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
