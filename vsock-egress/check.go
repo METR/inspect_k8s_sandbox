@@ -115,8 +115,15 @@ func line(c io.Reader) (string, error) {
 	return bufio.NewReader(io.LimitReader(c, 256)).ReadString('\n')
 }
 
+// canaryLife ends a canary, which nothing else in its container can: past the 60 s that gate.sh has check wait for it.
+const canaryLife = 90 * time.Second
+
 // canary is check's part in the sandbox: it holds a vsock port for the node to reach, and dials the node once a second to say whether it could.
 func canary([]string) error {
+	return canaryFor(canaryLife)
+}
+
+func canaryFor(life time.Duration) error {
 	bound := "ok"
 	if l, err := vsockListen(canaryPort); err != nil {
 		log.Print(err)
@@ -136,7 +143,7 @@ func canary([]string) error {
 			}
 		}()
 	}
-	for last := ""; ; time.Sleep(time.Second) {
+	for last, end := "", time.Now().Add(life); time.Now().Before(end); time.Sleep(time.Second) {
 		c, err := vsockDial(hostCID, canaryPort)
 		if err != nil {
 			if last != err.Error() { // reset while no check is running: said once
@@ -148,4 +155,5 @@ func canary([]string) error {
 		fmt.Fprintf(c, "bind: %s\n", bound)
 		c.Close()
 	}
+	return nil
 }

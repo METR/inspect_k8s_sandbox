@@ -33,7 +33,6 @@ func forward(args []string) error {
 	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
-	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
 	f := newForwarder(hostCID, streamPort)
 	if err := f.loadKey(*keyFile); err != nil {
 		return err
@@ -43,6 +42,7 @@ func forward(args []string) error {
 		return err
 	}
 	defer keys.f.Close()
+	os.Remove(*keyFile + readySuffix) // an earlier forwarder's: only now, with the port one forwarder alone can hold, so that a second one leaves the first ready
 	go f.serveKey(keys)
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
