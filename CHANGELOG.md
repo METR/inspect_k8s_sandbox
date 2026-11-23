@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `read_file()` and `write_file()` take a keyword-only `user`, as Inspect 0.3.286 asks
+  of a sandbox provider: the file is read or written, and a write's directories made, as
+  that user, through `runuser` over Kubernetes exec and by execd on a pod with execd.
+  `root` and `0` mean uid 0, as for `exec()`. A user the container cannot run as raises
+  `SandboxUserUnsupportedError` before anything is read or written. With no `user`, file
+  operations run as the container's user, as before. Requires Inspect 0.3.275, the first
+  with that error, and Python 3.11. See
+  [limitations](https://k8s-sandbox.aisi.org.uk/design/limitations#exec-user).
 - Once a process has converted one Docker Compose file to Helm values, each further
   conversion takes about 60 to 100 ms less.
 - Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
