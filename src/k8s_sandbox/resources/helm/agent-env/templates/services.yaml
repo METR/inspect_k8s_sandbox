@@ -122,6 +122,14 @@ spec:
           image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
           command: ["/vsock-egress", "forward", "-key", "/key/key"]
           restartPolicy: Always
+          {{- /* Equal, as every container's must be for the pod to be of the Guaranteed QoS class. */}}
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
           {{- /* The next container starts once the forwarder listens. An exec: no probe reaches a port of a pod with no network device. */}}
           startupProbe:
             exec:

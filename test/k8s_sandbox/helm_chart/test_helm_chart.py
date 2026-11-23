@@ -1024,6 +1024,23 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
 
 
+def test_a_pod_with_the_egress_forwarder_is_of_the_guaranteed_qos_class(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "egress-proxy-values.yaml",
+        set_string=f"services.default.podAnnotations.{_NO_CARD}",
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    # Kubernetes asks it of every container: CPU and memory, requests equal to limits.
+    for container in pod["initContainers"] + pod["containers"]:
+        resources = container["resources"]
+        assert resources["requests"] == resources["limits"], container["name"]
+        assert {"cpu", "memory"} <= resources["limits"].keys(), container["name"]
+
+
 def test_egress_proxy_annotation_needs_the_forwarder_image(
     chart_dir: pathlib.Path,
 ) -> None:
