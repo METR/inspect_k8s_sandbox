@@ -304,7 +304,7 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	}
 	defer kept.Close()
 	f := newForwarder(0, 0)
-	f.wait = time.Millisecond
+	f.wait = budget // a stalled runner must not time out the stream that has a place free
 	var held [2]int
 	f.connect = func(uint32, uint32) (*os.File, error) { // a stream dials the node once it has its place and its caps
 		held = buffers(t, placed)
@@ -315,9 +315,10 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	for range maxStreams { // every place is taken
 		f.slots <- struct{}{}
 	}
+	f.wait = 0
 	f.stream(waiting)
 
-	if want := capped(t, clientBuffer); held != want {
+	if want := capped(t, 128<<10); held != want { // the size itself: a change to it must be measured against the forwarder's memory limit in the chart
 		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
 	}
 	if got, want := buffers(t, kept), buffers(t, untouched); got != want {
