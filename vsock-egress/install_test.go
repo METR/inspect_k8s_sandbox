@@ -82,10 +82,12 @@ func TestInstallFailsWhereAProfileCannotTakeItsPlace(t *testing.T) {
 }
 
 func TestInstallFailsWhereHelpIsAsked(t *testing.T) {
-	out, err := installing(t, "-h", t.TempDir()).CombinedOutput()
-
-	if err == nil || !strings.Contains(string(out), "install_failed: ") {
-		t.Fatalf("got %v and %q: want install_failed, as exit status 0 would tell the kubelet the profiles are in place", err, out)
+	for _, args := range [][]string{{"-h"}, {"-h", t.TempDir()}} {
+		asked := installing(t, args...)
+		asked.Dir = t.TempDir() // where a build that took -h for the directory would install
+		if out, err := asked.CombinedOutput(); err == nil || !strings.Contains(string(out), "install_failed: ") {
+			t.Errorf("install %q gave %v and %q: want install_failed, as exit status 0 would tell the kubelet the profiles are in place", args, err, out)
+		}
 	}
 }
 
