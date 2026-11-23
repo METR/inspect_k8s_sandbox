@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -389,5 +391,23 @@ func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 		}
 	case err := <-refused:
 		t.Fatalf("the client's connection ended (%v) before the worker was up", err)
+	}
+}
+
+func TestCommandsForTheSandboxTakeOnlyTheseFlags(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second) // a command that started instead would serve until killed
+	defer cancel()
+	// The README tells an operator that none of these takes a vsock port or address from its caller: a flag is one its caller sets.
+	for command, want := range map[string]string{"forward": "-key -listen", "ready": "-key", "canary": ""} {
+		out, err := exec.CommandContext(ctx, os.Args[0], command, "-h").CombinedOutput()
+		var flags []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "  -") {
+				flags = append(flags, strings.Fields(line)[0])
+			}
+		}
+		if got := strings.Join(flags, " "); err != nil || got != want {
+			t.Errorf("%s takes %q (%v): want %q alone", command, got, err, want)
+		}
 	}
 }
