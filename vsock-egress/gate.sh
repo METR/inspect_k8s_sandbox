@@ -6,8 +6,8 @@ usage() {
 usage: CONTEXT=... NS=... CHART=... LAUNCHERS=... NODE=... gate.sh VALUES.yaml
   VALUES.yaml  chart values for one service, `default`, with no network card, that names the egress proxy of its own
                release (a pod <fullname>-egress-proxy-0 that allows LISTED's host and refuses UNLISTED's), as Hawk's
-               runner makes them for a strict sandbox that names a host. The proxy must allow
-               files.pythonhosted.org too: step 2's pip fetches its wheel there, and gets the proxy's 403 otherwise
+               runner makes them for a strict sandbox that names a host. The proxy must allow pypi.org and
+               files.pythonhosted.org too: step 2's pip downloads from both, and gets the proxy's 403 otherwise
   CONTEXT      kubectl context
   NS           namespace to install into; it must exist
   CHART        the agent-env chart's directory
@@ -36,6 +36,7 @@ LNS=${LAUNCHERS%%/*}; LDS=${LAUNCHERS##*/}
 REL=gate-$(date -u +%H%M%S)-$RANDOM$RANDOM # no other run's name: cleanup removes the release of this name, whole or half installed
 TAINT=inspect-k8s-sandbox/gate
 SANDBOX=agent-env-$REL-default-0
+FORWARDER=egress-forwarder-with-a-name-too-long-for-any-service-to-share # the chart's name for the forwarder's container
 k() { kubectl --context "$CONTEXT" --request-timeout=60s "$@"; }
 h() { HELM_DRIVER=configmap helm --kube-context "$CONTEXT" --namespace "$NS" "$@"; }
 failed=0
@@ -82,7 +83,7 @@ selector=$(k -n "$LNS" get daemonset "$LDS" -o jsonpath='{range .spec.selector.m
 echo "   node $node; launcher $(launcher); annotations: $(k -n "$NS" get pod "$SANDBOX" -o jsonpath='{.metadata.annotations.sandbox\.amazonaws\.com/network-isolated} {.metadata.annotations.inspect-k8s-sandbox/egress-proxy}')"
 nics=$(in_sandbox sh -c 'ls /sys/class/net && echo looked' | grep -v -e '^lo$' -e '^dummy' | tr '\n' ' ')
 [ "$nics" = "looked " ] && pass "the guest has no network device" || fail "the guest has a network device, or did not list them all: '$nics'"
-k -n "$NS" get pod "$SANDBOX" -o jsonpath='{range .spec.initContainers[*]}{.name}={.securityContext.seccompProfile}{"\n"}{end}' | grep -q 'egress-forwarder-with-a-name-too-long-for-any-service-to-share=.*"localhostProfile":"profiles/vsock-egress.json"' \
+k -n "$NS" get pod "$SANDBOX" -o jsonpath='{range .spec.initContainers[*]}{.name}={.securityContext.seccompProfile.localhostProfile}{"\n"}{end}' | grep -Fxq "$FORWARDER=profiles/vsock-egress.json" \
   && pass "the forwarder runs under the node's profile profiles/vsock-egress.json" || fail "the forwarder is not under profiles/vsock-egress.json"
 k -n "$LNS" get pod "$(launcher)" -o jsonpath='{.spec.containers[0].securityContext}' | grep -q '"localhostProfile":"profiles/vsock-egress-launcher.json"' \
   && pass "the launcher runs under profiles/vsock-egress-launcher.json" || fail "the launcher is not under profiles/vsock-egress-launcher.json"
@@ -212,7 +213,7 @@ print(*said)
   || fail "under the forwarder's profile ioctl 0xC0200A00, the same with bit 32 set, and 0xC0200A01 on /dev/null gave '$nsm', not 'EPERM EPERM ENOTTY'"
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
-k -n "$NS" exec "$SANDBOX" -c egress-forwarder-with-a-name-too-long-for-any-service-to-share -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
+k -n "$NS" exec "$SANDBOX" -c "$FORWARDER" -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
 pod=$(launcher)
 contract=$(k -n "$LNS" exec "$pod" -c "$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none)" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
