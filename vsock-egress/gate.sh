@@ -213,9 +213,9 @@ print(*said)
   || fail "under the forwarder's profile ioctl 0xC0200A00, the same with bit 32 set, and 0xC0200A01 on /dev/null gave '$nsm', not 'EPERM EPERM ENOTTY'"
 
 say "6. the contract with the runtime (vsock-egress check on the node, canary in the guest)"
+pod=$(launcher); launching=$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none) # found before the canary starts: check must start within the 90 s that the canary lasts
 k -n "$NS" exec "$SANDBOX" -c "$FORWARDER" -- /vsock-egress canary > /dev/null 2>&1 & canary=$!
-pod=$(launcher)
-contract=$(k -n "$LNS" exec "$pod" -c "$(k -n "$LNS" get pod "$pod" -o jsonpath='{.spec.containers[0].name}' || echo none)" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
+contract=$(k -n "$LNS" exec "$pod" -c "$launching" -- /vsock-egress check -pod "$NS/$SANDBOX" -wait 60s 2>&1 | tail -3 | tr '\n' ' ')
 kill "$canary" 2> /dev/null; canary=
 case "$contract" in *"ok: $NS/$SANDBOX runs as uid "*) pass "$contract" ;; *) fail "check: $contract" ;; esac
 vm=$(echo "$contract" | sed -n 's|.* at /var/lib/nitro-sandbox/firecracker/\([0-9a-f]*\)/root.*|\1|p')
