@@ -55,4 +55,4 @@ them, has one word to alarm on:
 
 `gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
 which names the assumption about AWS's runtime that broke. The `canary` that `check` meets in the sandbox ends by
-itself after 90 seconds.
+itself after 90 seconds: start `check` within them.
