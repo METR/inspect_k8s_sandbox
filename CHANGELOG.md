@@ -41,7 +41,8 @@
   port; those that `additionalResources` adds need policies of their own (see
   `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
   grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
-  sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
+  sidecar, which needs Kubernetes 1.29 or later and adds 500m of CPU and 256Mi of memory
+  to the pod's requests and limits. Set `https_proxy` and `http_proxy`
   yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
   `no_proxy` for a server on the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
