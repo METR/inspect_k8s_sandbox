@@ -327,3 +327,30 @@ func TestExecdEndsWhereAThreadCannotTakeItsIdentityBack(t *testing.T) {
 		}
 	}
 }
+
+// Regression: Go's listeners take Multipath TCP, and a multipath peer's bytes wait in buffers nothing set on execd's socket bounds.
+func TestExecdsListenerTakesAMultipathDialAsPlainTCP(t *testing.T) {
+	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
+		t.Skip("the kernel has Multipath TCP off")
+	}
+	l, err := listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var multipath net.Dialer
+	multipath.SetMultipathTCP(true)
+	c, err := multipath.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	taken, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	if is, _ := taken.(*net.TCPConn).MultipathTCP(); is {
+		t.Fatal("execd's listener took a Multipath TCP connection")
+	}
+}

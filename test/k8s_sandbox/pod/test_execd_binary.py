@@ -532,27 +532,26 @@ async def test_a_timed_out_command_is_killed(
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
 
 
-@pytest.mark.parametrize("procs", [(), ("-e", "GOMAXPROCS=64")])  # as on a large node
 async def test_a_timed_out_command_holding_every_pid_does_not_end_execd(
     sandbox: Sandbox,
     relay: Relay,
     client: execd.ExecdClient,
     monkeypatch: pytest.MonkeyPatch,
-    procs: tuple[str, ...],
 ) -> None:
     """Regression: with no PID left for a thread, Go ended execd in the kill's grace."""
     name = f"{sandbox.name}-pids"
     address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
     run = ["run", "-d", "--name", name, "--pids-limit=1024", "--cpus=2", sandbox.name]
     hold = "import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-    hold += "try:\n    while os.fork(): pass\nexcept OSError: os.write(1, b'full')\n"
-    hold += "time.sleep(99)"
+    hold += "try:\n    while os.fork(): pass\n"
+    hold += "except BlockingIOError: os.write(1, b'full')\ntime.sleep(99)"
     try:
         assert docker(*run, "sleep", "3600").returncode == 0
         monkeypatch.setattr(sandbox, "name", name)
         relay.ip = docker("inspect", "-f", address, name).stdout.strip()
-        monkeypatch.setattr(sandbox, "options", procs)
-        pid = await client.exec(["sh", "-c", "echo $PPID"], None, None, {}, None, None)
+        many = ("-e", "GOMAXPROCS=64")  # as on a large node: no cap fails anywhere
+        monkeypatch.setattr(sandbox, "options", many)
+        pid = await client.exec(["sh", "-c", "echo $PPID"], None, None, {}, None, 30)
         with pytest.raises(TimeoutError) as timed:
             await client.exec(["python3", "-c", hold], None, None, {}, None, 3)
         assert "full" in getattr(timed.value, "truncated_output")  # no PID was left

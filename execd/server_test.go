@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -35,6 +36,20 @@ func TestMain(m *testing.M) {
 	}
 	if len(os.Args) > 2 && os.Args[1] == "refused" {
 		refused(os.Args[2])
+		return
+	}
+	if len(os.Args) > 2 && os.Args[1] == "leave" { // runs the rest as a command that left its group for its parent's, and its environment
+		group, _ := syscall.Getpgid(os.Getppid())
+		syscall.Setpgid(0, group)
+		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+		syscall.Exec(os.Args[2], os.Args[2:], nil)
+		os.Exit(1) // not on into the tests, as the command
+	}
+	if len(os.Args) > 1 && os.Args[1] == "joined" { // as a setuid binary leaves the one who ran it: of user 65534 with root's effective user; it ignores SIGTERM until its stdin ends
+		syscall.Setreuid(65534, 0)
+		signal.Ignore(syscall.SIGTERM)
+		os.Stdout.WriteString("ready\n")
+		io.Copy(io.Discard, os.Stdin)
 		return
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
@@ -1417,35 +1432,39 @@ func TestAKilledCallEndsThoughWhatItsSigtermReachedStoppedItself(t *testing.T) {
 	}
 }
 
-// Regression: in execd's session, a process of another user could move into a command's group, or keep the command from stopping with SIGCONT.
-func TestACommandLeadsASessionOfItsOwn(t *testing.T) {
-	_, _, _, _, first := ready(t, "", "sh", "-c", "echo $$; exec sleep 600")
-	command, _ := strconv.Atoi(strings.TrimSpace(first))
-	if f := stat(command); len(f) < 4 || f[3] != strings.TrimSpace(first) {
-		t.Fatalf("command %d's state, parent, group and session are %v: want a session of its own", command, f)
+// Regression: joined to its group, another user's process held a timed-out call's exit for the grace.
+func TestAKilledCallsExitDoesNotWaitForAnotherUsersProcessThatJoinedItsGroup(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs a process of another user")
 	}
+	graced(t) // no grace's end lets the exit go: it comes without one
+	s, c, frames, _, group := ready(t, "", "sh", "-c", "echo $$; exec sleep 600")
+	joiner := exec.Command(os.Args[0], "joined") // root's only in its effective user: by that one alone it would pass for the command's
+	joiner.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	joiner.SysProcAttr.Pgid, _ = strconv.Atoi(strings.TrimSpace(group))
+	stdin, _ := joiner.StdinPipe()
+	stdout, _ := joiner.StdoutPipe()
+	if err := joiner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close(); joiner.Wait() })
+	stdout.Read(make([]byte, 6)) // "ready": it ignores SIGTERM by now
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	exitStatus(t, frames)
 }
 
 // Regression: with no descriptor left for the pidfd that names its group, a kill still gave a grace, whose end could not reach what was left in that group.
 func TestAKillWithNoDescriptorForItsCommandsPidfdSendsSigkillAtOnce(t *testing.T) {
-	graced(t) // no grace's end kills it
 	open := pidfdOpen
-	pidfdOpen = func(int) (uintptr, syscall.Errno) { return ^uintptr(0), syscall.EMFILE }
 	t.Cleanup(func() { pidfdOpen = open })
-	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "" TERM; echo ready; while :; do sleep 0.01; done`)
-	s.dispatch(c, frame{kind: fKill, id: 80})
-	exitStatus(t, frames)
-}
-
-func TestAKilledCommandsGroupIsContinuedByNumberWhereAPidfdSignalsNoGroup(t *testing.T) {
-	graced(t) // no SIGKILL of a grace's end ends it
-	flag := pidfdSignalProcessGroup
-	pidfdSignalProcessGroup = 1 << 30 // no kernel's: as on gVisor and before Linux 6.9
-	t.Cleanup(func() { pidfdSignalProcessGroup = flag })
-	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "echo continued; exit" TERM; echo ready; while :; do sleep 0.01; done`)
-	s.dispatch(c, frame{kind: fKill, id: 80})
-	said(t, frames, func(out string) bool { return strings.Contains(out, "continued") })
-	exitStatus(t, frames)
+	for errno, want := range map[syscall.Errno]float64{syscall.EMFILE: 137, syscall.ENOSYS: 7} { // none left: SIGKILL at once; none on this kernel: SIGTERM, and the group continued by its number, as where a pidfd signals none
+		pidfdOpen = func(int) (uintptr, syscall.Errno) { return ^uintptr(0), errno }
+		s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "" TERM; (trap "exit 7" TERM; echo ready; while :; do :; done) & wait $!`) // one of its group with no child: only the group's SIGCONT lets it take its SIGTERM
+		s.dispatch(c, frame{kind: fKill, id: 80})
+		if code := exitStatus(t, frames)["code"]; code != want {
+			t.Fatalf("exit %v where pidfd_open fails with %v: want %v", code, errno, want)
+		}
+	}
 }
 
 func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {
@@ -1531,16 +1550,23 @@ func TestAKillsSearchSlowerThanItsGraceStillKillsWhatItSignals(t *testing.T) {
 	until(t, "what a search slower than the grace signalled outlived the kill", func() bool { return gone(id) })
 }
 
-func TestAKillsLastSigkillSparesAProcessGivenASurvivorsId(t *testing.T) {
+func TestAKillsLastSigkillSparesProcessesGivenItsCommandsAndASurvivorsIds(t *testing.T) {
 	reaper.mu.Lock()
-	other, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{})
-	status := reaper.watch(other.Pid)
-	signalTree(nil, 0, map[int]string{other.Pid: "0"}, syscall.SIGKILL) // as the sweep's for a survivor whose id is another process's by now: not the one that started then
+	command, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{Sys: &syscall.SysProcAttr{Setpgid: true}})
+	survivor, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{})
+	others := map[*os.Process]chan syscall.WaitStatus{command: reaper.watch(command.Pid), survivor: reaper.watch(survivor.Pid)}
 	reaper.mu.Unlock()
-	other.Signal(syscall.SIGTERM)
-	until(t, "a process given a survivor's id was stopped by the kill: no SIGTERM ends it", func() bool { return len(stat(other.Pid)) == 0 })
-	if ws := <-status; ws.Signal() != syscall.SIGTERM {
-		t.Fatalf("a process given a survivor's id ended by %v: the kill's SIGKILL went to an id, not to the process that started then", ws.Signal())
+	up, found := make(chan struct{}), make(chan map[int]string, 1)
+	close(up)
+	found <- nil
+	// As for a command reaped in its grace whose id, and a survivor's, are other processes' by now: neither started then, and no pidfd names them.
+	(&call{ending: make(chan struct{})}).sweep(command.Pid, nil, nil, map[int]string{command.Pid: "0", survivor.Pid: "0"}, nil, nil, nil, found, up, ^uintptr(0))
+	for other, status := range others {
+		other.Signal(syscall.SIGTERM)
+		until(t, "a process given an id of the killed call's was stopped by the kill: no SIGTERM ends it", func() bool { return len(stat(other.Pid)) == 0 })
+		if ws := <-status; ws.Signal() != syscall.SIGTERM {
+			t.Fatalf("a process given an id of the killed call's ended by %v: the kill went to an id, not to the call's own process or group", ws.Signal())
+		}
 	}
 }
 
@@ -1610,11 +1636,18 @@ func TestAKillReachesAnotherUsersCommandAndItsGroupThoughTheyCarryNoTag(t *testi
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
+	open := t.TempDir() // where the user can run a copy of this binary: its own directory is root's alone
+	os.Chmod(open, 0o755)
+	os.Chmod(filepath.Dir(open), 0o755)
+	this, _ := os.Executable()
+	binary, _ := os.ReadFile(this)
+	leave := filepath.Join(open, "leave")
+	os.WriteFile(leave, binary, 0o755)
 	deadline := time.Now().Add(30 * time.Second) // for the whole test
 	// Without CAP_KILL root's signal reaches neither, and with no tag no search finds them: each names what must end.
 	for id, argv := range [][]string{
-		{"env", "-i", "sh", "-c", "sleep 600 & echo $! $$; wait"},                                                                      // the command and a child in its group
-		{"env", "-i", "sh", "-c", `setsid sleep 600 & until [ "$(cut -d" " -f5 /proc/$!/stat)" != $$ ]; do :; done; echo $! $$; wait`}, // and one that has left it, for a session of its own
+		{"env", "-i", "sh", "-c", "sleep 600 & echo $! $$; wait"}, // the command and a child in its group
+		{leave, "leave", "/bin/sleep", "600"},                     // the command, out of its own group
 	} {
 		// A tag each: the child that searches for the first's still runs as the second starts.
 		req, _ := json.Marshal(startRequest{Argv: argv, Env: map[string]string{}, User: "65534", Tag: "none" + strconv.Itoa(id)})
@@ -1721,6 +1754,29 @@ func TestAKillReachesAChildThatLeftTheGroupAndDroppedTheTag(t *testing.T) {
 	}
 }
 
+func TestAKillReachesACommandThatLeftItsOwnGroupAndDroppedTheTag(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	this, _ := os.Executable()
+	req, _ := json.Marshal(startRequest{Argv: []string{this, "leave", "/bin/sleep", "600"}, Env: map[string]string{}, Tag: "left"})
+	s.dispatch(c, frame{kind: fStart, id: 52, payload: req})
+	printed := nextFrame(t, frames)
+	command, _ := strconv.Atoi(strings.TrimSpace(string(printed.payload)))
+	if printed.kind != fStdout || command <= 0 { // or the kill below would be of this process's own group
+		t.Fatalf("the command printed %q, not its id", printed.payload)
+	}
+	t.Cleanup(func() { syscall.Kill(command, syscall.SIGKILL) })
+
+	s.dispatch(c, frame{kind: fKill, id: 52})
+
+	for deadline := time.Now().Add(30 * time.Second); syscall.Kill(command, 0) != syscall.ESRCH; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("command %d, which left its own group and dropped its tag, outlived its kill", command)
+		}
+	}
+}
+
 func TestAKillThatComesBeforeItsCommandHasStartedReachesAChildThatLeftTheGroupAndDroppedTheTag(t *testing.T) {
 	prctl(prSetChildSubreaper, 1) // as execd: the child is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
@@ -1775,6 +1831,7 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c := testConn(t)
 	s.authenticated(c)
+	this, _ := os.Executable()
 	// In the middle of starting 3,000 processes, each out of the group and with no tag: more than eight listings take.
 	starting := `trap "" TERM; i=0; while [ $i -lt 3000 ]; do env -i setsid sleep "$0" & i=$((i+1)); done; wait` // deaf to SIGTERM: the SIGKILL of a grace's end must reach each
 	for id := uint64(60); id < 72; id++ {                                                                        // a kill that lists them once, or lets their starter run on, leaves one in most
@@ -1783,6 +1840,8 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 		switch id % 4 {
 		case 1: // or its child does, out of the group itself
 			argv = []string{"sh", "-c", `setsid sh -c "$1" "$0" & wait`, mark, starting}
+		case 2: // or it does, out of its own group
+			argv = []string{this, "leave", "/bin/sh", "-c", starting, mark}
 		case 3: // or its child does, for longer than a kill waits for a process to stop
 			argv = []string{"sh", "-c", `setsid sh -c "$1" "$0" & wait`, mark, strings.Replace(starting, "&", "& sleep 0.001;", 1)}
 		}
@@ -1810,6 +1869,8 @@ func TestAKillReachesWhatIsStartedAsItKills(t *testing.T) {
 		}
 
 		s.dispatch(c, frame{kind: fKill, id: id})
+		left := len(live())
+		until(t, "what the kill's SIGTERM left was not continued", func() bool { return len(live()) > left }) // it starts more in its grace: the kill at its end must find those
 		end()
 
 		for deadline := time.Now().Add(30 * time.Second); len(live()) > 0; time.Sleep(10 * time.Millisecond) {
@@ -2123,8 +2184,8 @@ func TestAKillThatComesBeforeItsCommandHasStartedReachesWhatItLeftRunning(t *tes
 			grouped, _ = strconv.Atoi(strings.Fields(string(b))[1])
 			detached, _ = strconv.Atoi(strings.Fields(string(b))[2])
 		}
-		// Ended and not reaped: the START holds the reaper's lock until it has noted the id.
-		if stat, _ := os.ReadFile("/proc/" + strconv.Itoa(leader) + "/stat"); detached != 0 && strings.Contains(string(stat), ") Z ") {
+		// Ended and not reaped: the START holds the reaper's lock until it has noted the id. And the second out of its group, whose signal would reach it there.
+		if f, g := stat(leader), stat(detached); len(f) > 0 && f[0] == "Z" && len(g) > 2 && g[2] != strconv.Itoa(leader) {
 			break
 		}
 		if time.Now().After(deadline) {

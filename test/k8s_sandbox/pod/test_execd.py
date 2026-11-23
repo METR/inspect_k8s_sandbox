@@ -2238,8 +2238,8 @@ async def test_a_timed_out_call_whose_daemon_was_replaced_is_timed_out(
 
 
 KILLED: dict[str, tuple[bytes, bytes, typing.Any]] = {
-    "back late": (b"c", b"c", 137),
-    "restarted": (b"c", b"d", error.ExecdStoppedError),
+    "back late": (b"b:5", b"b:5", 137),
+    "restarted": (b"b:5", b"b:6", error.ExecdStoppedError),
     "no boot id": (b":5", b":5", error.ExecdStoppedError),
 }
 
@@ -3693,7 +3693,7 @@ async def test_only_one_fingerprint_line_starts_execd(
             return 0, printed, b""
 
     monkeypatch.setattr(pod_module, "ExecuteOperation", Execute)
-    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "raise")
+    pod = pod_module.Pod("p", "ns", None, "default", "u", 0, "warn")
     started = await pod._start_execd(False)
     assert (started.fingerprint, started.container) == ("0" * 64, b"c")
     cluster.shares_pids = True  # the container execd names is the pod's then

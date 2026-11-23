@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -240,10 +241,10 @@ func run(network, address, keyHash string, replace bool) {
 		os.Exit(2)
 	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
-	l, err := tls.Listen(network, address, config)
+	l, err := listen(network, address)
 	for i := 0; replace && err != nil && i < 20 && errors.Is(err, syscall.EADDRINUSE); i++ {
 		time.Sleep(100 * time.Millisecond) // the daemon --replace stopped may still hold the address
-		l, err = tls.Listen(network, address, config)
+		l, err = listen(network, address)
 	}
 	if err != nil {
 		report(err.Error())
@@ -253,7 +254,14 @@ func run(network, address, keyHash string, replace bool) {
 	startSearcher()
 	startKeeper()
 	report("ok " + fingerprint)
-	s.serve(l)
+	s.serve(tls.NewListener(l, config))
+}
+
+// listen is net.Listen without Multipath TCP, which Go's listeners take: a multipath peer's bytes wait on subflows, in buffers nothing set on this socket bounds.
+func listen(network, address string) (net.Listener, error) {
+	var plain net.ListenConfig
+	plain.SetMultipathTCP(false)
+	return plain.Listen(context.Background(), network, address)
 }
 
 // spare starts the threads a kill may need while the pod still has PIDs: Go keeps an idle thread, and ends execd where it cannot start one.
