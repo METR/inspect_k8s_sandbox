@@ -69,6 +69,8 @@ const termGrace = 5 * time.Second
 
 const sysPidfdOpen, sysPidfdSendSignal, pidfdSignalProcessGroup = 434, 424, 4 // not in package syscall
 
+var pidfdSignalThread uintptr = 1 // tests set one no kernel knows, as this one is before Linux 6.9
+
 // pidfdOpen gives a handle on a process; tests make it fail.
 var pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
 	fd, _, errno := syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0)
@@ -97,10 +99,12 @@ const authTimeout, maxKey, maxPreauth = 10 * time.Second, 64, 32
 type call struct {
 	id  uint64
 	tag string
-	kmu sync.Mutex // guards pid, status, as, killed, timeoutKilled and ending: a kill must not wait for mu
+	kmu sync.Mutex // guards pid, status, as, killed, timeoutFound, timeoutKilled and ending: a kill must not wait for mu
 	pid int
 	// its kill, from its SIGTERM on: closed once what that reached has ended or been killed, which its exit waits for
 	ending chan struct{}
+	// its grace's timer's copy of the command's pidfd, plus one, and 0 once taken: by the timer, or by the sweep as it kills
+	end atomic.Uintptr
 	// where the reaper sends its command's exit status
 	status chan syscall.WaitStatus
 	as     *syscall.Credential // who its command runs as, if not execd
@@ -129,6 +133,8 @@ type call struct {
 	timedOut  bool // a timeout's kill went ahead on it: its exit says so, as the code alone can't
 	// its timeout's kill went ahead on it
 	timeoutKilled bool
+	// a timeout's stop found its command running: the kill that goes ahead is the timeout's, though another stop sends it
+	timeoutFound bool
 }
 
 type conn struct {
@@ -925,7 +931,9 @@ func (cl *call) stop(timeout bool) {
 	its := func() bool { // no earlier kill is at it: a second SIGTERM would cut short what the first began
 		cl.kmu.Lock()
 		defer cl.kmu.Unlock()
-		return cl.ending == nil && reaper.waiting[pid] == status
+		found := cl.ending == nil && reaper.waiting[pid] == status
+		cl.timeoutFound = cl.timeoutFound || found && timeout
+		return found
 	}
 	running, up, until := its(), make(chan struct{}), time.Now().Add(time.Second)
 	if running {
@@ -955,7 +963,7 @@ func (cl *call) stop(timeout bool) {
 	if running {
 		hook(&beforeKill, true)
 		cl.kmu.Lock()
-		cl.timeoutKilled = cl.timeoutKilled || timeout
+		cl.timeoutKilled = cl.timeoutFound
 		cl.ending = make(chan struct{})
 		cl.kmu.Unlock()
 		var errno syscall.Errno
@@ -964,13 +972,12 @@ func (cl *call) stop(timeout bool) {
 		}
 		reached, listed, parents, apart = signalTree(as, pid, map[int]string{pid: ""}, sig, until)
 		end, _, _ := syscall.Syscall(syscall.SYS_FCNTL, group, syscall.F_DUPFD_CLOEXEC, 0) // the timer's own: the sweep closes group, whose number is another's after
+		cl.end.Store(end + 1)
 		afterFunc(grace, func() {
-			select {
-			case <-cl.ending: // the sweep is over, its SIGKILL sent: one that joined what is left of the group since would stay stopped
-			default:
-				byPidfd(as, end, syscall.SIGSTOP) // at once, from here: the sweep, among a thousand busy ones, waits seconds for a processor to kill them on
+			if end := cl.end.Swap(0); end != 0 { // not the sweep's yet: after its SIGKILL, one that joined what is left of the group would stay stopped
+				byPidfd(as, end-1, syscall.SIGSTOP) // at once, from here: the sweep, among a thousand busy ones, waits seconds for a processor to kill them on
+				syscall.Close(int(end - 1))
 			}
-			syscall.Close(int(end))
 			close(up) // from the SIGTERMs, as timeout(1) counts it
 		})
 	}
@@ -1080,6 +1087,9 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		case <-time.After(wait):
 		}
 	}
+	if end := cl.end.Swap(0); end != 0 { // the timer has not fired: its copy is closed here, and it stops nothing from now
+		syscall.Close(int(end - 1))
+	}
 	kill(reached)
 	byPidfd(as, group, syscall.SIGKILL) // what a reaped command left in its group
 }
@@ -1186,9 +1196,11 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sig sysc
 			}
 		}
 	}
-	if _, listed := reached[lead]; sig == syscall.SIGTERM && (lead == 0 || listed) { // each by its id, for its first thread: the group's is one more for a process asleep and not yet stopped
+	if _, listed := reached[lead]; sig == syscall.SIGTERM && listed { // each by its id, for its first thread: the group's is one more for a process asleep and not yet stopped
 		for p, started := range reached {
-			signalIf(as, p, started, sig)
+			if !signalIf(as, p, started, sig) && p == lead { // none by its id, as with one descriptor left: its group's by number, which the reaper holds
+				byNumber(as, lead, sig)
+			}
 		}
 	} else {
 		for _, p := range slices.Backward(stopped) { // while it is the process stopped: one that is not stopped may have killed and reaped it since
@@ -1222,13 +1234,19 @@ func signalIf(as *syscall.Credential, pid int, started string, sig syscall.Signa
 		return false
 	}
 	send := func() bool { return handle.Signal(sig) == nil }
-	var status []byte
-	if sig == syscall.SIGTERM { // its mask is asked of no other signal
-		status, _ = os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
-	}
-	_, blocked, shown := bytes.Cut(status, []byte("\nSigBlk:\t"))
-	if mask, _ := strconv.ParseUint(string(bytes.Fields(append(blocked, " 0"...))[0]), 16, 64); sig == syscall.SIGTERM && shown && f[0] != "Z" && mask>>(sig-1)&1 == 0 {
-		send = func() bool { return syscall.Tgkill(pid, pid, sig) == nil } // its first thread, the kernel's pick for a running process: for a stopped one any thread takes it once continued
+	if sig == syscall.SIGTERM && f[17] != "1" { // of one thread, the whole process's is that thread's: its mask is not read
+		status, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
+		_, blocked, shown := bytes.Cut(status, []byte("\nSigBlk:\t"))
+		if mask, _ := strconv.ParseUint(string(bytes.Fields(append(blocked, " 0"...))[0]), 16, 64); shown && f[0] != "Z" && mask>>(sig-1)&1 == 0 {
+			whole := send
+			send = func() bool { // its first thread, the kernel's pick for a running process: for a stopped one any thread takes it once continued
+				errno := syscall.ENOSYS
+				handle.WithHandle(func(pidfd uintptr) { // the handle's own, taken before the look at its start
+					_, _, errno = syscall.Syscall6(sysPidfdSendSignal, pidfd, uintptr(sig), 0, pidfdSignalThread, 0, 0)
+				})
+				return errno == 0 || whole() // refused, as before Linux 6.9: the process as a whole, through that handle too
+			}
+		}
 	}
 	return send() || asUser(as, send)
 }

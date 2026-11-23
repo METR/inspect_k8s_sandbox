@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -28,7 +29,35 @@ import (
 )
 
 // run() starts this binary, as it starts execd, to become another user.
+func init() {
+	if len(os.Args) > 1 && os.Args[1] == "headless" {
+		runtime.LockOSThread() // main stays on the process's first thread, to end it
+	}
+}
+
+// threaded is a program of several threads, as any Go one, that says "ready", and "term" at its SIGTERM: headless, once its first thread has
+// ended, as a C main's pthread_exit leaves it.
+func threaded(headless bool) {
+	got := make(chan os.Signal, 1)
+	signal.Notify(got, syscall.SIGTERM)
+	go func() {
+		for f := stat(os.Getpid()); headless && (len(f) == 0 || f[0] != "Z"); f = stat(os.Getpid()) {
+		}
+		os.Stdout.WriteString("ready\n")
+		<-got
+		os.Stdout.WriteString("term\n")
+		os.Exit(0)
+	}()
+	if headless {
+		syscall.Syscall(syscall.SYS_EXIT, 0, 0, 0)
+	}
+	select {}
+}
+
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && (os.Args[1] == "headless" || os.Args[1] == "threaded") {
+		threaded(os.Args[1] == "headless")
+	}
 	if len(os.Args) > 2 && os.Args[1] == "first" {
 		firstProcess(os.Args[2:])
 		return
@@ -1454,6 +1483,60 @@ func TestAKillWithNoDescriptorForItsCommandsPidfdSendsSigkillAtOnce(t *testing.T
 	}
 }
 
+// Regression: with one descriptor to spare a kill listed its command and could signal nothing by its id: the command had no SIGTERM.
+func TestAKillWithOneDescriptorToSpareStillSendsItsCommandSigterm(t *testing.T) {
+	open := pidfdOpen
+	var was syscall.Rlimit
+	limit := func(to, old *syscall.Rlimit) { // prlimit itself: after syscall.Setrlimit Go gives commands the limit it raised, not the one execd started with
+		syscall.Syscall6(syscall.SYS_PRLIMIT64, 0, syscall.RLIMIT_NOFILE, uintptr(unsafe.Pointer(to)), uintptr(unsafe.Pointer(old)), 0, 0)
+	}
+	limit(nil, &was)
+	t.Cleanup(func() { pidfdOpen = open; limit(&was, nil) })
+	pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
+		fd, errno := open(pid)
+		spare, _ := syscall.Dup(int(fd)) // the lowest number free: one descriptor at a time can take it, and none a higher one
+		syscall.Close(spare)
+		limit(&syscall.Rlimit{Cur: uint64(spare) + 1, Max: was.Max}, nil)
+		return fd, errno
+	}
+	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "exit 7" TERM; echo ready; while :; do :; done`)
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	code := exitStatus(t, frames)["code"]
+	if limit(&was, nil); code != 7.0 {
+		t.Fatalf("exit %v: want 7, its SIGTERM handler's", code)
+	}
+}
+
+// Regression: sent to the first thread of a process whose first thread had ended, a SIGTERM was lost, and the process sat out its grace.
+func TestAKilledCommandOfSeveralThreadsTakesItsSigtermWhereItsFirstThreadCannot(t *testing.T) {
+	thread := pidfdSignalThread
+	t.Cleanup(func() { pidfdSignalThread = thread })
+	for mode, flag := range map[string]uintptr{"headless": thread, "threaded": 1 << 30} { // its first thread ended; a flag no kernel knows, as before Linux 6.9
+		pidfdSignalThread = flag
+		s, c, frames, _, _ := ready(t, "", "sh", "-c", `setsid "$0" "$1" & wait`, os.Args[0], mode) // out of the command's group: the group's SIGTERM is none of its
+		s.dispatch(c, frame{kind: fKill, id: 80})
+		said(t, frames, func(out string) bool { return strings.Contains(out, "term") })
+	}
+}
+
+// Regression: a second stop, as the abandon timer's, that went ahead of a timeout's own left the call not timed out: its RESUME was told "abandoned".
+func TestACallItsTimeoutFoundRunningIsTimedOutThoughAnotherStopsKillWentAhead(t *testing.T) {
+	t.Cleanup(func() { beforeKill.Store(nil) })
+	for try := range 100 { // which stop goes ahead is a race: the other's does in a share of these
+		s, _, frames, _, _ := ready(t, "", "sh", "-c", "echo ready; exec sleep 600")
+		cl, other, once := s.get(80), make(chan struct{}), new(sync.Once)
+		behind := func(late bool) { // as the timeout's stop first finds it running, another sets out
+			once.Do(func() { go func() { cl.stop(false); close(other) }() })
+		}
+		beforeKill.Store(&behind)
+		cl.stop(true)
+		<-other
+		if status := exitStatus(t, frames); status["timeout"] != true {
+			t.Fatalf("EXIT %v on try %d: its timeout found it running, and a kill went ahead", status, try)
+		}
+	}
+}
+
 func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {
 	graced(t)
 	helper := `sh -c "trap \"echo y\" TERM; echo h; while :; do echo .; sleep 0.01; done"`                                                                                            // which the command's handler starts: it counts its SIGTERMs too
@@ -1480,11 +1563,17 @@ func TestAKillsSearchByTagSendsSigtermOnce(t *testing.T) {
 }
 
 func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *testing.T) {
+	orphan := "env -i sh -c"
+	status, _ := os.ReadFile("/proc/self/status")
+	_, caps, _ := strings.Cut(string(status), "CapEff:\t")
+	if eff, _ := strconv.ParseUint(strings.Fields(caps + " 0")[0], 16, 64); os.Getuid() == 0 && eff&(1<<5) != 0 { // Regression: another user's had no grace; root may signal it with CAP_KILL alone
+		orphan = "env -i su -s /bin/sh nobody -c"
+	}
 	for name, argv := range map[string][]string{
 		"left in its group by a handler":     {map[bool]string{true: "65534"}[os.Getuid() == 0], "env", "-i", "/bin/sh", "-c", `trap 'sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                                                                            // at its SIGTERM it starts one, says its id and ends: no SIGTERM went to that one, and with no tag only the command's group leads there
 		"left out of its group by a handler": {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & until [ "$(cut -d" " -f5 /proc/$!/stat)" != $$ ]; do :; done; echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                         // the same in a session of its own, which the handler waits for: only the tag leads there, in an environment root may not read
 		"found by its tag":                   {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "echo $$; exec env -i sh -c \"while :; do :; done\" >/dev/null 2>&1" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`}, // in a session of its own, its parent gone, one says its id at its SIGTERM and runs on with no tag: only the tag led there, and only its id leads the SIGKILL
-		"found in its group":                 {"", "sh", "-c", `trap exit TERM; (env -i sh -c 'trap "echo $$" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`},                                                                                                          // in its group with no tag, its parent gone, one says its id at its SIGTERM and runs on
+		"found in its group":                 {"", "sh", "-c", `trap exit TERM; (` + orphan + ` 'trap "echo $$" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`},                                                                                                        // in its group with no tag, its parent gone, one says its id at its SIGTERM and runs on
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); name == "left in its group by a handler" && err != syscall.EBADF {
@@ -1510,6 +1599,13 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 				end()
 			}
 			exitStatus(t, frames) // with no grace to wait out where nothing that had a SIGTERM is left
+			until(t, "a pidfd of the killed command is still open: its timer's copy is the sweep's to close once it kills", func() bool {
+				infos, _ := filepath.Glob("/proc/self/fdinfo/*")
+				return !slices.ContainsFunc(infos, func(info string) bool {
+					text, _ := os.ReadFile(info)
+					return bytes.Contains(text, []byte("\nPid:\t-1\n"))
+				})
+			})
 			until(t, "what ran on outlived the kill", func() bool { return gone(straggler) })
 		})
 	}
@@ -1621,7 +1717,7 @@ func TestAKillReachesAnotherUsersCommandAndItsGroupThoughTheyCarryNoTag(t *testi
 	}
 	prctl(prSetChildSubreaper, 1) // as execd: the command's child is reaped here once killed
 	t.Cleanup(func() { prctl(prSetChildSubreaper, 0) })
-	graced(t) // no SIGKILL ends them: the group's SIGTERM is sent as their user
+	graced(t) // no SIGKILL ends them: each one's SIGTERM is sent as their user
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -2492,7 +2588,7 @@ func TestAPipeExecdCannotKeepIsLetGo(t *testing.T) {
 func TestAKillOfACommandAlreadyReapedLeavesTheCommandThatHasItsIdNow(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
-	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `while :; do : >"$0"; sleep 0.01; done`, alive}, Env: map[string]string{}, Tag: "other"})
+	req, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `while :; do : >"$0"; sleep 0.01; done`, alive}, Env: map[string]string{}, Tag: strconv.FormatInt(time.Now().UnixNano(), 36)}) // its own: the last run's kill may still be searching
 	s.start(testConn(t), frame{kind: fStart, id: 32, payload: req})
 	other := s.get(32)
 	t.Cleanup(other.kill)

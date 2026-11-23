@@ -537,15 +537,16 @@ async def test_a_killed_commands_handler_runs_whichever_thread_sigterm_is_for(
 ) -> None:
     """Regression: sent to a stopped process as a whole, SIGTERM went to any thread."""
     mark = f"/tmp/{uuid.uuid4().hex}"
-    head = "import pathlib, signal, sys, threading\nwait = threading.Event().wait\n"
+    head = "import os, pathlib, signal, sys, threading\nwait = threading.Event().wait\n"
     head += "mark = pathlib.Path(sys.argv[1])\n"
-    first = head + "signal.signal(signal.SIGTERM, lambda *_: mark.touch())\n"
+    head += "def took(*_): mark.touch(); os._exit(0)\n"
+    first = head + "signal.signal(signal.SIGTERM, took)\n"
     first += "for _ in range(64): threading.Thread(target=wait, daemon=True).start()\n"
     other = head + "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
-    other += "def take(): signal.sigwait({signal.SIGTERM}); mark.touch()\n"
+    other += "def take(): signal.sigwait({signal.SIGTERM}); took()\n"
     other += "threading.Thread(target=take, daemon=True).start()\n"
     ready = "pathlib.Path(sys.argv[1] + '.ready').touch()\nwait()"
-    for script in (first, first, first, other):  # by chance the first takes it 1 in 65
+    for script in (first, first, first, other):  # by chance the first takes it at times
         argv = ["python3", "-c", script + ready, mark]
         call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, None))
         await sandbox.until(f"test -e {mark}.ready")
