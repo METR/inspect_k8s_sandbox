@@ -566,33 +566,47 @@ func TestConnectionPastThoseThatHaveShownNoKeyIsClosed(t *testing.T) {
 	}
 }
 
-// The kernel takes twice what is asked, up to its own maximum. On loopback it never grows a buffer, so reading the option back is all a test can hold of the cap.
-func TestProxySocketIsCappedEachWay(t *testing.T) {
-	most := func(sysctl string) int {
+// buffers is what the kernel holds a socket's buffers to, to take from its peer and to send it: all a test can read of a cap.
+func buffers(t *testing.T, c syscall.Conn) (each [2]int) {
+	t.Helper()
+	raw, err := c.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.Control(func(fd uintptr) {
+		for i, option := range []int{syscall.SO_RCVBUF, syscall.SO_SNDBUF} {
+			if each[i], err = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	return each
+}
+
+// capped is what buffers reads of a socket whose buffers are set to size: the kernel takes twice what is asked, up to its own maximum.
+func capped(t *testing.T, size int) (each [2]int) {
+	t.Helper()
+	for i, sysctl := range []string{"rmem_max", "wmem_max"} {
 		b, err := os.ReadFile("/proc/sys/net/core/" + sysctl)
-		n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-		if err != nil || n <= 0 {
+		most, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || most <= 0 {
 			t.Skipf("cannot read the kernel's %s: %v", sysctl, err)
 		}
-		return min(n, proxyBuffer)
+		each[i] = 2 * min(most, size)
 	}
+	return each
+}
+
+func TestProxySocketIsCappedEachWay(t *testing.T) {
 	target, _ := proxy(t)
 	c, err := newWorker("", target, 0).dial()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	raw, err := c.(*net.TCPConn).SyscallConn()
-	if err != nil {
-		t.Fatal(err)
+	if got, want := buffers(t, c.(*net.TCPConn)), capped(t, proxyBuffer); got != want {
+		t.Fatalf("the socket to the proxy holds %v bytes each way: want %v, the kernel's count of the cap", got, want)
 	}
-	raw.Control(func(fd uintptr) {
-		for option, want := range map[int]int{syscall.SO_RCVBUF: 2 * most("rmem_max"), syscall.SO_SNDBUF: 2 * most("wmem_max")} {
-			if got, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, option); got != want || err != nil {
-				t.Errorf("socket option %d is %d bytes (%v): want %d, the kernel's count of the cap", option, got, err, want)
-			}
-		}
-	})
 }
 
 func TestStreamWhoseProxyTakesNothingIsCutShort(t *testing.T) {
