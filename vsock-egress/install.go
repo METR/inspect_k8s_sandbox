@@ -10,7 +10,8 @@ import (
 	"runtime"
 )
 
-//go:embed profiles
+//go:embed profiles/amd64/vsock-egress-launcher.json profiles/amd64/vsock-egress.json
+//go:embed profiles/arm64/vsock-egress-launcher.json profiles/arm64/vsock-egress.json
 var profiles embed.FS
 
 // install writes this build's two seccomp profiles into profiles/ of the kubelet's seccomp directory, so the image that installs them needs no shell.
