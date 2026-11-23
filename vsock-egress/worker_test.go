@@ -748,7 +748,7 @@ const brokenReaper = "VSOCK_EGRESS_TEST_BROKEN_REAPER"
 const fullDisk = "VSOCK_EGRESS_TEST_FULL_DISK"
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && (os.Args[1] == "work" || os.Args[1] == "reap" || os.Args[1] == "install") { // tests start this binary as these commands
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") { // tests start this binary as its commands
 		switch how := os.Getenv(brokenReaper); {
 		case os.Args[1] == "reap" && how == "fails":
 			os.Exit(1)
