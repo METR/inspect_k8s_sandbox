@@ -1005,7 +1005,7 @@ func (cl *call) stop(timeout bool) {
 				}
 				status, _ := os.ReadFile("/proc/" + strconv.Itoa(p) + "/status")
 				_, ids, _ := bytes.Cut(status, []byte("\nUid:\t"))
-				if f, uid := bytes.Fields(ids), []byte(strconv.Itoa(int(as.Uid))); len(f) > 2 && (bytes.Equal(f[0], uid) || bytes.Equal(f[2], uid)) { // what its user may signal and no more: a traced helper says what its tracer likes
+				if f, uid := bytes.Fields(ids), fmt.Append(nil, as.Uid); len(f) > 2 && (bytes.Equal(f[0], uid) || bytes.Equal(f[2], uid)) { // what its user may signal and no more: a traced helper says what its tracer likes
 					t.sent[p] = started
 				}
 			}
