@@ -76,20 +76,21 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 }
 
 func TestSecondForwarderLeavesTheFirstReady(t *testing.T) {
-	first, err := vsockListen(keyPort) // the forwarder at work holds this port, which one alone can
-	if err != nil {
-		t.Skipf("no AF_VSOCK here, or its key port is taken: %v", err)
+	if first, err := vsockListen(keyPort); err == nil { // the forwarder at work holds this port, which one alone can; where the test cannot take it, nor can a second
+		defer first.f.Close()
 	}
-	defer first.f.Close()
 	file := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(file+readySuffix, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	err = forward([]string{"-listen", "127.0.0.1:0", "-key", file})
+	err := forward([]string{"-listen", "127.0.0.1:65536", "-key", file}) // a proxy port it cannot take: it ends, refused or not
 
-	if _, gone := os.Stat(file + readySuffix); err == nil || gone != nil {
-		t.Fatalf("a second forwarder ended with %v, and the first one's ready file gave %v: want it refused and the file left", err, gone)
+	if _, gone := os.Stat(file + readySuffix); gone != nil {
+		t.Fatalf("a second forwarder ended with %v, and the first one's ready file gave %v: want the file left", err, gone)
+	}
+	if _, kept := os.Stat(file); kept == nil {
+		t.Fatalf("a second forwarder ended with %v, and wrote a key file, which only the one that holds the port may", err)
 	}
 }
 

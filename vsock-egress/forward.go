@@ -34,15 +34,15 @@ func forward(args []string) error {
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
 	f := newForwarder(hostCID, streamPort)
-	if err := f.loadKey(*keyFile); err != nil {
-		return err
-	}
-	keys, err := vsockListen(keyPort)
+	keys, err := vsockListen(keyPort) // first: one forwarder alone can hold this port, and a second ends here having touched nothing of the first's
 	if err != nil {
 		return err
 	}
 	defer keys.f.Close()
-	os.Remove(*keyFile + readySuffix) // an earlier forwarder's: only now, with the port one forwarder alone can hold, so that a second one leaves the first ready
+	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
+	if err := f.loadKey(*keyFile); err != nil {
+		return err
+	}
 	go f.serveKey(keys)
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
