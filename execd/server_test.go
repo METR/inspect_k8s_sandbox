@@ -77,7 +77,7 @@ func TestMain(m *testing.M) {
 			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
 		}
 	}
-	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
+	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search" || os.Args[1] == "hold") {
 		main()
 		return
 	}
@@ -1590,6 +1590,35 @@ func TestAKilledCommandIsStoppedWhenItsGraceIsUpThoughNoPidfdSignalsItsGroup(t *
 	}
 }
 
+func TestAKilledCommandsGroupIsStoppedWhenItsGraceIsUp(t *testing.T) {
+	self, _ := os.FindProcess(os.Getpid())
+	if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); err != syscall.EBADF || self.WithHandle(func(uintptr) {}) != nil {
+		t.Skip("no group is signalled through a pidfd here, as on Linux before 6.9")
+	}
+	end := graced(t)
+	s, c, frames, _, first := ready(t, "", "sh", "-c", `trap "" TERM; (while :; do :; done) & echo $!; wait`)
+	child, _ := strconv.Atoi(strings.TrimSpace(first))
+	stops := func() string { // how often it has given up its processor: it spins, so a stop alone makes it
+		status, _ := os.ReadFile("/proc/" + strconv.Itoa(child) + "/status")
+		_, n, _ := strings.Cut(string(status), "\nvoluntary_ctxt_switches:\t")
+		return strings.Fields(n + " 0")[0]
+	}
+	before := stops()
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	until(t, "one of the command's group was not stopped and continued for its SIGTERM", func() bool { f := stat(child); return stops() != before && len(f) > 0 && f[0] != "T" })
+	reaper.mu.Lock() // the sweep's kill waits for this: stopped from here on, it is by the timer
+	end()
+	stopped := false
+	for until := time.Now().Add(30 * time.Second); !stopped && time.Now().Before(until); time.Sleep(time.Millisecond) {
+		f := stat(child)
+		stopped = len(f) > 0 && f[0] == "T"
+	}
+	reaper.mu.Unlock()
+	if exitStatus(t, frames); !stopped {
+		t.Fatal("one of the command's group ran on when its grace was up: the group's stop goes through a handle on its holder")
+	}
+}
+
 // Regression: root execd killed whatever its helper's report named: a line that a tracer of the helper wrote into it ended a root process that was none of the call's.
 func TestAKillTakesFromItsHelpersReportOnlyWhatTheCommandsUserMaySignal(t *testing.T) {
 	status, _ := os.ReadFile("/proc/self/status")
@@ -1688,8 +1717,9 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 		"found in its group":                 {"", "sh", "-c", `trap exit TERM; (` + orphan + ` 'trap "echo $$" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`},                                                                                                        // in its group with no tag, its parent gone, one says its id at its SIGTERM and runs on
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); name == "left in its group by a handler" && err != syscall.EBADF {
-				t.Skip("no group is signalled through a pidfd here, as on Linux before 6.9")
+			if name == "left in its group by a handler" { // as before Linux 6.9, where no pidfd signals a group: its holder's number does
+				pidfdNoGroup.Store(1 << 30)
+				t.Cleanup(func() { pidfdNoGroup.Store(0) })
 			}
 			end := graced(t)
 			s, c, frames, tag, _ := ready(t, argv[0], argv[1:]...)
@@ -1714,6 +1744,59 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 			until(t, "what ran on outlived the kill", func() bool { return gone(straggler) })
 		})
 	}
+}
+
+func TestACallWaitsForACommandThatMakesASessionOfItsOwn(t *testing.T) {
+	// Where it leads its group setsid(1) forks, and the call ends with the parent: a command that led it could make no session.
+	_, _, frames, _, first := ready(t, "", "setsid", "sh", "-c", "sleep 0.3; echo late; exit 42")
+	if first != "late\n" {
+		t.Fatalf("the call first said %q: want what its command says before it ends", first)
+	}
+	if status := exitStatus(t, frames); status["code"] != 42.0 {
+		t.Fatalf("EXIT %v, want the command's own 42", status)
+	}
+}
+
+func TestACommandsHolderEndsWithIt(t *testing.T) {
+	s, _, frames, _, _ := ready(t, "", "sh", "-c", "echo up; sleep 600 >/dev/null 2>&1 &") // it leaves one running in its group
+	cl := s.get(80)
+	cl.kmu.Lock()
+	holder := cl.group
+	cl.kmu.Unlock()
+	exitStatus(t, frames)
+	until(t, "a holder outlived its command: each call would leave one", func() bool { return gone(holder) })
+}
+
+func TestAKillReachesTheGroupOfACommandThatSignalledIt(t *testing.T) {
+	pidfdNoGroup.Store(1 << 30) // as before Linux 6.9: only a holder that is still there signals the group
+	t.Cleanup(func() { pidfdNoGroup.Store(0) })
+	// At once, as a script's `kill 0` may; then it leaves one in the group that carries no tag and, its parent gone before it is named, descends from nothing of the command's.
+	s, c, frames, _, first := ready(t, "", "env", "-i", "/bin/sh", "-c", `trap : TERM; kill -TERM 0; trap - TERM; left=$(sleep 600 >/dev/null 2>&1 & echo $!); echo $left; sleep 600`)
+	left, _ := strconv.Atoi(strings.TrimSpace(first))
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	exitStatus(t, frames)
+	until(t, "what the command left in its group outlived the kill: the group's own signal had ended its holder", func() bool { return gone(left) })
+}
+
+func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	alive := filepath.Join(t.TempDir(), "alive")
+	loop, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `while :; do : >"$0"; sleep 0.01; done`, alive}, Env: map[string]string{}, Tag: "other"})
+	s.start(testConn(t), frame{kind: fStart, id: 32, payload: loop})
+	sleep, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "reaped"})
+	s.start(testConn(t), frame{kind: fStart, id: 38, payload: sleep})
+	other, cl := s.get(32), s.get(38)
+	t.Cleanup(other.kill)
+	cl.kmu.Lock()
+	own := cl.group
+	cl.group, cl.held = other.group, make(chan syscall.WaitStatus, 1) // its holder was reaped: the number it still has is another command's group by now
+	cl.kmu.Unlock()
+	t.Cleanup(func() { syscall.Kill(own, syscall.SIGKILL) })
+
+	cl.kill()
+
+	os.Remove(alive)
+	until(t, "a kill reached the group that had been given its own holder's number", func() bool { _, err := os.Stat(alive); return err == nil })
 }
 
 func TestAKillsSearchSlowerThanItsGraceStillKillsWhatItSignals(t *testing.T) {

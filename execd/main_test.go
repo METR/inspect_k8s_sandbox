@@ -142,6 +142,19 @@ func firstProcess(argv []string) {
 	}
 }
 
+func TestAHolderSaysItIsReadyOnceItIgnoresSignals(t *testing.T) {
+	hold := exec.Command(os.Args[0], "hold")
+	stdin, _ := hold.StdinPipe() // open while the test runs: a holder lives until its stdin ends
+	out, _ := hold.StdoutPipe()
+	if err := hold.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stdin.Close(); hold.Process.Kill() })
+	if said, _ := io.ReadAll(out); string(said) != "true\n" {
+		t.Fatalf("a holder said %q and closed its stdout: want true, that it ignores SIGTERM by then", said)
+	}
+}
+
 func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	taken, err := net.Listen("tcp", ":0")
 	if err != nil {

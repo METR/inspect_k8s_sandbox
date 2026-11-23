@@ -86,7 +86,10 @@
   `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
   a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
   its environment holds `HAWK_NEXT_EXEC`, a `cwd` that does not exist ends it with
-  status 1, and with no `stdin` it reads end-of-file. Run as another user, it has a
+  status 1, and with no `stdin` it reads end-of-file. It does not lead its process
+  group: a process of execd's own does, as `timeout` does over Kubernetes exec, so it
+  can start a session of its own (`setsid`), and `kill -TERM -$$` finds no group.
+  Run as another user, it has a
   soft open-file limit of 1024 where the hard limit is no lower, whatever the image's
   PAM limits say, and may raise it to the hard limit. If a symbolic link on the path to
   the container's working directory is re-pointed, a command given no `cwd`, or a
@@ -101,8 +104,9 @@
   once the command and the processes execd signalled have ended or been sent SIGKILL, or
   16 seconds after its timeout at the latest. What they start after their SIGTERM gets
   SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts. (On
-  gVisor and on Linux before 6.9, one left in the command's group whose environment no
-  longer holds `HAWK_NEXT_EXEC` can run on. On Linux before 6.9 and on gVisor before
+  gVisor, one left in the command's group whose environment no longer holds
+  `HAWK_NEXT_EXEC` can run on; not measured since the group has a leader of execd's
+  own. On Linux before 6.9 and on gVisor before
   release-20260928.0, a threaded program's SIGTERM handler, as in Python, may not run;
   on gVisor release-20261109.0 it runs.) The processes of a command that has ended by
   itself are left running. Once execd has stopped reading a command's output, 100 ms
@@ -126,7 +130,8 @@
   volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up
   the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit
-  of about 30 to start.
+  of about 30 to start. Each running command holds 3 more, in the process that leads
+  its group, and about 0.75 MB of the container's memory.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has

@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -31,6 +32,13 @@ import (
 func init() { undumpable() }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "hold" { // how run() gives a command a group it does not lead, as timeout(1) does over Kubernetes exec: this process leads it
+		signal.Ignore()                                          // all that can be: it outlives a kill's SIGTERM, and what the command sends its group
+		fmt.Fprintln(os.Stdout, signal.Ignored(syscall.SIGTERM)) // run()'s word that it has, as the runtime knows it: only then is the command started
+		os.Stdout.Close()
+		io.Copy(io.Discard, os.Stdin) // run()'s pipe, which ends with execd: before that only execd's SIGKILL ends this
+		return
+	}
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
