@@ -77,6 +77,24 @@ func TestForwarderThatCannotListenIsNotReady(t *testing.T) {
 	}
 }
 
+func TestSecondForwarderLeavesTheFirstReady(t *testing.T) {
+	first, err := vsockListen(keyPort) // the forwarder at work holds this port, which one alone can
+	if err != nil {
+		t.Skipf("no AF_VSOCK here, or its key port is taken: %v", err)
+	}
+	defer first.f.Close()
+	file := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(file+readySuffix, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = forward([]string{"-listen", "127.0.0.1:0", "-key", file})
+
+	if _, gone := os.Stat(file + readySuffix); err == nil || gone != nil {
+		t.Fatalf("a second forwarder ended with %v, and the first one's ready file gave %v: want it refused and the file left", err, gone)
+	}
+}
+
 func TestForwarderWhoseWorkerDoesNotListenIsNotReady(t *testing.T) {
 	node, port := loopback(t)
 	f := newForwarder(unix.VMADDR_CID_LOCAL, port)

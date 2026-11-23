@@ -81,3 +81,12 @@ func TestProbePassesACanaryThatStartsAfterIt(t *testing.T) {
 		t.Fatalf("a canary that started after the check did: %v", err)
 	}
 }
+
+func TestCanaryEndsOnItsOwn(t *testing.T) {
+	ended := make(chan error, 1)
+	go func() { ended <- canaryFor(time.Nanosecond) }()
+
+	if err := within(t, ended, "end of a canary past its time"); err != nil {
+		t.Fatal(err)
+	}
+}
