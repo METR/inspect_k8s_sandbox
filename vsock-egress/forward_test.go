@@ -294,6 +294,51 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 	}
 }
 
+func TestStreamCapsItsClientSocketEachWay(t *testing.T) {
+	f := keyedForwarder(0, 0)
+	dialled, over := make(chan struct{}), make(chan struct{})
+	defer close(over)
+	f.connect = func(uint32, uint32) (*os.File, error) { // a stream dials the node once it has its place and its caps
+		close(dialled)
+		<-over
+		return nil, errors.New("the test is over")
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	c, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go f.stream(c.(*net.TCPConn))
+	within(t, dialled, "dial of the node")
+
+	// What the kernel makes of the cap is read from a socket the test caps itself: twice the cap, or twice its own maximum.
+	client.(*net.TCPConn).SetReadBuffer(proxyBuffer)
+	client.(*net.TCPConn).SetWriteBuffer(proxyBuffer)
+	var held [2][2]int
+	for i, end := range []net.Conn{c, client} {
+		raw, err := end.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Control(func(fd uintptr) {
+			held[i][0], _ = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
+			held[i][1], _ = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF)
+		})
+	}
+	if held[0] != held[1] {
+		t.Fatalf("the stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held[0], held[1])
+	}
+}
+
 func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
 	f := keyedForwarder(0, 0)
 	for range maxStreams + maxWaiting { // it holds back all it may, with a place free for the next it takes
