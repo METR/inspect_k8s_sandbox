@@ -1161,7 +1161,7 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, list boo
 			continue
 		}
 		status, _ := os.ReadFile("/proc/" + strconv.Itoa(p) + "/status")
-		if i := bytes.LastIndex(status, []byte("\nUid:\t")); i >= 0 && !bytes.HasPrefix(status[i+6:], []byte(strconv.Itoa(int(own))+"\t")) { // its real user, which a setuid binary leaves it; the last such line, as gVisor shows a newline in its name as one
+		if i := bytes.LastIndex(status, []byte("\nUid:\t")); i >= 0 && !bytes.HasPrefix(status[i+6:], []byte(strconv.FormatUint(uint64(own), 10)+"\t")) { // its real user, which a setuid binary leaves it; the last such line, as gVisor shows a newline in its name as one
 			joined[p] = true
 		}
 	}
