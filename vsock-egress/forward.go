@@ -119,6 +119,7 @@ func listen(addr string) (net.Listener, error) {
 	held := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		return c.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, clientBuffer/2) })
 	}}
+	held.SetMultipathTCP(false) // Go listens for it unasked, and a multipath connection's subflows have buffers of their own, which nothing set on the connection bounds
 	return held.Listen(context.Background(), "tcp", addr)
 }
 

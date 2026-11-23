@@ -339,6 +339,33 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	}
 }
 
+func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
+	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
+		t.Skip("this kernel has multipath TCP off")
+	}
+	l, err := listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var guest net.Dialer
+	guest.SetMultipathTCP(true)
+	client, err := guest.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	got, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+
+	if multipath, err := got.(*net.TCPConn).MultipathTCP(); multipath || err != nil {
+		t.Fatalf("the connection of a client that asked for multipath TCP is multipath: %v (%v): want plain TCP, the only kind whose buffers the forwarder's bounds hold", multipath, err)
+	}
+}
+
 func TestStreamWhoseClientHasNotTakenItsReplyKeepsItsPlace(t *testing.T) {
 	client, inSandbox := unreadPair(t)
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
