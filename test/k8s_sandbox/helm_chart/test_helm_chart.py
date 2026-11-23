@@ -1031,14 +1031,16 @@ def test_no_service_can_share_the_egress_forwarders_container_name(
     documents = _run_helm_template(
         chart_dir,
         test_resources_dir / "egress-proxy-values.yaml",
-        "global.fullnameOverride=x",
+        f"global.fullnameOverride=x,services.{_FORWARDER}.image=busybox",
     )
 
-    [stateful_set] = _get_documents(documents, "StatefulSet")
-    forwarder = stateful_set["spec"]["template"]["spec"]["initContainers"][0]["name"]
-    # A StatefulSet's name ("x-default" here) and a container's: 63 characters at most.
-    longest_service = 63 - len(stateful_set["metadata"]["name"]) + len("default")
-    assert longest_service < len(forwarder) <= 63
+    [of_that_name] = [
+        owner["metadata"]["name"]
+        for owner in _get_documents(documents, "StatefulSet")
+        if owner["spec"]["template"]["spec"]["containers"][0]["name"] == _FORWARDER
+    ]
+    # Kubernetes takes 63 characters of a container's name, and of a StatefulSet's.
+    assert len(_FORWARDER) <= 63 < len(of_that_name)
 
 
 def test_egress_proxy_annotation_needs_the_forwarder_image(
