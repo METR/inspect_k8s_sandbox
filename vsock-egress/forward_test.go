@@ -326,6 +326,37 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	}
 }
 
+func TestStreamWhoseClientHasNotTakenItsReplyKeepsItsPlace(t *testing.T) {
+	client, inSandbox := unreadPair(t)
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, node := os.NewFile(uintptr(pair[0]), "vsock"), os.NewFile(uintptr(pair[1]), "node")
+	defer node.Close()
+	f := keyedForwarder(0, 0)
+	f.connect = func(uint32, uint32) (*os.File, error) { return guest, nil }
+	ended := make(chan struct{})
+	go func() {
+		f.stream(inSandbox)
+		close(ended)
+	}()
+	reply := strings.Repeat("r", 100<<10) // all of it fits the socket's buffer: the stream ends cleanly with most of it unsent
+	client.CloseWrite()
+	if err := toFrames(node, strings.NewReader(reply), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	node.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) // a wait for nothing: a stalled runner can hide a stream that ends early, and fails none that does not
+	if _, err := io.Copy(io.Discard, node); !errors.Is(err, os.ErrDeadlineExceeded) || len(f.slots) != 1 {
+		t.Fatalf("the stream ended (%v, %d places taken) with its reply not yet taken: want it to keep its place, for the kernel holds what is unsent", err, len(f.slots))
+	}
+	if got, err := io.ReadAll(client); string(got) != reply || err != nil {
+		t.Fatalf("the client read %d bytes, %v: want the whole reply of %d and then a clean end", len(got), err, len(reply))
+	}
+	within(t, ended, "end of a stream whose client has taken its reply")
+}
+
 func TestConnectionPastTheWaitingBoundIsReset(t *testing.T) {
 	f := keyedForwarder(0, 0)
 	for range maxStreams + maxWaiting { // it holds back all it may, with a place free for the next it takes

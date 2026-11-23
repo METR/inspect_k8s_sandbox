@@ -10,8 +10,10 @@ The pod's network policy admits that port on the release's own pods alone, so th
 release's `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that port. Pods that
 `additionalResources` adds with those labels come under the release's other policies too: they need a policy that admits
 the pod on that port, and reach only what the release's egress grants and their own policies allow. For any other
-Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
-has not completed in five minutes.
+Service, add a policy that lets the pod reach it. The worker resets a connection once the proxy has left a write of its
+upload uncompleted, or its end unacknowledged, for five minutes, and the forwarder does the same for the sandbox's
+client and its reply. The forwarder carries 64 of a sandbox's connections at once, and one keeps its place among them
+until its client has acknowledged the whole reply.
 
 Each node needs:
 
