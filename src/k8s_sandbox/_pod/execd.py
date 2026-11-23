@@ -355,6 +355,7 @@ class Call:
     exited: bool = False
     words: int = 0  # EXIT and ERROR frames queued that its loop has yet to take
     resuming: bool = False  # a RESUME awaits its one RESUMED
+    ended: bool = False  # by its RESUMED's word: out of reach until its EXIT
     ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
     hold: int = HOLD
     ack_every: int = ACK_EVERY
@@ -430,7 +431,7 @@ class Link:
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self.bulk = asyncio.Lock()
-        self._last_rx = time.monotonic()
+        self._last_rx = self._last_tx = time.monotonic()
         self._tasks = [
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
@@ -469,6 +470,7 @@ class Link:
                 raise ConnectionError("execd stopped reading") from None
             if not sent:  # a START whose turn came once its call's time was up
                 raise asyncio.TimeoutError
+            self._last_tx = time.monotonic()
             if kind == RELEASE:
                 self._released.append(call_id)
             elif kind == PING:
@@ -545,14 +547,16 @@ class Link:
                         if sum(c.got) + n - sum(c.taken) > c.hold:
                             return
                         c.got[kind - STDOUT] += n
-                    if kind == RESUMED:  # out of reach until the EXIT of one that ended
+                    if kind == RESUMED:
                         said = json.loads(payload)
-                        c.resuming = type(said) is dict and said.get("exited") is True
+                        c.resuming = False
+                        c.ended = type(said) is dict and said.get("exited") is True
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
-        except OSError as e:  # but its close_notify: a live execd closed this one
-            self.ended = not isinstance(e, ConnectionAbortedError)
+        except OSError as e:  # not its close_notify, nor after our silence: execd's own
+            heard = time.monotonic() - self._last_tx < DEAD_AFTER
+            self.ended = heard and not isinstance(e, ConnectionAbortedError)
         except (ValueError, LookupError, TypeError):  # not execd's frames
             pass
         finally:
@@ -925,7 +929,7 @@ class ExecdClient:
             # Another container, or none execd names: its command may not have run.
             unnamed = old.container == b"unknown" or old.container[:1] == b":"
             # Out of reach before execd went: it may have ended, its status unheard.
-            apart = not was.killed or call.resuming
+            apart = not was.killed or call.resuming or call.ended
             if new.container != old.container or unnamed or apart:
                 raise ExecdStoppedError(
                     "execd stopped while it ran the command", pod=old.ip
