@@ -1067,7 +1067,9 @@ services:
     x-inspect_k8s_sandbox: {resources: {requests: *memory}}
 """)
 
-    with pytest.raises(ComposeConverterError, match="Conflicting 'requests.memory'"):
+    with pytest.raises(
+        _converter.ComposeConverterError, match="Conflicting 'requests.memory'"
+    ):
         _converter.convert_compose_to_helm_values(compose_path)
 
 
