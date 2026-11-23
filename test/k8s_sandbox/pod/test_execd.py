@@ -2289,7 +2289,8 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
-APART = ["a start found it running", "the look timed out", "ours", "resuming"]
+APART = ["a start found it running", "the look timed out", "ours", "it outlived"]
+APART += ["its command had ended"]
 
 
 @pytest.mark.parametrize("how", APART)
@@ -2298,20 +2299,32 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     clock: types.SimpleNamespace,
     timers: None,
     interval: collections.abc.Callable[[], None],
+    monkeypatch: pytest.MonkeyPatch,
     how: str,
 ) -> None:
     """Regression: it ended 137, though its command may have ended 0, unheard."""
     cut, reached, starts = asyncio.Event(), [0], [0]
+    wait = execd.asyncio.sleep
+
+    async def dies_in(seconds: float) -> None:
+        if how == "it outlived" and cut.is_set() and 0 < seconds < execd.PING_EVERY:
+            first.close()  # execd outlives the cut by the client's first wait
+        await wait(seconds)
+
+    monkeypatch.setattr(execd.asyncio, "sleep", dies_in)
 
     async def is_killed(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         reached[0] += 1
-        await read_frame(r)  # START; on a second connection, the call's RESUME
+        _, call, _ = await read_frame(r)  # START; on a second connection, its RESUME
         resumed = reached[0] == 2
         if not resumed:
             await cut.wait()
+        elif how == "its command had ended":  # execd says so, and dies before the EXIT
+            said = b'{"stdin": 0, "eof": true, "put": 0, "exited": true}'
+            w.write(frame(execd.RESUMED, call, said))
         if how == "the look timed out":  # reached again, it says nothing
             daemons.ports[old] = silent.sockets[0].getsockname()[1]
-        elif how != "resuming" or resumed:
+        elif how not in ("it outlived", "its command had ended") or resumed:
             first.close()  # execd is gone, and a start makes another
         if how == "ours":
             await r.read()  # the client's own timer ends this connection
@@ -2345,6 +2358,40 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     with pytest.raises(error.ExecdStoppedError):
         await asyncio.wait_for(call, 30)  # only bounds a hang
     silent.close()
+
+
+async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
+    tls: tuple[ssl.SSLContext, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: execd's own close, as of a client silent 60 s, read as its end."""
+    context, pin = tls
+
+    async def closes(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        await read_frame(r)  # START
+        servers[0].close()  # killed by the time the client looks for it
+        w.close()  # with a close_notify, as execd closes a connection while it lives
+
+    async def says_nothing(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        await read_frame(r)  # AUTH
+        w.write(frame(execd.OK, 0))
+        await r.read()
+
+    servers = [
+        await asyncio.start_server(handler, "127.0.0.1", 0, ssl=context)
+        for handler in (closes, says_nothing)
+    ]
+    ports = [server.sockets[0].getsockname()[1] for server in servers]
+
+    async def start(replace: bool) -> execd.Daemon:
+        monkeypatch.setattr(execd, "EXECD_PORT", ports.pop(0))
+        return execd.Daemon("127.0.0.1", pin, b"key", container=b"b:5")
+
+    call = execd.ExecdClient(start).exec(["sh"], None, None, {}, None, 99)
+    with pytest.raises(error.ExecdStoppedError):
+        await asyncio.wait_for(call, 30)  # only bounds a hang
+    servers[1].close()
 
 
 async def test_a_call_started_again_ends_with_our_wait_where_no_word_comes(

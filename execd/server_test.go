@@ -1564,6 +1564,32 @@ func TestAKilledCommandsGroupIsContinuedThoughItsCommandEndsAtItsSigterm(t *test
 	said(t, frames, func(out string) bool { return strings.Contains(out, "x") })
 }
 
+// Regression: where no pidfd signals a group, the timer at the grace's end no longer stopped the command itself: a busy one kept the sweep's kill from a processor.
+func TestAKilledCommandIsStoppedWhenItsGraceIsUpThoughNoPidfdSignalsItsGroup(t *testing.T) {
+	end := graced(t)
+	pidfdNoGroup.Store(1 << 30)
+	t.Cleanup(func() { pidfdNoGroup.Store(0) })
+	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "" TERM; echo ready; while :; do :; done`)
+	pid := s.get(80).pid
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	becomes := func(stopped bool) bool { // within 5 s
+		for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(time.Millisecond) {
+			if f := stat(pid); len(f) > 0 && (f[0] == "T") == stopped {
+				return true
+			}
+		}
+		return false
+	}
+	continued := becomes(false) // for its SIGTERM: stopped from here on, it is by the timer
+	reaper.mu.Lock()            // the sweep's kill waits for this
+	end()
+	stopped := becomes(true)
+	reaper.mu.Unlock()
+	if exitStatus(t, frames); !continued || !stopped {
+		t.Fatalf("continued for its SIGTERM: %v; stopped when its grace was up: %v", continued, stopped)
+	}
+}
+
 // Regression: root execd killed whatever its helper's report named: a line that a tracer of the helper wrote into it ended a root process that was none of the call's.
 func TestAKillTakesFromItsHelpersReportOnlyWhatTheCommandsUserMaySignal(t *testing.T) {
 	status, _ := os.ReadFile("/proc/self/status")
@@ -3005,6 +3031,27 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatalf("a RESUME of call %d got no answer", id)
+		}
+	}
+}
+
+// Regression: a RESUME's answer did not say whether the command had ended: an ended one, whose EXIT a killed execd never sent, was to its client one running under the kill.
+func TestAResumeSaysWhetherItsCommandHasEnded(t *testing.T) {
+	for argv, want := range map[string]string{"true": `"exited":true`, "sleep 600": `"exited":false`} {
+		tag := strconv.FormatInt(time.Now().UnixNano(), 36)
+		t.Cleanup(func() { killTagged(tag) })
+		s, _ := newServer(strings.Repeat("00", 32))
+		req, _ := json.Marshal(startRequest{Argv: strings.Fields(argv), Env: map[string]string{}, Tag: tag})
+		first := testConn(t)
+		s.start(first, frame{kind: fStart, id: 26, payload: req})
+		if argv == "true" {
+			exitCode(t, s.get(26))
+		}
+		s.detach(first)
+		late, frames := recordedConn(t)
+		go s.resume(late, frame{kind: fResume, id: 26, payload: []byte(`{"stdout":0,"stderr":0}`)})
+		if said := nextFrame(t, frames); said.kind != fResumed || !bytes.Contains(said.payload, []byte(want)) {
+			t.Fatalf("a RESUME of `%s` got a frame of kind %d: %s, want %s in it", argv, said.kind, said.payload, want)
 		}
 	}
 }
