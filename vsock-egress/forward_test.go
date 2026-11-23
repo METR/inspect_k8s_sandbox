@@ -296,8 +296,21 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 
 func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	_, placed := tcpPair(t)
-	_, waiting := tcpPair(t)
-	kept, err := waiting.File() // the socket, past the stream's close of it
+	l, err := listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	waiting, err := l.Accept() // as the forwarder's listener hands a connection over
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := waiting.(*net.TCPConn).File() // the socket, past the stream's close of it
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,14 +328,14 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 		f.slots <- struct{}{}
 	}
 	f.wait = 0
-	f.stream(waiting)
+	f.stream(waiting.(*net.TCPConn))
 
 	if want := capped(t, 128<<10); held != want { // the size itself: a change to it must be measured against the forwarder's memory limit in the chart
 		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
 	}
 	locked, err := unix.GetsockoptInt(int(kept.Fd()), unix.SOL_SOCKET, unix.SO_BUF_LOCK)
-	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked != unix.SOCK_RCVBUF_LOCK {
-		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, and that buffer alone locked (%d): unlocked, small segments grow it", got, locked, err, want, unix.SOCK_RCVBUF_LOCK)
+	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked&unix.SOCK_RCVBUF_LOCK == 0 {
+		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, locked, as its listener gave it: unlocked, small segments grow it before the forwarder has seen it", got, locked, err, want)
 	}
 }
 

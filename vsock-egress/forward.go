@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"flag"
 	"log"
 	"net"
 	"os"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -44,7 +46,7 @@ func forward(args []string) error {
 	}
 	defer keys.f.Close()
 	go f.serveKey(keys)
-	l, err := net.Listen("tcp", *addr)
+	l, err := listen(*addr)
 	if err != nil {
 		return err
 	}
@@ -112,6 +114,14 @@ func (f *forwarder) serveKey(l *vsockListener) {
 	}
 }
 
+// listen takes the proxy port, where every connection is born with its receive buffer held at half the cap, the size the kernel starts it with: left alone until stream runs, a client's small segments grow it to the kernel's maximum, and the forwarder is charged for it all as it accepts.
+func listen(addr string) (net.Listener, error) {
+	held := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, clientBuffer/2) })
+	}}
+	return held.Listen(context.Background(), "tcp", addr)
+}
+
 func (f *forwarder) serve(l net.Listener) error {
 	for {
 		c, err := l.Accept()
@@ -141,7 +151,6 @@ const clientBuffer = 128 << 10
 
 // stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
 func (f *forwarder) stream(c *net.TCPConn) {
-	c.SetReadBuffer(clientBuffer / 2) // what the kernel starts it with, now held: left alone, a client's small segments grow it to the kernel's maximum while it waits
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:
@@ -151,7 +160,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
-	// Only now the whole of it: the 448 that wait hold half as much.
+	// Only now the whole of it: the 448 that wait hold the half their listener gave them.
 	c.SetReadBuffer(clientBuffer)
 	c.SetWriteBuffer(clientBuffer)
 	up, err := f.dial()
