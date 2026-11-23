@@ -297,7 +297,6 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	_, placed := tcpPair(t)
 	_, waiting := tcpPair(t)
-	_, untouched := tcpPair(t)
 	kept, err := waiting.File() // the socket, past the stream's close of it
 	if err != nil {
 		t.Fatal(err)
@@ -321,8 +320,9 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	if want := capped(t, 128<<10); held != want { // the size itself: a change to it must be measured against the forwarder's memory limit in the chart
 		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
 	}
-	if got, want := buffers(t, kept), buffers(t, untouched); got != want {
-		t.Errorf("a connection that got no place holds %v bytes each way: want %v, as one nothing touched: capped, the 448 that wait can hold more than the forwarder's limit", got, want)
+	locked, err := unix.GetsockoptInt(int(kept.Fd()), unix.SOL_SOCKET, unix.SO_BUF_LOCK)
+	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked != unix.SOCK_RCVBUF_LOCK {
+		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, and that buffer alone locked (%d): unlocked, small segments grow it", got, locked, err, want, unix.SOCK_RCVBUF_LOCK)
 	}
 }
 
