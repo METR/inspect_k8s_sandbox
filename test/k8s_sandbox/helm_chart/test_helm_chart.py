@@ -1028,7 +1028,9 @@ def test_a_pod_with_the_egress_forwarder_is_of_the_guaranteed_qos_class(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
     documents = _run_helm_template(
-        chart_dir, test_resources_dir / "egress-proxy-values.yaml"
+        chart_dir,
+        test_resources_dir / "egress-proxy-values.yaml",
+        set_string=f"services.default.podAnnotations.{_NO_CARD}",
     )
 
     pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
