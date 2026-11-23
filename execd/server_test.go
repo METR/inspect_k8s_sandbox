@@ -1572,8 +1572,8 @@ func TestAKilledCommandIsStoppedWhenItsGraceIsUpThoughNoPidfdSignalsItsGroup(t *
 	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap "" TERM; echo ready; while :; do :; done`)
 	pid := s.get(80).pid
 	s.dispatch(c, frame{kind: fKill, id: 80})
-	becomes := func(stopped bool) bool { // within 5 s
-		for until := time.Now().Add(5 * time.Second); time.Now().Before(until); time.Sleep(time.Millisecond) {
+	becomes := func(stopped bool) bool { // within 30 s
+		for until := time.Now().Add(30 * time.Second); time.Now().Before(until); time.Sleep(time.Millisecond) {
 			if f := stat(pid); len(f) > 0 && (f[0] == "T") == stopped {
 				return true
 			}

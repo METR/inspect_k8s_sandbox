@@ -2290,7 +2290,7 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
 
 
 APART = ["a start found it running", "the look timed out", "ours", "it outlived"]
-APART += ["its command had ended"]
+APART += ["its command had ended", "we were silent"]
 
 
 @pytest.mark.parametrize("how", APART)
@@ -2348,6 +2348,8 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     call = asyncio.ensure_future(client.exec(["sh"], None, None, {}, None, 99))
     await until(lambda: starts_written(client) == 1)
     link = client._link
+    if how == "we were silent":  # held, we sent execd nothing: it closes such a one
+        clock.now += execd.DEAD_AFTER
     cut.set()
     if how == "the look timed out":
         await until(lambda: reached[0] == 2)
@@ -2355,9 +2357,11 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     while how == "ours" and link is not None and not link.closed:
         interval()  # no frame for 60 s: the client ends the connection itself
         await asyncio.sleep(0.001)
-    with pytest.raises(error.ExecdStoppedError):
-        await asyncio.wait_for(call, 30)  # only bounds a hang
-    silent.close()
+    try:
+        with pytest.raises(error.ExecdStoppedError):
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+    finally:
+        silent.close()
 
 
 async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
@@ -2389,9 +2393,36 @@ async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
         return execd.Daemon("127.0.0.1", pin, b"key", container=b"b:5")
 
     call = execd.ExecdClient(start).exec(["sh"], None, None, {}, None, 99)
-    with pytest.raises(error.ExecdStoppedError):
+    try:
+        with pytest.raises(error.ExecdStoppedError):
+            await asyncio.wait_for(call, 30)  # only bounds a hang
+    finally:
+        servers[1].close()
+
+
+async def test_a_call_resumed_as_ended_is_not_started_again(daemons: Daemons) -> None:
+    """Regression: "unknown call" behind a RESUMED that said "exited" sent it again."""
+    got: list[int] = []
+
+    async def contradicts(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call, _ = await read_frame(r)
+            got.append(kind)
+            if got == [execd.START]:
+                break  # the connection is dropped under it
+            if kind == execd.RESUME:
+                said = b'{"stdin": 0, "eof": true, "put": 0, "exited": true}'
+                w.write(frame(execd.RESUMED, call, said))
+                w.write(frame(execd.ERROR, call, b"unknown call"))
+            elif kind == execd.START:  # started again: answer, so the test ends
+                w.write(frame(execd.EXIT, call, b'{"code": 0}'))
+        w.close()
+
+    await daemons.serve(contradicts)
+    call = daemons.client().exec(["sh"], None, None, {}, None, 99)
+    with pytest.raises(error.ExecdResultUnknownError, match="unknown call"):
         await asyncio.wait_for(call, 30)  # only bounds a hang
-    servers[1].close()
+    assert got.count(execd.START) == 1
 
 
 async def test_a_call_started_again_ends_with_our_wait_where_no_word_comes(
