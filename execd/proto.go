@@ -13,7 +13,7 @@ const (
 	fAuth    = 1 // payload: the key
 	fStart   = 2 // payload: startRequest as JSON
 	fStdin   = 3 // payload: bytes; an empty payload closes the call's stdin
-	fKill    = 4 // SIGKILL every process the call started (found by its exec tag)
+	fKill    = 4 // SIGTERM the call's command and the processes it started that execd finds, then SIGKILL those still running 5 s on
 	fResume  = 5 // payload: resumeRequest; replay output from these offsets, then stream
 	fRelease = 6 // forget a finished call and free its buffered output
 	fPing    = 7

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
+  when `helm list` fails: it now fails with Helm's error.
 - Once a process has converted one Docker Compose file to Helm values, each further
   conversion takes about 60 to 100 ms less.
 - Fix a sandbox rendered inside a typed list such as a `DeploymentList` not being waited
@@ -42,12 +44,14 @@
   port; those that `additionalResources` adds need policies of their own (see
   `vsock-egress/README.md`). The annotated pod gets none of the release's other egress
   grants (`allowDomains`, `allowCIDR`, `allowEntities`), and its forwarder is a native
-  sidecar, which needs Kubernetes 1.29 or later. Set `https_proxy` and `http_proxy`
+  sidecar, which needs Kubernetes 1.29 or later and adds 500m of CPU and 256Mi of memory
+  to the pod's requests and limits. Set `https_proxy` and `http_proxy`
   yourself (curl reads `http_proxy` in lower case only), their upper-case forms,
   `no_proxy` for a server on the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
-  seccomp profiles (see `vsock-egress/README.md`): on a node with no launcher such a pod
-  does not start.
+  seccomp profiles, which `vsock-egress install` writes (see `vsock-egress/README.md`):
+  on a node with no launcher such a pod does not start. The forwarder's container is named
+  `egress-forwarder-with-a-name-too-long-for-any-service-to-share`.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
@@ -82,22 +86,42 @@
   PAM limits say, and may raise it to the hard limit. If a symbolic link on the path to
   the container's working directory is re-pointed, a command given no `cwd`, or a
   relative one, still runs where the link pointed when execd started, and ends with
-  status 1 once that directory is gone. On a timed-out `exec()` whose command is still
-  running, execd sends SIGKILL to the command, to its process group and to the other
-  processes it started that it can find, as far as it may signal each; one that has
-  detached from the command can survive. Those of a command that has ended are left
-  running. Once execd has stopped reading a command's output, 100 ms after the command
-  ended at the earliest, what it left running may write 1 MiB more in total to each of
-  the command's stdout and stderr, plus that pipe's free space; past that a write to
-  it blocks, or fails with EAGAIN where the pipe is non-blocking. execd keeps such pipes
-  for at most half of its open-file limit (512 in a Kata guest), and past that it closes
-  a further one: the next write to it raises SIGPIPE, or fails with EPIPE where that
-  signal is ignored. Both hold where execd holds the pipe's only read end. A command
-  that ends execd, by
-  killing every process or taking the pod's last PID, makes each running `exec()`,
-  `read_file()` and `write_file()` raise `ExecResultUnknownError`; an `exec()` whose
-  timeout passes first raises `TimeoutError`. Commands still running lose their
-  timeout and get end-of-file on `stdin`.
+  status 1 once that directory is gone. On a timed-out or cancelled `exec()`, or a
+  closed `exec_stdio()` stream, whose command is still running, execd sends SIGTERM, and
+  5 seconds later SIGKILL to what has not ended: to the command, to its process group
+  and to the other processes it started that it can find, as far as it may signal each;
+  one that has detached from the command can survive. A command still being started, or
+  one killed when execd has no file descriptor left, gets SIGKILL at once. A timed-out
+  `exec()` raises `TimeoutError`, whose `truncated_output` holds what the command wrote,
+  once the command and the processes execd signalled have ended or been sent SIGKILL, or
+  16 seconds after its timeout at the latest. What they start after their SIGTERM gets
+  SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts. (On
+  gVisor and on Linux before 6.9, one left in the command's group whose environment no
+  longer holds `HAWK_NEXT_EXEC` can run on. On Linux before 6.9 and on gVisor before
+  release-20260928.0, a threaded program's SIGTERM handler, as in Python, may not run;
+  on gVisor release-20261109.0 it runs.) The processes of a command that has ended by
+  itself are left running. Once execd has stopped reading a command's output, 100 ms
+  after the command ended at the earliest, what it left running may write 1 MiB more in
+  total to each of the command's stdout and stderr, plus that pipe's free space; past
+  that a write to it blocks, or fails with EAGAIN where the pipe is non-blocking. execd
+  keeps such pipes for at most half of its open-file limit (512 in a Kata guest), and
+  past that it closes a further one: the next write to it raises SIGPIPE, or fails with
+  EPIPE where that signal is ignored. Both hold where execd holds the pipe's only read
+  end. A command that ends execd, as by killing every process, ends each running
+  `exec()` as a killed command, with status 137 and the output so far, even one whose
+  command had not started; a running `read_file()` or `write_file()` is run again.
+  They raise `ExecResultUnknownError` instead (the cause of a `K8sError`;
+  `ContainerRestartedError` where a restarted container is set to raise) where the
+  call's connection to execd was lost before execd ended, since its command may have
+  ended unheard, and where execd cannot be started again or cannot be shown to run in
+  the same container (another one, or a pod that sets `shareProcessNamespace` or
+  `hostPID`); an `exec()` whose timeout had passed raises `TimeoutError`. A command
+  still running, as where execd alone was killed, goes on without its timeout and with
+  end-of-file on `stdin`, though its call has ended. Keep execd on a memory-backed
+  volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
+  code, and a timeout's kill can then take the client's whole 16 seconds and hold up
+  the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit
+  of about 30 to start.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
@@ -167,7 +191,8 @@
   `ExecResultUnknownError` (a `GetReturncodeError`, as the cause of a `K8sError`). They
   are not retried once the container has restarted or been replaced. A pod with execd
   resumes the command instead and never runs it a second time; if it can't resume, it
-  raises `ExecResultUnknownError`.
+  raises `ExecResultUnknownError`, or returns 137 where execd was killed under a call
+  still connected to it.
 - Images no longer need `sync`, and need `printf` (a shell builtin in dash, bash and
   busybox).
 - Add a per-service `podAnnotations` value: annotations for that service's Pod

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // maxFrame is the most payload toFrames puts in a frame: with its 4-byte length, a full frame is one 64 KiB vsock packet.
@@ -59,12 +61,29 @@ func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer, stall time.Du
 			}
 		}
 	}
-	if err != nil {
+	if err != nil || stall > 0 && !taken(tcp, stall) {
 		tcp.SetLinger(0)
 	}
 	tcp.Close()
 	vsock.Close()
 	running.Wait()
+}
+
+// taken waits, for wait at most, until the peer has acknowledged all that tcp sent it and its end: closed sooner, the kernel keeps the socket and what is unsent for minutes after its stream's place is free.
+func taken(tcp *net.TCPConn, wait time.Duration) (all bool) {
+	raw, _ := tcp.SyscallConn() // it fails for a nil connection alone
+	for pause, end := time.Millisecond, time.Now().Add(wait); ; pause = min(2*pause, 100*time.Millisecond) {
+		all = true // where the kernel does not say, the close is as it was
+		raw.Control(func(fd uintptr) {
+			if info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
+				all = info.State == unix.BPF_TCP_CLOSE // the kernel's TCP_CLOSE: each end is acknowledged, or the peer has reset
+			}
+		})
+		if all || !time.Now().Before(end) {
+			return all
+		}
+		time.Sleep(pause)
+	}
 }
 
 // bounded gives each write to its connection wait at most: a peer that takes nothing would else keep both of a stream's pumps waiting on it after the stream's other end had gone.

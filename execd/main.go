@@ -18,9 +18,11 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -32,11 +34,21 @@ func main() {
 	if len(os.Args) > 6 && os.Args[1] == "as" { // how run() starts a command for another user
 		become(os.Args[2], os.Args[3:6], os.Args[6:])
 	}
-	if len(os.Args) == 6 && os.Args[1] == "search" { // how the daemon kills what carries a tag as another user, with every id of theirs
+	if len(os.Args) > 6 && os.Args[1] == "search" { // how the daemon signals what carries a tag as another user, with every id of theirs
 		if err := take(os.Args[2:5]); err != nil {
 			fail(err.Error())
 		}
-		killTagged(os.Args[5])
+		undumpable() // the change of identity reset it: traced by its user, it would say what execd is to kill
+		sig, _ := strconv.Atoi(os.Args[6])
+		var among map[int]string // the only processes to signal: every one where none is given
+		for _, p := range os.Args[7:] {
+			if among == nil {
+				among = map[int]string{}
+			}
+			pid, _ := strconv.Atoi(p)
+			among[pid] = ""
+		}
+		signalTagged(os.Args[5], syscall.Signal(sig), among, os.Stdout) // the daemon waits for what it says, and kills each by its id when the grace is up
 		return
 	}
 	if len(os.Args) == 3 && os.Args[1] == "connect" { // how the client reaches a daemon on a socket
@@ -214,6 +226,8 @@ func run(network, address, keyHash string, replace bool) {
 		status.Close()
 	}
 	prctl(prSetChildSubreaper, 1)
+	runtime.GOMAXPROCS(min(4, runtime.GOMAXPROCS(0))) // on more CPUs Go starts more threads than execd keeps spare
+	spare(16)
 	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
 	s, err := newServer(keyHash)
 	if err != nil {
@@ -240,6 +254,18 @@ func run(network, address, keyHash string, replace bool) {
 	startKeeper()
 	report("ok " + fingerprint)
 	s.serve(l)
+}
+
+// spare starts the threads a kill may need while the pod still has PIDs: Go ends execd where it cannot start one.
+func spare(n int) {
+	var held sync.WaitGroup
+	free := make(chan struct{})
+	for range n {
+		held.Add(1)
+		go func() { runtime.LockOSThread(); held.Done(); <-free; runtime.UnlockOSThread() }()
+	}
+	held.Wait()
+	close(free)
 }
 
 // stopOthers kills every other process running this binary as the daemon.

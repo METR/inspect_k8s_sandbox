@@ -749,6 +749,13 @@ async def get_all_release_names(namespace: str, context_name: str | None) -> lis
         + _kubeconfig_context_args(context_name),
         capture_output=True,
     )
+    if not result.success:  # not "none": a cleanup would find nothing to uninstall
+        _raise_runtime_error(
+            "Helm list failed.",
+            namespace=namespace,
+            returncode=result.returncode,
+            stderr=result.stderr,
+        )
     return result.stdout.splitlines()
 
 
@@ -808,7 +815,7 @@ async def _run_subprocess(
         raise
     return ExecResult(
         success=proc.returncode == 0,
-        returncode=proc.returncode or 1,
+        returncode=await proc.wait(),
         stdout=stdout.decode(errors="replace") if stdout else "",
         stderr=stderr.decode(errors="replace") if stderr else "",
     )

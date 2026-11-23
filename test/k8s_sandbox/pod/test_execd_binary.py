@@ -166,8 +166,10 @@ async def execs(sandbox: Sandbox) -> collections.abc.AsyncIterator[Execs]:
         await process.aclose()
 
 
-async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, bytes]:
-    """`docker exec` starts execd, as an exec into a pod does: its fingerprint, key."""
+async def start_execd(
+    sandbox: Sandbox, replace: bool, *at: str
+) -> tuple[str, bytes, bytes]:
+    """`docker exec` starts execd, as an exec into a pod does: what it says, its key."""
     key = os.urandom(32)
     listen = [execd.EXECD_PATH, "listen", *at]
     listen += ["--key-sha256", hashlib.sha256(key).hexdigest()]
@@ -177,7 +179,8 @@ async def start_execd(sandbox: Sandbox, replace: bool, *at: str) -> tuple[str, b
     if "address already in use" in started.stderr:
         raise execd.DaemonRunning(started.stderr)
     assert started.returncode == 0, started.stderr
-    return started.stdout.split()[0], key
+    fingerprint, container = started.stdout.split()
+    return fingerprint, key, container.encode()
 
 
 @pytest.fixture
@@ -186,7 +189,7 @@ def client(sandbox: Sandbox, relay: Relay) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--port", str(PORT))
-        return execd.Daemon("127.0.0.1", *at)
+        return execd.Daemon("127.0.0.1", *at[:2])
 
     return execd.ExecdClient(start)
 
@@ -197,7 +200,7 @@ def stdio_client(sandbox: Sandbox, execs: Execs) -> execd.ExecdClient:
 
     async def start(replace: bool) -> execd.Daemon:
         at = await start_execd(sandbox, replace, "--socket", execd.EXECD_SOCKET)
-        return execd.Daemon("", *at, stdio=execs.connect)
+        return execd.Daemon("", *at[:2], stdio=execs.connect, container=at[2])
 
     return execd.ExecdClient(start)
 
@@ -527,6 +530,74 @@ async def test_a_timed_out_command_is_killed(
         await client.exec(argv, None, None, {}, None, 1)
 
     await sandbox.until(f"test -s {pid} && ! kill -0 $(cat {pid})")
+
+
+async def test_a_killed_commands_handler_runs_whichever_thread_sigterm_is_for(
+    sandbox: Sandbox, client: execd.ExecdClient
+) -> None:
+    """Regression: sent to a stopped process as a whole, SIGTERM went to any thread."""
+    probe = "import os, signal; signal.pidfd_send_signal(os.pidfd_open(1), 0, None, 1)"
+    if sandbox.sh(f"python3 -c '{probe}'").returncode:  # refused before Linux 6.9
+        pytest.skip("no thread is signalled through a pidfd here")
+    mark = f"/tmp/{uuid.uuid4().hex}"
+    head = "import os, pathlib, signal, sys, threading\nwait = threading.Event().wait\n"
+    head += "mark = pathlib.Path(sys.argv[1])\n"
+    head += "def took(*_): mark.touch(); os._exit(0)\n"
+    first = head + "signal.signal(signal.SIGTERM, took)\n"
+    first += "for _ in range(64): threading.Thread(target=wait, daemon=True).start()\n"
+    other = head + "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+    other += "def take(): signal.sigwait({signal.SIGTERM}); took()\n"
+    other += "threading.Thread(target=take, daemon=True).start()\n"
+    ready = "pathlib.Path(sys.argv[1] + '.ready').touch()\nwait()"
+    for script in (first, first, first, other):  # by chance the first takes it at times
+        argv = ["python3", "-c", script + ready, mark]
+        call = asyncio.ensure_future(client.exec(argv, None, None, {}, None, None))
+        await sandbox.until(f"test -e {mark}.ready")
+        call.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await call
+        await sandbox.until(f"test -e {mark} && rm {mark} {mark}.ready")
+
+
+async def test_a_timed_out_command_holding_every_pid_does_not_end_execd(
+    sandbox: Sandbox,
+    relay: Relay,
+    client: execd.ExecdClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: with no PID left for a thread, Go ended execd in the kill's grace."""
+    name = f"{sandbox.name}-pids"
+    address = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    run = ["run", "-d", "--name", name, "--pids-limit=1024", "--cpus=2", sandbox.name]
+    hold = "import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    hold += "try:\n    while os.fork(): pass\n"
+    hold += "except BlockingIOError: os.write(1, b'full')\ntime.sleep(99)"
+    try:
+        assert docker(*run, "sleep", "3600").returncode == 0
+        monkeypatch.setattr(sandbox, "name", name)
+        relay.ip = docker("inspect", "-f", address, name).stdout.strip()
+        many = ("-e", "GOMAXPROCS=64")  # as on a large node: no cap fails anywhere
+        monkeypatch.setattr(sandbox, "options", many)
+        pid = await client.exec(["sh", "-c", "echo $PPID"], None, None, {}, None, 30)
+        with pytest.raises(TimeoutError) as timed:
+            await client.exec(["python3", "-c", hold], None, None, {}, None, 3)
+        assert "full" in getattr(timed.value, "truncated_output")  # no PID was left
+        await sandbox.until("true")  # else the sandbox is still full, or Docker stuck
+        after = sandbox.sh(f"cat /proc/{pid.stdout.strip()}/cmdline 2>/dev/null")
+        assert "serve" in after.stdout, after.stderr or "execd ended"
+    finally:
+        docker("rm", "-f", name)
+
+
+async def test_a_command_that_kills_every_process_ends_137_and_the_next_one_runs(
+    stdio_client: execd.ExecdClient,
+) -> None:
+    ran = f"/tmp/{uuid.uuid4().hex}"
+    argv = ["sh", "-c", 'echo ran >> "$0"; kill -9 -1', ran]
+    with anyio.fail_after(30):  # only bounds a hang
+        killed = await stdio_client.exec(argv, None, None, {}, None, None)
+        after = await stdio_client.exec(["cat", ran], None, None, {}, None, None)
+    assert (killed.returncode, after.returncode, after.stdout) == (137, 0, "ran\n")
 
 
 async def test_a_streams_command_is_killed_when_its_connection_drops(

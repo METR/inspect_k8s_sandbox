@@ -4,21 +4,23 @@ An HTTP proxy port for a pod in an AWS Nitro Sandbox that has no network device.
 
 A pod annotated `inspect-k8s-sandbox/egress-proxy: "<service>.<namespace>.svc.cluster.local:<port>"`, in a release whose
 `egressForwarderImage` value is an image built from this directory, gets a proxy at `127.0.0.1:3128` that reaches only
-that Service of its own namespace. Its forwarder has no resource requests, so the pod is not of the Guaranteed QoS class.
+that Service of its own namespace. Its forwarder has requests and limits of 500m of CPU and 256Mi of memory.
 
 The pod's network policy admits that port on the release's own pods alone, so the Service's pods must carry the
 release's `app.kubernetes.io/name` and `app.kubernetes.io/instance` labels and listen on that port. Pods that
 `additionalResources` adds with those labels come under the release's other policies too: they need a policy that admits
 the pod on that port, and reach only what the release's egress grants and their own policies allow. For any other
-Service, add a policy that lets the pod reach it. The worker resets a connection once a write of its upload to the proxy
-has not completed in five minutes.
+Service, add a policy that lets the pod reach it. The worker resets a connection once the proxy has left a write of its
+upload uncompleted, or its end unacknowledged, for five minutes, and the forwarder does the same for the sandbox's
+client and its reply.
 
-Each node needs:
+Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
   containerd 2.3.7's default profile for a container with no capability, plus `socket(AF_VSOCK)` and less the one
   `ioctl` that `/dev/nsm`, the Nitro Secure Module, takes, for the pod's forwarder. Any pod that names it can open the
-  vsock, so admit it for that container alone.
+  vsock, so admit it for that container alone. `install` writes it first as `profiles/.vsock-egress.json`: admit
+  that name for no container.
 - `profiles/<architecture>/vsock-egress-launcher.json`, beside it: that default, less the six calls that set a
   process's scheduling or priority, plus `setns` into a network namespace, for the launcher.
 - `vsock-egress launch` as process 1 of a container of its own, as root with the capabilities `SYS_ADMIN`, `SETUID` and
@@ -35,6 +37,11 @@ Each node needs:
   of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
   resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
   the node's memory.
+
+A command run in the forwarder's container runs under the profile that admits the vsock, and need not be
+`/vsock-egress`: on runc, `/proc/self/exe` there is runc itself. `forward`, `ready` and `canary` take no vsock port or
+address from their caller. To bound what runs there, refuse exec into this container, admitting at most
+`/vsock-egress canary`, which `gate.sh` runs.
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
@@ -54,4 +61,5 @@ them, has one word to alarm on:
   counts each minute: what a sandbox can cause itself. Until a fetch of the key succeeds its streams are refused.
 
 `gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
-which names the assumption about AWS's runtime that broke.
+which names the assumption about AWS's runtime that broke. The `canary` that `check` meets in the sandbox ends by
+itself after 90 seconds: start `check` within them.
