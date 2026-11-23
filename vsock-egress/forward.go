@@ -147,6 +147,9 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
+	// Capped as the worker's socket to the proxy is: left to grow, the buffers of streams a guest stalls pass the forwarder's memory limit, and the kernel kills it.
+	c.SetReadBuffer(proxyBuffer)
+	c.SetWriteBuffer(proxyBuffer)
 	up, err := f.dial()
 	if err != nil {
 		log.Print(err)
