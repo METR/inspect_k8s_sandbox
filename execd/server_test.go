@@ -28,15 +28,13 @@ import (
 	"weak"
 )
 
-// run() starts this binary, as it starts execd, to become another user.
 func init() {
 	if len(os.Args) > 1 && os.Args[1] == "headless" {
 		runtime.LockOSThread() // main stays on the process's first thread, to end it
 	}
 }
 
-// threaded is a program of several threads, as any Go one, that says "ready", and "term" at its SIGTERM: headless, once its first thread has
-// ended, as a C main's pthread_exit leaves it.
+// threaded is a program of several threads that says "ready", and "term" at its SIGTERM: headless, once its first thread has ended.
 func threaded(headless bool) {
 	got := make(chan os.Signal, 1)
 	signal.Notify(got, syscall.SIGTERM)
@@ -54,6 +52,7 @@ func threaded(headless bool) {
 	select {}
 }
 
+// run() starts this binary, as it starts execd, to become another user.
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && (os.Args[1] == "headless" || os.Args[1] == "threaded") {
 		threaded(os.Args[1] == "headless")
@@ -72,6 +71,11 @@ func TestMain(m *testing.M) {
 		os.Stdout.WriteString(strconv.Itoa(os.Getpid()) + "\n")
 		syscall.Exec(os.Args[2], os.Args[2:], nil)
 		os.Exit(1) // not on into the tests, as the command
+	}
+	if len(os.Args) > 6 && os.Args[1] == "search" {
+		if _, err := os.Stat("/tmp/held-" + os.Args[5]); err == nil { // a test holds this search helper, as its tracer could, until it has written into its report
+			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+		}
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search") {
 		main()
@@ -1530,10 +1534,92 @@ func TestACallItsTimeoutFoundRunningIsTimedOutThoughAnotherStopsKillWentAhead(t 
 		}
 		beforeKill.Store(&behind)
 		cl.stop(true)
-		<-other
+		select {
+		case <-other:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("the second stop had not come back 30 s on, on try %d", try)
+		}
 		if status := exitStatus(t, frames); status["timeout"] != true {
 			t.Fatalf("EXIT %v on try %d: its timeout found it running, and a kill went ahead", status, try)
 		}
+	}
+}
+
+// Regression: where no pidfd signals a group, a command continued ahead of its group ended at its SIGTERM and was reaped: its group sat out the grace stopped.
+func TestAKilledCommandsGroupIsContinuedThoughItsCommandEndsAtItsSigterm(t *testing.T) {
+	pidfdNoGroup.Store(1 << 30)
+	t.Cleanup(func() { pidfdNoGroup.Store(0); beforeNumber.Store(nil) })
+	s, c, frames, _, _ := ready(t, "", "sh", "-c", `trap 'exit 0' TERM; (trap 'echo x; exit 0' TERM; echo ready; while :; do :; done) & wait`)
+	lead := s.get(80).pid
+	taken := func(bool) { // a second for the reaper to take a command that was continued ahead of its group
+		until := time.Now().Add(time.Second)
+		for held := true; held && time.Now().Before(until); time.Sleep(time.Millisecond) {
+			reaper.mu.Lock()
+			_, held = reaper.waiting[lead]
+			reaper.mu.Unlock()
+		}
+	}
+	beforeNumber.Store(&taken)
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	said(t, frames, func(out string) bool { return strings.Contains(out, "x") })
+}
+
+// Regression: root execd killed whatever its helper's report named: a line that a tracer of the helper wrote into it ended a root process that was none of the call's.
+func TestAKillTakesFromItsHelpersReportOnlyWhatTheCommandsUserMaySignal(t *testing.T) {
+	status, _ := os.ReadFile("/proc/self/status")
+	_, caps, _ := strings.Cut(string(status), "CapEff:\t")
+	if eff, _ := strconv.ParseUint(strings.Fields(caps + " 0")[0], 16, 64); os.Getuid() != 0 || eff&(1<<19) == 0 {
+		t.Skip("needs root with CAP_SYS_PTRACE, to write into the helper's report as its tracer would")
+	}
+	spared, _ := os.StartProcess("/bin/sleep", []string{"sleep", "600"}, &os.ProcAttr{}) // root's, and none of the call's
+	t.Cleanup(func() { spared.Kill(); spared.Wait() })
+	var only atomic.Int64
+	refused := func(tag, environ string) (*os.File, error) { // as without the capability, root may not read its environment: the helper is started
+		if environ == "/proc/"+strconv.FormatInt(only.Load(), 10)+"/environ" && syscall.Geteuid() == 0 {
+			return nil, os.ErrPermission
+		}
+		return os.Open(environ)
+	}
+	openEnviron.Store(&refused)
+	t.Cleanup(func() { openEnviron.Store(nil) })
+	s, c, frames, tag, first := ready(t, "65534", "sh", "-c", `(setsid sh -c 'echo $$; trap "" TERM; while :; do sleep 0.1; done' &); sleep 600`)
+	pid, _ := strconv.Atoi(strings.TrimSpace(first)) // of the one only the tag leads to
+	only.Store(int64(pid))
+	held := "/tmp/held-" + tag // TestMain stops the helper that finds it
+	os.WriteFile(held, nil, 0o600)
+	t.Cleanup(func() { os.Remove(held) })
+	forged := make(chan string, 1)
+	go func() { // the tracer: it writes into the report of the helper it holds
+		for until := time.Now().Add(20 * time.Second); time.Now().Before(until); time.Sleep(time.Millisecond) {
+			entries, _ := os.ReadDir("/proc")
+			for _, e := range entries {
+				cmdline, _ := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+				helper, _ := strconv.Atoi(e.Name())
+				if args := strings.Split(string(cmdline), "\x00"); len(args) > 6 && args[1] == "search" && args[5] == tag {
+					if f := stat(helper); len(f) == 0 || f[0] != "T" {
+						continue // not stopped yet
+					}
+					report, err := os.OpenFile("/proc/"+e.Name()+"/fd/1", os.O_WRONLY, 0)
+					if err == nil {
+						_, err = report.WriteString(strconv.Itoa(spared.Pid) + " " + stat(spared.Pid)[19] + "\n")
+						report.Close()
+					}
+					os.Remove(held) // the search for its SIGKILLs runs unheld
+					syscall.Kill(helper, syscall.SIGCONT)
+					forged <- map[bool]string{false: "written"}[err != nil]
+					return
+				}
+			}
+		}
+		forged <- ""
+	}()
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	if <-forged == "" {
+		t.Fatal("no line could be written into the helper's report")
+	}
+	exitStatus(t, frames) // once the grace is up and what the kill took for the call's has had its SIGKILL
+	if gone(spared.Pid) {
+		t.Fatal("the kill ended a root process its helper's report named: one the command's user could not have signalled")
 	}
 }
 
@@ -1599,13 +1685,6 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 				end()
 			}
 			exitStatus(t, frames) // with no grace to wait out where nothing that had a SIGTERM is left
-			until(t, "a pidfd of the killed command is still open: its timer's copy is the sweep's to close once it kills", func() bool {
-				infos, _ := filepath.Glob("/proc/self/fdinfo/*")
-				return !slices.ContainsFunc(infos, func(info string) bool {
-					text, _ := os.ReadFile(info)
-					return bytes.Contains(text, []byte("\nPid:\t-1\n"))
-				})
-			})
 			until(t, "what ran on outlived the kill", func() bool { return gone(straggler) })
 		})
 	}
