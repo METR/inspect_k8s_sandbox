@@ -47,7 +47,10 @@
   the sandbox's own loopback, and the new
   `egressForwarderImage` value. Each node must run `vsock-egress launch` and hold two
   seccomp profiles, which `vsock-egress install` writes (see `vsock-egress/README.md`):
-  on a node with no launcher such a pod does not start.
+  on a node with no launcher such a pod does not start. The forwarder's container is
+  named `egress-forwarder-with-a-name-too-long-for-any-service-to-share`, longer than
+  any service's name can be, so a rule on exec by that name catches no service's
+  container.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
