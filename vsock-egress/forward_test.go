@@ -397,7 +397,7 @@ func TestConnectionWaitsOutAWorkerThatIsStarting(t *testing.T) {
 func TestCommandsForTheSandboxTakeOnlyTheseFlags(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second) // a command that started instead would serve until killed
 	defer cancel()
-	// The README lets commands be run in the forwarder's container because none of these takes a vsock port or address.
+	// The README tells an operator that none of these takes a vsock port or address from its caller: a flag is one its caller sets.
 	for command, want := range map[string]string{"forward": "-key -listen", "ready": "-key", "canary": ""} {
 		out, err := exec.CommandContext(ctx, os.Args[0], command, "-h").CombinedOutput()
 		var flags []string

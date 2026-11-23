@@ -37,8 +37,10 @@ Each node needs these three. `vsock-egress install <the kubelet's seccomp direct
   resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
   the node's memory.
 
-A command run in the forwarder's container, as `gate.sh` runs `canary`, can open the vsock only as `forward`, `ready`
-and `canary` do, where the image holds this binary alone: none of them takes a vsock port or address from its caller.
+A command run in the forwarder's container runs under the profile that admits the vsock, and need not be
+`/vsock-egress`: on runc, `/proc/self/exe` there is runc itself. `forward`, `ready` and `canary` take no vsock port or
+address from their caller. To bound what runs there, refuse exec into this container, admitting at most
+`/vsock-egress canary`, which `gate.sh` runs.
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
