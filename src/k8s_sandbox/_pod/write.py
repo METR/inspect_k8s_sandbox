@@ -7,7 +7,6 @@ from typing import Generator
 
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     ERROR_CHANNEL,
-    STDERR_CHANNEL,
     WSClient,
 )
 from websocket import WebSocketException
@@ -44,14 +43,16 @@ def write_command(dst: Path, file_size: int) -> list[str]:
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         with self._start_write_command(dst, len(data)) as ws_client:
-            # Nor is a send that the exec does not read waited for past the bound.
+            # A send that the exec does not read fails after this long.
             ws_client.sock.settimeout(API_TIMEOUT)
             try:
                 self._write_stdin_chunked(ws_client, data)
             except (OSError, WebSocketException) as e:
                 # A status the exec sent before the upload failed is still unread.
+                ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
                 with contextlib.suppress(OSError, WebSocketException):
                     ws_client.run_forever(timeout=STREAM_END_GRACE_SECONDS)
+                ws_client.sock.shutdown()  # Not close(): that would wait on it.
                 raise_if_stopped_before_lost(ws_client, e, self._pod.name)
                 raise
             self._handle_stream_output(ws_client)
@@ -83,7 +84,7 @@ class WriteFileOperation(PodOperation):
                 returncode=returncode,
             )
         if returncode != 0:
-            stderr = str(ws_client._channels.pop(STDERR_CHANNEL, b""), errors="replace")
+            stderr = (ws_client.read_stderr() or b"").decode(errors="replace")
             raise_for_known_read_write_errors(stderr)
             raise PodError(
                 "Unrecognised error writing file to pod.",

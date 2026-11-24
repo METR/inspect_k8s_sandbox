@@ -1,5 +1,4 @@
 import concurrent.futures
-import contextlib
 import io
 import os
 import signal
@@ -122,28 +121,6 @@ def test_an_end_tls_has_already_decrypted_is_read(
         pool.shutdown()
 
 
-def test_an_upload_the_exec_does_not_read_is_not_waited_for(
-    tls_sockets: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A send had no deadline either: it would outlive a stop as the wait did."""
-    client, server = tls_sockets
-    operation, ws = write_module.WriteFileOperation(_POD), _SocketWSClient(client)
-    monkeypatch.setattr(
-        operation, "_start_write_command", lambda dst, size: contextlib.nullcontext(ws)
-    )
-    monkeypatch.setattr(write_module, "API_TIMEOUT", 0.05)
-    pool = concurrent.futures.ThreadPoolExecutor(1)
-    write = pool.submit(operation.write_file, bytes(2**22), Path("/tmp/dst"))
-
-    try:
-        raised = write.exception(timeout=30)  # only bounds a hang
-    finally:
-        server.close()  # wakes a send still waiting
-        pool.shutdown()
-
-    assert type(raised) is websocket.WebSocketTimeoutException
-
-
 def test_a_frame_cut_short_is_not_waited_for_past_the_bound(
     tls_sockets: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -231,13 +208,15 @@ def test_a_connection_lost_before_the_status_is_raised(lost: Exception) -> None:
     [
         (255, ContainerStoppedError),
         (2, OSError),  # the upload's own, which the provider retries
+        # Regression: held open with the upload unread, a send had no deadline.
+        (None, websocket.WebSocketTimeoutException),
     ],
 )
 def test_a_255_sent_before_the_upload_failed_is_a_stopped_container(
-    monkeypatch: pytest.MonkeyPatch, code: int, raised: type[Exception]
+    monkeypatch: pytest.MonkeyPatch, code: int | None, raised: type[Exception]
 ) -> None:
     """Regression: the upload's error was retried, in the container's replacement."""
-    listening = socket.create_server(("127.0.0.1", 0))
+    listening, held = socket.create_server(("127.0.0.1", 0)), threading.Event()
     listening.settimeout(30)  # only bounds a hang
 
     def ends() -> None:  # the exec, with the upload unread
@@ -245,6 +224,9 @@ def test_a_255_sent_before_the_upload_failed_is_a_stopped_container(
         with connection:
             connection.settimeout(30)  # only bounds a hang
             _upgrade(connection)
+            if code is None:
+                held.wait(30)  # only bounds a hang
+                return
             connection.sendall(_frame(*_status(code)))
 
     server = threading.Thread(target=ends, daemon=True)
@@ -253,6 +235,8 @@ def test_a_255_sent_before_the_upload_failed_is_a_stopped_container(
     configuration = kubernetes.client.Configuration(host=host)
     api = kubernetes.client.CoreV1Api(kubernetes.client.ApiClient(configuration))
     monkeypatch.setattr(op_module, "k8s_client", lambda _: api)
+    if code is None:
+        monkeypatch.setattr(write_module, "API_TIMEOUT", 0.05)
     pod = op_module.PodInfo("p", "ns", None, "default", "u", 0, "warn")
     pool = concurrent.futures.ThreadPoolExecutor(1)
 
@@ -263,6 +247,7 @@ def test_a_255_sent_before_the_upload_failed_is_a_stopped_container(
     try:
         assert isinstance(write.exception(timeout=30), raised)  # only bounds a hang
     finally:
+        held.set()
         listening.close()
         pool.shutdown(wait=False)
         server.join(30)
