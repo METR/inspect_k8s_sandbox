@@ -142,19 +142,6 @@ func firstProcess(argv []string) {
 	}
 }
 
-func TestAHolderSaysItIsReadyOnceItIgnoresSignals(t *testing.T) {
-	hold := exec.Command(os.Args[0], "hold")
-	stdin, _ := hold.StdinPipe() // open while the test runs: a holder lives until its stdin ends
-	out, _ := hold.StdoutPipe()
-	if err := hold.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { stdin.Close(); hold.Process.Kill() })
-	if said, _ := io.ReadAll(out); string(said) != "true\n" {
-		t.Fatalf("a holder said %q and closed its stdout: want true, that it ignores SIGTERM by then", said)
-	}
-}
-
 // Regression: made with no descriptor to spare, the holders' pipe was execd's own stdin, where every holder ends at once.
 func TestExecdWithNoDescriptorForItsHoldersPipeDoesNotStart(t *testing.T) {
 	out, err := exec.Command("sh", "-c", `ulimit -n 3 && exec "$0" hold`, os.Args[0]).CombinedOutput()

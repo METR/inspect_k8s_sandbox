@@ -81,10 +81,10 @@ var pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
 
 var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThisPod refuses when it can't tell
 
-// holdR is every holder's stdin: a pipe that nothing writes to and that ends with execd, read without blocking so that a holder keeps no thread for it.
+// holdR is every holder's stdin: a pipe that nothing writes to and that ends with execd.
 var holdR = func() *os.File {
 	var pipe [2]int
-	if err := syscall.Pipe2(pipe[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
+	if err := syscall.Pipe2(pipe[:], syscall.O_CLOEXEC); err != nil {
 		panic(err) // with none, a holder would read execd's own stdin and end at once
 	}
 	return os.NewFile(uintptr(pipe[0]), "hold")
@@ -509,13 +509,18 @@ func (cl *call) run(req startRequest) error {
 		cl.group, cl.held = holder.Pid, reaper.watch(holder.Pid)
 		holder.Release()
 		reaper.mu.Unlock() // for the wait: other commands start, end and are killed meanwhile
-		readyR.SetReadDeadline(time.Now().Add(time.Second))
-		readyR.Read(make([]byte, 1)) // until the holder has ignored what it can: a command started sooner could end it with a signal to its group
+		readyR.SetReadDeadline(time.Now().Add(readyWait))
+		_, late := readyR.Read(make([]byte, 1)) // until the holder has ignored what it can: a command started sooner could end it with a signal to its group
 		reaper.mu.Lock()
-		// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
-		if p, err = os.StartProcess(argv[0], argv, &os.ProcAttr{
-			Dir: dir, Env: env, Files: files, Sys: &syscall.SysProcAttr{Setpgid: true, Pgid: cl.lead()}, // a group of its own where its holder is gone
-		}); err != nil && cl.lead() != 0 {
+		if late != nil && !errors.Is(late, os.ErrDeadlineExceeded) { // ended before its word, as with no PID left for its threads: one that is only slow is not waited for longer
+			err = errors.New("the process that leads its group did not start")
+		} else {
+			// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
+			p, err = os.StartProcess(argv[0], argv, &os.ProcAttr{
+				Dir: dir, Env: env, Files: files, Sys: &syscall.SysProcAttr{Setpgid: true, Pgid: cl.lead()}, // a group of its own where its holder is gone
+			})
+		}
+		if err != nil && cl.lead() != 0 {
 			syscall.Kill(cl.lead(), syscall.SIGKILL)
 		}
 	}
@@ -1146,6 +1151,9 @@ func (cl *call) lead() int {
 	return cl.group
 }
 
+// readyWait is how long a start waits for its holder: one that takes longer, as in a container starved of CPU, leads its command's group before it ignores signals.
+var readyWait = time.Second
+
 // command is a kill's root: the process pid, as the one that started when it did, or with no start where no descriptor is left to read it.
 func command(pid int) map[int]string {
 	started := ""
@@ -1157,7 +1165,7 @@ func command(pid int) map[int]string {
 
 // byPidfd signals a holder's group through its handle and a pidfd's command, and says if the group was reached: by number either may be another's.
 func byPidfd(as *syscall.Credential, holder *os.Process, group uintptr, sig syscall.Signal) bool {
-	send := func() bool { // shortcut: no group signal so before Linux 6.9, nor by number once the command's user has killed its holder: its untagged leftovers run on
+	send := func() bool { // shortcut: no group signal so before Linux 6.9, nor by number once its holder is gone, killed by the command's user or by a signal to its group before it was ready: its untagged leftovers run on
 		err := syscall.ENOSYS
 		if holder != nil {
 			holder.WithHandle(func(led uintptr) {

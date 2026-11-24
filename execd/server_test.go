@@ -77,6 +77,15 @@ func TestMain(m *testing.M) {
 			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
 		}
 	}
+	for len(os.Args) == 2 && os.Args[1] == "hold" { // a test holds this holder back from its start, as a container starved of CPU does
+		if _, err := os.Stat("/tmp/dead-holders"); err == nil { // or ends it before its word, as with no PID left for its threads
+			os.Exit(2)
+		}
+		if _, err := os.Stat("/tmp/held-holders"); err != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search" || os.Args[1] == "hold") {
 		main()
 		return
@@ -1796,6 +1805,69 @@ func TestAKillReachesTheGroupOfACommandThatSignalledIt(t *testing.T) {
 	s.dispatch(c, frame{kind: fKill, id: 80})
 	exitStatus(t, frames)
 	until(t, "what the command left in its group outlived the kill: the group's own signal had ended its holder", func() bool { return gone(left) })
+}
+
+// A command started before its holder ignores signals could end that holder with one to its group.
+func TestACommandStartsOnlyOnceItsHolderIsReady(t *testing.T) {
+	wait := readyWait
+	readyWait = 30 * time.Second // only bounds a hang
+	os.WriteFile("/tmp/held-holders", nil, 0o600)
+	t.Cleanup(func() { readyWait = wait; os.Remove("/tmp/held-holders") })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"echo", "started"}, Env: map[string]string{}, Tag: "n"})
+	go s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
+	select {
+	case f := <-frames:
+		t.Fatalf("frame %d, %q, before the command's holder was ready", f.kind, f.payload)
+	case <-time.After(200 * time.Millisecond):
+	}
+	os.Remove("/tmp/held-holders")
+	exitStatus(t, frames)
+}
+
+// Regression: a command whose holder had ended before its word was started with none, and its kill then reached no group.
+func TestACommandWhoseHolderDidNotStartIsNotStarted(t *testing.T) {
+	os.WriteFile("/tmp/dead-holders", nil, 0o600)
+	t.Cleanup(func() { os.Remove("/tmp/dead-holders") })
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"echo", "started"}, Env: map[string]string{}, Tag: "n"})
+	s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
+	if status := exitStatus(t, frames); status["code"] != 126.0 {
+		t.Fatalf("EXIT %v: want 126, for a command that has no holder", status)
+	}
+}
+
+// Regression: a command that could not start left its holder behind, three tasks and 0.75 MB each time.
+func TestACommandThatCannotStartLeavesNoHolder(t *testing.T) {
+	s, _ := newServer(strings.Repeat("00", 32))
+	c, frames := recordedConn(t)
+	s.authenticated(c)
+	req, _ := json.Marshal(startRequest{Argv: []string{"true", strings.Repeat("a", 256<<10)}, Env: map[string]string{}, Tag: "n"})
+	s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
+	if status := exitStatus(t, frames); status["code"] != 126.0 {
+		t.Fatalf("EXIT %v: want 126, for an argument longer than execve takes", status)
+	}
+	holder := s.get(80).group
+	until(t, "its holder outlived a command that never started", func() bool { return gone(holder) })
+}
+
+// The handle a kill takes on its command's holder still signals the group once that holder is gone.
+func TestAKillReachesTheGroupOfACommandWhoseHandlerKilledItsHolder(t *testing.T) {
+	self, _ := os.FindProcess(os.Getpid())
+	if _, _, err := syscall.Syscall6(sysPidfdSendSignal, ^uintptr(0), 0, 0, pidfdSignalProcessGroup, 0, 0); err != syscall.EBADF || self.WithHandle(func(uintptr) {}) != nil {
+		t.Skip("no group is signalled through a pidfd here, as on Linux before 6.9")
+	}
+	// Its handler kills the holder, waits until that is reaped, then leaves one in the group with no tag whose parent is gone.
+	handler := `kill -9 $h; while [ -e /proc/$h ]; do :; done; left=$(sleep 600 >/dev/null 2>&1 & echo $!); echo $left; exit 0`
+	s, c, frames, _, _ := ready(t, "", "env", "-i", "/bin/sh", "-c", `h=$(cut -d" " -f5 /proc/$$/stat); trap '`+handler+`' TERM; echo ready; while :; do sleep 0.01; done`)
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	left, _ := strconv.Atoi(strings.TrimSpace(said(t, frames, func(out string) bool { return strings.HasSuffix(out, "\n") && out != "" })))
+	exitStatus(t, frames)
+	until(t, "what the command left in its group outlived the kill: its handler had killed the holder", func() bool { return left > 0 && gone(left) })
 }
 
 func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {

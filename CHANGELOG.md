@@ -86,10 +86,9 @@
   `exec_stdio()` over TLS to execd instead of Kubernetes exec. There, a command runs as
   a program: a shell builtin such as `cd`, or a name that starts with `-`, is not found,
   its environment holds `HAWK_NEXT_EXEC`, a `cwd` that does not exist ends it with
-  status 1, and with no `stdin` it reads end-of-file. It does not lead its process
-  group: a process of execd's own does, as `timeout` does over Kubernetes exec, so it
-  can start a session of its own (`setsid`), and `kill -TERM -$$` finds no group.
-  Run as another user, it has a
+  status 1, and with no `stdin` it reads end-of-file. A process of execd's own leads
+  its process group, so it can start a session of its own (`setsid`). Run as another
+  user, it has a
   soft open-file limit of 1024 where the hard limit is no lower, whatever the image's
   PAM limits say, and may raise it to the hard limit. If a symbolic link on the path to
   the container's working directory is re-pointed, a command given no `cwd`, or a
@@ -131,7 +130,8 @@
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up
   the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit
   of about 30 to start. Each running command holds 3 more, in the process that leads
-  its group, and about 0.75 MB of the container's memory.
+  its group, and about 0.75 MB of the container's memory; with no PID left for that
+  process, the command is not started and ends with status 126.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
