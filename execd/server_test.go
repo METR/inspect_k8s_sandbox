@@ -389,34 +389,34 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 func TestACallIsKeptForASilentClientPastItsOwnTimeout(t *testing.T) {
 	for name, tc := range map[string]struct {
 		timeout    float64
+		left       time.Duration // of its timeout as its connection drops, where the test sets that
 		least, top time.Duration
-		refused    string // a RESUME that comes after it
 	}{
-		"to six minutes past its timeout": {3600, time.Hour + 5*time.Minute, time.Hour + 6*time.Minute, "call abandoned after 1h"},
-		"for thirty minutes, with none":   {0, 30 * time.Minute, 30 * time.Minute, "call abandoned after 30m0s with no client"},
+		"an hour's timeout, dropped at once": {3600, 0, time.Hour + 5*time.Minute, time.Hour + 6*time.Minute},
+		"a quarter of its hour left":         {3600, 15 * time.Minute, 20 * time.Minute, 21 * time.Minute},
+		"its timeout up a minute ago":        {3600, -time.Minute, 6 * time.Minute, 6 * time.Minute}, // six minutes from the drop: its client's reconnect window
+		"no timeout":                         {0, 0, 30 * time.Minute, 30 * time.Minute},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := newServer(strings.Repeat("00", 32))
 			req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "t", Timeout: tc.timeout})
 			c := testConn(t)
 			s.start(c, frame{kind: fStart, id: 1, payload: req})
-			t.Cleanup(s.get(1).kill)
+			cl := s.get(1)
+			t.Cleanup(cl.kill)
+			if tc.left != 0 {
+				cl.mu.Lock()
+				cl.until = time.Now().Add(tc.left)
+				cl.mu.Unlock()
+			}
 			var waits []time.Duration
-			var abandon func()
-			afterFunc = func(d time.Duration, f func()) *time.Timer { waits, abandon = append(waits, d), f; return nil }
+			afterFunc = func(d time.Duration, _ func()) *time.Timer { waits = append(waits, d); return nil }
 			t.Cleanup(func() { afterFunc = time.AfterFunc })
 
 			s.detach(c)
 
 			if len(waits) != 1 || waits[0] < tc.least || waits[0] > tc.top {
 				t.Fatalf("kept for %v: want one wait of %v to %v", waits, tc.least, tc.top)
-			}
-			afterFunc = time.AfterFunc // its kill's own timers run
-			abandon()
-			late, frames := recordedConn(t)
-			s.resume(late, frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)})
-			if f := nextFrame(t, frames); f.kind != fError || !strings.HasPrefix(string(f.payload), tc.refused) {
-				t.Fatalf("a RESUME after it got frame %d %q: want an error that starts %q", f.kind, f.payload, tc.refused)
 			}
 		})
 	}
@@ -2807,7 +2807,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenItsCallIsReleased(t *testing.T) {
 	queued := weak.Make(&chunk[0])
 	s.dispatch(c, frame{kind: fStdin, id: 37, payload: chunk})
 
-	s.detach(c) // its timer holds the call for half an hour
+	s.detach(c) // its timer holds the call
 	cl.kill()
 	exitCode(t, cl)
 	s.release(37)

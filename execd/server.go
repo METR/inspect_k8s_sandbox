@@ -57,7 +57,7 @@ type server struct {
 
 const idleTimeout = 60 * time.Second
 
-// A call nobody resumes is kept keptPast its own timeout, which outlasts the client's reconnect window (5 minutes), or for abandonAfter where it has none: a client that only stalled is back by then.
+// A call nobody resumes is kept keptPast its own timeout, or past its connection's drop where that came later, which outlasts the client's reconnect window (5 minutes); one with no timeout is kept for abandonAfter.
 const abandonAfter, keptPast = 30 * time.Minute, 6 * time.Minute
 
 var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name sh keeps
@@ -137,9 +137,8 @@ type call struct {
 	timeoutKilled bool
 	// a timeout's stop found its command running: the kill that goes ahead is the timeout's, though another stop sends it
 	timeoutFound bool
-	// when its own timeout is up, if it has one: set before the call is shared
+	// when its own timeout is up, if it has one
 	until time.Time
-	kept  time.Duration // how long it was kept with no client, once abandoned
 }
 
 type conn struct {
@@ -299,7 +298,7 @@ func (s *server) detach(c *conn) {
 			cl.sub = nil
 			cl.detached++
 		}
-		detached := cl.detached
+		detached, until := cl.detached, cl.until
 		cl.mu.Unlock()
 		switch {
 		case mine && cl.stream: // nothing resumes a stream
@@ -307,14 +306,14 @@ func (s *server) detach(c *conn) {
 			s.release(cl.id)
 		case mine: // a client that hasn't resumed it by then has given up
 			wait := abandonAfter
-			if !cl.until.IsZero() { // not for its client's silence before its own timeout, as over Kubernetes exec
-				wait = max(time.Until(cl.until), 0) + keptPast
+			if !until.IsZero() { // not for its client's silence before its own timeout, as over Kubernetes exec
+				wait = max(time.Until(until), 0) + keptPast
 			}
 			afterFunc(wait, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
 				if orphaned {
-					cl.abandoned, cl.kept = true, wait // not forgotten: "unknown call" would have the client send its START again
+					cl.abandoned = true // not forgotten: "unknown call" would have the client send its START again
 				}
 				cl.mu.Unlock()
 				if orphaned {
@@ -337,7 +336,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl for half an hour, or past its timeout
+		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -359,9 +358,6 @@ func (s *server) start(c *conn, f frame) {
 		req.Env = map[string]string{}
 	}
 	cl := &call{id: f.id, tag: req.Tag, sub: c, stream: req.Stream}
-	if req.Timeout > 0 && req.Timeout < 1e9 { // as run() takes it; from here, a moment before its command starts
-		cl.until = time.Now().Add(time.Duration(req.Timeout * float64(time.Second)))
-	}
 	cl.room = sync.NewCond(&cl.mu)
 	s.mu.Lock()
 	if s.current != nil && s.current != c { // its client may have run this call again since dispatch looked
@@ -413,7 +409,7 @@ func (s *server) resume(c *conn, f frame) {
 	byTimeout := cl.timeoutKilled // the kill's own word: its exit may not have said so yet
 	cl.kmu.Unlock()
 	if cl.abandoned && !byTimeout { // one its own timeout ended still says so: that takes none of the output let go
-		c.send(fError, f.id, []byte("call abandoned after "+cl.kept.Round(time.Second).String()+" with no client"))
+		c.send(fError, f.id, []byte("call abandoned with no client"))
 		return
 	}
 	cl.sub = c
@@ -526,7 +522,11 @@ func (cl *call) run(req startRequest) error {
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = afterFunc(time.Duration(req.Timeout*float64(time.Second)), func() { cl.stop(true) })
+		timeout := time.Duration(req.Timeout * float64(time.Second))
+		deadline = afterFunc(timeout, func() { cl.stop(true) })
+		cl.mu.Lock()
+		cl.until = time.Now().Add(timeout) // a call whose client goes silent is kept past this
+		cl.mu.Unlock()
 	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)
