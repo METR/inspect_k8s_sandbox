@@ -91,7 +91,8 @@ RECONNECT_FOR = 300.0
 # A new sandbox's daemon that can't be reached this long won't be: say so soon.
 FIRST_OPEN_FOR = 30.0
 CONNECT_TIMEOUT = 10.0
-KILL_WAIT = 10.0  # for execd's word on a call our timer has passed: then we kill
+# For execd's word on a call past our timer, its SIGTERM's 5 s with it: then we kill.
+KILL_WAIT = 15.0
 TIMER_LAG = 1.0  # ours follows execd's own, which counts from the command's start
 
 
@@ -105,6 +106,7 @@ class Daemon:
     pod: str = ""  # the pod's UID
     # Opens an exec joined to the daemon's socket, for a pod with no network card.
     stdio: Callable[[], Awaitable[ByteStream]] | None = None
+    container: bytes = b"unknown"  # execd's name for the container it started in
 
 
 class Dropped(Exception):
@@ -173,7 +175,7 @@ class _Pipe:
     async def readexactly(self, n: int) -> bytes:
         while len(self._plain) < n:
             if self._ended:  # only now: the frames read with its end are execd's last
-                raise ConnectionResetError("execd ended the TLS session")
+                raise ConnectionAbortedError("execd ended the TLS session")
             raw = self._rest or await self._raw()
             began, had, held = time.thread_time(), len(self._plain), self._in.pending
             for i in range(0, len(raw), SLICE):
@@ -349,6 +351,7 @@ class Call:
     exited: bool = False
     words: int = 0  # EXIT and ERROR frames queued that its loop has yet to take
     resuming: bool = False  # a RESUME awaits its one RESUMED
+    ended: bool = False  # by its RESUMED's word: out of reach until its EXIT
     ends: int = 0  # bytes of EXIT and ERROR frames queued: execd sends one per resume
     hold: int = HOLD
     ack_every: int = ACK_EVERY
@@ -419,10 +422,12 @@ class Link:
         self._pinged: list[list[int]] = []  # those each unanswered PING followed
         self.calls: dict[int, Call] = {}
         self.closed = False
+        self.ended = False  # from execd's side, and execd not yet looked for since
+        self.killed = False  # execd went as it ended: the first look found it gone
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self.bulk = asyncio.Lock()
-        self._last_rx = time.monotonic()
+        self._last_rx = self._last_tx = time.monotonic()
         self._tasks = [
             asyncio.create_task(self._read()),
             asyncio.create_task(self._ping()),
@@ -461,6 +466,7 @@ class Link:
                 raise ConnectionError("execd stopped reading") from None
             if not sent:  # a START whose turn came once its call's time was up
                 raise asyncio.TimeoutError
+            self._last_tx = time.monotonic()
             if kind == RELEASE:
                 self._released.append(call_id)
             elif kind == PING:
@@ -538,11 +544,16 @@ class Link:
                             return
                         c.got[kind - STDOUT] += n
                     if kind == RESUMED:
+                        said = json.loads(payload)
                         c.resuming = False
+                        c.ended = type(said) is dict and said.get("exited") is True
                     c.queue.put_nowait((kind, payload))
                 elif self.strays.over(n):  # a pong, a repeated ack, anything unused
                     return
-        except (OSError, ValueError, LookupError, TypeError):  # not execd's frames
+        except OSError as e:  # not its close_notify, nor after our silence: execd's own
+            heard = time.monotonic() - self._last_tx < DEAD_AFTER
+            self.ended = heard and not isinstance(e, ConnectionAbortedError)
+        except (ValueError, LookupError, TypeError):  # not execd's frames
             pass
         finally:
             await self.close()
@@ -611,7 +622,11 @@ class ExecdClient:
         delay = self._backoff if recent else 0.0
         while True:
             # Paced, so a daemon that can't be reached isn't restarted in a tight loop.
-            await asyncio.sleep(delay)
+            wait, last = delay, self._link
+            # No wait where execd's side ended one: gone later, it may have outlived it.
+            at_once = last is not None and last.ended
+            if not at_once:
+                await asyncio.sleep(wait)
             delay = min(max(delay * 2, 0.2), 5.0)
             link = None
             try:
@@ -629,6 +644,8 @@ class ExecdClient:
                 await asyncio.wait_for(asyncio.shield(link.ready), CONNECT_TIMEOUT)
                 if daemon.pod != self._pod():  # replaced as this opened
                     raise Dropped("the daemon's pod was replaced")
+                if at_once:  # the wait it skipped: one that drops as it opens is paced
+                    await asyncio.sleep(wait)
                 # Set now: a caller arriving before the waiters wake opens no other.
                 self._link, self._opened, self._backoff = link, time.monotonic(), delay
                 async with link.bulk:  # no START or STDIN goes between what is owed
@@ -638,12 +655,19 @@ class ExecdClient:
                 self._failed = e
                 if link is not None:
                     await link.close()
+                # Only the first look, and no timeout, shows execd went as it ended.
+                timed_out = isinstance(e, asyncio.TimeoutError)
+                first = last if at_once and not timed_out else None
+                if last is not None:
+                    last.ended = False
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
                 # a start tells gone from unreachable; a daemon not ours is replaced
                 not_ours = isinstance(e, NotOurDaemon)
                 try:
                     self._daemon = await self._start(not_ours)
+                    if first is not None:
+                        first.killed = True
                 except DaemonRunning:
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
@@ -787,9 +811,10 @@ class ExecdClient:
                         sender.cancel()
                         link.calls.pop(call.id, None)
                         # No shield: _get waits without cancelling the shared reopen.
+                        was = link
                         try:
                             link = await asyncio.wait_for(self._get(stale=link), left())
-                            self._resume(link, call)
+                            self._resume(link, call, was)
                         except Exception as e:
                             if end < never:  # execd out of reach: our timer's word
                                 break
@@ -834,6 +859,7 @@ class ExecdClient:
                         kind == ERROR
                         and payload == b"unknown call"
                         and call.resuming
+                        and not call.ended
                         and not any(call.got)
                         and not call.stdin_put
                     ):
@@ -893,12 +919,23 @@ class ExecdClient:
                 await link.send(STDIN, call.id, stdin[i : i + CHUNK])
             await link.send(STDIN, call.id)  # an empty frame closes stdin
 
-    def _resume(self, link: Link, call: Call) -> None:
+    def _resume(self, link: Link, call: Call, was: Link) -> None:
         """Ask execd, over a new connection, to send the call on from what we have."""
-        if link.daemon is not call.daemon:
-            raise ExecdStoppedError(
-                "execd stopped while it ran the command", pod=call.daemon.ip
-            )
+        new, old = link.daemon, call.daemon
+        if new is not old:
+            # Another container, or none execd names: its command may not have run.
+            unnamed = old.container == b"unknown" or old.container[:1] == b":"
+            # Out of reach before execd went: it may have ended, its status unheard.
+            apart = not was.killed or call.resuming or call.ended
+            if new.container != old.container or unnamed or apart:
+                raise ExecdStoppedError(
+                    "execd stopped while it ran the command", pod=old.ip
+                )
+            log_warn("execd was killed: started again", pod=old.ip)
+            # Killed with it, or left: it ends as Kubernetes exec ends a killed command.
+            call.words += 1  # taken even past our timer
+            call.queue.put_nowait((EXIT, b'{"code": 137}'))
+            return
         link.calls[call.id] = call
         at = json.dumps({"stdout": call.got[0], "stderr": call.got[1]})
         call.resuming = True  # before the RESUMED can arrive
@@ -951,8 +988,13 @@ class ExecdClient:
                 limit_str=limits.MAX_EXEC_OUTPUT_SIZE_STR,
                 truncated_output=str(out[STDOUT]) + str(out[STDERR]),
             )
-        if status is None or timed_out:
-            raise TimeoutError(f"Command timed out after {timeout}s.")
+        if status is None or timed_out:  # its output where Inspect's tools look for it
+            error = TimeoutError(f"Command timed out after {timeout}s.")
+            text = ""
+            for stream in (STDOUT, STDERR):
+                text += str(out.pop(stream))  # freed as decoded, appended in place
+            setattr(error, "truncated_output", text)  # its traceback keeps this frame
+            raise error
         code = status["code"]
         result = ExecResult(
             success=code == 0,

@@ -113,8 +113,8 @@ def _convert_services(src: dict[str, Any], compose_file: Path) -> dict[str, Any]
         )
         service_converter = _ServiceConverter(
             service_name,
-            # Services that share a YAML alias share mappings, which converting empties.
-            copy.deepcopy(service_value),
+            # An alias makes services or keys share a mapping, which converting empties.
+            {key: copy.deepcopy(value) for key, value in service_value.items()},
             compose_file,
             is_default=output_service_name == "default",
         )

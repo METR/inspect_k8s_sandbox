@@ -970,6 +970,7 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
 
 
 _EGRESS_PROXY = "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local.:3128"
+_FORWARDER = "egress-forwarder-with-a-name-too-long-for-any-service-to-share"
 
 
 def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
@@ -990,7 +991,7 @@ def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
     }
     # A sidecar: started before `setup` and the service, restarted if it ends.
     forwarder, setup = pods["agent-env-my-release-default"]["initContainers"]
-    assert (forwarder["name"], setup["name"]) == ("egress-forwarder", "setup")
+    assert (forwarder["name"], setup["name"]) == (_FORWARDER, "setup")
     assert forwarder["restartPolicy"] == "Always"
     # The service starts once the probe finds the key where the forwarder keeps it.
     [mount] = forwarder["volumeMounts"]
@@ -1021,7 +1022,43 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["metadata"]["annotations"]["inspect-k8s-sandbox/egress-proxy"] == (
         "agent-env-my-release-egress-proxy.default.svc.cluster.local.:3128"
     )
-    assert pod["spec"]["initContainers"][0]["name"] == "egress-forwarder"
+    assert pod["spec"]["initContainers"][0]["name"] == _FORWARDER
+
+
+def test_no_service_can_share_the_egress_forwarders_container_name(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "egress-proxy-values.yaml",
+        f"global.fullnameOverride=x,services.{_FORWARDER}.image=busybox",
+    )
+
+    [of_that_name] = [
+        owner["metadata"]["name"]
+        for owner in _get_documents(documents, "StatefulSet")
+        if owner["spec"]["template"]["spec"]["containers"][0]["name"] == _FORWARDER
+    ]
+    # Kubernetes takes 63 characters of a container's name, and of a StatefulSet's.
+    assert len(_FORWARDER) <= 63 < len(of_that_name)
+
+
+@pytest.mark.parametrize("card", [False, True])
+def test_a_pod_with_the_egress_forwarder_is_of_the_guaranteed_qos_class(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, card: bool
+) -> None:
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "egress-proxy-values.yaml",
+        set_string=None if card else f"services.default.podAnnotations.{_NO_CARD}",
+    )
+
+    pod = _get_documents(documents, "StatefulSet")[0]["spec"]["template"]["spec"]
+    # Kubernetes asks it of every container: CPU and memory, requests equal to limits.
+    for container in pod["initContainers"] + pod["containers"]:
+        resources = container["resources"]
+        assert resources["requests"] == resources["limits"], container["name"]
+        assert {"cpu", "memory"} <= resources["limits"].keys(), container["name"]
 
 
 def test_egress_proxy_annotation_needs_the_forwarder_image(
@@ -1405,6 +1442,58 @@ def test_network_isolated_service_joining_a_global_network(
     ]
     assert len(normal_ingress_policies) == 1
     assert normal_ingress_policies[0]["spec"]["ingress"] != []
+
+
+@pytest.mark.parametrize(
+    "values", ["network-isolated-with-global-network", "egress-proxy", "multiple-ports"]
+)
+def test_policies_select_admit_and_reach_no_other_releases_pods(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, values: str
+) -> None:
+    # Releases share a namespace: only these labels keep a rule off another's pods.
+    own = {
+        "io.kubernetes.pod.namespace": "home",
+        "app.kubernetes.io/name": "agent-env",
+        "app.kubernetes.io/instance": "my-release",
+    }
+    dns = [
+        {"matchLabels": {"io.kubernetes.pod.namespace": "kube-system", "k8s-app": app}}
+        for app in ("kube-dns", "node-local-dns")
+    ]
+    read = {"description", "endpointSelector", "ingress", "egress", "egressDeny"}
+
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="home"
+    )
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        assert policy["metadata"].get("namespace", "home") == "home", policy
+        # A field this does not read, enableDefaultDeny or specs, could undo the rules.
+        assert policy.keys() <= {"apiVersion", "kind", "metadata", "spec"}, policy
+        spec = policy["spec"]
+        assert spec.keys() <= read, policy
+        ends = [spec["endpointSelector"]]
+        # The default deny's empty rule selects its pods and admits no one.
+        for rule in filter(None, spec.get("ingress", [])):
+            assert rule.keys() <= {"fromEndpoints", "toPorts", "icmps"}, policy
+            ends += rule.get("fromEndpoints") or [{}]
+        for rule in spec.get("egress", []):
+            assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
+            others = dns if "toPorts" in rule else []  # The cluster's DNS, on ports.
+            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in others]
+        for end in ends:  # Cilium requires every term: no other key widens these.
+            assert own.items() <= end.get("matchLabels", {}).items(), policy
+
+
+def test_no_egress_rule_mixes_kinds_of_peer(chart_dir: pathlib.Path) -> None:
+    allow = "allowDomains[0]=pypi.org,allowEntities[0]=world,allowCIDR[0]=10.0.0.0/8"
+
+    documents = _run_helm_template(chart_dir, set_str=allow)
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            # Cilium drops the whole policy for a rule that mixes kinds of peer.
+            assert len(rule.keys() - {"toPorts"}) == 1, rule
 
 
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(

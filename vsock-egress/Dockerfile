@@ -3,6 +3,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:30b1e546a9c7fa3b747c2bd
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum *.go ./
+COPY profiles profiles
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/vsock-egress .
 
 FROM scratch

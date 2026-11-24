@@ -177,6 +177,8 @@ services:
       resources:
         limits:
           memory: 1G
+    healthcheck: {{test: [CMD, "true"]}}
+    x-k8s: {{resources: {{requests: {{ephemeral-storage: 1Gi}}}}}}
   later: {later}
   last: {later}
 """)
@@ -184,6 +186,22 @@ services:
     services = _converter.convert_compose_to_helm_values(compose_path)["services"]
 
     assert services["last"] == services["later"] == services["default"]
+
+
+def test_keys_of_a_service_sharing_a_yaml_alias_each_keep_their_settings(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    compose_path = tmp_compose("""
+services:
+  default:
+    deploy: {resources: {reservations: &memory {memory: 1G}}}
+    x-inspect_k8s_sandbox: {resources: {limits: *memory}}
+""")
+
+    services = _converter.convert_compose_to_helm_values(compose_path)["services"]
+
+    assert services["default"]["resources"]["requests"] == {"memory": "1Gi"}
+    assert services["default"]["resources"]["limits"] == {"memory": "1G"}
 
 
 def test_rejects_service_name_that_yaml_reads_as_a_boolean(
@@ -1038,6 +1056,23 @@ services:
         convert_compose_to_helm_values(compose_path)
 
     assert "Conflicting 'requests.memory'" in str(exc_info.value)
+
+
+def test_rejects_a_deploy_limit_shared_as_the_extension_request(
+    tmp_compose: TmpComposeFixture,
+) -> None:
+    # deploy's limit populates requests.memory too, through an alias or written out.
+    compose_path = tmp_compose("""
+services:
+  default:
+    deploy: {resources: {limits: &memory {memory: 1G}}}
+    x-inspect_k8s_sandbox: {resources: {requests: *memory}}
+""")
+
+    with pytest.raises(
+        _converter.ComposeConverterError, match="Conflicting 'requests.memory'"
+    ):
+        _converter.convert_compose_to_helm_values(compose_path)
 
 
 def test_service_extension_output_validates_against_chart_schema(

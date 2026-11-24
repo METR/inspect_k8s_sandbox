@@ -25,11 +25,11 @@ func main() {
 	log.SetFlags(0)
 	commands := map[string]func([]string) error{
 		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
-		"launch": launch, "check": check, // on the node
+		"launch": launch, "check": check, "install": install, // on the node
 		"work": work, "probe": probe, "reap": reap, // started by launch and check
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
-		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check (on the node)")
+		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check|install (on the node)")
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {

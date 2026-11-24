@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -30,13 +31,17 @@ func TestPacerMakesUpForASleepThatRanLate(t *testing.T) {
 
 // pair returns the two ends of a new connection, closed when the test ends.
 func pair(t *testing.T, network, address string) (net.Conn, net.Conn) {
+	return pairBy(t, network, address, net.Dialer{})
+}
+
+func pairBy(t *testing.T, network, address string, d net.Dialer) (net.Conn, net.Conn) {
 	t.Helper()
 	l, err := net.Listen(network, address)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	near, err := net.Dial(network, l.Addr().String())
+	near, err := d.Dial(network, l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +58,14 @@ func pair(t *testing.T, network, address string) (net.Conn, net.Conn) {
 
 func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	near, far := pair(t, "tcp", "127.0.0.1:0")
+	return near.(*net.TCPConn), far.(*net.TCPConn)
+}
+
+// unreadPair is a tcpPair whose near end holds little that it has not read, from its first packet on: most of what the far end writes stays unsent.
+func unreadPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	near, far := pairBy(t, "tcp", "127.0.0.1:0", net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) { syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4<<10) })
+	}})
 	return near.(*net.TCPConn), far.(*net.TCPConn)
 }
 
@@ -91,44 +104,31 @@ func TestBytesReadAreAcknowledgedAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
-	atOnce := func() (quick int) {
+	quick := 0
+
+	// Before each request, acknowledgements are held back, as the kernel holds them once replies flow. Two requests: asking once a connection would not do.
+	for range 2 {
+		if controlled := raw.Control(func(fd uintptr) {
+			err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 0)
+		}); controlled != nil || err != nil {
+			t.Fatal(controlled, err)
+		}
+		if _, err := client.Write(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		// Into the room a stream's reads have, more than the peer fills.
+		if _, err := read.Read(make([]byte, maxFrame)); err != nil {
+			t.Fatal(err)
+		}
+		// Whether the kernel acknowledges what this side receives at once, or holds that back for a reply to carry.
 		if controlled := raw.Control(func(fd uintptr) {
 			quick, err = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK)
 		}); controlled != nil || err != nil {
 			t.Fatal(controlled, err)
 		}
-		return quick
-	}
-	one := make([]byte, 1)
-	// Requests and their replies, as through a proxy: the kernel then holds acknowledgements back. The first is read as the last will be: asking once a connection would not do.
-	receive := read.Read
-	for range 8 {
-		for _, step := range []func([]byte) (int, error){client.Write, receive, inSandbox.Write, client.Read} {
-			if _, err := step(one); err != nil {
-				t.Fatal(err)
-			}
+		if quick != 1 {
+			t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
 		}
-		receive = inSandbox.Read
-	}
-	if atOnce() != 0 {
-		t.Skip("this kernel holds no acknowledgement back here, so a read has nothing to change")
-	}
-	sent := time.Now()
-
-	if _, err := client.Write(one); err != nil {
-		t.Fatal(err)
-	}
-	// Into the room a stream's reads have, more than the peer fills.
-	if _, err := read.Read(make([]byte, maxFrame)); err != nil {
-		t.Fatal(err)
-	}
-
-	if atOnce() != 1 {
-		t.Fatal("the connection still holds its acknowledgements back after a read: a client without TCP_NODELAY waits 40 ms for each before its next small write")
-	}
-	if time.Since(sent) > 20*time.Millisecond {
-		t.Skip("too slow to tell: 40 ms after bytes arrive the kernel acknowledges them whatever was asked")
 	}
 }
 
@@ -171,6 +171,25 @@ func TestResetThatFollowsThePeersOwnEndLeavesItsReplyWhole(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got, err := io.ReadAll(unreset{onNode, new(atomic.Bool)}); string(got) != "reply" || err != nil {
 		t.Fatalf("the node read %q, %v: want the reply and then a clean end", got, err)
+	}
+}
+
+func TestReplyItsClientNeverTakesIsResetAtTheBound(t *testing.T) {
+	client, inSandbox := unreadPair(t)
+	guest, node := vsockPair(t)
+	ended := make(chan struct{})
+	go func() {
+		join(guest, inSandbox, nil, 100*time.Millisecond)
+		close(ended)
+	}()
+	client.CloseWrite()
+	if err := toFrames(node, strings.NewReader(strings.Repeat("r", 100<<10)), nil); err != nil { // all of it fits the socket's buffer: the stream ends cleanly
+		t.Fatal(err)
+	}
+
+	within(t, ended, "end of a stream whose client took none of its reply")
+	if got, err := io.ReadAll(client); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("the client read %d bytes, %v, once the stream had gone: want a reset, for closed with a reply unsent the kernel keeps the socket", len(got), err)
 	}
 }
 

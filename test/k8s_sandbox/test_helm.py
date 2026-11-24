@@ -441,15 +441,29 @@ async def test_helm_cleanup_asks_helm_whose_a_release_is_where_kubernetes_has_no
     assert (tmp_path / "release").exists() is not its
 
 
-async def test_helm_cleanup_fails_where_helm_cannot_say_whose_a_release_is(
+async def test_a_helm_list_that_fails_is_not_read_as_no_release(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: a list that failed read as no release, and the release was left."""
     _stand_in_for_helm(tmp_path, monkeypatch)
-    (tmp_path / "does").write_text("exit 1\n")
+    (tmp_path / "does").write_text("echo forbidden >&2; kill -9 $$\n")
     release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
 
     with pytest.raises(RuntimeError, match="Helm list failed"):
+        await release.uninstall(quiet=True)
+    with pytest.raises(RuntimeError, match="Helm list failed") as error:
+        await _helm.get_all_release_names("a-namespace", None)
+    assert all(fact in str(error.value) for fact in ("a-namespace", "-9", "forbidden"))
+
+
+async def test_helm_s_error_is_reported_where_its_output_is_not_utf_8(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stand_in_for_helm(tmp_path, monkeypatch)
+    (tmp_path / "does").write_text("printf '\\377'; printf 'no \\377' >&2; exit 1\n")
+    release = _helm.Release(__file__, None, _helm.ValuesSource.none(), None)
+
+    with pytest.raises(RuntimeError, match="Helm list failed.*no \ufffd"):
         await release.uninstall(quiet=True)
 
 
