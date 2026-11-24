@@ -90,8 +90,12 @@ def test_what_an_update_read_before_it_failed_is_kept(
     """As kubernetes 37's update() can: read every frame waiting, then fail."""
     ws = _FakeWSClient([(STDOUT_CHANNEL, b"file"), _status(0)], error=failure)
     read_one, dst = ws.update, io.BytesIO()
+    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
+    monkeypatch.setattr(execute_module, "time", clock)
+    monkeypatch.setattr(module, "time", clock, raising=False)
 
     def read_all_then_fail(timeout: float | None = 0) -> None:
+        ws.now += timeout or 0  # so a wait that goes on meets its bound, and fails
         while True:
             read_one(timeout)
 
