@@ -557,11 +557,9 @@ class Link:
             self.why.update(reader=repr(e), heard=heard)
         except (ValueError, LookupError, TypeError):  # not execd's frames
             pass
-        except asyncio.CancelledError:
-            self.why["reader"] = "cancelled"
-            raise
         finally:
-            self.why.setdefault("reader", "stopped")  # at a frame that was not execd's
+            # Cancelled by what closed it, or stopped by itself at a frame not execd's.
+            self.why.setdefault("reader", "cancelled" if self.closed else "stopped")
             await self.close()
 
     async def _ping(self) -> None:
@@ -665,13 +663,9 @@ class ExecdClient:
                 # Only the first look, and no timeout, shows execd went as it ended.
                 timed_out = isinstance(e, asyncio.TimeoutError)
                 first = last if at_once and not timed_out else None
-                # Kept: the first look for its own daemon, and the start after it.
-                why = (
-                    last.why
-                    if last and self._daemon is last.daemon and "look" not in last.why
-                    else {}
-                )
-                why.update(look=repr(e), at_once=at_once, connected=link is not None)
+                # Kept: the look made at once, which the rule reads, and its start.
+                why = last.why if last and at_once else {}
+                why.update(look=repr(e), connected=link is not None)
                 if last is not None:
                     last.ended = False
                 if time.monotonic() > deadline:
@@ -683,7 +677,7 @@ class ExecdClient:
                     if first is not None:
                         first.killed = True
                 except DaemonRunning as running:
-                    why["start"] = repr(running)
+                    why["start"] = f"{type(running).__name__}: {running}"
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
                 except Exception as failed:
