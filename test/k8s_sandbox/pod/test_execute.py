@@ -87,7 +87,10 @@ class _FakeWSClient(WSClient):
         self.binary = True
         # No socket: nothing for _update to read, nothing to close.
         self.sock = types.SimpleNamespace(
-            sock=None, close=lambda **kwargs: None, settimeout=lambda timeout: None
+            sock=None,
+            close=lambda **kwargs: None,
+            settimeout=lambda timeout: None,
+            shutdown=lambda: None,
         )
         self._frames = list(frames)
         self._ends = ends
@@ -811,13 +814,13 @@ def _keep_a_tls_error(tmp_path: Path, other: ssl.SSLSocket) -> bool:
 class _SocketWSClient(WSClient):
     """A WSClient on a real socket, with the client's own update() and its poll."""
 
-    def __init__(self, sock: socket.socket, binary: bool = True) -> None:
+    def __init__(self, sock: socket.socket) -> None:
         self._connected = True
         self._channels: dict[int, bytes] = {}
         self._closed_channels: set[int] = set()
-        self._all = io.BytesIO() if binary else io.StringIO()
+        self._all = io.BytesIO()
         self.subprotocol = None
-        self.binary = binary
+        self.binary = True
         self.sock = websocket.WebSocket()
         self.sock.sock = sock
         self.sock.connected = True

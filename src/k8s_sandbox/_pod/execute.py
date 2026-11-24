@@ -467,9 +467,24 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
         ws_client._connected = False
     elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
         channel, data = frame.data[0], frame.data[1:]
-        if not ws_client.binary:  # an exec opened as text: str, as update() keeps it
-            data = data.decode("utf-8", "replace")
-        ws_client._channels[channel] = ws_client._channels.get(channel, data[:0]) + data
+        ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
+
+
+def update_by(ws_client: WSClient, deadline: float, pod: str) -> None:
+    """Read the next frame of an exec that has no status yet, or raise at `deadline`."""
+    wait = deadline - time.monotonic()
+    if wait <= 0:
+        ws_client.sock.shutdown()  # Closes the socket: the close then awaits no answer.
+        raise ExecResultUnknownError("The exec sent no more and did not end", pod=pod)
+    # Nor wait past it for the rest of a frame already started.
+    ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
+    try:
+        _update(ws_client, wait)
+    except websocket.WebSocketTimeoutException:
+        pass  # What it read first is the caller's: kubernetes 37 reads on.
+    except (OSError, websocket.WebSocketException):
+        if ERROR_CHANNEL not in ws_client._channels:
+            raise
 
 
 class PodStdio(ByteStream):
