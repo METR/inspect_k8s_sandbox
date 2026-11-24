@@ -9,6 +9,7 @@ import itertools
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -2298,8 +2299,14 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
-APART = ["a start found it running", "the look timed out", "ours", "it outlived"]
-APART += ["its command had ended", "we were silent"]
+APART = {  # how it was out of reach, and where its error says so
+    "a start found it running": '"start": "DaemonRunning(',
+    "the look timed out": '"look": "TimeoutError()',
+    "ours": '"reader": "cancelled"',
+    "it outlived": '"resuming": "True"',
+    "its command had ended": '"ended": "True"',
+    "we were silent": "heard=False",
+}
 
 
 @pytest.mark.parametrize("how", APART)
@@ -2367,7 +2374,7 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
         interval()  # no frame for 60 s: the client ends the connection itself
         await asyncio.sleep(0.001)
     try:
-        with pytest.raises(error.ExecdStoppedError):
+        with pytest.raises(error.ExecdStoppedError, match=re.escape(APART[how])):
             await asyncio.wait_for(call, 30)  # only bounds a hang
     finally:
         silent.close()

@@ -424,6 +424,7 @@ class Link:
         self.closed = False
         self.ended = False  # from execd's side, and execd not yet looked for since
         self.killed = False  # execd went as it ended: the first look found it gone
+        self.why = {"reader": "returned"}  # how it ended, for an ExecdStoppedError
         self.ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._wlock = asyncio.Lock()
         self.bulk = asyncio.Lock()
@@ -553,8 +554,12 @@ class Link:
         except OSError as e:  # not its close_notify, nor after our silence: execd's own
             heard = time.monotonic() - self._last_tx < DEAD_AFTER
             self.ended = heard and not isinstance(e, ConnectionAbortedError)
-        except (ValueError, LookupError, TypeError):  # not execd's frames
-            pass
+            self.why["reader"] = f"{e!r} heard={heard}"
+        except (ValueError, LookupError, TypeError) as e:  # not execd's frames
+            self.why["reader"] = repr(e)
+        except asyncio.CancelledError:
+            self.why["reader"] = "cancelled"
+            raise
         finally:
             await self.close()
 
@@ -660,6 +665,7 @@ class ExecdClient:
                 first = last if at_once and not timed_out else None
                 if last is not None:
                     last.ended = False
+                    last.why.setdefault("look", f"{e!r} at_once={at_once}")
                 if time.monotonic() > deadline:
                     raise ConnectionError(f"execd unreachable: {e!r}") from e
                 # a start tells gone from unreachable; a daemon not ours is replaced
@@ -668,10 +674,14 @@ class ExecdClient:
                     self._daemon = await self._start(not_ours)
                     if first is not None:
                         first.killed = True
-                except DaemonRunning:
+                except DaemonRunning as running:
+                    if last is not None:
+                        last.why.setdefault("start", repr(running))
                     if not_ours:  # what holds the port isn't execd: it won't let go
                         raise _port_held() from e
                 except Exception as failed:
+                    if last is not None:
+                        last.why.setdefault("start", repr(failed))
                     # Only a deleted pod: a start can fail and its daemon run on.
                     gone = isinstance(failed, ApiException) and failed.status == 404
                     if self._link is None or gone or isinstance(failed, K8sError):
@@ -929,7 +939,13 @@ class ExecdClient:
             apart = not was.killed or call.resuming or call.ended
             if new.container != old.container or unnamed or apart:
                 raise ExecdStoppedError(
-                    "execd stopped while it ran the command", pod=old.ip
+                    "execd stopped while it ran the command",
+                    pod=old.ip,
+                    containers=(old.container, new.container),
+                    killed=was.killed,
+                    resuming=call.resuming,
+                    ended=call.ended,
+                    **was.why,  # which of these refused its 137, for the log
                 )
             log_warn("execd was killed: started again", pod=old.ip)
             # Killed with it, or left: it ends as Kubernetes exec ends a killed command.

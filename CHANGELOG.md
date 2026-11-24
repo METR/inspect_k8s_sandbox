@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- An `ExecdStoppedError` for a call whose execd was started again says what kept the
+  call from ending 137: how its connection ended, what the first look for execd met,
+  and whether the call was resuming or had ended.
 - The `execd` image takes its bases from Docker Hub, by the same digests, where it took
   them from ECR Public: a host that builds it from `execd/` must reach Docker Hub.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
