@@ -1,19 +1,23 @@
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Generator
 
 from inspect_ai.util import OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
-from websocket import WebSocketException
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
+    STDERR_CHANNEL,
+    STDOUT_CHANNEL,
+    WSClient,
+)
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
-from k8s_sandbox._pod.get_returncode import (
-    get_returncode,
-    raise_if_stopped_before_lost,
-)
+from k8s_sandbox._pod.execute import update_by
+from k8s_sandbox._pod.get_returncode import get_returncode
 from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
     SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
@@ -58,19 +62,16 @@ class ReadFileOperation(PodOperation):
         start_position = dst.tell()
         # Stream the response, writing it to dst as we go to avoid holding the whole
         # response in memory.
-        try:
-            while ws_client.is_open():
-                # `timeout=None` means `update` will block indefinitely until there is
-                # data to read.
-                ws_client.update(timeout=None)
-                if ws_client.peek_stdout():
-                    dst.write(ws_client.read_stdout())
-                    self._verify_output_limit(dst.tell() - start_position)
-                if ws_client.peek_stderr():
-                    stderr.append(ws_client.read_stderr())
-        except (OSError, WebSocketException) as e:
-            raise_if_stopped_before_lost(ws_client, e, self._pod.name)
-            raise
+        quiet = time.monotonic() + API_TIMEOUT
+        while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
+            update_by(ws_client, quiet, self._pod.name)
+            # Not peek_*(): it reads another frame first, and may wait for the rest.
+            if out := ws_client._channels.pop(STDOUT_CHANNEL, b""):
+                dst.write(out)
+                self._verify_output_limit(dst.tell() - start_position)
+                quiet = time.monotonic() + API_TIMEOUT
+            stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
+        ws_client.close(timeout=0)  # The status is the result: no wait for an answer.
         returncode = get_returncode(ws_client)
         # `head` never exits 255: Kata gives it when the VM stopped.
         if returncode == 255:

@@ -470,6 +470,23 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
         ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
 
 
+def update_by(ws_client: WSClient, deadline: float, pod: str) -> None:
+    """Read the next frame of an exec that has no status yet, or raise at `deadline`."""
+    wait = deadline - time.monotonic()
+    if wait <= 0:
+        ws_client.sock.shutdown()  # Closes the socket: the close then awaits no answer.
+        raise ExecResultUnknownError("Timed out waiting for the exec's status", pod=pod)
+    # The rest of a frame already started is waited for this long at a time.
+    ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
+    try:
+        _update(ws_client, wait)
+    except websocket.WebSocketTimeoutException:
+        pass  # A pause inside a frame: read on, to the deadline.
+    except (OSError, websocket.WebSocketException):
+        if ERROR_CHANNEL not in ws_client._channels:
+            raise
+
+
 class PodStdio(ByteStream):
     """An exec's stdin and stdout as a byte stream (see Pod.exec_stdio())."""
 

@@ -87,13 +87,19 @@ class _FakeWSClient(WSClient):
         self.binary = True
         # No socket: nothing for _update to read, nothing to close.
         self.sock = types.SimpleNamespace(
-            sock=None, close=lambda **kwargs: None, settimeout=lambda timeout: None
+            sock=None,
+            close=self._close,
+            settimeout=lambda timeout: None,
+            shutdown=lambda: None,
         )
         self._frames = list(frames)
         self._ends = ends
         self._error = error
         self.now = 0.0  # its own clock: only its pauses and waits move it
         self._waited = 0
+
+    def _close(self, timeout: float = 3, **kwargs: object) -> None:
+        self.now += timeout  # as websocket-client waits for an answer to its close
 
     def update(self, timeout: float | None = 0) -> None:
         if not self.is_open():
@@ -112,6 +118,9 @@ class _FakeWSClient(WSClient):
             channel, data = frame
             self._channels[channel] = self._channels.get(channel, b"") + data
         elif self._error is not None:
+            self._waited += 1
+            if self._waited > 10_000:  # so that code which swallows it for ever fails
+                raise AssertionError("failed for ever on a client with no more to send")
             raise self._error
         elif self._ends:
             self._connected = False

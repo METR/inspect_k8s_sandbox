@@ -1,21 +1,27 @@
 import io
 import os
 import subprocess
+import types
 from pathlib import Path
 from typing import Any, Generator
 from unittest.mock import MagicMock
 
 import pytest
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
-    ERROR_CHANNEL,
+    STDOUT_CHANNEL,
     WSClient,
 )
-from websocket import WebSocketConnectionClosedException
 
-from k8s_sandbox._pod import read
+import k8s_sandbox._pod.op as op_module
+from k8s_sandbox._pod import execute, read
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.read import ReadFileOperation
-from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
+from test.k8s_sandbox.pod import test_execute
+
+_FakeWSClient = test_execute._FakeWSClient  # pyright: ignore[reportPrivateUsage]
+_status = test_execute._status  # pyright: ignore[reportPrivateUsage]
+
+_POD = op_module.PodInfo("p", "ns", None, "default", "u", 0, "raise")
 
 
 def _exec_kwargs(monkeypatch: pytest.MonkeyPatch, src: Path) -> dict[str, Any]:
@@ -78,31 +84,21 @@ def test_a_255_is_a_stopped_container(returncode: int, error: type[Exception]) -
     assert type(raised.value) is error
 
 
-@pytest.mark.parametrize(
-    "lost",
-    [ConnectionResetError(), WebSocketConnectionClosedException()],
-    ids=["reset", "closed"],
-)
-@pytest.mark.parametrize(
-    ("frames", "stopped"),
-    [
-        ([_status(255)], True),
-        ([_status(2)], False),
-        # As for an exec into a dead container: no exit code, nor even `details`.
-        ([(ERROR_CHANNEL, b'{"status":"Failure","reason":"InternalError"}')], False),
-        ([], False),
-    ],
-    ids=["255", "another-status", "no-exit-code", "no-status"],
-)
-def test_a_255_before_the_connection_is_lost_is_a_stopped_container(
-    frames: list[tuple[int, bytes]], stopped: bool, lost: Exception
+def test_a_read_that_goes_on_past_the_bound_is_not_cut_short(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ws = _FakeWSClient(frames, error=lost)
+    """The bound is on its silence: a large file takes longer than that to read."""
+    pause = read.API_TIMEOUT - 1.0
+    ws = _FakeWSClient(
+        [(STDOUT_CHANNEL, b"a"), pause, (STDOUT_CHANNEL, b"b"), pause, _status(0)]
+    )
+    clock, dst = types.SimpleNamespace(monotonic=lambda: ws.now), io.BytesIO()
+    monkeypatch.setattr(execute, "time", clock)
+    monkeypatch.setattr(read, "time", clock)
 
-    with pytest.raises(Exception) as raised:
-        ReadFileOperation(MagicMock())._handle_stream_output(ws, io.BytesIO())
+    read.ReadFileOperation(_POD)._handle_stream_output(ws, dst)
 
-    assert type(raised.value) is (ContainerStoppedError if stopped else type(lost))
+    assert dst.getvalue() == b"ab"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX shell")

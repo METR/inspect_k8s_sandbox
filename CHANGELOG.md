@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix `write_file()` and `read_file()` over Kubernetes exec hanging when the exec
+  stalls: they are retried after 60 seconds without progress, or once 1 MiB of an
+  upload has taken that long to send.
 - The `execd` image takes its bases from Docker Hub, by the same digests, where it took
   them from ECR Public: a host that builds it from `execd/` must reach Docker Hub.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
