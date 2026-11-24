@@ -1080,6 +1080,9 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		hook(&beforeNumber, false)
 		reaper.mu.Lock()
 		byNumber(as, cl.lead(), syscall.SIGCONT)
+		if reaper.waiting[pid] == status && syscall.Kill(pid, syscall.SIGCONT) != nil { // the command too, behind its group: it may have left that, its start unread
+			signalAs(as, pid, syscall.SIGCONT)
+		}
 		reaper.mu.Unlock()
 	}
 	resume := func() { // as su and runuser, one stops itself at its child's stop: left so, it would sit out the grace
@@ -1219,6 +1222,13 @@ func stat(pid int) []string {
 // signalTree stops lead's group and what runs under roots, then sends them sig: stopped, none starts another meanwhile.
 func signalTree(as *syscall.Credential, lead int, roots map[int]string, sig syscall.Signal, until time.Time) (reached, listed map[int]string, parents map[int]bool, apart []int) {
 	byNumber(as, lead, syscall.SIGSTOP) // the group at once, so that none starts another
+	defer func() {                      // a command whose start was not read, last and though none other was found: by its number, which the reaper holds, since it may have left its group
+		for root, started := range roots {
+			if started == "" && root != lead && syscall.Kill(root, sig) != nil {
+				signalAs(as, root, sig)
+			}
+		}
+	}()
 	var stopped []int
 	seen, grouped, waits := map[int]bool{}, map[int]bool{}, time.Now().Add(time.Second)
 	reached, parents = map[int]string{}, map[int]bool{}
@@ -1281,11 +1291,6 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sig sysc
 			signalIf(as, p, reached[p], sig)
 		}
 		byNumber(as, lead, sig)
-	}
-	for root, started := range roots { // a command whose start was not read: by its number, which the reaper holds, since it may have left its group
-		if started == "" && root != lead && syscall.Kill(root, sig) != nil {
-			signalAs(as, root, sig)
-		}
 	}
 	maps.DeleteFunc(parents, func(p int, _ bool) bool { return reached[p] == "" })
 	return reached, listed, parents, slices.DeleteFunc(stopped, func(p int) bool { return grouped[p] })

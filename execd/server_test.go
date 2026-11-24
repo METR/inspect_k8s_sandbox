@@ -78,10 +78,10 @@ func TestMain(m *testing.M) {
 		}
 	}
 	for len(os.Args) == 2 && os.Args[1] == "hold" { // a test holds this holder back from its start, as a container starved of CPU does
-		if _, err := os.Stat("/tmp/dead-holders"); err == nil { // or ends it before its word, as with no PID left for its threads
+		if _, err := os.Stat(holders(os.Getppid(), "dead")); err == nil { // or ends it before its word, as with no PID left for its threads
 			os.Exit(2)
 		}
-		if _, err := os.Stat("/tmp/held-holders"); err != nil {
+		if _, err := os.Stat(holders(os.Getppid(), "held")); err != nil {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -1376,8 +1376,9 @@ func endAsNobody(pids ...int) {
 	}
 }
 
-func killTagged(tag string) { signalTagged(tag, syscall.SIGKILL, nil, nil) }                       // what a test left carrying a tag
-func gone(pid int) bool     { f := stat(pid); return len(f) == 0 || strings.Contains("ZX", f[0]) } // ended: a zombie, or one being reaped
+func killTagged(tag string)             { signalTagged(tag, syscall.SIGKILL, nil, nil) }                       // what a test left carrying a tag
+func gone(pid int) bool                 { f := stat(pid); return len(f) == 0 || strings.Contains("ZX", f[0]) } // ended: a zombie, or one being reaped
+func holders(of int, how string) string { return "/tmp/" + how + "-holders-" + strconv.Itoa(of) }              // a mark for one test binary's holders: its tests set it, its holders look for it
 
 // graced has each kill's grace, timeout(1)'s -k 5s over Kubernetes exec, last until the test ends it; end ends them, and says how many.
 func graced(t *testing.T) (end func() int) {
@@ -1526,17 +1527,34 @@ func TestAKillWithNoDescriptorLeftReachesACommandThatHasLeftItsGroup(t *testing.
 	var was syscall.Rlimit
 	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &was)
 	t.Cleanup(func() { pidfdOpen = open; nofile(was) })
-	pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
-		spare, _ := syscall.Dup(0) // the lowest number free: with the limit there, no descriptor can be taken
-		syscall.Close(spare)
-		nofile(syscall.Rlimit{Cur: uint64(spare), Max: was.Max})
-		return open(pid)
-	}
-	s, c, frames, _, _ := ready(t, "", "setsid", "sh", "-c", "echo ready; exec sleep 600")
-	s.dispatch(c, frame{kind: fKill, id: 80})
-	code := exitStatus(t, frames)["code"]
-	if nofile(was); code != 137.0 {
-		t.Fatalf("exit %v: want 137, the SIGKILL of a kill with no descriptor", code)
+	for name, tc := range map[string]struct {
+		left   uint64 // the descriptors its kill finds free
+		orphan bool   // its holder was killed before
+		script string
+		want   float64
+	}{
+		"none":                  {0, false, "echo ready; exec sleep 600", 137}, // the SIGKILL of a kill with no descriptor
+		"none, its holder gone": {0, true, "echo ready; exec sleep 600", 137},
+		"one, for its pidfd":    {1, false, "trap 'exit 42' TERM; echo ready; sleep 600 & wait", 42}, // its SIGTERM, which it must be continued to take
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer nofile(was) // for the next case's start, though this one fails
+			pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
+				spare, _ := syscall.Dup(0) // the lowest number free: with the limit there, no descriptor can be taken
+				syscall.Close(spare)
+				nofile(syscall.Rlimit{Cur: uint64(spare) + tc.left, Max: was.Max})
+				return open(pid)
+			}
+			s, c, frames, _, _ := ready(t, "", "setsid", "sh", "-c", tc.script)
+			if cl := s.get(80); tc.orphan {
+				syscall.Kill(cl.group, syscall.SIGKILL)
+				until(t, "its holder was not reaped", func() bool { reaper.mu.Lock(); defer reaper.mu.Unlock(); return cl.lead() == 0 })
+			}
+			s.dispatch(c, frame{kind: fKill, id: 80})
+			if code := exitStatus(t, frames)["code"]; code != tc.want {
+				t.Fatalf("exit %v: want %v", code, tc.want)
+			}
+		})
 	}
 }
 
@@ -1741,7 +1759,7 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 	}
 	for name, argv := range map[string][]string{
 		"left in its group by a handler":     {map[bool]string{true: "65534"}[os.Getuid() == 0], "env", "-i", "/bin/sh", "-c", `trap 'sleep 600 >/dev/null 2>&1 & echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                                                                            // at its SIGTERM it starts one, says its id and ends: no SIGTERM went to that one, and with no tag only the command's group leads there
-		"left out of its group by a handler": {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & until [ "$(cut -d" " -f5 /proc/$!/stat)" != $$ ]; do :; done; echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                         // the same in a session of its own, which the handler waits for: only the tag leads there, in an environment root may not read
+		"left out of its group by a handler": {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap 'setsid sleep 600 >/dev/null 2>&1 & until [ "$(cut -d" " -f6 /proc/$!/stat)" = $! ]; do :; done; echo $!; exit' TERM; echo ready; while :; do sleep 0.01; done`},                                                                                                          // the same in a session of its own, which the handler waits for: only the tag leads there, in an environment root may not read
 		"found by its tag":                   {map[bool]string{true: "65534"}[os.Getuid() == 0], "sh", "-c", `trap exit TERM; (setsid sh -c 'trap "echo $$; exec env -i sh -c \"while :; do :; done\" >/dev/null 2>&1" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`}, // in a session of its own, its parent gone, one says its id at its SIGTERM and runs on with no tag: only the tag led there, and only its id leads the SIGKILL
 		"found in its group":                 {"", "sh", "-c", `trap exit TERM; (` + orphan + ` 'trap "echo $$" TERM; while [ "$(cut -d" " -f4 /proc/$(cut -d" " -f4 /proc/$$/stat)/stat)" = $0 ]; do :; done; echo ready; while :; do :; done' $$ &); while :; do sleep 0.01; done`},                                                                                                        // in its group with no tag, its parent gone, one says its id at its SIGTERM and runs on
 	} {
@@ -1793,7 +1811,7 @@ func TestACommandsHolderEndsWithIt(t *testing.T) {
 	holder := cl.group
 	cl.kmu.Unlock()
 	exitStatus(t, frames)
-	until(t, "a holder outlived its command: each call would leave one", func() bool { return gone(holder) })
+	until(t, "a holder outlived its command: each call would leave one", func() bool { return holder > 0 && gone(holder) })
 }
 
 func TestAKillReachesTheGroupOfACommandThatSignalledIt(t *testing.T) {
@@ -1811,8 +1829,9 @@ func TestAKillReachesTheGroupOfACommandThatSignalledIt(t *testing.T) {
 func TestACommandStartsOnlyOnceItsHolderIsReady(t *testing.T) {
 	wait := readyWait
 	readyWait = 30 * time.Second // only bounds a hang
-	os.WriteFile("/tmp/held-holders", nil, 0o600)
-	t.Cleanup(func() { readyWait = wait; os.Remove("/tmp/held-holders") })
+	held := holders(os.Getpid(), "held")
+	os.WriteFile(held, nil, 0o600)
+	t.Cleanup(func() { readyWait = wait; os.Remove(held) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -1823,14 +1842,17 @@ func TestACommandStartsOnlyOnceItsHolderIsReady(t *testing.T) {
 		t.Fatalf("frame %d, %q, before the command's holder was ready", f.kind, f.payload)
 	case <-time.After(200 * time.Millisecond):
 	}
-	os.Remove("/tmp/held-holders")
-	exitStatus(t, frames)
+	os.Remove(held)
+	if status := exitStatus(t, frames); status["code"] != 0.0 {
+		t.Fatalf("EXIT %v: want 0, from the command its holder then let start", status)
+	}
 }
 
 // Regression: a command whose holder had ended before its word was started with none, and its kill then reached no group.
 func TestACommandWhoseHolderDidNotStartIsNotStarted(t *testing.T) {
-	os.WriteFile("/tmp/dead-holders", nil, 0o600)
-	t.Cleanup(func() { os.Remove("/tmp/dead-holders") })
+	dead := holders(os.Getpid(), "dead")
+	os.WriteFile(dead, nil, 0o600)
+	t.Cleanup(func() { os.Remove(dead) })
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
@@ -1846,13 +1868,13 @@ func TestACommandThatCannotStartLeavesNoHolder(t *testing.T) {
 	s, _ := newServer(strings.Repeat("00", 32))
 	c, frames := recordedConn(t)
 	s.authenticated(c)
-	req, _ := json.Marshal(startRequest{Argv: []string{"true", strings.Repeat("a", 256<<10)}, Env: map[string]string{}, Tag: "n"})
+	req, _ := json.Marshal(startRequest{Argv: []string{"true", strings.Repeat("a", 32*os.Getpagesize())}, Env: map[string]string{}, Tag: "n"})
 	s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
 	if status := exitStatus(t, frames); status["code"] != 126.0 {
 		t.Fatalf("EXIT %v: want 126, for an argument longer than execve takes", status)
 	}
 	holder := s.get(80).group
-	until(t, "its holder outlived a command that never started", func() bool { return gone(holder) })
+	until(t, "its holder outlived a command that never started", func() bool { return holder > 0 && gone(holder) })
 }
 
 // The handle a kill takes on its command's holder still signals the group once that holder is gone.
@@ -1871,6 +1893,7 @@ func TestAKillReachesTheGroupOfACommandWhoseHandlerKilledItsHolder(t *testing.T)
 }
 
 func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {
+	end := graced(t)
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	loop, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `while :; do : >"$0"; sleep 0.01; done`, alive}, Env: map[string]string{}, Tag: "other"})
@@ -1881,11 +1904,23 @@ func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {
 	t.Cleanup(other.kill)
 	cl.kmu.Lock()
 	own := cl.group
+	if own <= 0 || other.group <= 0 {
+		t.Fatal("a command started with no holder") // and a kill of 0 below would be of the tests' own group
+	}
 	cl.group, cl.held = other.group, make(chan syscall.WaitStatus, 1) // its holder was reaped: the number it still has is another command's group by now
 	cl.kmu.Unlock()
 	t.Cleanup(func() { syscall.Kill(own, syscall.SIGKILL) })
 
 	cl.kill()
+	until(t, "its kill's sweep did not end", func() bool { // its SIGKILLs by number come last
+		select {
+		case <-cl.ending:
+			return true
+		default:
+			return false
+		}
+	})
+	end()
 
 	os.Remove(alive)
 	until(t, "a kill reached the group that had been given its own holder's number", func() bool { _, err := os.Stat(alive); return err == nil })
