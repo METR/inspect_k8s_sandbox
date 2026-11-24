@@ -1,19 +1,31 @@
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Generator
 
 from inspect_ai.util import OutputLimitExceededError
 from inspect_ai.util import SandboxEnvironmentLimits as limits
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
-from websocket import WebSocketException
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
+    STDERR_CHANNEL,
+    STDOUT_CHANNEL,
+    WSClient,
+)
+from websocket import WebSocketException, WebSocketTimeoutException
 
 from k8s_sandbox._pod.buffer import LimitedBuffer
-from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    PodError,
+)
+from k8s_sandbox._pod.execute import _update
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
 )
 from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
     SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
@@ -58,19 +70,32 @@ class ReadFileOperation(PodOperation):
         start_position = dst.tell()
         # Stream the response, writing it to dst as we go to avoid holding the whole
         # response in memory.
+        quiet = time.monotonic() + API_TIMEOUT
         try:
             while ws_client.is_open():
-                # `timeout=None` means `update` will block indefinitely until there is
-                # data to read.
-                ws_client.update(timeout=None)
-                if ws_client.peek_stdout():
-                    dst.write(ws_client.read_stdout())
+                wait = quiet - time.monotonic()
+                if wait <= 0:
+                    if ERROR_CHANNEL in ws_client._channels:
+                        break  # The exec ended, and its close was lost on its way.
+                    raise ExecResultUnknownError(
+                        "The exec that read the file sent no more and did not end",
+                        pod=self._pod.name,
+                    )
+                ws_client.sock.settimeout(wait)
+                try:
+                    _update(ws_client, wait)
+                except WebSocketTimeoutException:
+                    continue
+                # Not peek_*(): it reads another frame first, and may wait for the rest.
+                if out := ws_client._channels.pop(STDOUT_CHANNEL, b""):
+                    dst.write(out)
                     self._verify_output_limit(dst.tell() - start_position)
-                if ws_client.peek_stderr():
-                    stderr.append(ws_client.read_stderr())
+                    quiet = time.monotonic() + API_TIMEOUT
+                stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
         except (OSError, WebSocketException) as e:
             raise_if_stopped_before_lost(ws_client, e, self._pod.name)
             raise
+        ws_client.close()
         returncode = get_returncode(ws_client)
         # `head` never exits 255: Kata gives it when the VM stopped.
         if returncode == 255:

@@ -1,4 +1,5 @@
 import concurrent.futures
+import io
 import os
 import signal
 import socket
@@ -6,28 +7,109 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Generator
-from unittest.mock import MagicMock
+from typing import Any, Callable, Generator
+from unittest.mock import MagicMock, patch
 
 import kubernetes.client
 import pytest
 from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     ERROR_CHANNEL,
+    STDERR_CHANNEL,
+    STDOUT_CHANNEL,
     WSClient,
 )
 from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
+import k8s_sandbox._pod.read as read_module
 import k8s_sandbox._pod.write as write_module
-from k8s_sandbox._pod.error import ContainerStoppedError, PodError
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    PodError,
+)
+from k8s_sandbox._pod.read import ReadFileOperation
 from k8s_sandbox._pod.write import WriteFileOperation
 from test.k8s_sandbox.pod import test_execute, test_op
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
 
 _frame = test_execute._frame  # pyright: ignore[reportPrivateUsage]
 _upgrade = test_op._upgrade  # pyright: ignore[reportPrivateUsage]
+tls_sockets = test_execute.tls_sockets
+
+# Each file operation's wait for its exec to end.
+_WAITS = [
+    pytest.param(
+        write_module,
+        lambda ws: WriteFileOperation(MagicMock())._handle_stream_output(ws),
+        id="write",
+    ),
+    pytest.param(
+        read_module,
+        lambda ws: ReadFileOperation(MagicMock())._handle_stream_output(
+            ws, io.BytesIO()
+        ),
+        id="read",
+    ),
+]
+
+
+@pytest.mark.parametrize(("module", "wait"), _WAITS)
+@pytest.mark.parametrize("ended", [False, True], ids=["no-status", "status"])
+def test_an_exec_whose_close_never_comes_is_not_waited_for(
+    module: Any, wait: Callable[[WSClient], None], ended: bool
+) -> None:
+    """Regression: a write whose command had ended waited two hours for its close."""
+    ws = _FakeWSClient([_status(0)] if ended else [], ends=False)
+    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
+
+    with patch.object(module, "time", clock):
+        if ended:
+            wait(ws)  # its status is in: the operation is done
+        else:
+            with pytest.raises(ExecResultUnknownError):
+                wait(ws)
+
+    assert ws.now == op_module.API_TIMEOUT
+
+
+def test_a_read_that_goes_on_past_the_bound_is_not_cut_short() -> None:
+    """The bound is on its silence: a large file takes longer than that to read."""
+    pause = op_module.API_TIMEOUT - 1.0
+    ws, dst = (
+        _FakeWSClient(
+            [(STDOUT_CHANNEL, b"a"), pause, (STDOUT_CHANNEL, b"b"), pause, _status(0)]
+        ),
+        io.BytesIO(),
+    )
+    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
+
+    with patch.object(read_module, "time", clock):
+        ReadFileOperation(MagicMock())._handle_stream_output(ws, dst)
+
+    assert dst.getvalue() == b"ab"
+
+
+@pytest.mark.parametrize(("module", "wait"), _WAITS)
+def test_an_end_tls_has_already_decrypted_is_read(
+    module: Any,
+    wait: Callable[[WSClient], None],
+    tls_sockets: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output, the status and the close in one TLS record, as a proxy sends them on."""
+    monkeypatch.setattr(module, "API_TIMEOUT", 0.5)
+    client, server = tls_sockets
+    err = _frame(STDERR_CHANNEL, b"sh: ") + _frame(STDERR_CHANNEL, b"Permission denied")
+    server.sendall(err + _frame(*_status(1)) + test_execute._close_frame())  # pyright: ignore[reportPrivateUsage]
+    # Each as it opens its exec: a write's output is text.
+    ws = test_execute._SocketWSClient(client, binary=module is read_module)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(PermissionError, match="sh: Permission denied"):
+        wait(ws)
 
 
 def test_write_file_writes_data_via_chunked_helper(
@@ -54,6 +136,28 @@ def test_write_file_writes_data_via_chunked_helper(
     assert captured["file_size"] == len(data)
     assert b"".join(call.args[0] for call in ws.write_stdin.call_args_list) == data
     assert ws.write_stdin.call_count > 1
+
+
+@pytest.mark.parametrize(("module", "wait"), _WAITS)
+def test_a_frame_cut_short_is_not_waited_for_past_the_bound(
+    module: Any,
+    wait: Callable[[WSClient], None],
+    tls_sockets: tuple[Any, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Part of a frame and no more, as from a connection that has gone dark."""
+    monkeypatch.setattr(module, "API_TIMEOUT", 0.5)
+    client, server = tls_sockets
+    server.sendall(_frame(STDOUT_CHANNEL, b"x"))  # a record of its own, read whole
+    server.sendall(_frame(STDERR_CHANNEL, b"x")[:1])
+    unblock = threading.Timer(30, server.close)  # only bounds a hang
+    unblock.start()
+
+    try:
+        with pytest.raises(ExecResultUnknownError):
+            wait(test_execute._SocketWSClient(client))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        unblock.cancel()
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix `write_file()` and `read_file()` over Kubernetes exec never returning when the
+  exec's end did not reach the client. They now raise `ExecResultUnknownError` 60
+  seconds after the upload, or after the last of the file to arrive, and are retried.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
   when `helm list` fails: it now fails with Helm's error.
 - Once a process has converted one Docker Compose file to Helm values, each further

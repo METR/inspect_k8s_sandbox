@@ -467,7 +467,9 @@ def _update(ws_client: WSClient, timeout: float | None) -> None:
         ws_client._connected = False
     elif op_code in (ABNF.OPCODE_BINARY, ABNF.OPCODE_TEXT) and len(frame.data) > 1:
         channel, data = frame.data[0], frame.data[1:]
-        ws_client._channels[channel] = ws_client._channels.get(channel, b"") + data
+        if not ws_client.binary:  # an exec opened as text: str, as update() keeps it
+            data = data.decode("utf-8", "replace")
+        ws_client._channels[channel] = ws_client._channels.get(channel, data[:0]) + data
 
 
 class PodStdio(ByteStream):

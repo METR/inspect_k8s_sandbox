@@ -811,13 +811,13 @@ def _keep_a_tls_error(tmp_path: Path, other: ssl.SSLSocket) -> bool:
 class _SocketWSClient(WSClient):
     """A WSClient on a real socket, with the client's own update() and its poll."""
 
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: socket.socket, binary: bool = True) -> None:
         self._connected = True
         self._channels: dict[int, bytes] = {}
         self._closed_channels: set[int] = set()
-        self._all = io.BytesIO()
+        self._all = io.BytesIO() if binary else io.StringIO()
         self.subprotocol = None
-        self.binary = True
+        self.binary = binary
         self.sock = websocket.WebSocket()
         self.sock.sock = sock
         self.sock.connected = True

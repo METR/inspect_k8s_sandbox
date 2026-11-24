@@ -1,19 +1,28 @@
 import contextlib
 import shlex
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
-from kubernetes.stream.ws_client import WSClient  # type: ignore[import-untyped]
-from websocket import WebSocketException
+from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
+    ERROR_CHANNEL,
+    WSClient,
+)
+from websocket import WebSocketException, WebSocketTimeoutException
 
-from k8s_sandbox._pod.error import ContainerStoppedError, PodError
-from k8s_sandbox._pod.execute import STREAM_END_GRACE_SECONDS
+from k8s_sandbox._pod.error import (
+    ContainerStoppedError,
+    ExecResultUnknownError,
+    PodError,
+)
+from k8s_sandbox._pod.execute import STREAM_END_GRACE_SECONDS, _update
 from k8s_sandbox._pod.get_returncode import (
     get_returncode,
     raise_if_stopped_before_lost,
 )
 from k8s_sandbox._pod.op import (
+    API_TIMEOUT,
     SYSTEM_PATH,
     PodOperation,
     raise_for_known_read_write_errors,
@@ -64,11 +73,26 @@ class WriteFileOperation(PodOperation):
     def _handle_stream_output(self, ws_client: WSClient) -> None:
         # Wait until the websocket connection is closed. All stderr will be stored by us
         # in memory anyway so there is no value in streaming it.
+        deadline = time.monotonic() + API_TIMEOUT
         try:
-            ws_client.run_forever()
+            while ws_client.is_open():
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    # The upload is in: the command that read it had only to end.
+                    if ERROR_CHANNEL in ws_client._channels:
+                        break  # It did, and its close was lost on its way.
+                    raise ExecResultUnknownError(
+                        "The exec that wrote the file did not end", pod=self._pod.name
+                    )
+                ws_client.sock.settimeout(wait)
+                try:
+                    _update(ws_client, wait)
+                except WebSocketTimeoutException:
+                    continue
         except (OSError, WebSocketException) as e:
             raise_if_stopped_before_lost(ws_client, e, self._pod.name)
             raise
+        ws_client.close()
         returncode = get_returncode(ws_client)
         # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
         if returncode == 255:
