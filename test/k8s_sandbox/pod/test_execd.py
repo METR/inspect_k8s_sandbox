@@ -2166,7 +2166,7 @@ async def test_a_call_out_of_time_as_its_connection_reopens_has_our_wait_for_exe
     ("had", "answer", "raised", "said"),
     [
         # execd let it go, its client away too long: how it ended is not known
-        (b"", b"call abandoned after 6m0s", error.ExecdResultUnknownError, "abandoned"),
+        (b"", b"call abandoned", error.ExecdResultUnknownError, "abandoned"),
         # execd never had it: nothing ran, in all its time
         (None, b"unknown call", TimeoutError, "Command timed out"),
         # execd says so of a call whose output we have: what became of it is not known
@@ -2669,7 +2669,7 @@ async def test_a_connection_is_given_up_after_three_intervals_with_no_frame(
 
 @pytest.mark.parametrize(
     ("word", "said"),
-    [(execd.EXIT, b'{"code": 3}'), (execd.ERROR, b"call abandoned after 6m0s")],
+    [(execd.EXIT, b'{"code": 3}'), (execd.ERROR, b"call abandoned")],
     ids=["an exit", "an error"],
 )
 async def test_execds_word_that_comes_as_our_writes_wait_behind_a_stuck_one_is_taken(

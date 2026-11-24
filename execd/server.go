@@ -57,8 +57,8 @@ type server struct {
 
 const idleTimeout = 60 * time.Second
 
-// abandonAfter outlasts the client's reconnect window (5 minutes).
-const abandonAfter = 6 * time.Minute
+// A call nobody resumes is kept for abandonAfter from its connection's drop, or to keptPast its own timeout where that is later, which outlasts the client's reconnect window (5 minutes).
+const abandonAfter, keptPast = 30 * time.Minute, 6 * time.Minute
 
 var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name sh keeps
 
@@ -137,6 +137,8 @@ type call struct {
 	timeoutKilled bool
 	// a timeout's stop found its command running: the kill that goes ahead is the timeout's, though another stop sends it
 	timeoutFound bool
+	// when its own timeout is up, if it has one
+	until time.Time
 }
 
 type conn struct {
@@ -296,14 +298,15 @@ func (s *server) detach(c *conn) {
 			cl.sub = nil
 			cl.detached++
 		}
-		detached := cl.detached
+		detached, until := cl.detached, cl.until
 		cl.mu.Unlock()
 		switch {
 		case mine && cl.stream: // nothing resumes a stream
 			cl.kill()
 			s.release(cl.id)
 		case mine: // a client that hasn't resumed it by then has given up
-			afterFunc(abandonAfter, func() {
+			wait := max(abandonAfter, time.Until(until)+keptPast) // with no timeout, until is zero: long past
+			afterFunc(wait, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since
 				if orphaned {
@@ -330,7 +333,7 @@ func (s *server) release(id uint64) {
 	s.mu.Unlock()
 	if cl != nil {
 		cl.mu.Lock()
-		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl for six minutes
+		cl.gone, cl.out, cl.stdinQ = true, [2]fifo{}, nil // a dropped connection's timer holds cl
 		cl.room.Broadcast()
 		cl.mu.Unlock()
 	}
@@ -403,7 +406,7 @@ func (s *server) resume(c *conn, f frame) {
 	byTimeout := cl.timeoutKilled // the kill's own word: its exit may not have said so yet
 	cl.kmu.Unlock()
 	if cl.abandoned && !byTimeout { // one its own timeout ended still says so: that takes none of the output let go
-		c.send(fError, f.id, []byte("call abandoned after "+abandonAfter.String()+" with no client"))
+		c.send(fError, f.id, []byte("call abandoned with no client"))
 		return
 	}
 	cl.sub = c
@@ -516,7 +519,11 @@ func (cl *call) run(req startRequest) error {
 	p.Release()
 	var deadline *time.Timer
 	if req.Timeout > 0 && req.Timeout < 1e9 { // longer is never; converting it could overflow to "now"
-		deadline = afterFunc(time.Duration(req.Timeout*float64(time.Second)), func() { cl.stop(true) })
+		timeout := time.Duration(req.Timeout * float64(time.Second))
+		deadline = afterFunc(timeout, func() { cl.stop(true) })
+		cl.mu.Lock()
+		cl.until = time.Now().Add(timeout) // a call whose client goes silent is kept past this
+		cl.mu.Unlock()
 	}
 	if stdinW != nil {
 		go cl.feedStdin(stdinW)

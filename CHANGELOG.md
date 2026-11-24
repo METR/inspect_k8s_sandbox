@@ -127,7 +127,10 @@
   the same container (another one, or a pod that sets `shareProcessNamespace` or
   `hostPID`); an `exec()` whose timeout had passed raises `TimeoutError`. A command
   still running, as where execd alone was killed, goes on without its timeout and with
-  end-of-file on `stdin`, though its call has ended. Keep execd on a memory-backed
+  end-of-file on `stdin`, though its call has ended. An `exec()` whose client has gone
+  silent is kept for 30 minutes, or to 6 minutes past its own timeout where that is
+  later; its command runs on to its timeout, or with none to the end of the 30
+  minutes. Keep execd on a memory-backed
   volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up
   the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit
