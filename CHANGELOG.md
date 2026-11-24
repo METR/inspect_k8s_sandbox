@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-- An `ExecdStoppedError` for a call whose execd was started again says what kept the
-  call from ending 137: how its connection ended, what the first look for execd met,
-  and whether the call was resuming or had ended.
 - The `execd` image takes its bases from Docker Hub, by the same digests, where it took
   them from ECR Public: a host that builds it from `execd/` must reach Docker Hub.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
@@ -125,9 +122,10 @@
   call's connection to execd was lost before execd ended, since its command may have
   ended unheard, and where execd cannot be started again or cannot be shown to run in
   the same container (another one, or a pod that sets `shareProcessNamespace` or
-  `hostPID`); an `exec()` whose timeout had passed raises `TimeoutError`. A command
-  still running, as where execd alone was killed, goes on without its timeout and with
-  end-of-file on `stdin`, though its call has ended. Keep execd on a memory-backed
+  `hostPID`), and the error's message says which; an `exec()` whose timeout had passed
+  raises `TimeoutError`. A command still running, as where execd alone was killed, goes
+  on without its timeout and with end-of-file on `stdin`, though its call has ended.
+  Keep execd on a memory-backed
   volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up
   the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit

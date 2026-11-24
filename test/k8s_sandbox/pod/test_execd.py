@@ -9,7 +9,6 @@ import itertools
 import json
 import os
 import pathlib
-import re
 import shutil
 import signal
 import socket
@@ -2290,7 +2289,7 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
         await until(lambda: clock.expired == 1)
         back.set()
     if not isinstance(ends, int):
-        with pytest.raises(ends):
+        with pytest.raises(ends, match=repr(again)):  # the container it found
             await asyncio.wait_for(call, 30)  # only bounds a hang
         return
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
@@ -2299,13 +2298,15 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
-APART = {  # how it was out of reach, and where its error says so
-    "a start found it running": '"start": "DaemonRunning(',
-    "the look timed out": '"look": "TimeoutError()',
-    "ours": '"reader": "cancelled"',
-    "it outlived": '"resuming": "True"',
-    "its command had ended": '"ended": "True"',
-    "we were silent": "heard=False",
+FOUND = execd.DaemonRunning("address already in use")
+APART = {  # how it was out of reach, and what its error says of that
+    "a start found it running": {"at_once": "True", "start": repr(FOUND)},
+    "a start failed": {"heard": "True", "start": "PodError: no exec"},
+    "the look timed out": {"look": "TimeoutError()", "connected": "True"},
+    "ours": {"closed": "silence", "reader": "cancelled", "connected": "False"},
+    "it outlived": {"killed": "True", "resuming": "True", "ended": "False"},
+    "its command had ended": {"killed": "True", "resuming": "False", "ended": "True"},
+    "we were silent": {"killed": "False", "heard": "False", "at_once": "False"},
 }
 
 
@@ -2353,11 +2354,17 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     async def start(replace: bool) -> execd.Daemon:
         starts[0] += 1
         if how == "a start found it running" and starts[0] == 2:
-            raise execd.DaemonRunning("address already in use")
+            raise FOUND
+        if how == "the look timed out" and starts[0] == 3:  # what a later look met
+            raise FOUND
+        if how == "a start failed" and starts[0] == 2:
+            raise error.PodError("no exec")
         return daemons.unstarted.pop(0)
 
     first = await daemons.serve(is_killed, container=b"b:5")
     old = daemons.unstarted[0]
+    if how == "the look timed out":  # its start makes one that is gone by the next look
+        (await daemons.serve(says_nothing, container=b"b:5")).close()
     await daemons.serve(says_nothing, container=b"b:5")
     silent = await asyncio.start_server(says_nothing, "127.0.0.1", 0)
     client = execd.ExecdClient(start)
@@ -2370,14 +2377,22 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     if how == "the look timed out":
         await until(lambda: reached[0] == 2)
         clock.now += execd.CONNECT_TIMEOUT
-    while how == "ours" and link is not None and not link.closed:
-        interval()  # no frame for 60 s: the client ends the connection itself
-        await asyncio.sleep(0.001)
+
+    async def unheard() -> None:
+        while link is not None and not link.closed:
+            interval()  # no frame for 60 s: the client ends the connection itself
+            await asyncio.sleep(0.001)
+
     try:
-        with pytest.raises(error.ExecdStoppedError, match=re.escape(APART[how])):
+        if how == "ours":
+            await asyncio.wait_for(unheard(), 30)  # only bounds a hang
+        with pytest.raises(error.ExecdStoppedError) as raised:
             await asyncio.wait_for(call, 30)  # only bounds a hang
     finally:
         silent.close()
+    said = json.loads(str(raised.value).partition("command ")[2])
+    assert {word: said[word] for word in APART[how]} == APART[how]
+    assert ("start" in said) == ("start" in APART[how])  # never a later look's
 
 
 async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
@@ -2410,7 +2425,7 @@ async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
 
     call = execd.ExecdClient(start).exec(["sh"], None, None, {}, None, 99)
     try:
-        with pytest.raises(error.ExecdStoppedError):
+        with pytest.raises(error.ExecdStoppedError, match="ConnectionAbortedError"):
             await asyncio.wait_for(call, 30)  # only bounds a hang
     finally:
         servers[1].close()
