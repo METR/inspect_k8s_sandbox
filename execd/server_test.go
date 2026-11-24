@@ -385,6 +385,43 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 	}
 }
 
+// Regression: a client silent for six minutes, as one whose event loop was held, had its calls killed for that though their own timeouts were not up.
+func TestACallIsKeptForASilentClientPastItsOwnTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		timeout    float64
+		least, top time.Duration
+		refused    string // a RESUME that comes after it
+	}{
+		"to six minutes past its timeout": {3600, time.Hour + 5*time.Minute, time.Hour + 6*time.Minute, "call abandoned after 1h"},
+		"for thirty minutes, with none":   {0, 30 * time.Minute, 30 * time.Minute, "call abandoned after 30m0s with no client"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := newServer(strings.Repeat("00", 32))
+			req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "t", Timeout: tc.timeout})
+			c := testConn(t)
+			s.start(c, frame{kind: fStart, id: 1, payload: req})
+			t.Cleanup(s.get(1).kill)
+			var waits []time.Duration
+			var abandon func()
+			afterFunc = func(d time.Duration, f func()) *time.Timer { waits, abandon = append(waits, d), f; return nil }
+			t.Cleanup(func() { afterFunc = time.AfterFunc })
+
+			s.detach(c)
+
+			if len(waits) != 1 || waits[0] < tc.least || waits[0] > tc.top {
+				t.Fatalf("kept for %v: want one wait of %v to %v", waits, tc.least, tc.top)
+			}
+			afterFunc = time.AfterFunc // its kill's own timers run
+			abandon()
+			late, frames := recordedConn(t)
+			s.resume(late, frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)})
+			if f := nextFrame(t, frames); f.kind != fError || !strings.HasPrefix(string(f.payload), tc.refused) {
+				t.Fatalf("a RESUME after it got frame %d %q: want an error that starts %q", f.kind, f.payload, tc.refused)
+			}
+		})
+	}
+}
+
 func abandoned(cl *call) bool {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -2434,7 +2471,7 @@ func TestWhatACommandLeftRunningOutlivesItsAbandonedCall(t *testing.T) {
 	}
 	s.detach(c)
 
-	timers[0]() // six minutes with no client
+	timers[0]() // its time with no client
 	cl.kill()   // and the client's KILL, on finding the call abandoned
 
 	os.Remove(alive)
@@ -2770,7 +2807,7 @@ func TestStdinACommandLeftUnreadIsLetGoWhenItsCallIsReleased(t *testing.T) {
 	queued := weak.Make(&chunk[0])
 	s.dispatch(c, frame{kind: fStdin, id: 37, payload: chunk})
 
-	s.detach(c) // its timer holds the call for six minutes
+	s.detach(c) // its timer holds the call for half an hour
 	cl.kill()
 	exitCode(t, cl)
 	s.release(37)
@@ -3015,7 +3052,7 @@ func TestACallExecdAbandonedIsNotTakenForOneThatNeverStarted(t *testing.T) {
 	first := testConn(t)
 	s.start(first, frame{kind: fStart, id: 23, payload: req})
 	s.detach(first)
-	timers[0]() // six minutes with no client
+	timers[0]() // its time with no client
 	if code := exitCode(t, s.get(23)); code != 143 {
 		t.Fatalf("exit %d: an abandoned call is killed", code)
 	}
@@ -3067,7 +3104,7 @@ func TestACallExecdAbandonedStillSaysThatItsOwnTimeoutEndedIt(t *testing.T) {
 	timers[0]() // its timeout
 	exitCode(t, s.get(24))
 	s.detach(first)
-	timers[len(timers)-1]() // six minutes with no client: the last asked for, after its kill's graces
+	timers[len(timers)-1]() // its time with no client: the last asked for, after its kill's graces
 	late, frames := recordedConn(t)
 
 	go s.resume(late, frame{kind: fResume, id: 24, payload: []byte(`{"stdout":0,"stderr":0}`)}) // a RESUME that waits fails by the frames' wait
@@ -3123,7 +3160,7 @@ func TestAResumeAsExecdAbandonsACallThatItsTimeoutIsKillingIsToldOfTheTimeout(t 
 		t.Fatal("the timeout's kill never began")
 	}
 	s.detach(first)
-	go timers[1]() // six minutes with no client: the kill that abandons it waits for the timeout's
+	go timers[1]() // its time with no client: the kill that abandons it waits for the timeout's
 	for abandoned := false; !abandoned; time.Sleep(time.Millisecond) {
 		cl.mu.Lock()
 		abandoned = cl.abandoned
