@@ -33,7 +33,7 @@ func init() { undumpable() }
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "hold" { // how run() gives a command a group it does not lead, as timeout(1) does over Kubernetes exec: this process leads it
-		signal.Ignore()               // all that Go can: it outlives a kill's SIGTERM, and what else the command sends its group with kill(2) but 32 and 34
+		signal.Ignore()               // all that Go can: it outlives a kill's SIGTERM, and what else the command sends its group with kill(2) but SIGKILL, 32 and 34
 		os.Stdout.WriteString("\n")   // run()'s word that it has, which the command's start waits a second for
 		io.Copy(io.Discard, os.Stdin) // run()'s pipe, which ends with execd
 		return
