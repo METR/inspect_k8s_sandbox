@@ -1444,6 +1444,58 @@ def test_network_isolated_service_joining_a_global_network(
     assert normal_ingress_policies[0]["spec"]["ingress"] != []
 
 
+@pytest.mark.parametrize(
+    "values", ["network-isolated-with-global-network", "egress-proxy", "multiple-ports"]
+)
+def test_policies_select_admit_and_reach_no_other_releases_pods(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, values: str
+) -> None:
+    # Releases share a namespace: only these labels keep a rule off another's pods.
+    own = {
+        "io.kubernetes.pod.namespace": "home",
+        "app.kubernetes.io/name": "agent-env",
+        "app.kubernetes.io/instance": "my-release",
+    }
+    dns = [
+        {"matchLabels": {"io.kubernetes.pod.namespace": "kube-system", "k8s-app": app}}
+        for app in ("kube-dns", "node-local-dns")
+    ]
+    read = {"description", "endpointSelector", "ingress", "egress", "egressDeny"}
+
+    documents = _run_helm_template(
+        chart_dir, test_resources_dir / f"{values}-values.yaml", namespace="home"
+    )
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        assert policy["metadata"].get("namespace", "home") == "home", policy
+        # A field this does not read, enableDefaultDeny or specs, could undo the rules.
+        assert policy.keys() <= {"apiVersion", "kind", "metadata", "spec"}, policy
+        spec = policy["spec"]
+        assert spec.keys() <= read, policy
+        ends = [spec["endpointSelector"]]
+        # The default deny's empty rule selects its pods and admits no one.
+        for rule in filter(None, spec.get("ingress", [])):
+            assert rule.keys() <= {"fromEndpoints", "toPorts", "icmps"}, policy
+            ends += rule.get("fromEndpoints") or [{}]
+        for rule in spec.get("egress", []):
+            assert rule.keys() <= {"toEndpoints", "toPorts"}, policy
+            others = dns if "toPorts" in rule else []  # The cluster's DNS, on ports.
+            ends += [to for to in rule.get("toEndpoints") or [{}] if to not in others]
+        for end in ends:  # Cilium requires every term: no other key widens these.
+            assert own.items() <= end.get("matchLabels", {}).items(), policy
+
+
+def test_no_egress_rule_mixes_kinds_of_peer(chart_dir: pathlib.Path) -> None:
+    allow = "allowDomains[0]=pypi.org,allowEntities[0]=world,allowCIDR[0]=10.0.0.0/8"
+
+    documents = _run_helm_template(chart_dir, set_str=allow)
+
+    for policy in _get_documents(documents, "CiliumNetworkPolicy"):
+        for rule in policy["spec"].get("egress", []):
+            # Cilium drops the whole policy for a rule that mixes kinds of peer.
+            assert len(rule.keys() - {"toPorts"}) == 1, rule
+
+
 def test_allow_domains_egress_enforces_identity_on_pinned_ips(
     chart_dir: Path, test_resources_dir: Path
 ) -> None:
