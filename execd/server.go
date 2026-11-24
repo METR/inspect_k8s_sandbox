@@ -57,7 +57,7 @@ type server struct {
 
 const idleTimeout = 60 * time.Second
 
-// A call nobody resumes is kept keptPast its own timeout, or past its connection's drop where that came later, which outlasts the client's reconnect window (5 minutes); one with no timeout is kept for abandonAfter.
+// A call nobody resumes is kept for abandonAfter from its connection's drop, or to keptPast its own timeout where that is later, which outlasts the client's reconnect window (5 minutes).
 const abandonAfter, keptPast = 30 * time.Minute, 6 * time.Minute
 
 var shName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`) // a variable name sh keeps
@@ -305,10 +305,7 @@ func (s *server) detach(c *conn) {
 			cl.kill()
 			s.release(cl.id)
 		case mine: // a client that hasn't resumed it by then has given up
-			wait := abandonAfter
-			if !until.IsZero() { // not for its client's silence before its own timeout, as over Kubernetes exec
-				wait = max(time.Until(until), 0) + keptPast
-			}
+			wait := max(abandonAfter, time.Until(until)+keptPast) // with no timeout, until is zero: long past
 			afterFunc(wait, func() {
 				cl.mu.Lock()
 				orphaned := cl.sub == nil && cl.detached == detached // not resumed since

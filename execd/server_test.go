@@ -385,38 +385,51 @@ func TestAResumedCallOutlivesAnEarlierDropsTimer(t *testing.T) {
 	}
 }
 
-// Regression: a client silent for six minutes, as one whose event loop was held, had its calls killed for that though their own timeouts were not up.
-func TestACallIsKeptForASilentClientPastItsOwnTimeout(t *testing.T) {
+// Regression: execd killed a silent client's calls 6 minutes after their connection closed, so one whose event loop was held for 535 s lost them.
+func TestAClientBackFromItsSilenceFindsItsCall(t *testing.T) {
 	for name, tc := range map[string]struct {
-		timeout    float64
-		left       time.Duration // of its timeout as its connection drops, where the test sets that
-		least, top time.Duration
+		timeout float64
+		left    time.Duration // of its timeout as its connection drops, where the test sets that
+		away    time.Duration // its client, from the drop
+		kept    bool
 	}{
-		"an hour's timeout, dropped at once": {3600, 0, time.Hour + 5*time.Minute, time.Hour + 6*time.Minute},
-		"a quarter of its hour left":         {3600, 15 * time.Minute, 20 * time.Minute, 21 * time.Minute},
-		"its timeout up a minute ago":        {3600, -time.Minute, 6 * time.Minute, 6 * time.Minute}, // six minutes from the drop: its client's reconnect window
-		"no timeout":                         {0, 0, 30 * time.Minute, 30 * time.Minute},
+		"a minute's timeout, 535 s":      {60, 0, 535 * time.Second, true},
+		"an hour's timeout, 65 minutes":  {3600, 0, 65 * time.Minute, true},
+		"an hour's timeout, 67 minutes":  {3600, 0, 67 * time.Minute, false},
+		"half its hour left, 35 minutes": {3600, 30 * time.Minute, 35 * time.Minute, true},
+		"half its hour left, 37 minutes": {3600, 30 * time.Minute, 37 * time.Minute, false},
+		"no timeout, 29 minutes":         {0, 0, 29 * time.Minute, true},
+		"no timeout, 31 minutes":         {0, 0, 31 * time.Minute, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _ := newServer(strings.Repeat("00", 32))
-			req, _ := json.Marshal(startRequest{Argv: []string{"sleep", "600"}, Env: map[string]string{}, Tag: "t", Timeout: tc.timeout})
+			req, _ := json.Marshal(startRequest{Argv: []string{"true"}, Env: map[string]string{}, Tag: "t", Timeout: tc.timeout})
 			c := testConn(t)
 			s.start(c, frame{kind: fStart, id: 1, payload: req})
 			cl := s.get(1)
-			t.Cleanup(cl.kill)
+			exitCode(t, cl) // what is kept is its result
 			if tc.left != 0 {
 				cl.mu.Lock()
 				cl.until = time.Now().Add(tc.left)
 				cl.mu.Unlock()
 			}
 			var waits []time.Duration
-			afterFunc = func(d time.Duration, _ func()) *time.Timer { waits = append(waits, d); return nil }
+			var timers []func()
+			afterFunc = func(d time.Duration, f func()) *time.Timer {
+				waits, timers = append(waits, d), append(timers, f)
+				return nil
+			}
 			t.Cleanup(func() { afterFunc = time.AfterFunc })
-
 			s.detach(c)
+			if waits[0] <= tc.away { // its time with no client is up before its client is back
+				timers[0]()
+			}
+			back, frames := recordedConn(t)
 
-			if len(waits) != 1 || waits[0] < tc.least || waits[0] > tc.top {
-				t.Fatalf("kept for %v: want one wait of %v to %v", waits, tc.least, tc.top)
+			go s.resume(back, frame{kind: fResume, id: 1, payload: []byte(`{"stdout":0,"stderr":0}`)}) // a RESUME that waits fails by the frame's wait
+
+			if said := nextFrame(t, frames); (said.kind == fResumed) != tc.kept {
+				t.Fatalf("back after %v, of the %v it is kept, its client got a frame of kind %d: %s", tc.away, waits[0], said.kind, said.payload)
 			}
 		})
 	}
