@@ -1835,6 +1835,11 @@ func TestACommandWhoseHolderHasEndedIsNotStarted(t *testing.T) {
 			readyWait = 30 * time.Second // a holder slow to start, as on a stalled runner, is not taken for one that is ready
 			s, _ := newServer(strings.Repeat("00", 32))
 			reaped := func(bool) {
+				if !reaper.mu.TryLock() {
+					t.Error("the reaper's lock is held through the wait for a holder: no other command is reaped or killed meanwhile")
+					return
+				}
+				reaper.mu.Unlock()
 				cl := s.get(80)
 				until(t, "its holder was not reaped", func() bool { reaper.mu.Lock(); defer reaper.mu.Unlock(); return how == "mute" || cl.lead() == 0 })
 			}
@@ -2825,12 +2830,14 @@ func answered(call uintptr, answer syscall.Errno) syscall.Errno {
 
 // startedWith is what this process was handed besides its stdio, and hands every child in turn: a CI runner's own pipes.
 var startedWith = func() (links []string) {
+	held, _ := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(holdR.Fd()))) // the holders' pipe is execd's own, though open by now: no command may have it
 	fds, _ := os.ReadDir("/proc/self/fd")
 	for _, fd := range fds {
 		n, _ := strconv.Atoi(fd.Name())
 		if flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(n), syscall.F_GETFD, 0); n > 2 && errno == 0 && flags&syscall.FD_CLOEXEC == 0 {
-			link, _ := os.Readlink("/proc/self/fd/" + fd.Name())
-			links = append(links, link)
+			if link, _ := os.Readlink("/proc/self/fd/" + fd.Name()); link != held {
+				links = append(links, link)
+			}
 		}
 	}
 	return links
