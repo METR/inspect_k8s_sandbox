@@ -103,10 +103,10 @@
   `exec()` raises `TimeoutError`, whose `truncated_output` holds what the command wrote,
   once the command and the processes execd signalled have ended or been sent SIGKILL, or
   16 seconds after its timeout at the latest. What they start after their SIGTERM gets
-  SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts. (On
-  gVisor, one left in the command's group whose environment no longer holds
-  `HAWK_NEXT_EXEC` can run on; not measured since the group has a leader of execd's
-  own. On Linux before 6.9 and on gVisor before
+  SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts.
+  (Once the command's user has killed the process that leads its group, one left in
+  that group whose environment no longer holds `HAWK_NEXT_EXEC` can run on. On Linux
+  before 6.9 and on gVisor before
   release-20260928.0, a threaded program's SIGTERM handler, as in Python, may not run;
   on gVisor release-20261109.0 it runs.) The processes of a command that has ended by
   itself are left running. Once execd has stopped reading a command's output, 100 ms
