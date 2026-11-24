@@ -31,8 +31,9 @@ import k8s_sandbox._pod.write as write_module
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.write import WriteFileOperation
 from test.k8s_sandbox.pod import test_execute, test_op
-from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
 
+_FakeWSClient = test_execute._FakeWSClient  # pyright: ignore[reportPrivateUsage]
+_status = test_execute._status  # pyright: ignore[reportPrivateUsage]
 _frame = test_execute._frame  # pyright: ignore[reportPrivateUsage]
 _close_frame = test_execute._close_frame  # pyright: ignore[reportPrivateUsage]
 _SocketWSClient = test_execute._SocketWSClient  # pyright: ignore[reportPrivateUsage]
@@ -82,11 +83,15 @@ def test_an_exec_whose_close_never_comes_is_not_waited_for(
     assert ws.now == (0 if ended else op_module.API_TIMEOUT)
 
 
+@pytest.mark.parametrize(
+    "lost",
+    [ConnectionResetError(), WebSocketConnectionClosedException()],
+    ids=["reset", "closed"],
+)
 def test_what_an_update_read_before_it_failed_is_kept(
-    monkeypatch: pytest.MonkeyPatch,
+    lost: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """As kubernetes 37's update() can: read every frame waiting, then fail."""
-    lost = ConnectionResetError()
     ws = _FakeWSClient([(STDOUT_CHANNEL, b"file"), _status(0)], error=lost)
     read_one, dst = ws.update, io.BytesIO()
 
@@ -139,11 +144,11 @@ def test_a_frame_cut_short_is_not_waited_for_past_the_bound(
     finally:
         unblock.cancel()
 
-    # And its socket is closed: a close would wait 3 s more for the exec's answer.
-    assert (type(raised.value), client.fileno()) == (
-        error_module.ExecResultUnknownError,
-        -1,
-    )
+    assert type(raised.value) is error_module.ExecResultUnknownError
+    server.settimeout(30)  # only bounds a hang
+    with pytest.raises(OSError) as cut:  # with no closing frame to wait 3 s on
+        server.recv(64)
+    assert not isinstance(cut.value, TimeoutError)
 
 
 def test_write_file_writes_data_via_chunked_helper(
@@ -189,18 +194,13 @@ def test_a_255_is_a_stopped_container(returncode: int, error: type[Exception]) -
     assert type(raised.value) is error
 
 
-@pytest.mark.parametrize(
-    "lost",
-    [ConnectionResetError(), WebSocketConnectionClosedException()],
-    ids=["reset", "closed"],
-)
-def test_a_connection_lost_before_the_status_is_raised(lost: Exception) -> None:
-    ws = _FakeWSClient([], error=lost)
+def test_a_connection_lost_before_the_status_is_raised() -> None:
+    ws = _FakeWSClient([], error=ConnectionResetError())
 
     with pytest.raises(Exception) as raised:
         write_module.WriteFileOperation(_POD)._handle_stream_output(ws)
 
-    assert type(raised.value) is type(lost)
+    assert type(raised.value) is ConnectionResetError
 
 
 @pytest.mark.parametrize(

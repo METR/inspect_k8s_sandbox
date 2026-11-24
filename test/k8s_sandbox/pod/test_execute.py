@@ -88,7 +88,7 @@ class _FakeWSClient(WSClient):
         # No socket: nothing for _update to read, nothing to close.
         self.sock = types.SimpleNamespace(
             sock=None,
-            close=lambda **kwargs: None,
+            close=self._close,
             settimeout=lambda timeout: None,
             shutdown=lambda: None,
         )
@@ -97,6 +97,9 @@ class _FakeWSClient(WSClient):
         self._error = error
         self.now = 0.0  # its own clock: only its pauses and waits move it
         self._waited = 0
+
+    def _close(self, timeout: float = 3, **kwargs: object) -> None:
+        self.now += timeout  # as websocket-client waits for an answer to its close
 
     def update(self, timeout: float | None = 0) -> None:
         if not self.is_open():

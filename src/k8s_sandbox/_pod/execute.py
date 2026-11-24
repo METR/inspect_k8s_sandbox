@@ -475,7 +475,7 @@ def update_by(ws_client: WSClient, deadline: float, pod: str) -> None:
     wait = deadline - time.monotonic()
     if wait <= 0:
         ws_client.sock.shutdown()  # Closes the socket: the close then awaits no answer.
-        raise ExecResultUnknownError("The exec sent no more and did not end", pod=pod)
+        raise ExecResultUnknownError("Timed out waiting for the exec's status", pod=pod)
     # The rest of a frame already started is waited for this long at a time.
     ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
     try:

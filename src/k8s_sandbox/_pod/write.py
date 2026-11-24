@@ -43,7 +43,7 @@ def write_command(dst: Path, file_size: int) -> list[str]:
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         with self._start_write_command(dst, len(data)) as ws_client:
-            # A send that the exec does not read fails after this long.
+            # Each chunk of the upload has this long: one the exec does not read fails.
             ws_client.sock.settimeout(API_TIMEOUT)
             try:
                 self._write_stdin_chunked(ws_client, data)

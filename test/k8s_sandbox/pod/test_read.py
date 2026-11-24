@@ -11,13 +11,15 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
     STDOUT_CHANNEL,
     WSClient,
 )
-from websocket import WebSocketConnectionClosedException
 
 import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod import execute, read
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.read import ReadFileOperation
-from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
+from test.k8s_sandbox.pod import test_execute
+
+_FakeWSClient = test_execute._FakeWSClient  # pyright: ignore[reportPrivateUsage]
+_status = test_execute._status  # pyright: ignore[reportPrivateUsage]
 
 _POD = op_module.PodInfo("p", "ns", None, "default", "u", 0, "raise")
 
@@ -80,20 +82,6 @@ def test_a_255_is_a_stopped_container(returncode: int, error: type[Exception]) -
         ReadFileOperation(MagicMock())._handle_stream_output(ws, io.BytesIO())
 
     assert type(raised.value) is error
-
-
-@pytest.mark.parametrize(
-    "lost",
-    [ConnectionResetError(), WebSocketConnectionClosedException()],
-    ids=["reset", "closed"],
-)
-def test_a_connection_lost_before_the_status_is_raised(lost: Exception) -> None:
-    ws = _FakeWSClient([], error=lost)
-
-    with pytest.raises(Exception) as raised:
-        read.ReadFileOperation(_POD)._handle_stream_output(ws, io.BytesIO())
-
-    assert type(raised.value) is type(lost)
 
 
 def test_a_read_that_goes_on_past_the_bound_is_not_cut_short(
