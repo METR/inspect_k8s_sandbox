@@ -44,6 +44,8 @@ def write_command(dst: Path, file_size: int) -> list[str]:
 class WriteFileOperation(PodOperation):
     def write_file(self, data: bytes, dst: Path) -> None:
         with self._start_write_command(dst, len(data)) as ws_client:
+            # Nor is a send that the exec does not read waited for past the bound.
+            ws_client.sock.settimeout(API_TIMEOUT)
             try:
                 self._write_stdin_chunked(ws_client, data)
             except (OSError, WebSocketException) as e:
@@ -68,11 +70,10 @@ class WriteFileOperation(PodOperation):
         )
 
     def _handle_stream_output(self, ws_client: WSClient) -> None:
-        # As in exec(), the exec's status ends the wait: only its close comes after.
         deadline = time.monotonic() + API_TIMEOUT
         while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
             update_by(ws_client, deadline, self._pod.name)
-        ws_client.close()
+        ws_client.close(timeout=0)  # The status is the result: no wait for an answer.
         returncode = get_returncode(ws_client)
         # `head` and `mkdir` never exit 255: Kata gives it when the VM stopped.
         if returncode == 255:

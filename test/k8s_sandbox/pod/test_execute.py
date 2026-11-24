@@ -115,6 +115,9 @@ class _FakeWSClient(WSClient):
             channel, data = frame
             self._channels[channel] = self._channels.get(channel, b"") + data
         elif self._error is not None:
+            self._waited += 1
+            if self._waited > 10_000:  # so that code which swallows it for ever fails
+                raise AssertionError("failed for ever on a client with no more to send")
             raise self._error
         elif self._ends:
             self._connected = False

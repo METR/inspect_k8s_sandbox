@@ -476,12 +476,12 @@ def update_by(ws_client: WSClient, deadline: float, pod: str) -> None:
     if wait <= 0:
         ws_client.sock.shutdown()  # Closes the socket: the close then awaits no answer.
         raise ExecResultUnknownError("The exec sent no more and did not end", pod=pod)
-    # Nor wait past it for the rest of a frame already started.
+    # The rest of a frame already started is waited for this long at a time.
     ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
     try:
         _update(ws_client, wait)
     except websocket.WebSocketTimeoutException:
-        pass  # What it read first is the caller's: kubernetes 37 reads on.
+        pass  # A pause inside a frame: read on, to the deadline.
     except (OSError, websocket.WebSocketException):
         if ERROR_CHANNEL not in ws_client._channels:
             raise

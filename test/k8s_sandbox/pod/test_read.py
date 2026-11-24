@@ -13,10 +13,13 @@ from kubernetes.stream.ws_client import (  # type: ignore[import-untyped]
 )
 from websocket import WebSocketConnectionClosedException
 
+import k8s_sandbox._pod.op as op_module
 from k8s_sandbox._pod import execute, read
 from k8s_sandbox._pod.error import ContainerStoppedError, PodError
 from k8s_sandbox._pod.read import ReadFileOperation
 from test.k8s_sandbox.pod.test_execute import _FakeWSClient, _status
+
+_POD = op_module.PodInfo("p", "ns", None, "default", "u", 0, "raise")
 
 
 def _exec_kwargs(monkeypatch: pytest.MonkeyPatch, src: Path) -> dict[str, Any]:
@@ -88,7 +91,7 @@ def test_a_connection_lost_before_the_status_is_raised(lost: Exception) -> None:
     ws = _FakeWSClient([], error=lost)
 
     with pytest.raises(Exception) as raised:
-        ReadFileOperation(MagicMock())._handle_stream_output(ws, io.BytesIO())
+        read.ReadFileOperation(_POD)._handle_stream_output(ws, io.BytesIO())
 
     assert type(raised.value) is type(lost)
 
@@ -103,9 +106,9 @@ def test_a_read_that_goes_on_past_the_bound_is_not_cut_short(
     )
     clock, dst = types.SimpleNamespace(monotonic=lambda: ws.now), io.BytesIO()
     monkeypatch.setattr(execute, "time", clock)
-    monkeypatch.setattr(read, "time", clock, raising=False)
+    monkeypatch.setattr(read, "time", clock)
 
-    read.ReadFileOperation(MagicMock())._handle_stream_output(ws, dst)
+    read.ReadFileOperation(_POD)._handle_stream_output(ws, dst)
 
     assert dst.getvalue() == b"ab"
 

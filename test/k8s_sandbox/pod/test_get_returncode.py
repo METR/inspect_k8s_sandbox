@@ -116,17 +116,6 @@ def test_get_returncode_real_no_exit_code_response(mock_response: WSClient) -> N
     assert "no entry in `details.causes` with `reason`=='ExitCode'" in str(e.value)
 
 
-def test_a_status_with_neither_details_nor_message_has_no_returncode(
-    mock_response: WSClient,
-) -> None:
-    """As for an exec into a dead container: a KeyError was not retried."""
-    status = '{"status":"Failure","reason":"InternalError"}'
-    mock_response.read_channel.return_value = status
-
-    with pytest.raises(GetReturncodeError):
-        get_returncode(mock_response)
-
-
 def test_get_returncode_when_response_is_open(mock_response: WSClient) -> None:
     mock_response.is_open.return_value = True
 

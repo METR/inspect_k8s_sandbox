@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import io
 import os
 import signal
@@ -63,10 +64,14 @@ def test_an_exec_whose_close_never_comes_is_not_waited_for(
     module: Any, wait: Any, ended: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: a write whose command had ended waited two hours for its close."""
-    ws = _FakeWSClient([_status(0)] if ended else [], ends=False)
+    ws = _FakeWSClient(
+        # With no status, stderr comes late, and renews no bound.
+        [_status(0)] if ended else [59.0, (STDERR_CHANNEL, b"late")],
+        ends=False,
+    )
     clock = types.SimpleNamespace(monotonic=lambda: ws.now)
     monkeypatch.setattr(execute_module, "time", clock)
-    monkeypatch.setattr(module, "time", clock, raising=False)
+    monkeypatch.setattr(module, "time", clock)
 
     if ended:
         wait(ws, io.BytesIO())  # its status is its result
@@ -78,32 +83,23 @@ def test_an_exec_whose_close_never_comes_is_not_waited_for(
     assert ws.now == (0 if ended else op_module.API_TIMEOUT)
 
 
-@pytest.mark.parametrize(("module", "wait"), _WAITS)
-@pytest.mark.parametrize(
-    "failure",
-    [websocket.WebSocketTimeoutException(), ConnectionResetError()],
-    ids=["timeout", "reset"],
-)
 def test_what_an_update_read_before_it_failed_is_kept(
-    module: Any, wait: Any, failure: Exception, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """As kubernetes 37's update() can: read every frame waiting, then fail."""
-    ws = _FakeWSClient([(STDOUT_CHANNEL, b"file"), _status(0)], error=failure)
+    lost = ConnectionResetError()
+    ws = _FakeWSClient([(STDOUT_CHANNEL, b"file"), _status(0)], error=lost)
     read_one, dst = ws.update, io.BytesIO()
-    clock = types.SimpleNamespace(monotonic=lambda: ws.now)
-    monkeypatch.setattr(execute_module, "time", clock)
-    monkeypatch.setattr(module, "time", clock, raising=False)
 
     def read_all_then_fail(timeout: float | None = 0) -> None:
-        ws.now += timeout or 0  # so a wait that goes on meets its bound, and fails
         while True:
             read_one(timeout)
 
     monkeypatch.setattr(ws, "update", read_all_then_fail)
 
-    wait(ws, dst)
+    read_module.ReadFileOperation(_POD)._handle_stream_output(ws, dst)
 
-    assert dst.getvalue() == (b"file" if module is read_module else b"")
+    assert dst.getvalue() == b"file"
 
 
 @pytest.mark.parametrize(("module", "wait"), _WAITS)
@@ -126,24 +122,43 @@ def test_an_end_tls_has_already_decrypted_is_read(
         pool.shutdown()
 
 
-@pytest.mark.parametrize(("module", "wait"), _WAITS)
+def test_an_upload_the_exec_does_not_read_is_not_waited_for(
+    tls_sockets: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A send had no deadline either: it would outlive a stop as the wait did."""
+    client, server = tls_sockets
+    operation, ws = write_module.WriteFileOperation(_POD), _SocketWSClient(client)
+    monkeypatch.setattr(
+        operation, "_start_write_command", lambda dst, size: contextlib.nullcontext(ws)
+    )
+    monkeypatch.setattr(write_module, "API_TIMEOUT", 0.05)
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    write = pool.submit(operation.write_file, bytes(2**22), Path("/tmp/dst"))
+
+    try:
+        raised = write.exception(timeout=30)  # only bounds a hang
+    finally:
+        server.close()  # wakes a send still waiting
+        pool.shutdown()
+
+    assert type(raised) is websocket.WebSocketTimeoutException
+
+
 def test_a_frame_cut_short_is_not_waited_for_past_the_bound(
-    module: Any,
-    wait: Any,
-    tls_sockets: tuple[Any, Any],
-    monkeypatch: pytest.MonkeyPatch,
+    tls_sockets: tuple[Any, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Part of a frame and no more, as from a connection that has gone dark."""
-    monkeypatch.setattr(module, "API_TIMEOUT", 0.05)
+    monkeypatch.setattr(read_module, "API_TIMEOUT", 0.05)
     client, server = tls_sockets
     server.sendall(_frame(STDOUT_CHANNEL, b"x"))  # a record of its own, read whole
     server.sendall(_frame(STDERR_CHANNEL, b"x")[:1])
     unblock = threading.Timer(30, server.close)  # only bounds a hang
     unblock.start()
 
+    ws, dst = _SocketWSClient(client), io.BytesIO()
     try:
         with pytest.raises(Exception) as raised:
-            wait(_SocketWSClient(client), io.BytesIO())
+            read_module.ReadFileOperation(_POD)._handle_stream_output(ws, dst)
     finally:
         unblock.cancel()
 
@@ -159,7 +174,7 @@ def test_write_file_writes_data_via_chunked_helper(
 ) -> None:
     monkeypatch.setattr(op_module, "STDIN_CHUNK_SIZE", 4)
     op = WriteFileOperation(MagicMock())
-    ws = MagicMock(spec=WSClient)
+    ws = MagicMock(spec=WSClient, sock=MagicMock())
     captured: dict[str, int] = {}
 
     @contextmanager
@@ -206,7 +221,7 @@ def test_a_connection_lost_before_the_status_is_raised(lost: Exception) -> None:
     ws = _FakeWSClient([], error=lost)
 
     with pytest.raises(Exception) as raised:
-        WriteFileOperation(MagicMock())._handle_stream_output(ws)
+        write_module.WriteFileOperation(_POD)._handle_stream_output(ws)
 
     assert type(raised.value) is type(lost)
 

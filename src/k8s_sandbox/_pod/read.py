@@ -63,7 +63,6 @@ class ReadFileOperation(PodOperation):
         # Stream the response, writing it to dst as we go to avoid holding the whole
         # response in memory.
         quiet = time.monotonic() + API_TIMEOUT
-        # As in exec(), the exec's status ends the read: only its close comes after.
         while ws_client.is_open() and ERROR_CHANNEL not in ws_client._channels:
             update_by(ws_client, quiet, self._pod.name)
             # Not peek_*(): it reads another frame first, and may wait for the rest.
@@ -72,7 +71,7 @@ class ReadFileOperation(PodOperation):
                 self._verify_output_limit(dst.tell() - start_position)
                 quiet = time.monotonic() + API_TIMEOUT
             stderr.append(ws_client._channels.pop(STDERR_CHANNEL, b""))
-        ws_client.close()
+        ws_client.close(timeout=0)  # The status is the result: no wait for an answer.
         returncode = get_returncode(ws_client)
         # `head` never exits 255: Kata gives it when the VM stopped.
         if returncode == 255:

@@ -2,12 +2,10 @@
 
 ## Unreleased
 
-- Fix `write_file()` and `read_file()` over Kubernetes exec never returning when the
-  exec's end did not reach the client. They end at the exec's status, as `exec()` does,
-  so a status wins over a connection lost after it. With no status 60 seconds after
-  the upload, or in 60 seconds with no more of the file, they are retried; if every
-  attempt fails they raise `ExecResultUnknownError` (as the cause of a `K8sError`). A
-  status with no exit code no longer raises `KeyError`: its exec's result is unknown.
+- Fix `write_file()` and `read_file()` over Kubernetes exec waiting without end for an
+  exec that has stalled: after 60 seconds in which none of an upload is taken, no more
+  of a file arrives, or no status follows an upload, they are retried. They end at the
+  exec's status, so a status wins over a connection lost after it.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
   when `helm list` fails: it now fails with Helm's error.
 - Once a process has converted one Docker Compose file to Helm values, each further
