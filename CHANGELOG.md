@@ -14,6 +14,7 @@
   one document of a manifest defines a YAML anchor twice.
 - Fix a "Helm release did not become ready" error hiding the API error that its last
   check of the Pods failed with: it is now that error's cause.
+- Fix a Helm command failing with a `UnicodeDecodeError` when its output is not UTF-8.
 - **BREAKING CHANGE**: Fail the install as soon as Helm returns when a sandbox is
   declared only by Deployments or StatefulSets at `replicas: 0`, even if something would
   scale one up later. Render each sandbox with at least one replica.
