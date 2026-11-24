@@ -93,7 +93,7 @@ var holdR = func() *os.File {
 var workdir, _ = syscall.Getwd() // where execd started, and so does a command given no cwd; the kernel's name for it
 
 // Tests hold execd at these points, or hear that it has reached them.
-var afterRead, afterDrainCheck, beforeKill, afterTaken, beforeExit, beforeWait, beforeNumber atomic.Pointer[func(late bool)]
+var afterRead, afterDrainCheck, beforeStart, beforeKill, afterTaken, beforeExit, beforeWait, beforeNumber atomic.Pointer[func(late bool)]
 
 func hook(h *atomic.Pointer[func(late bool)], late bool) {
 	if f := h.Load(); f != nil {
@@ -511,13 +511,14 @@ func (cl *call) run(req startRequest) error {
 		reaper.mu.Unlock() // for the wait: other commands start, end and are killed meanwhile
 		readyR.SetReadDeadline(time.Now().Add(readyWait))
 		_, late := readyR.Read(make([]byte, 1)) // until the holder has ignored what it can: a command started sooner could end it with a signal to its group
+		hook(&beforeStart, false)
 		reaper.mu.Lock()
-		if late != nil && !errors.Is(late, os.ErrDeadlineExceeded) { // ended before its word, as with no PID left for its threads: one that is only slow is not waited for longer
-			err = errors.New("the process that leads its group did not start")
+		if lead := cl.lead(); lead == 0 || late != nil && !errors.Is(late, os.ErrDeadlineExceeded) { // ended, before its word, as with no PID left for its threads, or since: one that is only slow is not waited for longer
+			err = errors.New("the process that leads its group has ended")
 		} else {
 			// The user's own shell finds the command on PATH and becomes it, a script with no #! line too.
 			p, err = os.StartProcess(argv[0], argv, &os.ProcAttr{
-				Dir: dir, Env: env, Files: files, Sys: &syscall.SysProcAttr{Setpgid: true, Pgid: cl.lead()}, // a group of its own where its holder is gone
+				Dir: dir, Env: env, Files: files, Sys: &syscall.SysProcAttr{Setpgid: true, Pgid: lead},
 			})
 		}
 		if err != nil && cl.lead() != 0 {
@@ -1014,6 +1015,9 @@ func (cl *call) stop(timeout bool) {
 		}
 		cl.holder, _ = os.FindProcess(cl.lead()) // taken while that id is its own
 		reached, listed, parents, apart = signalTree(as, cl.lead(), command(pid), sig, until)
+		if reached[pid] == "" && syscall.Kill(pid, sig) != nil { // the command itself, which none of that reached by its id, as with too few descriptors to look by: by its number, which the reaper holds, and no second signal to one in its holder's group, stopped as it is
+			signalAs(as, pid, sig)
+		}
 		afterFunc(grace, func() {
 			cl.kmu.Lock() // the sweep's kill waits for this: after its SIGKILL one that joined what is left of the group would stay stopped, and group is closed
 			if !cl.swept {
@@ -1064,9 +1068,7 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 	defer debug.FreeOSMemory() // a kill's listings leave garbage that a pod at its memory limit has no room for
 	defer close(cl.ending)
 	defer syscall.Close(int(group))
-	if cl.holder != nil {
-		defer cl.holder.Release()
-	}
+	defer cl.holder.Release()
 	defer func() { go cl.search(as, syscall.SIGKILL, nil) }() // off the exit's path: each read of an environment may wait behind its process's memory
 	// Continued with no lock held, and by the goroutine that closes group: its number is another's after.
 	for _, p := range slices.Backward(apart) { // a child first: its parent, ended before it, would leave it stopped to the kernel's SIGHUP for an orphaned group
@@ -1080,9 +1082,6 @@ func (cl *call) sweep(pid int, as *syscall.Credential, status chan syscall.WaitS
 		hook(&beforeNumber, false)
 		reaper.mu.Lock()
 		byNumber(as, cl.lead(), syscall.SIGCONT)
-		if reaper.waiting[pid] == status && syscall.Kill(pid, syscall.SIGCONT) != nil { // the command too, behind its group: it may have left that, its start unread
-			signalAs(as, pid, syscall.SIGCONT)
-		}
 		reaper.mu.Unlock()
 	}
 	resume := func() { // as su and runuser, one stops itself at its child's stop: left so, it would sit out the grace
@@ -1157,27 +1156,22 @@ func (cl *call) lead() int {
 // readyWait is how long a start waits for its holder: one that takes longer, as in a container starved of CPU, leads its command's group before it ignores signals.
 var readyWait = time.Second
 
-// command is a kill's root: the process pid, as the one that started when it did, or with no start where no descriptor is left to read it.
+// command is a kill's root: the process pid, as the one that started when it did.
 func command(pid int) map[int]string {
-	started := ""
 	if f := stat(pid); len(f) > 19 {
-		started = f[19]
+		return map[int]string{pid: f[19]}
 	}
-	return map[int]string{pid: started}
+	return nil
 }
 
 // byPidfd signals a holder's group through its handle and a pidfd's command, and says if the group was reached: by number either may be another's.
 func byPidfd(as *syscall.Credential, holder *os.Process, group uintptr, sig syscall.Signal) bool {
 	send := func() bool { // shortcut: no group signal so before Linux 6.9, nor by number once its holder is gone, killed by the command's user or by a signal to its group before it was ready: its untagged leftovers run on
 		err := syscall.ENOSYS
-		if holder != nil {
-			holder.WithHandle(func(led uintptr) {
-				_, _, err = syscall.Syscall6(sysPidfdSendSignal, led, uintptr(sig), 0, pidfdSignalProcessGroup|pidfdNoGroup.Load(), 0, 0)
-			})
-		}
-		if err == 0 || sig != syscall.SIGCONT { // the command itself too, which may have left its group: its continue only behind its group's, which the group's number brings where no pidfd does
-			syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, 0, 0, 0)
-		}
+		holder.WithHandle(func(led uintptr) {
+			_, _, err = syscall.Syscall6(sysPidfdSendSignal, led, uintptr(sig), 0, pidfdSignalProcessGroup|pidfdNoGroup.Load(), 0, 0)
+		})
+		syscall.Syscall6(sysPidfdSendSignal, group, uintptr(sig), 0, 0, 0, 0) // the command itself too, which may have left its group
 		return err == 0
 	}
 	sent := send()
@@ -1222,13 +1216,6 @@ func stat(pid int) []string {
 // signalTree stops lead's group and what runs under roots, then sends them sig: stopped, none starts another meanwhile.
 func signalTree(as *syscall.Credential, lead int, roots map[int]string, sig syscall.Signal, until time.Time) (reached, listed map[int]string, parents map[int]bool, apart []int) {
 	byNumber(as, lead, syscall.SIGSTOP) // the group at once, so that none starts another
-	defer func() {                      // a command whose start was not read, last and though none other was found: by its number, which the reaper holds, since it may have left its group
-		for root, started := range roots {
-			if started == "" && root != lead && syscall.Kill(root, sig) != nil {
-				signalAs(as, root, sig)
-			}
-		}
-	}()
 	var stopped []int
 	seen, grouped, waits := map[int]bool{}, map[int]bool{}, time.Now().Add(time.Second)
 	reached, parents = map[int]string{}, map[int]bool{}

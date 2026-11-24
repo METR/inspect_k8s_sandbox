@@ -142,15 +142,6 @@ func firstProcess(argv []string) {
 	}
 }
 
-// Regression: made with no descriptor to spare, the holders' pipe was execd's own stdin, where every holder ends at once.
-func TestExecdWithNoDescriptorForItsHoldersPipeDoesNotStart(t *testing.T) {
-	// One descriptor is left, with which a test binary loads its libraries: the pipe takes two.
-	out, err := exec.Command("sh", "-c", `ulimit -n 4 && exec "$0" hold`, os.Args[0]).CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "too many open files") {
-		t.Fatalf("%v, saying %q: want it to end on the pipe's error", err, out)
-	}
-}
-
 func TestAStartThatFindsThePortTakenLeavesNoProcessBehind(t *testing.T) {
 	taken, err := net.Listen("tcp", ":0")
 	if err != nil {

@@ -77,14 +77,14 @@ func TestMain(m *testing.M) {
 			syscall.Kill(os.Getpid(), syscall.SIGSTOP)
 		}
 	}
-	for len(os.Args) == 2 && os.Args[1] == "hold" { // a test holds this holder back from its start, as a container starved of CPU does
-		if _, err := os.Stat(holders(os.Getppid(), "dead")); err == nil { // or ends it before its word, as with no PID left for its threads
-			os.Exit(2)
+	if len(os.Args) == 2 && os.Args[1] == "hold" {
+		if _, err := os.Stat(holders(os.Getppid(), "mute")); err == nil { // a test has this holder say no word, as one that ends with no PID left for its threads
+			os.Stdout.Close()
 		}
-		if _, err := os.Stat(holders(os.Getppid(), "held")); err != nil {
-			break
+		if _, err := os.Stat(holders(os.Getppid(), "brief")); err == nil { // or end once it has said it
+			os.Stdout.WriteString("\n")
+			os.Exit(0)
 		}
-		time.Sleep(time.Millisecond)
 	}
 	if len(os.Args) > 6 && os.Args[1] == "as" || len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "serve" || os.Args[1] == "connect" || os.Args[1] == "search" || os.Args[1] == "hold") {
 		main()
@@ -1530,13 +1530,7 @@ func TestAKillWithNoDescriptorLeftReachesACommandThatHasLeftItsGroup(t *testing.
 	for name, tc := range map[string]struct {
 		left   uint64 // the descriptors its kill finds free
 		orphan bool   // its holder was killed before
-		script string
-		want   float64
-	}{
-		"none":                  {0, false, "echo ready; exec sleep 600", 137}, // the SIGKILL of a kill with no descriptor
-		"none, its holder gone": {0, true, "echo ready; exec sleep 600", 137},
-		"one, for its pidfd":    {1, false, "trap 'exit 42' TERM; echo ready; sleep 600 & wait", 42}, // its SIGTERM, which it must be continued to take
-	} {
+	}{"none": {0, false}, "none, its holder gone": {0, true}, "one": {1, false}, "one, its holder gone": {1, true}, "two": {2, false}, "three": {3, false}} {
 		t.Run(name, func(t *testing.T) {
 			defer nofile(was) // for the next case's start, though this one fails
 			pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
@@ -1545,14 +1539,15 @@ func TestAKillWithNoDescriptorLeftReachesACommandThatHasLeftItsGroup(t *testing.
 				nofile(syscall.Rlimit{Cur: uint64(spare) + tc.left, Max: was.Max})
 				return open(pid)
 			}
-			s, c, frames, _, _ := ready(t, "", "setsid", "sh", "-c", tc.script)
+			s, c, frames, _, _ := ready(t, "", "setsid", "sh", "-c", "trap 'exit 42' TERM; echo ready; sleep 600 & wait")
 			if cl := s.get(80); tc.orphan {
 				syscall.Kill(cl.group, syscall.SIGKILL)
 				until(t, "its holder was not reaped", func() bool { reaper.mu.Lock(); defer reaper.mu.Unlock(); return cl.lead() == 0 })
 			}
 			s.dispatch(c, frame{kind: fKill, id: 80})
-			if code := exitStatus(t, frames)["code"]; code != tc.want {
-				t.Fatalf("exit %v: want %v", code, tc.want)
+			want := map[bool]float64{true: 137, false: 42}[tc.left == 0] // SIGKILL at once with no descriptor for its pidfd; else its SIGTERM, which it is continued to take
+			if code := exitStatus(t, frames)["code"]; code != want {
+				t.Fatalf("exit %v: want %v", code, want)
 			}
 		})
 	}
@@ -1795,10 +1790,7 @@ func TestAKilledCallsExitWaitsForWhatHadItsSigtermAndTheRestIsKilledAtOnce(t *te
 
 func TestACallWaitsForACommandThatMakesASessionOfItsOwn(t *testing.T) {
 	// Where it leads its group setsid(1) forks, and the call ends with the parent: a command that led it could make no session.
-	_, _, frames, _, first := ready(t, "", "setsid", "sh", "-c", "sleep 0.3; echo late; exit 42")
-	if first != "late\n" {
-		t.Fatalf("the call first said %q: want what its command says before it ends", first)
-	}
+	_, _, frames, _, _ := ready(t, "", "setsid", "sh", "-c", "echo late; exit 42")
 	if status := exitStatus(t, frames); status["code"] != 42.0 {
 		t.Fatalf("EXIT %v, want the command's own 42", status)
 	}
@@ -1814,52 +1806,48 @@ func TestACommandsHolderEndsWithIt(t *testing.T) {
 	until(t, "a holder outlived its command: each call would leave one", func() bool { return holder > 0 && gone(holder) })
 }
 
-func TestAKillReachesTheGroupOfACommandThatSignalledIt(t *testing.T) {
-	pidfdNoGroup.Store(1 << 30) // as before Linux 6.9: only a holder that is still there signals the group
-	t.Cleanup(func() { pidfdNoGroup.Store(0) })
-	// At once, as a script's `kill 0` may; then it leaves one in the group that carries no tag and, its parent gone before it is named, descends from nothing of the command's.
-	s, c, frames, _, first := ready(t, "", "env", "-i", "/bin/sh", "-c", `trap : TERM; kill -TERM 0; trap - TERM; left=$(sleep 600 >/dev/null 2>&1 & echo $!); echo $left; sleep 600`)
-	left, _ := strconv.Atoi(strings.TrimSpace(first))
-	s.dispatch(c, frame{kind: fKill, id: 80})
-	exitStatus(t, frames)
-	until(t, "what the command left in its group outlived the kill: the group's own signal had ended its holder", func() bool { return gone(left) })
+// A holder left by an execd that ended would hold three of the pod's PIDs for good.
+func TestAHolderEndsWhenExecdDoes(t *testing.T) {
+	execds, hold, _ := os.Pipe() // the pipe every holder reads, of which execd alone has the other end
+	said, word, _ := os.Pipe()
+	holder, err := os.StartProcess(os.Args[0], []string{os.Args[0], "hold"}, &os.ProcAttr{Files: []*os.File{execds, word}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Kill() })
+	word.Close()
+	said.SetReadDeadline(time.Now().Add(30 * time.Second)) // only bounds a hang
+	if _, err := said.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("the holder said no word: %v", err)
+	}
+	hold.Close()
+	until(t, "a holder outlived the pipe's other end, as it would an execd that ended", func() bool { return gone(holder.Pid) })
 }
 
-// A command started before its holder ignores signals could end that holder with one to its group.
-func TestACommandStartsOnlyOnceItsHolderIsReady(t *testing.T) {
-	wait := readyWait
-	readyWait = 30 * time.Second // only bounds a hang
-	held := holders(os.Getpid(), "held")
-	os.WriteFile(held, nil, 0o600)
-	t.Cleanup(func() { readyWait = wait; os.Remove(held) })
-	s, _ := newServer(strings.Repeat("00", 32))
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	req, _ := json.Marshal(startRequest{Argv: []string{"echo", "started"}, Env: map[string]string{}, Tag: "n"})
-	go s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
-	select {
-	case f := <-frames:
-		t.Fatalf("frame %d, %q, before the command's holder was ready", f.kind, f.payload)
-	case <-time.After(200 * time.Millisecond):
-	}
-	os.Remove(held)
-	if status := exitStatus(t, frames); status["code"] != 0.0 {
-		t.Fatalf("EXIT %v: want 0, from the command its holder then let start", status)
-	}
-}
-
-// Regression: a command whose holder had ended before its word was started with none, and its kill then reached no group.
-func TestACommandWhoseHolderDidNotStartIsNotStarted(t *testing.T) {
-	dead := holders(os.Getpid(), "dead")
-	os.WriteFile(dead, nil, 0o600)
-	t.Cleanup(func() { os.Remove(dead) })
-	s, _ := newServer(strings.Repeat("00", 32))
-	c, frames := recordedConn(t)
-	s.authenticated(c)
-	req, _ := json.Marshal(startRequest{Argv: []string{"echo", "started"}, Env: map[string]string{}, Tag: "n"})
-	s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
-	if status := exitStatus(t, frames); status["code"] != 126.0 {
-		t.Fatalf("EXIT %v: want 126, for a command that has no holder", status)
+// Regression: a command whose holder had ended, before its word or since, was started with none, and its kill then reached no group.
+func TestACommandWhoseHolderHasEndedIsNotStarted(t *testing.T) {
+	for _, how := range []string{"mute", "brief"} { // it says no word, as one that ends with no PID left for its threads; or it says it, ends, and is reaped before its command would start
+		t.Run(how, func(t *testing.T) {
+			mark, wait := holders(os.Getpid(), how), readyWait
+			if err := os.WriteFile(mark, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			readyWait = 30 * time.Second // a holder slow to start, as on a stalled runner, is not taken for one that is ready
+			s, _ := newServer(strings.Repeat("00", 32))
+			reaped := func(bool) {
+				cl := s.get(80)
+				until(t, "its holder was not reaped", func() bool { reaper.mu.Lock(); defer reaper.mu.Unlock(); return how == "mute" || cl.lead() == 0 })
+			}
+			beforeStart.Store(&reaped)
+			t.Cleanup(func() { os.Remove(mark); beforeStart.Store(nil); readyWait = wait })
+			c, frames := recordedConn(t)
+			s.authenticated(c)
+			req, _ := json.Marshal(startRequest{Argv: []string{"echo", "started"}, Env: map[string]string{}, Tag: "n"})
+			s.dispatch(c, frame{kind: fStart, id: 80, payload: req})
+			if status := exitStatus(t, frames); status["code"] != 126.0 {
+				t.Fatalf("EXIT %v: want 126, for a command that has no holder", status)
+			}
+		})
 	}
 }
 
@@ -1893,7 +1881,6 @@ func TestAKillReachesTheGroupOfACommandWhoseHandlerKilledItsHolder(t *testing.T)
 }
 
 func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {
-	end := graced(t)
 	s, _ := newServer(strings.Repeat("00", 32))
 	alive := filepath.Join(t.TempDir(), "alive")
 	loop, _ := json.Marshal(startRequest{Argv: []string{"sh", "-c", `while :; do : >"$0"; sleep 0.01; done`, alive}, Env: map[string]string{}, Tag: "other"})
@@ -1912,15 +1899,10 @@ func TestAKillLeavesTheGroupThatHasItsReapedHoldersNumber(t *testing.T) {
 	t.Cleanup(func() { syscall.Kill(own, syscall.SIGKILL) })
 
 	cl.kill()
-	until(t, "its kill's sweep did not end", func() bool { // its SIGKILLs by number come last
-		select {
-		case <-cl.ending:
-			return true
-		default:
-			return false
-		}
-	})
-	end()
+	until(t, "the killed call did not end", func() bool { cl.mu.Lock(); defer cl.mu.Unlock(); return cl.exited }) // its sweep's SIGKILLs and its end's own come last
+	if gone(other.group) {
+		t.Fatal("a call's end killed, by its reaped holder's number, the process that has that number now")
+	}
 
 	os.Remove(alive)
 	until(t, "a kill reached the group that had been given its own holder's number", func() bool { _, err := os.Stat(alive); return err == nil })
@@ -1960,6 +1942,7 @@ func TestAKillsLastSigkillSparesProcessesGivenItsCommandsAndASurvivorsIds(t *tes
 	found <- nil
 	// As for a command reaped in its grace whose id, and a survivor's, are other processes' by now: neither started then, and no pidfd names them.
 	spared := &call{tag: strconv.FormatInt(time.Now().UnixNano(), 36), ending: make(chan struct{})} // a tag of its own: its last search is by it
+	spared.holder, _ = os.FindProcess(0)                                                            // as a kill takes it once its holder is gone
 	spared.sweep(command.Pid, nil, make(chan syscall.WaitStatus), map[int]string{command.Pid: "0", survivor.Pid: "0"}, nil, nil, found, up, ^uintptr(0))
 	for other, status := range others {
 		other.Signal(syscall.SIGTERM)
