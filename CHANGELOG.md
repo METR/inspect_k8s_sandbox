@@ -105,9 +105,11 @@
   `exec()` raises `TimeoutError`, whose `truncated_output` holds what the command wrote,
   once the command and the processes execd signalled have ended or been sent SIGKILL, or
   16 seconds after its timeout at the latest. What they start after their SIGTERM gets
-  SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts. (On
-  gVisor and on Linux before 6.9, one left in the command's group whose environment no
-  longer holds `HAWK_NEXT_EXEC` can run on. On Linux before 6.9 and on gVisor before
+  SIGKILL as soon as they have ended: a handler must wait for the cleanup it starts.
+  (Once the command's user has killed the process of execd's own that leads the
+  command's group, one in that group whose environment no longer holds
+  `HAWK_NEXT_EXEC` can run on where the command has left the group, or where it
+  started after the command's SIGTERM. On Linux before 6.9 and on gVisor before
   release-20260928.0, a threaded program's SIGTERM handler, as in Python, may not run;
   on gVisor release-20261109.0 it runs.) The processes of a command that has ended by
   itself are left running. Once execd has stopped reading a command's output, 100 ms
@@ -134,7 +136,9 @@
   volume: on the container's disk, a pod thrashing at its memory limit evicts execd's
   code, and a timeout's kill can then take the client's whole 16 seconds and hold up
   the next call. Idle, execd holds 20 to 23 of the pod's PIDs, and needs a PID limit
-  of about 30 to start.
+  of about 30 to start. Each running command holds 3 more and about
+  0.9 MB of the container's memory; with no PID left for those, the command is not
+  started and ends with status 126.
   Make execd mode 111; where a container runs on gVisor as a
   user other than root it must be readable too (555). A process running as execd's user
   can stand in for it while it starts, unless execd is mode 111 and the container has
