@@ -2299,9 +2299,10 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
 
 
 T, F = "True", "False"  # as an error's message spells them
+HELD = "address already in use"
 # How it was out of reach, and what its error says of that: None where it says nothing.
 APART: dict[str, dict[str, str | None]] = {
-    "a start found it running": {"connected": F, "start": "DaemonRunning: in use"},
+    "a start found it running": {"connected": F, "start": f"DaemonRunning: {HELD}"},
     "a start failed": {"start": 'PodError: execd did not start {"returncode": "1"}'},
     "the look timed out": {"look": "TimeoutError()", "heard": T, "connected": T},
     "ours": {"reader": "cancelled", "closed": "silence", "look": None},
@@ -2359,11 +2360,13 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     async def start(replace: bool) -> execd.Daemon:
         starts[0] += 1
         if how == "a start found it running" and starts[0] == 2:
-            raise execd.DaemonRunning("in use")
-        if how == "a start failed" and starts[0] == 2:  # as Pod._start_execd() raises
+            raise execd.DaemonRunning(HELD)
+        if how == "a start failed" and starts[0] == 2:
             raise error.PodError("execd did not start", returncode=1)
         if how == "a start failed" and starts[0] == 3:  # what a later look met
-            raise execd.DaemonRunning("in use")
+            raise execd.DaemonRunning(HELD)
+        if how == "a start failed" and starts[0] == 4:  # and the look after that
+            raise error.PodError("execd did not start", returncode=2)
         return daemons.unstarted.pop(0)
 
     async def broken(data: bytes) -> None:

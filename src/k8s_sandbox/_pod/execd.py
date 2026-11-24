@@ -558,7 +558,6 @@ class Link:
         except (ValueError, LookupError, TypeError):  # not execd's frames
             pass
         finally:
-            # Cancelled by what closed it, or stopped by itself at a frame not execd's.
             self.why.setdefault("reader", "cancelled" if self.closed else "stopped")
             await self.close()
 
