@@ -2289,7 +2289,7 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
         await until(lambda: clock.expired == 1)
         back.set()
     if not isinstance(ends, int):
-        with pytest.raises(ends):
+        with pytest.raises(ends, match=f'"containers": "\\({was!r}, {again!r}\\)"'):
             await asyncio.wait_for(call, 30)  # only bounds a hang
         return
     result = await asyncio.wait_for(call, 30)  # only bounds a hang
@@ -2298,8 +2298,20 @@ async def test_a_call_whose_execd_was_killed_ends_as_a_killed_command(
     assert (result.returncode, result.stdout, resent) == (ends, "so far\n", set())
 
 
-APART = ["a start found it running", "the look timed out", "ours", "it outlived"]
-APART += ["its command had ended", "we were silent"]
+T, F = "True", "False"  # as an error's message spells them
+HELD = "address already in use"
+# How it was out of reach, and what its error says of that: None where it says nothing.
+APART: dict[str, dict[str, str | None]] = {
+    "a start found it running": {"connected": F, "start": f"DaemonRunning: {HELD}"},
+    "a start failed": {"start": 'PodError: execd did not start {"returncode": "1"}'},
+    "the look timed out": {"look": "TimeoutError()", "heard": T, "connected": T},
+    "ours": {"reader": "cancelled", "closed": "silence", "look": None},
+    "a ping failed": {"reader": "cancelled", "heard": None, "look": None},
+    "it outlived": {"killed": T, "resuming": T, "ended": F},
+    "its command had ended": {"killed": T, "resuming": F, "ended": T},
+    "we were silent": {"killed": F, "heard": F, "look": None},
+    "its frame was too large": {"reader": "stopped", "look": None},
+}
 
 
 @pytest.mark.parametrize("how", APART)
@@ -2335,8 +2347,10 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
             daemons.ports[old] = silent.sockets[0].getsockname()[1]
         elif how not in ("it outlived", "its command had ended") or resumed:
             first.close()  # execd is gone, and a start makes another
-        if how == "ours":
-            await r.read()  # the client's own timer ends this connection
+        if how in ("ours", "a ping failed"):
+            await r.read()  # the client ends this connection itself
+        if how == "its frame was too large":  # none of execd's is: the reader stops
+            w.write(execd.HEADER.pack(execd.STDOUT, call, execd.MAX_FRAME + 1))
         w.close()
 
     async def says_nothing(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -2346,8 +2360,17 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     async def start(replace: bool) -> execd.Daemon:
         starts[0] += 1
         if how == "a start found it running" and starts[0] == 2:
-            raise execd.DaemonRunning("address already in use")
+            raise execd.DaemonRunning(HELD)
+        if how == "a start failed" and starts[0] == 2:
+            raise error.PodError("execd did not start", returncode=1)
+        if how == "a start failed" and starts[0] == 3:  # what a later look met
+            raise execd.DaemonRunning(HELD)
+        if how == "a start failed" and starts[0] == 4:  # and the look after that
+            raise error.PodError("execd did not start", returncode=2)
         return daemons.unstarted.pop(0)
+
+    async def broken(data: bytes) -> None:
+        raise BrokenPipeError
 
     first = await daemons.serve(is_killed, container=b"b:5")
     old = daemons.unstarted[0]
@@ -2363,14 +2386,22 @@ async def test_a_call_out_of_reach_when_its_execd_was_killed_raises(
     if how == "the look timed out":
         await until(lambda: reached[0] == 2)
         clock.now += execd.CONNECT_TIMEOUT
-    while how == "ours" and link is not None and not link.closed:
-        interval()  # no frame for 60 s: the client ends the connection itself
-        await asyncio.sleep(0.001)
+    if how == "a ping failed" and link is not None:
+        monkeypatch.setattr(link.pipe, "write", broken)
     try:
-        with pytest.raises(error.ExecdStoppedError):
-            await asyncio.wait_for(call, 30)  # only bounds a hang
+        with anyio.fail_after(30):  # only bounds a hang
+            # No frame for 60 s, or a PING that cannot be written: the client closes it.
+            while how in ("ours", "a ping failed") and link and not link.closed:
+                interval()
+                await asyncio.sleep(0.001)
+            with pytest.raises(error.ExecdStoppedError) as raised:
+                await call
     finally:
         silent.close()
+    said = json.loads(str(raised.value).partition("command ")[2])
+    # Neither of these where the case has none: not a later look's, nor another close's.
+    want = {"start": None, "closed": None} | APART[how]
+    assert {word: said.get(word) for word in want} == want
 
 
 async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
@@ -2403,7 +2434,8 @@ async def test_a_call_whose_live_execd_closed_its_connection_is_out_of_reach(
 
     call = execd.ExecdClient(start).exec(["sh"], None, None, {}, None, 99)
     try:
-        with pytest.raises(error.ExecdStoppedError):
+        ended = r"\"reader\": \"ConnectionAbortedError\('execd ended the TLS session'\)"
+        with pytest.raises(error.ExecdStoppedError, match=ended):
             await asyncio.wait_for(call, 30)  # only bounds a hang
     finally:
         servers[1].close()
