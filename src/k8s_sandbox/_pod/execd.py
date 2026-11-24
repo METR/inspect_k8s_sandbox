@@ -561,6 +561,7 @@ class Link:
             self.why["reader"] = "cancelled"
             raise
         finally:
+            self.why.setdefault("reader", "stopped")  # at a frame that was not execd's
             await self.close()
 
     async def _ping(self) -> None:
@@ -664,8 +665,12 @@ class ExecdClient:
                 # Only the first look, and no timeout, shows execd went as it ended.
                 timed_out = isinstance(e, asyncio.TimeoutError)
                 first = last if at_once and not timed_out else None
-                # Only the first look, and the start after it, go into its error.
-                why = last.why if last is not None and "look" not in last.why else {}
+                # Kept: the first look for its own daemon, and the start after it.
+                why = (
+                    last.why
+                    if last and self._daemon is last.daemon and "look" not in last.why
+                    else {}
+                )
                 why.update(look=repr(e), at_once=at_once, connected=link is not None)
                 if last is not None:
                     last.ended = False
