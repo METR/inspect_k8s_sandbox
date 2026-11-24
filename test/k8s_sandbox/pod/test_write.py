@@ -66,7 +66,9 @@ def test_an_exec_whose_close_never_comes_is_not_waited_for(
     """Regression: a write whose command had ended waited two hours for its close."""
     ws = _FakeWSClient(
         # With no status, stderr comes late, and renews no bound.
-        [_status(0)] if ended else [59.0, (STDERR_CHANNEL, b"late")],
+        [_status(0)]
+        if ended
+        else [op_module.API_TIMEOUT - 1.0, (STDERR_CHANNEL, b"late")],
         ends=False,
     )
     clock = types.SimpleNamespace(monotonic=lambda: ws.now)
@@ -146,9 +148,10 @@ def test_a_frame_cut_short_is_not_waited_for_past_the_bound(
 
     assert type(raised.value) is error_module.ExecResultUnknownError
     server.settimeout(30)  # only bounds a hang
-    with pytest.raises(OSError) as cut:  # with no closing frame to wait 3 s on
-        server.recv(64)
-    assert not isinstance(cut.value, TimeoutError)
+    try:
+        assert server.recv(64) == b""  # no closing frame, to wait 3 s on
+    except OSError as closed:  # as some OpenSSL builds report the socket closed
+        assert not isinstance(closed, TimeoutError)
 
 
 def test_write_file_writes_data_via_chunked_helper(

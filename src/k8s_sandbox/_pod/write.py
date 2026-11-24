@@ -52,7 +52,6 @@ class WriteFileOperation(PodOperation):
                 ws_client.sock.settimeout(STREAM_END_GRACE_SECONDS)
                 with contextlib.suppress(OSError, WebSocketException):
                     ws_client.run_forever(timeout=STREAM_END_GRACE_SECONDS)
-                ws_client.sock.shutdown()  # Not close(): that would wait on it.
                 raise_if_stopped_before_lost(ws_client, e, self._pod.name)
                 raise
             self._handle_stream_output(ws_client)
