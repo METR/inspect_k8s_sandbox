@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The `execd` image takes its bases from Docker Hub, by the same digests, where it took
+  them from ECR Public: a host that builds it from `execd/` must reach Docker Hub.
 - Fix `inspect sandbox cleanup k8s` (with no release name) reporting no releases found
   when `helm list` fails: it now fails with Helm's error.
 - Once a process has converted one Docker Compose file to Helm values, each further
