@@ -1511,6 +1511,26 @@ func TestAKillWithOneDescriptorToSpareStillSendsItsCommandSigterm(t *testing.T) 
 	}
 }
 
+// Regression: with no descriptor left, a kill's SIGKILL went to its holder's group alone: a command that had left it stayed stopped.
+func TestAKillWithNoDescriptorLeftReachesACommandThatHasLeftItsGroup(t *testing.T) {
+	open := pidfdOpen
+	var was syscall.Rlimit
+	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &was)
+	t.Cleanup(func() { pidfdOpen = open; nofile(was) })
+	pidfdOpen = func(pid int) (uintptr, syscall.Errno) {
+		spare, _ := syscall.Dup(0) // the lowest number free: with the limit there, no descriptor can be taken
+		syscall.Close(spare)
+		nofile(syscall.Rlimit{Cur: uint64(spare), Max: was.Max})
+		return open(pid)
+	}
+	s, c, frames, _, _ := ready(t, "", "setsid", "sh", "-c", "echo ready; exec sleep 600")
+	s.dispatch(c, frame{kind: fKill, id: 80})
+	code := exitStatus(t, frames)["code"]
+	if nofile(was); code != 137.0 {
+		t.Fatalf("exit %v: want 137, the SIGKILL of a kill with no descriptor", code)
+	}
+}
+
 // Regression: sent to the first thread of a process whose first thread had ended, a SIGTERM was lost, and the process sat out its grace.
 func TestAKilledCommandOfSeveralThreadsTakesItsSigtermWhereItsFirstThreadCannot(t *testing.T) {
 	thread := pidfdSignalThread

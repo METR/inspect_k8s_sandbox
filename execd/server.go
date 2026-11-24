@@ -84,7 +84,9 @@ var interfaceAddrs = net.InterfaceAddrs // tests make it fail, to check fromThis
 // holdR is every holder's stdin: a pipe that nothing writes to and that ends with execd, read without blocking so that a holder keeps no thread for it.
 var holdR = func() *os.File {
 	var pipe [2]int
-	syscall.Pipe2(pipe[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK)
+	if err := syscall.Pipe2(pipe[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
+		panic(err) // with none, a holder would read execd's own stdin and end at once
+	}
 	return os.NewFile(uintptr(pipe[0]), "hold")
 }()
 
@@ -1144,12 +1146,13 @@ func (cl *call) lead() int {
 	return cl.group
 }
 
-// command is a kill's root: the process pid, as the one that started when it did.
+// command is a kill's root: the process pid, as the one that started when it did, or with no start where no descriptor is left to read it.
 func command(pid int) map[int]string {
+	started := ""
 	if f := stat(pid); len(f) > 19 {
-		return map[int]string{pid: f[19]}
+		started = f[19]
 	}
-	return nil
+	return map[int]string{pid: started}
 }
 
 // byPidfd signals a holder's group through its handle and a pidfd's command, and says if the group was reached: by number either may be another's.
@@ -1270,6 +1273,11 @@ func signalTree(as *syscall.Credential, lead int, roots map[int]string, sig sysc
 			signalIf(as, p, reached[p], sig)
 		}
 		byNumber(as, lead, sig)
+	}
+	for root, started := range roots { // a command whose start was not read: by its number, which the reaper holds, since it may have left its group
+		if started == "" && root != lead && syscall.Kill(root, sig) != nil {
+			signalAs(as, root, sig)
+		}
 	}
 	maps.DeleteFunc(parents, func(p int, _ bool) bool { return reached[p] == "" })
 	return reached, listed, parents, slices.DeleteFunc(stopped, func(p int) bool { return grouped[p] })
