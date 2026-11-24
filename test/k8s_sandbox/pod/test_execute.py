@@ -634,8 +634,7 @@ def bare_image() -> Generator[str, None, None]:
         pytest.skip("needs Docker")
     name = f"exec-stdio-test-{uuid.uuid4().hex[:8]}"
     dockerfile = (
-        "FROM public.ecr.aws/docker/library/busybox:1.37\n"
-        "RUN rm /bin/id && sed -i s/^root:/toor:/ /etc/passwd\n"
+        "FROM busybox:1.37\nRUN rm /bin/id && sed -i s/^root:/toor:/ /etc/passwd\n"
     )
     built = test_execd_binary.docker("build", "-q", "-t", name, "-", stdin=dockerfile)
     assert built.returncode == 0, built.stderr

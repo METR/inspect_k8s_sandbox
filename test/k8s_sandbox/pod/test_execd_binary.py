@@ -28,7 +28,7 @@ from test.k8s_sandbox.pod import test_execd
 
 EXECD = pathlib.Path(__file__).parents[3] / "execd"
 PORT = execd.EXECD_PORT
-IMAGE = "public.ecr.aws/docker/library/python:3.12-slim-bookworm"
+IMAGE = "python:3.12-slim-bookworm"
 # Run in the container: whether execd serves a TLS handshake from each address given.
 PROBE = """
 import socket, ssl, sys
