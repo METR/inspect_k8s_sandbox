@@ -40,8 +40,9 @@ networkPolicy:
 # `securityContext`: none of the service's hardening applies to it.
 extraContainers: []
 # -- The vsock-egress image (built from `vsock-egress/`), required once a pod carries
-# the annotation `inspect-k8s-sandbox/egress-proxy`; with it, the pods of an AWS Nitro
-# Sandbox with no network device also reach the services they share a network with.
+# the annotation `inspect-k8s-sandbox/egress-proxy` or `inspect-k8s-sandbox/ingress-listen`;
+# with it, the pods of an AWS Nitro Sandbox with no network device also reach the services
+# they share a network with.
 # @default -- Empty
 egressForwarderImage: ""
 # -- Tunnel every TCP connection of a pod with no network device through the egress proxy it names, and answer its DNS lookups in the pod: see `vsock-egress/README.md`.
