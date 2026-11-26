@@ -161,6 +161,14 @@ func work(args []string) error {
 		return err
 	}
 	ended := make(chan error)
+	// Before the sockets its forwarder's readiness waits for: a pod that is ready takes its siblings' connections.
+	if *ports != "" {
+		l, err := listen(fmt.Sprintf(":%d", relayPort), proxyBuffer)
+		if err != nil {
+			return err
+		}
+		go func() { ended <- w.serve(l, w.arrive) }()
+	}
 	for port, carry := range map[int]func(net.Conn){streamPort: w.proxied, siblingPort: w.sibling} {
 		path := fmt.Sprintf("%s_%d", *vsock, port) // where Firecracker takes the guest's connection to (host, port)
 		os.Remove(path)                            // an earlier worker's
@@ -169,13 +177,6 @@ func work(args []string) error {
 			return err
 		}
 		go func() { ended <- w.serve(l, carry) }()
-	}
-	if *ports != "" {
-		l, err := listen(fmt.Sprintf(":%d", relayPort), proxyBuffer)
-		if err != nil {
-			return err
-		}
-		go func() { ended <- w.serve(l, w.arrive) }()
 	}
 	go func() {
 		for range time.Tick(time.Minute) {
@@ -288,7 +289,7 @@ func (w *worker) arrive(c net.Conn) {
 	tcp.SetReadDeadline(time.Time{})
 	tcp.SetReadBuffer(proxyBuffer)
 	tcp.SetWriteBuffer(proxyBuffer)
-	g, err := guestDial(w.vsock, inboundPort)
+	g, err := guestDial(w.vsock, inboundPort, w.keyWait)
 	if err == nil {
 		key := make([]byte, keySize)
 		if _, err = io.ReadFull(g, key); err == nil && !w.holds(key) {
@@ -373,7 +374,7 @@ func (w *worker) holds(key []byte) bool {
 }
 
 func fetchKey(vsock string) ([]byte, error) {
-	c, err := guestDial(vsock, keyPort)
+	c, err := guestDial(vsock, keyPort, dialWait)
 	if err != nil {
 		return nil, err
 	}
@@ -385,13 +386,13 @@ func fetchKey(vsock string) ([]byte, error) {
 	return key, nil
 }
 
-// guestDial connects to a guest's vsock port as Firecracker's socket asks ("CONNECT port\n", answered "OK port\n"); the connection keeps a deadline of dialWait.
-func guestDial(vsock string, port uint32) (net.Conn, error) {
+// guestDial connects to a guest's vsock port as Firecracker's socket asks ("CONNECT port\n", answered "OK port\n"); the connection keeps a deadline of wait.
+func guestDial(vsock string, port uint32, wait time.Duration) (net.Conn, error) {
 	c, err := net.DialTimeout("unix", vsock, dialWait)
 	if err != nil {
 		return nil, err
 	}
-	c.SetDeadline(time.Now().Add(dialWait))
+	c.SetDeadline(time.Now().Add(wait))
 	fmt.Fprintf(c, "CONNECT %d\n", port)
 	reply := make([]byte, 0, 32)
 	for b := make([]byte, 1); !bytes.HasSuffix(reply, []byte("\n")) && len(reply) < cap(reply); reply = append(reply, b[0]) {

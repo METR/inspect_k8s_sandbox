@@ -51,7 +51,7 @@ spec:
       {{- if hasKey $podAnnotations . }}{{ fail (printf "services.%s is given the annotation %s, which the chart writes itself: remove it" $name .) }}{{ end }}
       {{- end }}
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
-      {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
+      {{- $noCard := include "agentEnv.noCard" (dict "root" $ "name" $name) }}
       {{- $siblings := include "agentEnv.siblings" (dict "root" $ "name" $name) | fromJsonArray }}
       {{- $aliases := list }}
       {{- $carried := list }}

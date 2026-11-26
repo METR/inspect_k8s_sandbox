@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
 
@@ -21,7 +22,10 @@ var (
 )
 
 // redirect sends the sandbox's TCP connections to siblingRange to the forwarder, and refuses what else it sends there: it needs NET_ADMIN, so it runs once, before any program of the task.
-func redirect([]string) error {
+func redirect(args []string) error {
+	if len(args) > 0 { // one given for help, say, as root on a node, would make ownRange that machine's own
+		return fmt.Errorf("redirect takes no argument, and was given %q", args)
+	}
 	lo, err := net.InterfaceByName("lo")
 	if err != nil {
 		return err

@@ -176,7 +176,7 @@ func relayed(t *testing.T, w *worker) (dial func() *net.TCPConn) {
 	t.Cleanup(func() { l.Close() })
 	go w.serve(l, w.arrive)
 	return func() *net.TCPConn {
-		c, err := net.Dial("tcp", l.Addr().String())
+		c, err := net.DialTimeout("tcp", l.Addr().String(), budget)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -274,6 +274,28 @@ func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T)
 				t.Fatalf("the guest took %q and the sibling's worker read %q, %v: want port 8000, the request, and the reply back", got, reply, err)
 			}
 		})
+	}
+}
+
+func TestSiblingsStreamOutlivesTheWaitForTheForwardersKey(t *testing.T) {
+	key := newKey()
+	wait := 250 * time.Millisecond
+	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.Write(key)
+		io.ReadFull(guest, make([]byte, 2))
+		fromFrames(io.Discard, guest, nil)
+		time.Sleep(2 * wait) // past what the forwarder had to show its key in: left on the connection, that deadline would end the stream here
+		toFrames(guest, strings.NewReader("reply"), nil)
+	}), "", 0)
+	w.keyWait = wait
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	c := relayed(t, w)()
+	c.Write([]byte("\x1f\x40request"))
+	c.CloseWrite()
+	if reply, err := io.ReadAll(c); string(reply) != "reply" || err != nil {
+		t.Fatalf("the sibling's worker read %q, %v: want the reply its guest sent once the wait for the key was long over", reply, err)
 	}
 }
 

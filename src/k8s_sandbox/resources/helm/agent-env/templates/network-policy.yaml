@@ -8,10 +8,10 @@
 {{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
 {{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
-{{- if include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}{{ $unenforced = append $unenforced (printf "which pods reach services.%s over vsock-egress" $svcName) }}{{ end }}
+{{- range include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}{{ if .named }}{{ $unenforced = append $unenforced (printf "which pods reach services.%s over vsock-egress" .service) }}{{ end }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
-{{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
+{{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " (uniq $unenforced))) }}
 {{- end }}
 {{- else -}}
 {{- /* A pod that names an egress proxy takes the last policy of this file in place of sandbox-egress. */}}

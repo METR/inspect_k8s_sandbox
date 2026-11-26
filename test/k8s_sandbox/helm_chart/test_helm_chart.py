@@ -1512,20 +1512,45 @@ def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
     assert "egress-forwarder-key" in exc_info.value.stderr
 
 
+def _peers_with_no_policy(
+    chart_dir: pathlib.Path, dns_record: bool
+) -> list[dict[str, Any]]:
+    """Three services with no network card, no networks and no network policy."""
+    services = ",".join(
+        f"services.{name}.image=agent:1,services.{name}.dnsRecord={str(dns_record).lower()}"
+        for name in ("default", "game", "hidden")
+    )
+    return _run_helm_template(
+        chart_dir,
+        set_str=f"networkPolicy.enabled=false,egressForwarderImage=vsock-egress:1,{services}",
+        set_string=f"annotations.{_NO_CARD}",
+    )
+
+
 def test_network_policy_disabled_refuses_siblings_over_vsock(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+    chart_dir: pathlib.Path,
 ) -> None:
     # A caller shows no key at a worker's port: only an ingress policy says who it is.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _sibling_pods(
-            chart_dir,
-            test_resources_dir,
-            f"annotations.{_NO_CARD}",
-            "networkPolicy.enabled=false",
+        _peers_with_no_policy(chart_dir, dns_record=True)
+    for service in ("default", "game", "hidden"):
+        reached = f"which pods reach services.{service} over vsock-egress"
+        assert exc_info.value.stderr.count(reached) == 1
+
+
+def test_network_policy_disabled_renders_services_no_relay_carries(
+    chart_dir: pathlib.Path,
+) -> None:
+    documents = _peers_with_no_policy(chart_dir, dns_record=False)
+
+    containers = {
+        container["name"]
+        for stateful_set in _get_documents(documents, "StatefulSet")
+        for container in stateful_set["spec"]["template"]["spec"].get(
+            "initContainers", []
         )
-    assert (
-        "which pods reach services.default over vsock-egress" in exc_info.value.stderr
-    )
+    }
+    assert not {_FORWARDER, _REDIRECT} & containers
 
 
 def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy(

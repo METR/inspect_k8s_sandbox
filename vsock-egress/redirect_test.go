@@ -32,9 +32,12 @@ func namespaced(t *testing.T) bool {
 		there.Env = append(os.Environ(), ownNamespace+"=1")
 		there.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNET}
 		out, err := there.CombinedOutput()
-		t.Logf("%s", out) // a test that skips there is named here
+		t.Logf("%s", out)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if bytes.Contains(out, []byte("--- SKIP")) {
+			t.Skip("it skipped there")
 		}
 		return false
 	}
@@ -61,6 +64,24 @@ func redirected(t *testing.T) bool {
 		t.Fatalf("redirect: %v", err)
 	}
 	return true
+}
+
+func TestRedirectGivenAnArgumentChangesNothing(t *testing.T) {
+	if !namespaced(t) {
+		return
+	}
+	if err := redirect([]string{"help"}); err == nil {
+		t.Fatal("redirect took an argument")
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range addrs {
+		if addr.String() == ownRange.String() {
+			t.Fatalf("redirect, given an argument, gave this machine %v", addr)
+		}
+	}
 }
 
 func TestConnectionToASiblingsAddressOpensAStreamThatSaysWhereItWasGoing(t *testing.T) {

@@ -99,7 +99,7 @@ func probeVM(vsock string, wait time.Duration) error {
 
 // greet connects to the canary's port in the guest and reads its greeting.
 func greet(vsock string) error {
-	c, err := guestDial(vsock, canaryPort)
+	c, err := guestDial(vsock, canaryPort, dialWait)
 	if err != nil {
 		return err
 	}
