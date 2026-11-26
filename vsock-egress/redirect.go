@@ -21,7 +21,7 @@ var (
 	deliverTo = netip.MustParseAddr("198.19.0.1")
 )
 
-// redirect sends the sandbox's TCP connections to siblingRange to the forwarder: it needs NET_ADMIN, so it runs once, before any program of the task.
+// redirect sends the sandbox's TCP connections to siblingRange to the forwarder, and refuses what else it sends there: it needs NET_ADMIN, so it runs once, before any program of the task.
 func redirect(args []string) error {
 	flag.NewFlagSet("redirect", flag.ExitOnError).Parse(args) // it has none: -h ends here, before the namespace is changed
 	lo, err := net.InterfaceByName("lo")
@@ -56,16 +56,28 @@ func redirect(args []string) error {
 	chain := c.AddChain(&nftables.Chain{Name: "output", Table: table, Type: nftables.ChainTypeNAT,
 		Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityNATDest})
 	first := siblingRange.Addr().As4()
-	// ip daddr 198.18.0.0/16 meta l4proto tcp redirect to :3128
-	c.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
-		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: net.CIDRMask(siblingRange.Bits(), 32), Xor: make([]byte, 4)},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: first[:]},
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+	// ip daddr 198.18.0.0/16 meta l4proto
+	toSibling := func(then ...expr.Any) []expr.Any {
+		return append([]expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: net.CIDRMask(siblingRange.Bits(), 32), Xor: make([]byte, 4)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: first[:]},
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		}, then...)
+	}
+	// ... tcp redirect to :3128
+	c.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: toSibling(
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
 		&expr.Immediate{Register: 1, Data: binary.BigEndian.AppendUint16(nil, forwarderPort)},
 		&expr.Redir{RegisterProtoMin: 1},
-	}})
+	)})
+	// ... != tcp drop: the range is the sandbox's own, so its own server would take a datagram meant for a sibling, and its own kernel answer a ping
+	sent := c.AddChain(&nftables.Chain{Name: "sent", Table: table, Type: nftables.ChainTypeFilter,
+		Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityFilter})
+	c.AddRule(&nftables.Rule{Table: table, Chain: sent, Exprs: toSibling(
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	)})
 	return c.Flush()
 }
 

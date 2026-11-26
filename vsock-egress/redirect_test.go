@@ -137,6 +137,21 @@ func TestConnectionToASiblingsAddressOpensAStreamThatSaysWhereItWasGoing(t *test
 	}
 }
 
+func TestDatagramToASiblingsAddressIsRefusedWhereItIsSent(t *testing.T) {
+	if !redirected(t) {
+		return
+	}
+	c, err := net.Dial("udp", "198.18.0.2:8000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Nothing carries it, and the address is the sandbox's own: sent, a server of the task's on that port would take it as its sibling's.
+	if _, err := c.Write([]byte("datagram")); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("a datagram to a sibling's address was sent with %v: want it refused", err)
+	}
+}
+
 func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T) {
 	if !redirected(t) {
 		return
