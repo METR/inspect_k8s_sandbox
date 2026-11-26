@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -84,5 +86,15 @@ func TestForwarderStartedAgainGivesNoAddressAnEarlierOneGaveAnotherName(t *testi
 	again := newNames(kept)
 	if later, _ := again.address("later.example"); later == earlier || again.named(earlier) != "" {
 		t.Fatalf("after a restart later.example is at %v and %v stands for %q: want %v to stand for no name", later, earlier, again.named(earlier), earlier)
+	}
+	// One started once every address was given has none that is not an earlier answer's, until those have expired.
+	os.WriteFile(kept, binary.BigEndian.AppendUint32(nil, 1<<(32-nameRange.Bits())-2), 0o600)
+	last := newNames(kept)
+	if addr, room := last.address("last.example"); room {
+		t.Fatalf("a forwarder started after every address was given gave %v at once: want none while an earlier answer may be in use", addr)
+	}
+	last.now = func() time.Time { return last.since.Add(2 * nameTTL) }
+	if _, room := last.address("last.example"); !room {
+		t.Fatal("it has no address still, once the earlier answers have expired")
 	}
 }

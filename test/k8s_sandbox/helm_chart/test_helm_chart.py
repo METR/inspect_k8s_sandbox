@@ -1604,7 +1604,7 @@ def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_relea
     )
 
     pod = stateful_set["spec"]["template"]["spec"]
-    # With no sibling, the init container is there to capture or not at all.
+    # With no sibling it is there to capture, for a listened port, or not at all.
     commands = {
         container["name"]: container["command"][-1]
         for container in pod.get("initContainers", [])

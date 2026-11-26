@@ -21,8 +21,9 @@ type names struct {
 	mu     sync.Mutex
 	byName map[string]*alias
 	byAddr map[netip.Addr]string
-	next   uint32 // addresses given out since the pod started, by this forwarder and any before it
-	kept   string // the file that holds next: a forwarder started again gives no address an earlier one gave another name
+	next   uint32    // addresses given out since the pod started, by this forwarder and any before it
+	since  time.Time // when this forwarder started
+	kept   string    // the file that holds next: a forwarder started again gives no address an earlier one gave another name
 	now    func() time.Time
 }
 
@@ -33,14 +34,14 @@ type alias struct {
 }
 
 func newNames(kept string) *names {
-	n := &names{byName: map[string]*alias{}, byAddr: map[netip.Addr]string{}, kept: kept, now: time.Now}
+	n := &names{byName: map[string]*alias{}, byAddr: map[netip.Addr]string{}, since: time.Now(), kept: kept, now: time.Now}
 	if was, err := os.ReadFile(kept); err == nil && len(was) == 4 {
 		n.next = binary.BigEndian.Uint32(was)
 	}
 	return n
 }
 
-// address is name's own, the same one each time it is asked. With every address given, the name looked up longest ago gives its up, unless an answer with it may still be in use: then there is none.
+// address is name's own, the same one each time it is asked. With every address given, here or by an earlier forwarder, one is given again only once no answer with it can still be in use: until then there is none.
 func (n *names) address(name string) (addr netip.Addr, room bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -51,12 +52,20 @@ func (n *names) address(name string) (addr netip.Addr, room bool) {
 	}
 	hosts := uint32(1)<<(32-nameRange.Bits()) - 2 // but the range's first address and its last
 	if uint32(len(n.byAddr)) < hosts {
+		// With every address given and room in this table, the next was an earlier forwarder's, whose answer with it may still be in use.
+		if n.next >= hosts && now.Sub(n.since) < 2*nameTTL {
+			return netip.Addr{}, false
+		}
 		for taken := true; taken; _, taken = n.byAddr[addr] {
 			first := nameRange.Addr().As4()
 			addr = netip.AddrFrom4([4]byte(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(first[:])+1+n.next%hosts)))
 			n.next++
 		}
-		os.WriteFile(n.kept, binary.BigEndian.AppendUint32(nil, n.next), 0o600)
+		if n.kept != "" {
+			// Whole or not at all: a count cut short would start the addresses over.
+			os.WriteFile(n.kept+".new", binary.BigEndian.AppendUint32(nil, n.next), 0o600)
+			os.Rename(n.kept+".new", n.kept)
+		}
 	} else {
 		var oldest string
 		for held, at := range n.byName {

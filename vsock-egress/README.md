@@ -39,7 +39,9 @@ the program wrote. The forwarder answers the sandbox's DNS lookups itself, those
 (`dnsPolicy: None`), and those sent over UDP to a resolver outside the sandbox: a name gets an address of `198.19.128.0/17` that
 stands for it, and a name with no dot, a question for an IPv6 address or any other record gets none. Past 32,766
 names the one looked up longest ago loses its address to the next, and a forwarder that restarts forgets every name: a
-program that kept an old address is reset, and looks the name up again. A connection is accepted before the proxy
+program that kept an old address is reset, and looks the name up again. An address goes to another name no sooner
+than ten seconds after its last answer or after the forwarder's start, so a program that keeps one longer can reach
+the newer name's host. A connection is accepted before the proxy
 answers for it, and reset if the proxy refuses it or cannot reach its host: a port scan sees every port open. What
 is neither TCP nor a lookup fails where it is sent (`EPERM`). The forwarder holds port 3128 for TCP and for UDP in
 every pod it runs in, and carries 64 connections at once, the pod's siblings' among them.
