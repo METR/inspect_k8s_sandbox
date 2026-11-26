@@ -27,6 +27,8 @@ const (
 	siblingsAnnotation = "inspect-k8s-sandbox/egress-siblings"
 	// portsAnnotation names the ports of the pod its siblings may reach: *, or a list with commas between.
 	portsAnnotation = "inspect-k8s-sandbox/ingress-ports"
+	// listenAnnotation names ports of the pod its worker takes connections on, from whoever the pod's network policy lets in: a list with commas between.
+	listenAnnotation = "inspect-k8s-sandbox/ingress-listen"
 )
 
 var (
@@ -92,9 +94,10 @@ type sandbox struct {
 	root     string // the VM's directory: Firecracker's jail root, which holds vm.vsock
 	uid, gid uint32 // the VM's own: Firecracker runs as them, and so does the VM's worker
 	netns    string
-	target   string // its three annotations
+	target   string // its four annotations
 	siblings string
 	ports    string
+	listen   string
 }
 
 // carried checks what a sandbox's annotations ask its worker to carry.
@@ -122,6 +125,14 @@ func (sb sandbox) carried() error {
 			}
 		}
 	}
+	if sb.listen != "" {
+		for _, port := range strings.Split(sb.listen, ",") {
+			// A worker is no root, so binds no port below 1024, and holds relayPort itself.
+			if n, _ := strconv.Atoi(port); !isPort(port) || n < 1024 || n == relayPort {
+				return fmt.Errorf("its annotation %s is %q, not ports from 1024 to 65535 other than %d, with commas between", listenAnnotation, sb.listen, relayPort)
+			}
+		}
+	}
 	return nil
 }
 
@@ -134,6 +145,7 @@ func (n *node) sandbox(r record) (sandbox, error) {
 		target:   r.Capability.Annotations[proxyAnnotation],
 		siblings: r.Capability.Annotations[siblingsAnnotation],
 		ports:    r.Capability.Annotations[portsAnnotation],
+		listen:   r.Capability.Annotations[listenAnnotation],
 	}
 	st, err := os.Stat(sb.root)
 	if err != nil {
@@ -320,7 +332,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	for _, r := range records {
 		present[r.ContainerID] = true
-		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" {
+		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" && named[listenAnnotation] == "" {
 			continue
 		}
 		sb, err := l.sandbox(r)
@@ -408,7 +420,7 @@ func (l *launcher) pass() error {
 		}
 		l.tried[id] = time.Now()
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
-			"-target", sb.target, "-siblings", sb.siblings, "-ports", sb.ports, "-rate", strconv.Itoa(l.rate))
+			"-target", sb.target, "-siblings", sb.siblings, "-ports", sb.ports, "-listen", sb.listen, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
 			l.fault(id, sb.pod, err)
 			continue

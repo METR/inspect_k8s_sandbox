@@ -1511,6 +1511,53 @@ def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
     assert "egress-forwarder-key" in exc_info.value.stderr
 
 
+_LISTENED = "inspect-k8s-sandbox/ingress-listen"
+
+
+def _listening(
+    chart_dir: pathlib.Path, ports: str, no_card: bool = True
+) -> dict[str, Any]:
+    """The pod of a release's one service, asked to take connections on `ports`."""
+    annotations = [f"services.default.podAnnotations.{_LISTENED}={ports}"]
+    (stateful_set,) = _get_documents(
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1",
+            set_string=",".join(annotations + [f"annotations.{_NO_CARD}"] * no_card),
+        ),
+        "StatefulSet",
+    )
+    return stateful_set["spec"]["template"]
+
+
+def test_a_pod_asked_to_listen_runs_the_forwarder_and_the_redirect(
+    chart_dir: pathlib.Path,
+) -> None:
+    pod = _listening(chart_dir, r"2222\,8022")
+
+    # The forwarder delivers at an address only the redirect makes the pod's own.
+    assert pod["metadata"]["annotations"][_LISTENED] == "2222,8022"
+    assert [c["name"] for c in pod["spec"]["initContainers"]] == [_FORWARDER, _REDIRECT]
+
+
+@pytest.mark.parametrize(
+    ("ports", "no_card"),
+    [
+        pytest.param("2222", False, id="a-pod-with-a-network-card"),
+        pytest.param("1023", True, id="a-port-no-worker-binds"),
+        pytest.param("65536", True, id="past-the-last-port"),
+        pytest.param("3134", True, id="the-workers-own-port"),
+        pytest.param("+2222", True, id="not-digits"),
+    ],
+)
+def test_a_pod_is_asked_to_listen_only_on_ports_its_worker_can_take(
+    chart_dir: pathlib.Path, ports: str, no_card: bool
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _listening(chart_dir, ports, no_card)
+    assert _LISTENED in exc_info.value.stderr
+
+
 def _peers_with_no_policy(
     chart_dir: pathlib.Path, dns_record: bool
 ) -> list[dict[str, Any]]:

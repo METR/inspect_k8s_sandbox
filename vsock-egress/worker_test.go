@@ -174,7 +174,7 @@ func relayed(t *testing.T, w *worker) (dial func() *net.TCPConn) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go w.serve(l, w.arrive)
+	go w.serve(l, func(c net.Conn) { w.arrive(c, 0) })
 	return func() *net.TCPConn {
 		c, err := net.DialTimeout("tcp", l.Addr().String(), budget)
 		if err != nil {
@@ -385,6 +385,46 @@ func TestWorkerStartedForAPodWithSiblingsCarriesItToThemAndThemToIt(t *testing.T
 	c.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...)) // to 198.18.0.2, port 8000
 	if got, want := within(t, took, "connection in the guest"), "\x1f\x40"+string(frame("request")); got != want {
 		t.Fatalf("the guest took %q: want port 8000 and the request, in frames", got)
+	}
+}
+
+func TestWorkerTakesAConnectionToAPortItsPodListensOnIntoTheGuestAtThatPort(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a worker does not run as root")
+	}
+	key := newKey()
+	took := make(chan string, 1)
+	vsock := firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.SetDeadline(time.Now().Add(budget))
+		guest.Write(key)
+		hello := make([]byte, 2+4+len("request"))
+		io.ReadFull(guest, hello)
+		took <- string(hello)
+	})
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+	worker := exec.Command(os.Args[0], "work", "-pod", "ns/pod", "-vsock", vsock, "-listen", strconv.Itoa(port))
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Wait()
+	defer worker.Process.Kill()
+	var c net.Conn
+	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
+		if c, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), budget); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the worker did not come to listen on port %d: %v", port, err)
+		}
+	}
+	defer c.Close()
+	c.Write([]byte("request")) // a client that knows nothing of the relay: it names no port
+	if got, want := within(t, took, "connection in the guest"), string([]byte{byte(port >> 8), byte(port)})+string(frame("request")); got != want {
+		t.Fatalf("the guest took %q: want port %d and the request, in frames", got, port)
 	}
 }
 

@@ -68,8 +68,15 @@ spec:
       {{- range $service.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $served = append $served (toString .port) }}{{ end }}{{ end }}
       {{- $taken := and $siblings (include "shouldCreateDnsRecord" $service) (or $served (not $service.ports)) }}
       {{- if $taken }}{{ $_ := set $podAnnotations "inspect-k8s-sandbox/ingress-ports" (join "," $served | default "*") }}{{ end }}
-      {{- /* With neither annotation the node starts the pod no worker, and its forwarder would never be ready. */}}
-      {{- $relayed := or $carried $taken }}
+      {{- /* Ports the pod's worker takes connections on, from whoever the release's network policies let in: a worker is no root, and holds 3134 itself. */}}
+      {{- $listened := get $podAnnotations "inspect-k8s-sandbox/ingress-listen" }}
+      {{- if $listened }}
+      {{- range splitList "," $listened }}
+      {{- if or (not $noCard) (not (regexMatch "^[1-9][0-9]{3,4}$" .)) (lt (atoi .) 1024) (gt (atoi .) 65535) (eq . "3134") }}{{ fail (printf "services.%s has the annotation inspect-k8s-sandbox/ingress-listen %q: it takes ports from 1024 to 65535 other than 3134, with commas between, on a pod with no network device" $name $listened) }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- /* With none of the three annotations the node starts the pod no worker, and its forwarder would never be ready. */}}
+      {{- $relayed := or $carried $taken $listened }}
       {{- $forwarder := or $egressProxy $relayed }}
       {{- if and $forwarder (has "3128" $served) }}{{ fail (printf "services.%s declares TCP port 3128, which its pod's egress forwarder holds: use another port" $name) }}{{ end }}
       {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
@@ -149,7 +156,7 @@ spec:
         {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
         {{- /* Longer than a service's name can be, as <fullname>-<service> names its StatefulSet in 63 characters: a rule on exec by this name catches no service's container. */}}
         - name: egress-forwarder-with-a-name-too-long-for-any-service-to-share
-          image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
+          image: {{ required "set egressForwarderImage: a pod annotated inspect-k8s-sandbox/egress-proxy or inspect-k8s-sandbox/ingress-listen runs vsock-egress's forwarder" $.Values.egressForwarderImage | quote }}
           command: ["/vsock-egress", "forward", "-key", "/key/key"]
           restartPolicy: Always
           {{- /* Equal, as every container's must be for the pod to be of the Guaranteed QoS class. */}}

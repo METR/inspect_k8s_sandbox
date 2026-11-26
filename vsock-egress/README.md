@@ -26,6 +26,12 @@ HTTP proxy needs its siblings' names in `no_proxy`. A pod's connections to its s
 container alone, as the chart renders it and from the image you built, on a pod with no network device, and refuse
 exec into it.
 
+A pod with no network device that carries the annotation `inspect-k8s-sandbox/ingress-listen` is reached from outside
+its release too: its worker takes a connection on each port the annotation lists (1024 to 65535 other than 3134, with
+commas between) and hands it to the same port in the sandbox, at `198.19.0.1`, so such a pod runs the forwarder and
+the redirect whatever its siblings. The chart adds no network policy for those ports: yours says who reaches them. A
+connection made before the sandbox's server listens is accepted and then reset.
+
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:
@@ -69,7 +75,7 @@ them, has one word to alarm on:
   sandbox of that uid gets a worker meanwhile. Again each minute while that lasts.
 - `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
 - `<pod>: proxy_unreached: <why>`, then `<pod>: proxy_unreached: <n> streams since the last report` each minute.
-- `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open, of which its siblings may hold 64`
+- `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open, of which those made to the pod may hold 64`
   and `<pod>: key_unfetched: <why>`, then their counts each minute: what a sandbox or its siblings can cause. Until a
   fetch of the key succeeds its streams are refused.
 - `<pod>: sibling_unreached: <why>` and `<pod>: guest_unreached: <why>`, then their counts each minute: the worker
