@@ -74,6 +74,8 @@ spec:
       {{- /* With none of the three annotations the node starts the pod no worker, and its forwarder would never be ready. */}}
       {{- $relayed := or $carried $taken $listened }}
       {{- $forwarder := or $egressProxy $relayed }}
+      {{- /* With egressCapture the pod's every connection and lookup goes to its forwarder, for the proxy it names: a network device's own routes would not survive that. */}}
+      {{- $captured := and $egressProxy $.Values.egressCapture $noCard }}
       {{- range $service.ports }}
       {{- if and $forwarder (eq (toString .port) "3128") (has (default "TCP" .protocol | upper) (list "TCP" "UDP")) }}{{ fail (printf "services.%s declares port 3128, which its pod's egress forwarder holds for TCP and for UDP: use another port" $name) }}{{ end }}
       {{- end }}
@@ -108,8 +110,8 @@ spec:
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
-      {{- if $.Values.corednsUpstream }}
-      {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
+      {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. Captured, every name a search list made would get an address from the forwarder. */}}
+      {{- if or $.Values.corednsUpstream $captured }}
       dnsPolicy: None
       dnsConfig:
         nameservers:
@@ -187,8 +189,6 @@ spec:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
       {{- end }}
-      {{- /* With egressCapture the pod's every connection and lookup goes to its forwarder, for the proxy it names: a network device's own routes would not survive that. */}}
-      {{- $captured := and $egressProxy $.Values.egressCapture $noCard }}
       {{- if or $relayed $captured }}
         {{- /* Ahead of every container that runs an image of the task's: the rule it installs needs NET_ADMIN once, and none of them gets it. */}}
         - name: egress-redirector-with-a-name-too-long-for-any-service-to-share

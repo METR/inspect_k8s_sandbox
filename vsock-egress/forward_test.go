@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -409,6 +410,19 @@ func TestForwardTakesItsSiblingsConnectionsFromTheNodeAlone(t *testing.T) {
 	c.SetDeadline(time.Now().Add(budget))
 	if n, err := c.Read(make([]byte, 1)); n != 0 || err != io.EOF {
 		t.Fatalf("a process of the VM read %d bytes, %v, at the port for siblings' connections: want it closed with no key", n, err)
+	}
+}
+
+func TestForwardAnswersLookupsAtItsProxyPort(t *testing.T) {
+	addr := forwarding(t)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	// Where capture sends a sandbox's lookups: the proxy's port, over UDP.
+	asks := net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	}}
+	if got, err := asks.LookupHost(ctx, "example.com"); err != nil || len(got) != 1 || !nameRange.Contains(netip.MustParseAddr(got[0])) {
+		t.Fatalf("example.com, asked of forward at %v, resolved to %v, %v: want one address of %v", addr, got, err, nameRange)
 	}
 }
 

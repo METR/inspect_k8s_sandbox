@@ -106,6 +106,16 @@ func TestCaptureFailsWhereTheForwarderGetsNothingOfWhatItRedirects(t *testing.T)
 	}
 }
 
+// reset reads a connection the forwarder is to reset to its end: the reset may land before the dial returns, which then fails with it.
+func reset(c net.Conn, err error) (int64, error) {
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(budget))
+	return io.Copy(io.Discard, c)
+}
+
 // asked takes the next stream at node as the proxy: it returns what the forwarder asked for after its key, once it has answered with reply, a frame for each part.
 func asked(t *testing.T, f *forwarder, node *vsockListener, reply ...string) chan string {
 	requests := make(chan string, 1)
@@ -186,14 +196,9 @@ func TestCapturedConnectionTheProxyRefusesIsReset(t *testing.T) {
 		return
 	}
 	requests := asked(t, f, node, "HTTP/1.1 403 Forbidden\r\n\r\nHawk's egress proxy refused this request")
-	c, err := net.DialTimeout("tcp", "203.0.113.9:443", budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+	read, err := reset(net.DialTimeout("tcp", "203.0.113.9:443", budget))
 	within(t, requests, "stream to the proxy")
-	c.SetDeadline(time.Now().Add(budget))
-	if read, err := io.Copy(io.Discard, c); read != 0 || !errors.Is(err, syscall.ECONNRESET) {
+	if read != 0 || !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("the refused connection gave %d bytes and ended with %v: want a reset, and none of the proxy's answer", read, err)
 	}
 }
@@ -237,13 +242,7 @@ func TestCapturedSandboxSendsNothingButTCPAndLookups(t *testing.T) {
 		t.Fatalf("the sandbox's own resolver at %v read %d bytes, %v: want the question sent to it", own.LocalAddr(), size, err)
 	}
 	// An address of the range that this forwarder gave no name.
-	c, err := net.DialTimeout("tcp", "198.19.200.200:443", budget)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	c.SetDeadline(time.Now().Add(budget))
-	if _, err := io.Copy(io.Discard, c); !errors.Is(err, syscall.ECONNRESET) {
+	if _, err := reset(net.DialTimeout("tcp", "198.19.200.200:443", budget)); !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("a connection to an address no name was given ended with %v: want a reset", err)
 	}
 	select {

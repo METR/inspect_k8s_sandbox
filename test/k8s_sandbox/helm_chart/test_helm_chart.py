@@ -1603,14 +1603,18 @@ def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_relea
         "StatefulSet",
     )
 
+    pod = stateful_set["spec"]["template"]["spec"]
     # With no sibling, the init container is there to capture or not at all.
     commands = {
         container["name"]: container["command"][-1]
-        for container in stateful_set["spec"]["template"]["spec"].get(
-            "initContainers", []
-        )
+        for container in pod.get("initContainers", [])
     }
     assert commands.get(_REDIRECT) == command
+    # No search list: the forwarder would give each name it made an address.
+    assert pod.get("dnsConfig") == (
+        {"nameservers": ["127.0.0.1"]} if command == "capture" else None
+    )
+    assert pod.get("dnsPolicy") == ("None" if command == "capture" else None)
 
 
 def _peers_with_no_policy(

@@ -78,8 +78,8 @@
   sends that proxy every TCP connection it makes, and its DNS lookups get addresses that
   stand for the names. UDP and ICMP fail where they are sent, and a connection the proxy
   refuses or cannot place is accepted and then reset. Admit the init container's command
-  `vsock-egress capture` as you admit `redirect`. The chart now refuses a service that
-  declares UDP port 3128 on a pod with the forwarder too.
+  `vsock-egress capture` as you admit `redirect`, and the pod's `dnsPolicy: None`. The
+  chart now refuses a service that declares UDP port 3128 on a pod with the forwarder too.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
