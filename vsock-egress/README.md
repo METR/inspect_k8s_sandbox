@@ -15,15 +15,15 @@ upload uncompleted, or its end unacknowledged, for five minutes, and the forward
 client and its reply.
 
 In a release whose `egressForwarderImage` is set, a pod with no network device also reaches the services it shares a
-network with, and they reach it. The chart gives each service of the release an address in `198.18.0.0/16` and names it
-in the pod's `/etc/hosts`; an init container runs `vsock-egress redirect` once, as root with `NET_ADMIN`, which makes
-`198.18.0.0/15` the VM's own and redirects every TCP connection to `198.18.0.0/16` to the forwarder. The pod's worker
-carries it to port 3134 of the sibling's pod, where that pod's worker hands it into its VM, to the port the program
-asked for at `198.19.0.1`: a server that listens on every address takes it, and one on `127.0.0.1` alone does not. The
-release's ingress policies decide which pods reach port 3134, and a service that declares `ports` takes connections to
-those alone. UDP and ICMP are not carried. A connection to a port with no server behind it is accepted and then reset.
-Admit `NET_ADMIN` for that init container alone, as the chart renders it, on a pod with no network device, and refuse
-exec into it.
+network with, over TCP, and they reach it. An init container runs `vsock-egress redirect` once, as root with
+`NET_ADMIN`: it makes `198.18.0.0/15` the VM's own, where each sibling has an address in `198.18.0.0/16`. A sibling's
+connection arrives at `198.19.0.1` from `198.18.0.0`, whichever sibling made it, so a server takes it only if it
+listens on every address. A connection to a port with no server is accepted and then reset: a readiness check has to
+exchange data. A program that uses the pod's HTTP proxy needs its siblings' names in `no_proxy`. A pod's connections
+to its siblings count among its forwarder's 64, and those its siblings make to it among its worker's 128. A pod's
+worker reaches a sibling's at port 3134 of its pod: the release's ingress policies decide which pods reach that port,
+so the chart refuses `networkPolicy.enabled: false` here. Admit `NET_ADMIN` for that init container alone, as the
+chart renders it and from the image you built, on a pod with no network device, and refuse exec into it.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
@@ -56,7 +56,7 @@ address from their caller. To bound what runs there, refuse exec into this conta
 
 A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
 A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
-launchers be replaced before the forwarders. A worker from before this version carries no pod to its siblings.
+launchers be replaced before the forwarders.
 
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails, and `forward_failed:
 <why>` when it ends with an error. Each line the launcher's container writes about a failure, its workers' among
@@ -68,12 +68,13 @@ them, has one word to alarm on:
   sandbox of that uid gets a worker meanwhile. Again each minute while that lasts.
 - `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
 - `<pod>: proxy_unreached: <why>`, then `<pod>: proxy_unreached: <n> streams since the last report` each minute.
-- `<pod>: streams_refused: a stream with no key, to no sibling of the pod's or no port it serves, or past the 128 open`
+- `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open`
   and `<pod>: key_unfetched: <why>`, then their counts each minute: what a sandbox or its siblings can cause. Until a
   fetch of the key succeeds its streams are refused.
 - `<pod>: sibling_unreached: <why>` and `<pod>: guest_unreached: <why>`, then their counts each minute: the worker
-  could not reach a sibling's worker, or its own VM's forwarder for a sibling's connection.
+  could not reach a sibling's worker, or its own VM's forwarder for a sibling's connection. A sandbox or its siblings
+  can cause both: a sibling that is not up yet is one.
 
-`gate.sh` proves the whole path with real traffic on a node set aside for it. It runs `vsock-egress check` there,
+`gate.sh` proves the path to the proxy with real traffic on a node set aside for it. It runs `vsock-egress check` there,
 which names the assumption about AWS's runtime that broke. The `canary` that `check` meets in the sandbox ends by
 itself after 90 seconds: start `check` within them.

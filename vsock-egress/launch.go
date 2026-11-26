@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,8 +33,7 @@ var (
 	// A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
 	proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([0-9]{1,5})$`)
 	// A sibling is an address of siblingRange and a Service of the pod's own namespace.
-	siblingTarget = regexp.MustCompile(`^198\.18\.[0-9]{1,3}\.[0-9]{1,3}=[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?$`)
-	servedPorts   = regexp.MustCompile(`^(\*|[0-9]{1,5}(,[0-9]{1,5})*)$`)
+	siblingTarget = regexp.MustCompile(`^([0-9.]+)=[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?$`)
 )
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
@@ -105,13 +105,22 @@ func (sb sandbox) carried() error {
 	}
 	if sb.siblings != "" {
 		for _, sibling := range strings.Split(sb.siblings, ",") {
-			if m := siblingTarget.FindStringSubmatch(sibling); m == nil || m[2] != namespace {
+			var at netip.Addr // none, where the annotation gives no address: no range holds it
+			m := siblingTarget.FindStringSubmatch(sibling)
+			if m != nil {
+				at, _ = netip.ParseAddr(m[1])
+			}
+			if m == nil || m[3] != namespace || !siblingRange.Contains(at) {
 				return fmt.Errorf("its annotation %s is %q, not <address in %s>=<service>.<its namespace>.svc.cluster.local, with commas between", siblingsAnnotation, sb.siblings, siblingRange)
 			}
 		}
 	}
-	if sb.ports != "" && !servedPorts.MatchString(sb.ports) {
-		return fmt.Errorf("its annotation %s is %q, not * or ports with commas between", portsAnnotation, sb.ports)
+	if sb.ports != "" && sb.ports != "*" {
+		for _, port := range strings.Split(sb.ports, ",") {
+			if !isPort(port) {
+				return fmt.Errorf("its annotation %s is %q, not * or ports from 1 to 65535 with commas between", portsAnnotation, sb.ports)
+			}
+		}
 	}
 	return nil
 }
@@ -311,10 +320,10 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	for _, r := range records {
 		present[r.ContainerID] = true
-		sb, err := l.sandbox(r)
-		if sb.target == "" && sb.siblings == "" && sb.ports == "" {
+		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" {
 			continue
 		}
+		sb, err := l.sandbox(r)
 		gone := errors.Is(err, os.ErrNotExist)
 		l.had[r.ContainerID] = l.had[r.ContainerID] || !gone
 		if err == nil {

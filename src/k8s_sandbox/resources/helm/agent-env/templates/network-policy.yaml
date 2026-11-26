@@ -8,6 +8,7 @@
 {{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
 {{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
+{{- if include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}{{ $unenforced = append $unenforced (printf "which pods reach services.%s over vsock-egress" $svcName) }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
 {{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
@@ -327,9 +328,12 @@ spec:
           rules:
             dns:
               - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
-              {{- $siblings := include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}
-              {{- range $siblings }}
+              {{- $carried := list }}
+              {{- range include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}
+              {{- if .named }}
+              {{- $carried = append $carried .service }}
               - matchName: {{ printf "%s-%s.%s.svc.cluster.local" (include "agentEnv.fullname" $) .service $.Release.Namespace | quote }}
+              {{- end }}
               {{- end }}
     - toEndpoints:
       - matchLabels:
@@ -339,9 +343,19 @@ spec:
         - ports:
             - port: {{ regexFind "[0-9]+$" $proxy | quote }}
               protocol: TCP
-            {{- if $siblings }}
+    {{- with $carried }}
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
+          {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
+        matchExpressions:
+          - key: inspect/service
+            operator: In
+            values: {{ toJson . }}
+      toPorts:
+        - ports:
             - port: "3134"
               protocol: TCP
-            {{- end }}
+    {{- end }}
 {{- end }}
 {{- end }}

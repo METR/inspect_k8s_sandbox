@@ -9,17 +9,17 @@ import (
 )
 
 const (
-	streamPort  = 3129 // the sandbox dials this vsock port on the node, once for each proxy connection
-	keyPort     = 3130 // the sandbox serves its key on this vsock port, to the node alone
-	canaryPort  = 3131 // check and canary meet on this vsock port, both ways
-	siblingPort = 3132 // the sandbox dials this vsock port on the node, once for each connection to a sibling service
-	inboundPort = 3133 // the sandbox serves this vsock port to the node, once for each connection a sibling makes to it
-	capturePort = 3127 // redirect sends the sandbox's connections to its siblings to this TCP port of the forwarder
-	relayPort   = 3134 // a worker serves this TCP port in its pod's network namespace to the workers of the pod's siblings
-	hostCID     = 2
-	keySize     = 32
-	maxStreams  = 64  // a sandbox's streams at once: the forwarder holds the next back until one ends
-	maxWaiting  = 448 // connections the forwarder holds back at once: the next is reset
+	streamPort    = 3129 // the sandbox dials this vsock port on the node, once for each proxy connection
+	keyPort       = 3130 // the sandbox serves its key on this vsock port, to the node alone
+	canaryPort    = 3131 // check and canary meet on this vsock port, both ways
+	siblingPort   = 3132 // the sandbox dials this vsock port on the node, once for each connection to a sibling service
+	inboundPort   = 3133 // the sandbox serves this vsock port to the node, once for each connection a sibling makes to it
+	forwarderPort = 3128 // the forwarder's TCP port in the sandbox: its programs' HTTP proxy, and where redirect sends their connections to siblings
+	relayPort     = 3134 // a worker serves this TCP port in its pod's network namespace to the workers of the pod's siblings
+	hostCID       = 2
+	keySize       = 32
+	maxStreams    = 64  // a sandbox's streams at once: the forwarder holds the next back until one ends
+	maxWaiting    = 448 // connections the forwarder holds back at once: the next is reset
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second

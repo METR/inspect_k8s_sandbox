@@ -69,7 +69,7 @@ func id(c string) string { return strings.Repeat(c, 64) }
 func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testing.T) {
 	proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}
 	siblings := func(named string) map[string]string {
-		return map[string]string{siblingsAnnotation: named, portsAnnotation: "*"}
+		return map[string]string{siblingsAnnotation: named}
 	}
 	for name, tc := range map[string]struct {
 		ifName      string
@@ -92,9 +92,11 @@ func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testi
 		"a sibling of another namespace":  {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.other.svc.cluster.local."), vmUID, false},
 		"a sibling that is an address":    {"eth0", siblings("198.18.0.2=10.0.0.9"), vmUID, false},
 		"a sibling at another address":    {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
+		"a sibling at no address":         {"eth0", siblings("198.18.0.256=game.ns.svc.cluster.local."), vmUID, false},
 		"more than a sibling":             {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
+		"every port and no sibling":       {"eth0", map[string]string{portsAnnotation: "*"}, vmUID, true},
 		"ports and no sibling":            {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
-		"more than ports":                 {"eth0", map[string]string{portsAnnotation: "8000 -rate=1"}, vmUID, false},
+		"a served port past the last":     {"eth0", map[string]string{portsAnnotation: "8000,65536"}, vmUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.uid != vmUID && os.Geteuid() != 0 {
@@ -515,7 +517,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	l.reap = budget
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
-	addSandbox(t, l, id("b"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID+1)
+	addSandbox(t, l, id("b"), "eth0", map[string]string{siblingsAnnotation: "198.18.0.2=game.ns.svc.cluster.local.", portsAnnotation: "8000"}, vmUID+1)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
 			w.end(budget)
@@ -526,10 +528,15 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	}
 	first, other := l.workers[id("a")], l.workers[id("b")]
 	if first == nil || other == nil {
-		t.Fatal("no worker for a sandbox that names a proxy")
+		t.Fatal("no worker for a sandbox that names a proxy, or for one that names siblings")
 	}
 	listening(t, l, id("a"))
 	listening(t, l, id("b"))
+	// A worker carries its pod only to what the launcher hands it from the pod's annotations.
+	named := "\x00-siblings\x00198.18.0.2=game.ns.svc.cluster.local.\x00-ports\x008000\x00"
+	if argv, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", other.cmd.Process.Pid)); !strings.Contains(string(argv), named) {
+		t.Fatalf("the worker was started as %q (%v): want its pod's siblings and ports", argv, err)
+	}
 	pid := first.cmd.Process.Pid
 	uids, caps := fmt.Sprintf("%d %[1]d %[1]d %[1]d", vmUID), "0000000000000000"
 	if got := status(t, pid, "Uid"); got != uids {

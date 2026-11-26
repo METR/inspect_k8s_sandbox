@@ -28,18 +28,16 @@ type forwarder struct {
 	queue    chan struct{} // one for each connection it carries or holds back
 	wait     time.Duration // how long a connection is held back for a place
 	connect  func(cid, port uint32) (*os.File, error)
-	original func(*net.TCPConn) (netip.AddrPort, error) // where a connection was going before redirect sent it here
-	deliver  netip.Addr                                 // where a sibling's connection to this pod is handed over
 }
 
 func newForwarder(host, port uint32) *forwarder {
 	return &forwarder{host: host, port: port, siblings: siblingPort, slots: make(chan struct{}, maxStreams),
-		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial, original: originalDst, deliver: deliverTo}
+		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
 func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
-	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
+	addr := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", forwarderPort), "the address the sandbox's programs use as their HTTP proxy")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
 	f := newForwarder(hostCID, streamPort)
@@ -57,11 +55,6 @@ func forward(args []string) error {
 	if err != nil {
 		return err
 	}
-	captured, err := listen(fmt.Sprintf("127.0.0.1:%d", capturePort), clientBuffer)
-	if err != nil {
-		return err
-	}
-	go f.serve(captured, f.captured)
 	arrivals, err := vsockListen(inboundPort)
 	if err != nil {
 		return err
@@ -71,7 +64,7 @@ func forward(args []string) error {
 	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
 		return err
 	}
-	return f.serve(l, f.proxied)
+	return f.serve(l)
 }
 
 // readySuffix names the file beside the key that is there while the forwarder listens on all of its ports.
@@ -151,7 +144,7 @@ func (f *forwarder) arrive(c *os.File) {
 	}
 	var t net.Conn
 	if err == nil {
-		t, err = net.DialTimeout("tcp", netip.AddrPortFrom(f.deliver, binary.BigEndian.Uint16(port)).String(), dialWait)
+		t, err = net.DialTimeout("tcp", netip.AddrPortFrom(deliverTo, binary.BigEndian.Uint16(port)).String(), dialWait)
 	}
 	if err != nil { // no server on that port, say: the node resets the sibling's connection
 		c.Close()
@@ -172,22 +165,7 @@ func listen(addr string, buffer int) (net.Listener, error) {
 	return held.Listen(context.Background(), "tcp", addr)
 }
 
-// proxied carries a connection to the proxy port: its program says where it wants to go.
-func (f *forwarder) proxied(c *net.TCPConn) { f.stream(c, f.port, nil) }
-
-// captured carries a connection that redirect sent here to the sibling it was going to: the node knows which Service that address is.
-func (f *forwarder) captured(c *net.TCPConn) {
-	to, err := f.original(c)
-	if err != nil { // dialled here itself, and going to no sibling
-		c.SetLinger(0)
-		c.Close()
-		return
-	}
-	asked, _ := to.MarshalBinary() // the address's 4 bytes, then the port's 2
-	f.stream(c, f.siblings, asked)
-}
-
-func (f *forwarder) serve(l net.Listener, carry func(*net.TCPConn)) error {
+func (f *forwarder) serve(l net.Listener) error {
 	for {
 		c, err := l.Accept()
 		if errors.Is(err, net.ErrClosed) {
@@ -202,7 +180,7 @@ func (f *forwarder) serve(l net.Listener, carry func(*net.TCPConn)) error {
 		case f.queue <- struct{}{}:
 			go func() {
 				defer func() { <-f.queue }()
-				carry(c.(*net.TCPConn))
+				f.stream(c.(*net.TCPConn))
 			}()
 		default:
 			c.(*net.TCPConn).SetLinger(0)
@@ -214,8 +192,12 @@ func (f *forwarder) serve(l net.Listener, carry func(*net.TCPConn)) error {
 // clientBuffer caps a stream's socket to its client each way, and the kernel accounts twice it: it bounds what the streams a guest stalls hold, under the forwarder's memory limit in the chart, and is smaller than the worker's proxyBuffer because loopback needs no more.
 const clientBuffer = 128 << 10
 
-// stream carries one of the sandbox's connections to the node's vsock port, on a vsock connection of its own that opens with the key and then asked.
-func (f *forwarder) stream(c *net.TCPConn, port uint32, asked []byte) {
+// stream carries one of the sandbox's connections to the node on a vsock connection of its own: to the sibling redirect found it going to, named after the key, or else to the proxy.
+func (f *forwarder) stream(c *net.TCPConn) {
+	port, asked := f.port, []byte(nil)
+	if to, err := originalDst(c); err == nil && siblingRange.Contains(to.Addr()) {
+		port, asked = f.siblings, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
+	}
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:

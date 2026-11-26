@@ -76,23 +76,25 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 {{- end -}}
 
-{{/*
-The siblings vsock-egress carries a service's pod to, as a JSON list of each one's service and the address that stands
-for it in the sandbox: those the pod shares a network with, by the rule of the ingress policies. None unless the pod has
-no network device and the release a forwarder image. Takes a dict of root ($) and name.
-*/}}
+{{/* Whether a service's pod has no network device, by the annotations its template gives it. Takes a dict of root ($) and name. */}}
+{{- define "agentEnv.noCard" -}}
+{{- $annotations := deepCopy (default (dict) .root.Values.annotations) -}}
+{{- range $key, $value := (get .root.Values.services .name).podAnnotations }}{{ $_ := set $annotations $key $value }}{{ end -}}
+{{- if eq (get $annotations "sandbox.amazonaws.com/network-isolated") "true" }}true{{ end -}}
+{{- end -}}
+
+{{/* A service's siblings over vsock-egress, as a JSON list of {service, address, named}: those with no network device on a network of its; named, if a DNS record lets its pod find one. Takes a dict of root ($) and name. */}}
 {{- define "agentEnv.siblings" -}}
 {{- $own := get .root.Values.services .name -}}
-{{- $annotations := merge (dict) (default (dict) $own.podAnnotations) (default (dict) .root.Values.annotations) -}}
 {{- $siblings := list -}}
-{{- if and (eq (get $annotations "sandbox.amazonaws.com/network-isolated") "true") .root.Values.egressForwarderImage (not $own.networkIsolated) -}}
+{{- if and (include "agentEnv.noCard" .) .root.Values.egressForwarderImage (not $own.networkIsolated) -}}
 {{- $index := 0 -}}
 {{- range $name, $service := .root.Values.services -}}
 {{- $index = add1 $index -}}
 {{- $shared := not $.root.Values.networks -}}
 {{- range $own.networks }}{{ if has . (default (list) $service.networks) }}{{ $shared = true }}{{ end }}{{ end -}}
-{{- if and (ne $name $.name) $shared (not $service.networkIsolated) -}}
-{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256))) -}}
+{{- if and (ne $name $.name) $shared (not $service.networkIsolated) (include "agentEnv.noCard" (dict "root" $.root "name" $name)) -}}
+{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256)) "named" (ne (include "shouldCreateDnsRecord" $service) "")) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -120,14 +122,15 @@ true
 {{- $yaml -}}
 {{- end -}}
 
-{{/* Render a deduped list of ports for a single service object (svc), and the port its pod's worker takes its siblings' connections at where vsock-egress carries them (relayed). */}}
+{{/* Render a deduped list of ports for a single service object (svc), and where vsock-egress carries its siblings to a TCP port of its (relayed), the port its pod's worker takes them at. */}}
 {{- define "agentEnv.servicePortsListFor" -}}
 {{- $seen := dict -}}
 {{- $out := list -}}
-{{- if .relayed }}{{ $out = append $out (dict "port" "3134" "protocol" "TCP") }}{{ end -}}
+{{- $tcp := false -}}
 {{- with .svc }}
   {{- range .ports }}
     {{- $proto := (default "TCP" .protocol) | upper -}}
+    {{- if eq $proto "TCP" }}{{ $tcp = true }}{{ end -}}
     {{- $key := printf "%s/%v" $proto .port -}}
     {{- if not (hasKey $seen $key) -}}
       {{- $_ := set $seen $key true -}}
@@ -135,5 +138,6 @@ true
     {{- end }}
   {{- end }}
 {{- end }}
+{{- if and .relayed $tcp (not (hasKey $seen "TCP/3134")) }}{{ $out = append $out (dict "port" "3134" "protocol" "TCP") }}{{ end -}}
 {{ include "agentEnv.toYaml" $out -}}
 {{- end -}}

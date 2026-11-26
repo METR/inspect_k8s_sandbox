@@ -51,10 +51,14 @@ type worker struct {
 // target is a place the worker dials for its sandbox, as host:port.
 type target struct {
 	name       string
+	fresh      time.Duration             // how long its address is used before its name is asked again: 0 for until a dial fails
 	addr       atomic.Pointer[string]    // its address, once looked up
 	asked      atomic.Pointer[time.Time] // when that was: a Time, whose monotonic reading no step of the node's clock moves
 	unresolved atomic.Pointer[failedLookup]
 }
+
+// siblingFresh is the cluster DNS's own time to live for a Service: a sibling's names its pod, whose address another sibling's pod can take once it is replaced, and that one's worker would answer.
+const siblingFresh = 5 * time.Second
 
 // workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest.
 const workerStreams = 2 * maxStreams
@@ -90,7 +94,7 @@ func (w *worker) annotated(siblings, ports string) error {
 		if err != nil {
 			return err
 		}
-		w.siblings[addr] = &target{name: net.JoinHostPort(host, strconv.Itoa(relayPort))}
+		w.siblings[addr] = &target{name: net.JoinHostPort(host, strconv.Itoa(relayPort)), fresh: siblingFresh}
 	}
 	if ports == "*" {
 		return nil
@@ -128,7 +132,7 @@ func (w *worker) report() {
 // refuse counts a stream turned away; the first of each report is written at once.
 func (w *worker) refuse() {
 	if w.refused.Add(1) == 1 {
-		log.Printf("streams_refused: a stream with no key, to no sibling of the pod's or no port it serves, or past the %d open", workerStreams)
+		log.Printf("streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the %d open", workerStreams)
 	}
 }
 
@@ -202,7 +206,7 @@ func (w *worker) serve(l net.Listener, carry func(net.Conn)) error {
 func (w *worker) proxied(c net.Conn) { w.stream(c, 0) }
 
 // sibling joins one to the worker of the sibling whose address follows the key, and tells that worker the port.
-func (w *worker) sibling(c net.Conn) { w.stream(c, 6) }
+func (w *worker) sibling(c net.Conn) { w.stream(c, net.IPv4len+2) }
 
 // stream reads the key and the asked bytes that say where one of the guest's connections was going, and joins it to there.
 func (w *worker) stream(c net.Conn, asked int) {
@@ -213,10 +217,8 @@ func (w *worker) stream(c net.Conn, asked int) {
 	keyed := err == nil && w.holds(hello[:keySize])
 	<-w.unkeyed
 	to, port, unreached, word := w.proxy, []byte(nil), &w.failed, "proxy_unreached"
-	if asked > 0 {
-		var going netip.AddrPort
-		going.UnmarshalBinary(hello[keySize:])
-		to, port, unreached, word = w.siblings[going.Addr()], binary.BigEndian.AppendUint16(nil, going.Port()), &w.unreached, "sibling_unreached"
+	if asked > 0 { // the address the connection was going to, then its port, which the sibling's worker reads as it is
+		to, port, unreached, word = w.siblings[netip.AddrFrom4([4]byte(hello[keySize:]))], hello[keySize+4:], &w.unreached, "sibling_unreached"
 	}
 	if !keyed || to == nil {
 		w.refuse()
@@ -240,6 +242,10 @@ func (w *worker) stream(c net.Conn, asked int) {
 		// The forwarder's startup probe ends its stream at once: one that came before the proxy is no stream that failed.
 		c.SetReadDeadline(time.Now().Add(endedWait))
 		if _, ended := c.Read(make([]byte, 1)); ended == io.EOF {
+			return
+		}
+		if to.name == "" { // its pod names no proxy: the sandbox sent this itself, and no proxy failed
+			w.refuse()
 			return
 		}
 		if unreached.Add(1) == 1 { // the first of each report says why
@@ -293,13 +299,16 @@ func (w *worker) arrive(c net.Conn) {
 		return
 	}
 	g.SetDeadline(time.Time{})
-	tcp.SetLinger(-1)
 	join(g, tcp, w.pace, w.stall)
 }
 
 // dial connects to t. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a target that is down nor a name that does not resolve may cost a lookup a stream.
 func (w *worker) dial(t *target) (net.Conn, error) {
 	addr := t.addr.Load()
+	if addr != nil && t.fresh > 0 && w.now().Sub(*t.asked.Load()) >= t.fresh {
+		t.addr.CompareAndSwap(addr, nil)
+		addr = nil
+	}
 	if addr == nil { // under no lock: streams that ask during a lookup share it, each for dialWait at most
 		if t.name == "" {
 			return nil, errors.New("its pod names none")

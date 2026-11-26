@@ -971,6 +971,7 @@ def test_coredns_security_context_can_be_overridden(chart_dir: Path) -> None:
 
 _EGRESS_PROXY = "inspect-k8s-sandbox/egress-proxy=proxy.default.svc.cluster.local.:3128"
 _FORWARDER = "egress-forwarder-with-a-name-too-long-for-any-service-to-share"
+_REDIRECT = "egress-redirector-with-a-name-too-long-for-any-service-to-share"
 
 
 def test_egress_proxy_annotation_puts_the_forwarder_ahead_of_the_pod(
@@ -1025,22 +1026,23 @@ def test_egress_proxy_annotation_can_name_a_service_of_the_release(
     assert pod["spec"]["initContainers"][0]["name"] == _FORWARDER
 
 
-def test_no_service_can_share_the_egress_forwarders_container_name(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+@pytest.mark.parametrize("name", [_FORWARDER, _REDIRECT])
+def test_no_service_can_share_the_name_of_a_container_vsock_egress_runs_in(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, name: str
 ) -> None:
     documents = _run_helm_template(
         chart_dir,
         test_resources_dir / "egress-proxy-values.yaml",
-        f"global.fullnameOverride=x,services.{_FORWARDER}.image=busybox",
+        f"global.fullnameOverride=x,services.{name}.image=busybox",
     )
 
     [of_that_name] = [
         owner["metadata"]["name"]
         for owner in _get_documents(documents, "StatefulSet")
-        if owner["spec"]["template"]["spec"]["containers"][0]["name"] == _FORWARDER
+        if owner["spec"]["template"]["spec"]["containers"][0]["name"] == name
     ]
     # Kubernetes takes 63 characters of a container's name, and of a StatefulSet's.
-    assert len(_FORWARDER) <= 63 < len(of_that_name)
+    assert len(name) <= 63 < len(of_that_name)
 
 
 @pytest.mark.parametrize("card", [False, True])
@@ -1281,7 +1283,6 @@ def test_a_pod_that_names_an_egress_proxy_reaches_only_that_name_and_port(
     assert pods["matchLabels"]["app.kubernetes.io/instance"] == "my-release"
 
 
-_REDIRECT = "egress-redirect-with-a-name-too-long-for-any-service-to-share"
 _SIBLINGS = "inspect-k8s-sandbox/egress-siblings"
 _SERVED = "inspect-k8s-sandbox/ingress-ports"
 
@@ -1349,6 +1350,7 @@ def test_a_pod_with_no_network_card_reaches_the_siblings_on_its_networks(
     )
     assert redirect["command"] == ["/vsock-egress", "redirect"]
     assert redirect["image"] == forwarder["image"]
+    # It ends before them: one that restarted would hold NET_ADMIN beside the task.
     assert "restartPolicy" not in redirect
     assert redirect["securityContext"]["capabilities"] == {
         "drop": ["ALL"],
@@ -1356,12 +1358,16 @@ def test_a_pod_with_no_network_card_reaches_the_siblings_on_its_networks(
     }
     # A service on no network has nothing to carry: no forwarder, and no worker.
     assert "initContainers" not in pods["offline"]["spec"]
+    # With no proxy either, its forwarder still mounts the volume that holds its key.
+    assert [v["name"] for v in pods["default"]["spec"]["volumes"]].count(
+        "egress-forwarder-key"
+    ) == 1
 
 
-def test_a_service_on_no_network_is_no_sibling_where_the_release_has_no_networks(
+def test_an_isolated_service_is_no_sibling_where_the_release_has_no_networks(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
-    pods, _ = _sibling_pods(
+    pods, policies = _sibling_pods(
         chart_dir, test_resources_dir, f"annotations.{_NO_CARD}", "networks=null"
     )
 
@@ -1375,7 +1381,14 @@ def test_a_service_on_no_network_is_no_sibling_where_the_release_has_no_networks
         "hidden": ["default", "game"],
         "offline": [],
     }
-    assert _SIBLINGS not in pods["offline"]["metadata"]["annotations"]
+    # `game` declares ports, so its one policy names what it admits: its worker's too.
+    (game,) = (
+        policy["spec"]
+        for policy in policies
+        if policy["metadata"]["name"] == "agent-env-my-release-svc-game-ingress"
+    )
+    ports = game["ingress"][0]["toPorts"][0]["ports"]
+    assert {"port": "3134", "protocol": "TCP"} in ports
 
 
 @pytest.mark.parametrize(
@@ -1396,19 +1409,111 @@ def test_siblings_are_carried_only_for_a_pod_with_no_network_card_and_a_forwarde
         name
         for name, pod in pods.items()
         if {_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()
-        or _REDIRECT in str(pod["spec"].get("initContainers"))
-        or len(pod["spec"].get("hostAliases", [])) > 1
+        or _REDIRECT in [c["name"] for c in pod["spec"].get("initContainers", [])]
+        or [a for a in pod["spec"].get("hostAliases", []) if a["ip"] != "127.0.0.1"]
     ] == []
     assert "3134" not in str(policies)
+
+
+def test_a_pod_runs_the_forwarder_only_where_its_node_starts_it_a_worker(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    # `game` serves UDP alone and no sibling of its has a DNS record: nothing to carry.
+    pods, _ = _sibling_pods(
+        chart_dir,
+        test_resources_dir,
+        f"annotations.{_NO_CARD}",
+        "services.game.ports[0].protocol=UDP,services.game.ports[0].port=9000,"
+        "services.game.initContainers[0].name=setup,"
+        "services.game.initContainers[0].image=game:1,"
+        "services.default.dnsRecord=false,services.hidden.dnsRecord=false",
+    )
+
+    # A forwarder is ready once its worker listens: only these annotations start one.
+    assert {
+        name: (
+            sorted({_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()),
+            [c["name"] for c in pod["spec"].get("initContainers", [])][:2],
+        )
+        for name, pod in pods.items()
+    } == {
+        "default": ([_SIBLINGS], [_FORWARDER, _REDIRECT]),
+        "game": ([], ["setup"]),
+        "hidden": ([_SIBLINGS], [_FORWARDER, _REDIRECT]),
+        "offline": ([], []),
+    }
+
+
+def test_a_service_that_keeps_its_network_card_is_no_sibling(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    pods, _ = _sibling_pods(
+        chart_dir,
+        test_resources_dir,
+        f"annotations.{_NO_CARD},services.hidden.podAnnotations.{_NO_CARD[:-4]}",
+    )
+
+    # `hidden` has no worker to take a connection and no forwarder to send one.
+    assert _SIBLINGS not in pods["hidden"]["metadata"]["annotations"]
+    assert "initContainers" not in pods["hidden"]["spec"]
+    aliases = pods["game"]["spec"]["hostAliases"][1:]
+    assert [alias["hostnames"][0] for alias in aliases] == ["default"]
+
+
+@pytest.mark.parametrize("annotation", [_SIBLINGS, _SERVED])
+def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, annotation: str
+) -> None:
+    # Left in, a sibling the chart never listed could be a Service of another release.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _sibling_pods(
+            chart_dir,
+            test_resources_dir,
+            f"annotations.{_NO_CARD},services.default.podAnnotations.{annotation}=x",
+        )
+    assert f"{annotation}, which the chart writes itself" in exc_info.value.stderr
+
+
+def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    # Whoever reads the key can open streams to the node as the forwarder.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _sibling_pods(
+            chart_dir,
+            test_resources_dir,
+            f"annotations.{_NO_CARD}",
+            "services.default.volumeMounts[0].name=egress-forwarder-key,"
+            "services.default.volumeMounts[0].mountPath=/mnt",
+        )
+    assert "egress-forwarder-key" in exc_info.value.stderr
+
+
+def test_network_policy_disabled_refuses_siblings_over_vsock(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    # A caller shows no key at a worker's port: only an ingress policy says who it is.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _sibling_pods(
+            chart_dir,
+            test_resources_dir,
+            f"annotations.{_NO_CARD}",
+            "networkPolicy.enabled=false",
+        )
+    assert (
+        "which pods reach services.default over vsock-egress" in exc_info.value.stderr
+    )
 
 
 def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
+    # `hidden` joins `default`'s network with no DNS record: a sibling with no name.
     _, policies = _sibling_pods(
         chart_dir,
         test_resources_dir,
         f"annotations.{_NO_CARD},services.default.podAnnotations.{_EGRESS_PROXY}",
+        "services.hidden.networks[0]=front,services.hidden.dnsRecord=false",
     )
     by_name = {
         policy["metadata"]["name"].removeprefix("agent-env-my-release-"): policy["spec"]
@@ -1420,17 +1525,37 @@ def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy
     for network in ("front", "back"):
         ports = by_name[f"svc-game-{network}-ingress"]["ingress"][0]["toPorts"]
         assert relay in ports[0]["ports"]
-    # `default` names a proxy, so its policy names all it reaches: its sibling too.
-    dns, release = by_name["svc-default-egress-proxy"]["egress"]
+    # Once where the service declares that port itself, and not where it takes no TCP.
+    udp_alone = "9000,services.game.ports[0].protocol=UDP"
+    for declared, named in (("3134", 1), (udp_alone, 0)):
+        _, again = _sibling_pods(
+            chart_dir,
+            test_resources_dir,
+            f"annotations.{_NO_CARD}",
+            f"services.game.ports[0].port={declared}",
+        )
+        (ingress,) = (
+            policy["spec"]["ingress"][0]
+            for policy in again
+            if policy["metadata"]["name"].endswith("svc-game-front-ingress")
+        )
+        assert ingress["toPorts"][0]["ports"].count(relay) == named
+    # `default` names a proxy, so its policy names all it reaches: its one sibling's
+    # record, and that sibling's worker alone.
+    dns, proxy, siblings = by_name["svc-default-egress-proxy"]["egress"]
     assert dns["toPorts"][0]["rules"] == {
         "dns": [
             {"matchName": "proxy.default.svc.cluster.local"},
             {"matchName": "agent-env-my-release-game.default.svc.cluster.local"},
         ]
     }
-    assert release["toPorts"] == [
-        {"ports": [{"port": "3128", "protocol": "TCP"}, relay]}
+    assert proxy["toPorts"] == [{"ports": [{"port": "3128", "protocol": "TCP"}]}]
+    (workers,) = siblings["toEndpoints"]
+    assert workers["matchExpressions"] == [
+        {"key": "inspect/service", "operator": "In", "values": ["game"]}
     ]
+    assert workers["matchLabels"]["app.kubernetes.io/instance"] == "my-release"
+    assert siblings["toPorts"] == [{"ports": [relay]}]
 
 
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
