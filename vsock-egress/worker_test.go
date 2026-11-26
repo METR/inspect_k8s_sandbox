@@ -58,6 +58,39 @@ func firecrackerThat(t *testing.T, says func(port uint32) (say string, listening
 	return vsock
 }
 
+// firecrackerWith is firecracker for a guest whose forwarder holds key and takes its siblings' connections: arrive gets each one to inboundPort.
+func firecrackerWith(t *testing.T, key []byte, arrive func(net.Conn)) (vsock string) {
+	t.Helper()
+	vsock = filepath.Join(t.TempDir(), "vm.vsock")
+	l, err := net.Listen("unix", vsock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+			var port uint32
+			fmt.Fscanf(bufio.NewReader(c), "CONNECT %d\n", &port)
+			switch port {
+			case keyPort:
+				fmt.Fprintf(c, "OK 1073741824\n%s", key)
+				c.Close()
+			case inboundPort:
+				fmt.Fprint(c, "OK 1073741824\n")
+				go arrive(c)
+			default:
+				c.Close()
+			}
+		}
+	}()
+	return vsock
+}
+
 // proxy is a TCP server that hands over each connection it accepts.
 func proxy(t *testing.T) (address string, accepted chan net.Conn) {
 	t.Helper()
@@ -91,13 +124,19 @@ func served(t *testing.T, key []byte, target string, pace *pacer) (dial func() n
 // serve starts w at its VM's stream socket, and returns a dial for the guest's side.
 func serve(t *testing.T, w *worker) (dial func() net.Conn) {
 	t.Helper()
-	streams := fmt.Sprintf("%s_%d", w.vsock, streamPort)
+	return serveAt(t, w, streamPort, w.proxied)
+}
+
+// serveAt starts w at its VM's socket for one vsock port, and returns a dial for the guest's side.
+func serveAt(t *testing.T, w *worker, port int, carry func(net.Conn)) (dial func() net.Conn) {
+	t.Helper()
+	streams := fmt.Sprintf("%s_%d", w.vsock, port)
 	l, err := net.Listen("unix", streams)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go w.serve(l)
+	go w.serve(l, carry)
 	return func() net.Conn {
 		c, err := net.Dial("unix", streams)
 		if err != nil {
@@ -135,6 +174,129 @@ func newKey() []byte {
 	key := make([]byte, keySize)
 	rand.Read(key)
 	return key
+}
+
+// relayed starts w at a TCP port that stands for its pod's relay port, and returns a dial for a sibling's worker.
+func relayed(t *testing.T, w *worker) (dial func() *net.TCPConn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go w.serve(l, w.arrive)
+	return func() *net.TCPConn {
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(budget))
+		t.Cleanup(func() { c.Close() })
+		return c.(*net.TCPConn)
+	}
+}
+
+func TestSiblingStreamReachesTheWorkerOfTheSiblingItsAddressStandsFor(t *testing.T) {
+	key := newKey()
+	sibling, accepted := proxy(t)
+	other, strayed := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), other, 0)
+	w.siblings[netip.MustParseAddr("198.18.0.2")] = &target{name: sibling}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+
+	asked, _ := netip.MustParseAddrPort("198.18.0.2:8000").MarshalBinary()
+	c := dial()
+	c.Write(append(append(key, asked...), frame("request")...))
+	got := within(t, accepted, "connection to the sibling's worker")
+	got.SetDeadline(time.Now().Add(budget))
+	hello := make([]byte, 2+len("request"))
+	if _, err := io.ReadFull(got, hello); err != nil || string(hello) != "\x1f\x40request" {
+		t.Fatalf("the sibling's worker read %q, %v: want port 8000 as two bytes and then the request", hello, err)
+	}
+
+	asked, _ = netip.MustParseAddrPort("198.18.0.3:8000").MarshalBinary()
+	c = dial()
+	c.Write(append(append(key, asked...), frame("request")...))
+	<-closed(c)
+	select {
+	case <-accepted:
+		t.Fatal("a stream for an address that is no sibling's reached a sibling's worker")
+	case <-strayed:
+		t.Fatal("a stream for an address that is no sibling's reached the proxy")
+	default:
+	}
+}
+
+func TestWorkerTakesItsPodsSiblingsAndPortsFromTheLauncher(t *testing.T) {
+	w := newWorker("", "", 0)
+	if err := w.annotated("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.ns.svc.cluster.local.", "8000,8765"); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for addr, to := range w.siblings {
+		names[addr.String()] = to.name
+	}
+	want := map[string]string{"198.18.0.1": "default.ns.svc.cluster.local.:3134", "198.18.0.2": "game.ns.svc.cluster.local.:3134"}
+	if fmt.Sprint(names) != fmt.Sprint(want) || fmt.Sprint(w.ports) != "map[8000:true 8765:true]" {
+		t.Fatalf("got siblings %v and ports %v: want %v, each at its worker's relay port, and ports 8000 and 8765", names, w.ports, want)
+	}
+	every := newWorker("", "", 0)
+	if err := every.annotated("", "*"); err != nil || every.ports != nil {
+		t.Fatalf("* gave ports %v, %v: want every port", every.ports, err)
+	}
+}
+
+func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		shown   func(key []byte) []byte // what holds the guest's inbound port shows
+		ports   string
+		entered bool
+	}{
+		"the forwarder, every port served":   {func(key []byte) []byte { return key }, "*", true},
+		"the forwarder, that port served":    {func(key []byte) []byte { return key }, "22,8000", true},
+		"the forwarder, another port served": {func(key []byte) []byte { return key }, "22", false},
+		"another process on the vsock port":  {func([]byte) []byte { return newKey() }, "*", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			key := newKey()
+			took := make(chan string, 1)
+			w := newWorker(firecrackerWith(t, key, func(guest net.Conn) {
+				guest.SetDeadline(time.Now().Add(budget))
+				guest.Write(tc.shown(key))
+				port := make([]byte, 2)
+				var request bytes.Buffer
+				if _, err := io.ReadFull(guest, port); err != nil || fromFrames(&request, guest, nil) != nil {
+					took <- ""
+					return
+				}
+				toFrames(guest, strings.NewReader("reply"), nil)
+				took <- string(port) + request.String()
+			}), "", 0)
+			if err := w.annotated("", tc.ports); err != nil {
+				t.Fatal(err)
+			}
+			c := relayed(t, w)()
+			c.Write([]byte("\x1f\x40request"))
+			c.CloseWrite()
+			reply, err := io.ReadAll(c)
+			if !tc.entered {
+				select {
+				case got := <-took:
+					if got != "" {
+						t.Fatalf("the guest took %q", got)
+					}
+				default: // the guest was never asked
+				}
+				if !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatalf("the sibling's worker read %q, %v: want a reset, as a closed port gives", reply, err)
+				}
+				return
+			}
+			if got := within(t, took, "connection in the guest"); got != "\x1f\x40request" || string(reply) != "reply" || err != nil {
+				t.Fatalf("the guest took %q and the sibling's worker read %q, %v: want port 8000, the request, and the reply back", got, reply, err)
+			}
+		})
+	}
 }
 
 func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
@@ -482,7 +644,7 @@ func TestStreamEndedBeforeItsProxyCouldBeDialledIsNoFailure(t *testing.T) {
 		guest.Close()
 	}()
 	w.unkeyed <- struct{}{}
-	w.stream(node)
+	w.proxied(node)
 	w.report()
 	if out.String() != "" {
 		t.Fatalf("the log is %q: want nothing for a stream its guest had ended", out.String())
@@ -599,7 +761,8 @@ func capped(t *testing.T, size int) (each [2]int) {
 
 func TestProxySocketIsCappedEachWay(t *testing.T) {
 	target, _ := proxy(t)
-	c, err := newWorker("", target, 0).dial()
+	w := newWorker("", target, 0)
+	c, err := w.dial(w.proxy)
 	if err != nil {
 		t.Fatal(err)
 	}

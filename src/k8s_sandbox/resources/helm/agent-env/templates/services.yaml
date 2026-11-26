@@ -48,6 +48,25 @@ spec:
       {{- end }}
       {{- /* An AWS Nitro Sandbox with no network device: the kubelet's HTTP probe can't reach a sidecar there. */}}
       {{- $noCard := eq (get $podAnnotations "sandbox.amazonaws.com/network-isolated") "true" }}
+      {{- /* There, vsock-egress carries the pod to the siblings it shares a network with, and them to it. */}}
+      {{- $siblings := include "agentEnv.siblings" (dict "root" $ "name" $name) | fromJsonArray }}
+      {{- $aliases := list }}
+      {{- if $siblings }}
+      {{- $carried := list }}
+      {{- range $siblings }}
+      {{- if include "shouldCreateDnsRecord" (get $.Values.services .service) }}
+      {{- $fullname := printf "%s-%s" (include "agentEnv.fullname" $) .service }}
+      {{- $carried = append $carried (printf "%s=%s.%s.svc.cluster.local." .address $fullname $.Release.Namespace) }}
+      {{- $aliases = append $aliases (dict "ip" .address "hostnames" (list .service $fullname)) }}
+      {{- end }}
+      {{- end }}
+      {{- if $carried }}{{ $_ := set $podAnnotations "inspect-k8s-sandbox/egress-siblings" (join "," $carried) }}{{ end }}
+      {{- /* Every TCP port, or as its ingress policy has it on a pod with a network device: the ports the service declares. */}}
+      {{- $served := list }}
+      {{- range $service.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $served = append $served (toString .port) }}{{ end }}{{ end }}
+      {{- if or $served (not $service.ports) }}{{ $_ := set $podAnnotations "inspect-k8s-sandbox/ingress-ports" (join "," $served | default "*") }}{{ end }}
+      {{- end }}
+      {{- $forwarder := or $egressProxy $siblings }}
       {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
       {{- $noDnsVolume := $noCard }}
       {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}
@@ -58,7 +77,7 @@ spec:
       {{- range .volumeMounts }}
       {{- if not (kindIs "string" (required (printf "a container of services.%s mounts a volume with no name" $name) .name)) }}{{ fail (printf "a container of services.%s mounts a volume named %s: quote the name" $name (toJson .name)) }}{{ end }}
       {{- /* The forwarder's key lets whoever holds it open streams as the forwarder: no container of the service may mount it. */}}
-      {{- if and $egressProxy (eq .name "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
+      {{- if and $forwarder (eq .name "egress-forwarder-key") }}{{ fail (printf "a container of services.%s mounts the volume egress-forwarder-key, which holds the key of the pod's egress forwarder: no other container may read it" $name) }}{{ end }}
       {{- if and $noDnsVolume (eq .name "coredns-config") }}{{ fail (printf "a container of services.%s mounts the volume coredns-config: that is the DNS sidecar's, and a pod with no network device runs none" $name) }}{{ end }}
       {{- end }}
       {{- end }}
@@ -92,15 +111,20 @@ spec:
       {{- /* The kubelet writes them as one line of /etc/hosts, and musl reads no more than 510 bytes of a line. */}}
       {{- $line := join "\t" (prepend $names "127.0.0.1") }}
       {{- if gt (len $line) 510 }}{{ fail (printf "services.%s.additionalDnsRecords: in a pod with no network device its names are one line of /etc/hosts, here %d bytes, and musl resolves no name past byte 510 of a line" $name (len $line)) }}{{ end }}
+      {{- $aliases = prepend $aliases (dict "ip" "127.0.0.1" "hostnames" $names) }}
+      {{- end }}
+      {{- with $aliases }}
       hostAliases:
-        - ip: "127.0.0.1"
+        {{- range . }}
+        - ip: {{ .ip | quote }}
           hostnames:
-            {{- range $names }}
+            {{- range .hostnames }}
             - {{ . | quote }}
             {{- end }}
+        {{- end }}
       {{- end }}
 
-      {{- if or $service.initContainers $egressProxy }}
+      {{- if or $service.initContainers $forwarder }}
       {{- /* A mount that names no volume of the Pod means the colon-separated volume of that name. */}}
       {{- $generated := dict }}
       {{- $volumeNames := empty $.Values.corednsUpstream | ternary (list "coredns-config" "resolv-conf") (list "coredns-config") }}
@@ -116,7 +140,7 @@ spec:
         {{- $_ := unset $generated . }}
       {{- end }}
       initContainers:
-      {{- if $egressProxy }}
+      {{- if $forwarder }}
         {{- /* First, and restarted if it ends: the init containers after it and the service use its port. */}}
         {{- /* Longer than a service's name can be, as <fullname>-<service> names its StatefulSet in 63 characters: a rule on exec by this name catches no service's container. */}}
         - name: egress-forwarder-with-a-name-too-long-for-any-service-to-share
@@ -152,6 +176,29 @@ spec:
             seccompProfile:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
+      {{- end }}
+      {{- if $siblings }}
+        {{- /* Ahead of every container that runs an image of the task's: the rule it installs needs NET_ADMIN once, and none of them gets it. */}}
+        - name: egress-redirect-with-a-name-too-long-for-any-service-to-share
+          image: {{ $.Values.egressForwarderImage | quote }}
+          command: ["/vsock-egress", "redirect"]
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN"]
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            runAsGroup: 0
+            seccompProfile:
+              type: RuntimeDefault
       {{- end }}
       {{- range $service.initContainers }}
         - name: {{ .name | quote }}
@@ -337,7 +384,7 @@ spec:
         -  {{- include "agentEnv.toYaml" . | nindent 10 }}
         {{- end }}
       {{- end }}
-      {{- if $egressProxy }}
+      {{- if $forwarder }}
         {{- /* Mounted by the forwarder alone: its key outlives a restart of it, and no other container reads it. */}}
         - name: egress-forwarder-key
           emptyDir:

@@ -57,6 +57,17 @@
   seccomp profiles, which `vsock-egress install` writes (see `vsock-egress/README.md`):
   on a node with no launcher such a pod does not start. The forwarder's container is named
   `egress-forwarder-with-a-name-too-long-for-any-service-to-share`.
+- With `egressForwarderImage` set, the services of an AWS Nitro Sandbox with no network
+  device reach each other: each pod resolves the names of the services it shares a
+  network with (`<service>` and `$AGENT_ENV-<service>`), and a TCP connection to one, on
+  any port, is carried over the VM's vsock. A service's `ports` hold as they do in its
+  ingress policy. Not carried: UDP, ICMP, and a service's `additionalDnsRecords`. A
+  connection to a port with no server behind it is accepted and then reset, where a
+  network device refuses it. Each such pod runs the forwarder, and an init container
+  named `egress-redirect-with-a-name-too-long-for-any-service-to-share` that runs as
+  root with `NET_ADMIN`, so the namespace's Pod Security level must admit that
+  capability. Every node must run a launcher of this version (see
+  `vsock-egress/README.md`).
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

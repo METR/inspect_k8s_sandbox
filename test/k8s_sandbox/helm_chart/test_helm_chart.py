@@ -1281,6 +1281,158 @@ def test_a_pod_that_names_an_egress_proxy_reaches_only_that_name_and_port(
     assert pods["matchLabels"]["app.kubernetes.io/instance"] == "my-release"
 
 
+_REDIRECT = "egress-redirect-with-a-name-too-long-for-any-service-to-share"
+_SIBLINGS = "inspect-k8s-sandbox/egress-siblings"
+_SERVED = "inspect-k8s-sandbox/ingress-ports"
+
+
+def _sibling_pods(
+    chart_dir: pathlib.Path,
+    test_resources_dir: pathlib.Path,
+    set_string: str | None,
+    set_str: str | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """The pod of each service of four on two networks, and the release's policies."""
+    documents = _run_helm_template(
+        chart_dir,
+        test_resources_dir / "sibling-relay-values.yaml",
+        set_str,
+        set_string,
+    )
+    pods = {
+        stateful_set["metadata"]["name"].removeprefix("agent-env-my-release-"): (
+            stateful_set["spec"]["template"]
+        )
+        for stateful_set in _get_documents(documents, "StatefulSet")
+    }
+    return pods, _get_documents(documents, "CiliumNetworkPolicy")
+
+
+def test_a_pod_with_no_network_card_reaches_the_siblings_on_its_networks(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    pods, _ = _sibling_pods(chart_dir, test_resources_dir, f"annotations.{_NO_CARD}")
+
+    def service(name: str, address: str) -> tuple[dict[str, Any], str]:
+        fullname = f"agent-env-my-release-{name}"
+        return (
+            {"ip": address, "hostnames": [name, fullname]},
+            f"{address}={fullname}.default.svc.cluster.local.",
+        )
+
+    default, game, hidden = (
+        service("default", "198.18.0.1"),
+        service("game", "198.18.0.2"),
+        service("hidden", "198.18.0.3"),
+    )
+    # A name resolves only where its service shares a network: `hidden` is off `front`.
+    assert {
+        name: (
+            pod["spec"]["hostAliases"][1:],
+            pod["metadata"]["annotations"].get(_SIBLINGS),
+            pod["metadata"]["annotations"].get(_SERVED),
+        )
+        for name, pod in pods.items()
+    } == {
+        "default": ([game[0]], game[1], "*"),
+        # As its ingress policy has it with a network card: the TCP port it declares.
+        "game": ([default[0], hidden[0]], f"{default[1]},{hidden[1]}", "8000"),
+        "hidden": ([game[0]], game[1], "*"),
+        "offline": ([], None, None),
+    }
+    # The rule is in place, and its container gone, before `setup` runs its image.
+    forwarder, redirect, setup = pods["default"]["spec"]["initContainers"]
+    assert (forwarder["name"], redirect["name"], setup["name"]) == (
+        _FORWARDER,
+        _REDIRECT,
+        "setup",
+    )
+    assert redirect["command"] == ["/vsock-egress", "redirect"]
+    assert redirect["image"] == forwarder["image"]
+    assert "restartPolicy" not in redirect
+    assert redirect["securityContext"]["capabilities"] == {
+        "drop": ["ALL"],
+        "add": ["NET_ADMIN"],
+    }
+    # A service on no network has nothing to carry: no forwarder, and no worker.
+    assert "initContainers" not in pods["offline"]["spec"]
+
+
+def test_a_service_on_no_network_is_no_sibling_where_the_release_has_no_networks(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    pods, _ = _sibling_pods(
+        chart_dir, test_resources_dir, f"annotations.{_NO_CARD}", "networks=null"
+    )
+
+    # With no network declared every service reaches every other, but `offline`.
+    assert {
+        name: [alias["hostnames"][0] for alias in pod["spec"]["hostAliases"][1:]]
+        for name, pod in pods.items()
+    } == {
+        "default": ["game", "hidden"],
+        "game": ["default", "hidden"],
+        "hidden": ["default", "game"],
+        "offline": [],
+    }
+    assert _SIBLINGS not in pods["offline"]["metadata"]["annotations"]
+
+
+@pytest.mark.parametrize(
+    "set_string",
+    [
+        pytest.param(None, id="a network card"),
+        pytest.param(
+            f"annotations.{_NO_CARD},egressForwarderImage=", id="no forwarder image"
+        ),
+    ],
+)
+def test_siblings_are_carried_only_for_a_pod_with_no_network_card_and_a_forwarder(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, set_string: str | None
+) -> None:
+    pods, policies = _sibling_pods(chart_dir, test_resources_dir, set_string)
+
+    assert [
+        name
+        for name, pod in pods.items()
+        if {_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()
+        or _REDIRECT in str(pod["spec"].get("initContainers"))
+        or len(pod["spec"].get("hostAliases", [])) > 1
+    ] == []
+    assert "3134" not in str(policies)
+
+
+def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    _, policies = _sibling_pods(
+        chart_dir,
+        test_resources_dir,
+        f"annotations.{_NO_CARD},services.default.podAnnotations.{_EGRESS_PROXY}",
+    )
+    by_name = {
+        policy["metadata"]["name"].removeprefix("agent-env-my-release-"): policy["spec"]
+        for policy in policies
+    }
+
+    # `game` declares ports, so its policies name what they admit: its worker's too.
+    relay = {"port": "3134", "protocol": "TCP"}
+    for network in ("front", "back"):
+        ports = by_name[f"svc-game-{network}-ingress"]["ingress"][0]["toPorts"]
+        assert relay in ports[0]["ports"]
+    # `default` names a proxy, so its policy names all it reaches: its sibling too.
+    dns, release = by_name["svc-default-egress-proxy"]["egress"]
+    assert dns["toPorts"][0]["rules"] == {
+        "dns": [
+            {"matchName": "proxy.default.svc.cluster.local"},
+            {"matchName": "agent-env-my-release-game.default.svc.cluster.local"},
+        ]
+    }
+    assert release["toPorts"] == [
+        {"ports": [{"port": "3128", "protocol": "TCP"}, relay]}
+    ]
+
+
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:
     documents = _run_helm_template(
         chart_dir,

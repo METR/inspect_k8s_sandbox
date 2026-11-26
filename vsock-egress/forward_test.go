@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,7 +168,7 @@ func proxyPort(t *testing.T, f *forwarder) *net.TCPConn {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	c, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +207,154 @@ func TestConnectionOpensWithTheKeyAndEndsEachWayInTheStream(t *testing.T) {
 	}
 }
 
+func TestConnectionRedirectSentHereOpensASiblingStreamThatSaysWhereItWasGoing(t *testing.T) {
+	node, port := loopback(t)
+	f := keyedForwarder(unix.VMADDR_CID_LOCAL, 0)
+	f.siblings = port
+	going := netip.MustParseAddrPort("198.18.0.2:8000")
+	f.original = func(*net.TCPConn) (netip.AddrPort, error) { return going, nil }
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go f.serve(l, f.captured)
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	client.SetDeadline(time.Now().Add(budget))
+	client.Write([]byte("request"))
+
+	up, _, err := node.accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	up.SetDeadline(time.Now().Add(budget))
+	asked, _ := going.MarshalBinary()
+	hello := make([]byte, keySize+len(asked)+4+len("request"))
+	if _, err := io.ReadFull(up, hello); err != nil || !bytes.Equal(hello, append(append(f.key[:], asked...), frame("request")...)) {
+		t.Fatalf("the stream opened with %q, %v: want the key, then the address and port the connection was going to, then the request", hello, err)
+	}
+
+	f.original = func(*net.TCPConn) (netip.AddrPort, error) { return netip.AddrPort{}, unix.ENOENT } // as for a connection made to the port itself
+	f.connect = func(uint32, uint32) (*os.File, error) {
+		t.Error("a connection redirect did not send opened a stream to the node")
+		return nil, unix.ECONNRESET
+	}
+	direct, err := net.Dial("tcp", l.Addr().String())
+	if err == nil {
+		t.Cleanup(func() { direct.Close() })
+		direct.SetDeadline(time.Now().Add(budget))
+		_, err = direct.Read(make([]byte, 1))
+	}
+	if !errors.Is(err, unix.ECONNRESET) {
+		t.Fatalf("a connection made to the port itself ended with %v: want a reset", err)
+	}
+}
+
+func TestSiblingsConnectionIsDeliveredToThePortTheNodeNamesAfterTheKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		node      uint32 // the CID the forwarder takes for the node's; the test's own connections come from VMADDR_CID_LOCAL
+		delivered bool
+	}{
+		"a process in the VM": {node: hostCID, delivered: false},
+		"the node":            {node: unix.VMADDR_CID_LOCAL, delivered: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			arrivals, port := loopback(t)
+			f := keyedForwarder(tc.node, 0)
+			f.deliver = netip.MustParseAddr("127.0.0.1") // redirect has given this machine no other address
+			go f.fromNode(arrivals, func(c *os.File) { go f.arrive(c) })
+			server, accepted := proxy(t)
+			c, err := vsockDial(unix.VMADDR_CID_LOCAL, port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(budget))
+			key := make([]byte, keySize)
+			if _, err := io.ReadFull(c, key); tc.delivered != (err == nil && bytes.Equal(key, f.key[:])) {
+				t.Fatalf("the peer read the key: %v (%v); want: %v", err == nil, err, tc.delivered)
+			}
+			if !tc.delivered {
+				return
+			}
+			c.Write(append(binary.BigEndian.AppendUint16(nil, netip.MustParseAddrPort(server).Port()), frame("request")...))
+			got := within(t, accepted, "connection to the port the node named")
+			got.SetDeadline(time.Now().Add(budget))
+			request := make([]byte, len("request"))
+			if _, err := io.ReadFull(got, request); err != nil || string(request) != "request" {
+				t.Fatalf("the server read %q, %v: want the request", request, err)
+			}
+		})
+	}
+}
+
+// bridged is the guest's end of a vsock connection whose node's end is c.
+func bridged(c net.Conn) (*os.File, error) {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	guest, relay := os.NewFile(uintptr(pair[0]), "vsock"), os.NewFile(uintptr(pair[1]), "relay")
+	for _, copy := range []func(){func() { io.Copy(relay, c) }, func() { io.Copy(c, relay) }} {
+		go func() { // Firecracker passes no half-close on: either end's close ends both
+			copy()
+			relay.Close()
+			c.Close()
+		}()
+	}
+	return guest, nil
+}
+
+func TestOneServiceReachesItsSiblingThroughBothForwardersAndBothWorkers(t *testing.T) {
+	server, accepted := proxy(t)
+	// The sibling's side: its worker takes the connection at its relay port and hands it to its forwarder, which delivers it.
+	theirs := keyedForwarder(hostCID, 0)
+	theirs.deliver = netip.MustParseAddr("127.0.0.1")
+	relay := relayed(t, newWorker(firecrackerWith(t, theirs.key[:], func(c net.Conn) {
+		if guest, err := bridged(c); err == nil {
+			theirs.arrive(guest)
+		}
+	}), "", 0))().RemoteAddr().String()
+	// This service's side: its forwarder takes the connection redirect sent it, and its worker dials the sibling's.
+	ours := keyedForwarder(hostCID, 0)
+	going := netip.AddrPortFrom(netip.MustParseAddr("198.18.0.2"), netip.MustParseAddrPort(server).Port())
+	ours.original = func(*net.TCPConn) (netip.AddrPort, error) { return going, nil }
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(ours.key[:])}), "", 0)
+	w.siblings[going.Addr()] = &target{name: relay}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	ours.connect = func(uint32, uint32) (*os.File, error) { return bridged(dial()) }
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go ours.serve(l, ours.captured)
+
+	client, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	client.SetDeadline(time.Now().Add(budget))
+	client.Write([]byte("request"))
+	client.(*net.TCPConn).CloseWrite()
+	got := within(t, accepted, "connection to the sibling's server")
+	got.SetDeadline(time.Now().Add(budget))
+	if request, err := io.ReadAll(got); string(request) != "request" || err != nil {
+		t.Fatalf("the sibling's server read %q, %v: want the request and then its end", request, err)
+	}
+	got.Write([]byte("reply"))
+	got.Close()
+	if reply, err := io.ReadAll(client); string(reply) != "reply" || err != nil {
+		t.Fatalf("the client read %q, %v: want the reply and then a clean end", reply, err)
+	}
+}
+
 func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 	node, port := loopback(t)
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, port)
@@ -220,7 +370,7 @@ func TestConnectionPastTheCapWaitsForAPlace(t *testing.T) {
 		}
 		return vsockDial(cid, port)
 	}
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	dialled := make(chan *os.File, 2*maxStreams)
 	go func() {
 		for {
@@ -294,7 +444,7 @@ func refused(t *testing.T, f *forwarder) (ended error, streams int32) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 	c, err := net.Dial("tcp", l.Addr().String()) // a reset may be there before the dial returns
 	if err == nil {
 		t.Cleanup(func() { c.Close() })
@@ -317,7 +467,7 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 
 func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	_, placed := tcpPair(t)
-	l, err := listen("127.0.0.1:0")
+	l, err := listen("127.0.0.1:0", clientBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,12 +494,12 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 		return nil, errors.New("the test has seen the socket")
 	}
 
-	f.stream(placed)
+	f.proxied(placed)
 	for range maxStreams { // every place is taken
 		f.slots <- struct{}{}
 	}
 	f.wait = 0
-	f.stream(waiting.(*net.TCPConn))
+	f.proxied(waiting.(*net.TCPConn))
 
 	if want := capped(t, 128<<10); held != want { // the size itself: a change to it must be measured against the forwarder's memory limit in the chart
 		t.Errorf("a stream's socket to its client holds %v bytes each way: want %v, the kernel's count of the cap", held, want)
@@ -422,7 +572,7 @@ func TestStreamWhoseClientHasNotTakenItsReplyKeepsItsPlace(t *testing.T) {
 	f.connect = func(uint32, uint32) (*os.File, error) { return guest, nil }
 	ended := make(chan struct{})
 	go func() {
-		f.stream(inSandbox)
+		f.proxied(inSandbox)
 		close(ended)
 	}()
 	reply := strings.Repeat("r", 100<<10) // all of it fits the socket's buffer: the stream ends cleanly with most of it unsent
@@ -482,7 +632,7 @@ func TestStreamsTheGuestDroppedDoNotShutOutTheNext(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go f.serve(l)
+	go f.serve(l, f.proxied)
 
 	for _, round := range []string{"first", "next"} {
 		clients := make([]*net.TCPConn, maxStreams)
@@ -543,7 +693,7 @@ func TestCommandsForTheSandboxTakeOnlyTheseFlags(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second) // a command that started instead would serve until killed
 	defer cancel()
 	// The README tells an operator that none of these takes a vsock port or address from its caller: a flag is one its caller sets.
-	for command, want := range map[string]string{"forward": "-key -listen", "ready": "-key", "canary": ""} {
+	for command, want := range map[string]string{"forward": "-key -listen", "ready": "-key", "canary": "", "redirect": ""} {
 		out, err := exec.CommandContext(ctx, os.Args[0], command, "-h").CombinedOutput()
 		var flags []string
 		for _, line := range strings.Split(string(out), "\n") {

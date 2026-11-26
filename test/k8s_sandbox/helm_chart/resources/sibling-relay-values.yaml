@@ -1,0 +1,27 @@
+egressForwarderImage: vsock-egress:1
+networks:
+  front: {}
+  back: {}
+services:
+  default:
+    image: agent:1
+    dnsRecord: true
+    networks: [front]
+    initContainers:
+      - name: setup
+        image: agent:1
+  game:
+    image: game:1
+    dnsRecord: true
+    networks: [front, back]
+    ports:
+      - {protocol: TCP, port: 8000}
+      - {protocol: UDP, port: 9000}
+  hidden:
+    image: hidden:1
+    dnsRecord: true
+    networks: [back]
+  offline:
+    image: offline:1
+    dnsRecord: true
+    networkIsolated: true

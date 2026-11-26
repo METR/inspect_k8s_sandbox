@@ -66,8 +66,11 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 
 func id(c string) string { return strings.Repeat(c, 64) }
 
-func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
+func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testing.T) {
 	proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}
+	siblings := func(named string) map[string]string {
+		return map[string]string{siblingsAnnotation: named, portsAnnotation: "*"}
+	}
 	for name, tc := range map[string]struct {
 		ifName      string
 		annotations map[string]string
@@ -85,6 +88,13 @@ func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 		"the loopback interface's record": {"lo", proxied, vmUID, false},
 		"a VM directory that is root's":   {"eth0", proxied, 0, false},
 		"a VM with the reaper's uid":      {"eth0", proxied, reaperUID, false},
+		"siblings and no proxy":           {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.ns.svc.cluster.local."), vmUID, true},
+		"a sibling of another namespace":  {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.other.svc.cluster.local."), vmUID, false},
+		"a sibling that is an address":    {"eth0", siblings("198.18.0.2=10.0.0.9"), vmUID, false},
+		"a sibling at another address":    {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
+		"more than a sibling":             {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
+		"ports and no sibling":            {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
+		"more than ports":                 {"eth0", map[string]string{portsAnnotation: "8000 -rate=1"}, vmUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.uid != vmUID && os.Geteuid() != 0 {
@@ -101,7 +111,7 @@ func TestOnlySandboxesThatNameAProxyAreWanted(t *testing.T) {
 				t.Fatalf("wanted %v, want the sandbox: %v", wanted, tc.wanted)
 			}
 			want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net",
-				target: tc.annotations[proxyAnnotation], uid: sb.uid, gid: sb.gid}
+				target: tc.annotations[proxyAnnotation], siblings: tc.annotations[siblingsAnnotation], ports: tc.annotations[portsAnnotation], uid: sb.uid, gid: sb.gid}
 			if ok && (sb != want || os.Geteuid() == 0 && sb.uid != vmUID) {
 				t.Fatalf("got %+v, want %+v", sb, want)
 			}

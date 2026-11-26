@@ -77,6 +77,29 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 
 {{/*
+The siblings vsock-egress carries a service's pod to, as a JSON list of each one's service and the address that stands
+for it in the sandbox: those the pod shares a network with, by the rule of the ingress policies. None unless the pod has
+no network device and the release a forwarder image. Takes a dict of root ($) and name.
+*/}}
+{{- define "agentEnv.siblings" -}}
+{{- $own := get .root.Values.services .name -}}
+{{- $annotations := merge (dict) (default (dict) $own.podAnnotations) (default (dict) .root.Values.annotations) -}}
+{{- $siblings := list -}}
+{{- if and (eq (get $annotations "sandbox.amazonaws.com/network-isolated") "true") .root.Values.egressForwarderImage (not $own.networkIsolated) -}}
+{{- $index := 0 -}}
+{{- range $name, $service := .root.Values.services -}}
+{{- $index = add1 $index -}}
+{{- $shared := not $.root.Values.networks -}}
+{{- range $own.networks }}{{ if has . (default (list) $service.networks) }}{{ $shared = true }}{{ end }}{{ end -}}
+{{- if and (ne $name $.name) $shared (not $service.networkIsolated) -}}
+{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $siblings -}}
+{{- end -}}
+
+{{/*
 Whether to create a ClusterIP type Service (which implies a DNS record) for a service
 */}}
 {{- define "shouldCreateDnsRecord" -}}
@@ -97,10 +120,11 @@ true
 {{- $yaml -}}
 {{- end -}}
 
-{{/* Render a deduped list of ports for a single service object (svc) */}}
+{{/* Render a deduped list of ports for a single service object (svc), and the port its pod's worker takes its siblings' connections at where vsock-egress carries them (relayed). */}}
 {{- define "agentEnv.servicePortsListFor" -}}
 {{- $seen := dict -}}
 {{- $out := list -}}
+{{- if .relayed }}{{ $out = append $out (dict "port" "3134" "protocol" "TCP") }}{{ end -}}
 {{- with .svc }}
   {{- range .ports }}
     {{- $proto := (default "TCP" .protocol) | upper -}}

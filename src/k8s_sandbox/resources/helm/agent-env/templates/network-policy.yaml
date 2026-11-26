@@ -198,7 +198,7 @@ spec:
       {{- if $svc.ports }}
       toPorts:
         - ports:
-{{ include "agentEnv.servicePortsListFor" (dict "svc" $svc) | nindent 12 }}
+{{ include "agentEnv.servicePortsListFor" (dict "svc" $svc "relayed" (include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray)) | nindent 12 }}
       {{- end }}
     - fromEndpoints:
       - matchLabels:
@@ -247,7 +247,7 @@ spec:
       {{- if $svc.ports }}
       toPorts:
         - ports:
-{{ include "agentEnv.servicePortsListFor" (dict "svc" $svc) | nindent 12 }}
+{{ include "agentEnv.servicePortsListFor" (dict "svc" $svc "relayed" (include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray)) | nindent 12 }}
       {{- end }}
     - fromEndpoints:
       - matchLabels:
@@ -305,7 +305,8 @@ metadata:
 spec:
   description: |
     Service "{{ $svcName }}" names an egress proxy: its pod reaches only that name's
-    DNS record and the proxy's port on the pods of this sandbox.
+    DNS record and the proxy's port on the pods of this sandbox, and where vsock-egress
+    carries it to its siblings, their records and their workers' port.
   endpointSelector:
     matchLabels:
       io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
@@ -326,6 +327,10 @@ spec:
           rules:
             dns:
               - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
+              {{- $siblings := include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}
+              {{- range $siblings }}
+              - matchName: {{ printf "%s-%s.%s.svc.cluster.local" (include "agentEnv.fullname" $) .service $.Release.Namespace | quote }}
+              {{- end }}
     - toEndpoints:
       - matchLabels:
           io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
@@ -334,5 +339,9 @@ spec:
         - ports:
             - port: {{ regexFind "[0-9]+$" $proxy | quote }}
               protocol: TCP
+            {{- if $siblings }}
+            - port: "3134"
+              protocol: TCP
+            {{- end }}
 {{- end }}
 {{- end }}
