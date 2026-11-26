@@ -34,7 +34,7 @@ type forwarder struct {
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, siblings: siblingPort, names: newNames(), slots: make(chan struct{}, maxStreams),
+	return &forwarder{host: host, port: port, siblings: siblingPort, names: newNames(""), slots: make(chan struct{}, maxStreams),
 		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
@@ -63,6 +63,7 @@ func forward(args []string) error {
 	if err != nil {
 		return err
 	}
+	f.names = newNames(*keyFile + ".names") // beside the key, which outlives a restart too
 	go f.names.serve(lookups)
 	arrivals, err := vsockListen(inboundPort)
 	if err != nil {
@@ -241,11 +242,12 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		return
 	}
 	_, err = up.Write(append(f.key[:], asked...))
-	if err == nil && captured != "" {
-		err = tunnel(up, c, captured)
-	}
 	if err != nil {
 		log.Print(err)
+	} else if captured != "" {
+		err = tunnel(up, c, captured) // the proxy's own record says what it refused: a line here for each would be the sandbox's to write at will
+	}
+	if err != nil {
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
@@ -269,7 +271,8 @@ func tunnel(up *os.File, c *net.TCPConn, target string) error {
 			return err
 		}
 		size := int(binary.BigEndian.Uint32(length))
-		if size == 0 || len(answer)+size > maxFrame {
+		// What follows the headers in their last frame is the origin's, and may fill it.
+		if size == 0 || size > maxFrame || len(answer) > maxFrame {
 			return fmt.Errorf("the proxy's answer to CONNECT %s ended, or ran past %d bytes, with no end of its headers", target, maxFrame)
 		}
 		answer = append(answer, make([]byte, size)...)

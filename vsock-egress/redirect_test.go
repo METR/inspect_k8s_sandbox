@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -74,10 +75,6 @@ func capturing(t *testing.T) (f *forwarder, node *vsockListener) {
 	if !namespaced(t) {
 		return nil, nil
 	}
-	// As the chart's init container runs it.
-	if out, err := exec.Command(os.Args[0], "capture").CombinedOutput(); err != nil {
-		t.Fatalf("capture: %v: %s", err, out)
-	}
 	node, port := loopback(t)
 	f = keyedForwarder(unix.VMADDR_CID_LOCAL, port)
 	at := fmt.Sprintf("127.0.0.1:%d", forwarderPort)
@@ -92,11 +89,25 @@ func capturing(t *testing.T) (f *forwarder, node *vsockListener) {
 	t.Cleanup(func() { l.Close(); lookups.Close() })
 	go f.serve(l)
 	go f.names.serve(lookups)
+	// As the chart's init container runs it, once the forwarder listens.
+	if out, err := exec.Command(os.Args[0], "capture").CombinedOutput(); err != nil {
+		t.Fatalf("capture: %v: %s", err, out)
+	}
 	return f, node
 }
 
-// asked takes the next stream at node as the proxy: it returns what the forwarder asked for after its key, once it has answered with reply.
-func asked(t *testing.T, f *forwarder, node *vsockListener, reply string) chan string {
+func TestCaptureFailsWhereTheForwarderGetsNothingOfWhatItRedirects(t *testing.T) {
+	if !namespaced(t) {
+		return
+	}
+	// No forwarder: to capture it is a kernel that took the rules and sends nothing where they say.
+	if out, err := exec.Command(os.Args[0], "capture").CombinedOutput(); err == nil || !bytes.Contains(out, []byte("got no address from the forwarder")) {
+		t.Fatalf("capture ended with %v and said %q: want it to fail, and the sandbox with it", err, out)
+	}
+}
+
+// asked takes the next stream at node as the proxy: it returns what the forwarder asked for after its key, once it has answered with reply, a frame for each part.
+func asked(t *testing.T, f *forwarder, node *vsockListener, reply ...string) chan string {
 	requests := make(chan string, 1)
 	go func() {
 		up, _, err := node.accept()
@@ -113,7 +124,9 @@ func asked(t *testing.T, f *forwarder, node *vsockListener, reply string) chan s
 		if _, err := io.ReadFull(up, request); err != nil {
 			return
 		}
-		up.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(reply))), reply...))
+		for _, part := range reply {
+			up.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(part))), part...))
+		}
 		requests <- string(request)
 	}()
 	return requests
@@ -138,12 +151,19 @@ func TestCapturedSandboxReachesANameAndAnAddressThroughItsProxy(t *testing.T) {
 		}
 		found = got
 	}
-	for target, want := range map[string]string{
-		found[0] + ":22":  "CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n",
-		"203.0.113.9:443": "CONNECT 203.0.113.9:443 HTTP/1.1\r\nHost: 203.0.113.9:443\r\n\r\n",
-	} {
+	const answer, banner = "HTTP/1.1 200 OK\r\nserver: envoy\r\n\r\n", "SSH-2.0-origin\r\n"
+	for target, as := range map[string]struct {
+		want  string
+		reply []string
+	}{
 		// The proxy's answer and a server that speaks first, in one frame.
-		requests := asked(t, f, node, "HTTP/1.1 200 OK\r\nserver: envoy\r\n\r\nSSH-2.0-origin\r\n")
+		found[0] + ":22": {"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n", []string{answer + banner}},
+		// The answer in two, the second a full frame: the rest of it is the server's.
+		"203.0.113.9:443": {"CONNECT 203.0.113.9:443 HTTP/1.1\r\nHost: 203.0.113.9:443\r\n\r\n",
+			[]string{answer[:9], answer[9:] + banner + strings.Repeat("x", maxFrame-len(answer[9:]+banner))}},
+	} {
+		want := as.want
+		requests := asked(t, f, node, as.reply...)
 		c, err := net.DialTimeout("tcp", target, budget)
 		if err != nil {
 			t.Fatalf("a connection to %s: %v", target, err)
@@ -153,9 +173,9 @@ func TestCapturedSandboxReachesANameAndAnAddressThroughItsProxy(t *testing.T) {
 			t.Fatalf("for a connection to %s the proxy was asked %q, want %q", target, got, want)
 		}
 		c.SetDeadline(time.Now().Add(budget))
-		banner := make([]byte, len("SSH-2.0-origin\r\n"))
-		if _, err := io.ReadFull(c, banner); string(banner) != "SSH-2.0-origin\r\n" {
-			t.Fatalf("the client of %s read %q, %v: want what followed the proxy's answer, and none of the answer", target, banner, err)
+		first := make([]byte, len(banner))
+		if _, err := io.ReadFull(c, first); string(first) != banner {
+			t.Fatalf("the client of %s read %q, %v: want what followed the proxy's answer, and none of the answer", target, first, err)
 		}
 	}
 }
@@ -173,8 +193,8 @@ func TestCapturedConnectionTheProxyRefusesIsReset(t *testing.T) {
 	defer c.Close()
 	within(t, requests, "stream to the proxy")
 	c.SetDeadline(time.Now().Add(budget))
-	if _, err := io.Copy(io.Discard, c); !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("the refused connection ended with %v: want a reset, and none of the proxy's answer", err)
+	if read, err := io.Copy(io.Discard, c); read != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("the refused connection gave %d bytes and ended with %v: want a reset, and none of the proxy's answer", read, err)
 	}
 }
 
@@ -189,7 +209,8 @@ func TestCapturedSandboxSendsNothingButTCPAndLookups(t *testing.T) {
 			streams <- struct{}{}
 		}
 	}()
-	for _, to := range []string{"203.0.113.9:123", f.names.address("example.com").String() + ":123"} {
+	named, _ := f.names.address("example.com")
+	for _, to := range []string{"203.0.113.9:123", named.String() + ":123"} {
 		c, err := net.Dial("udp", to)
 		if err != nil {
 			t.Fatal(err)

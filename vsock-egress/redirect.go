@@ -2,13 +2,18 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"syscall"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"github.com/mdlayher/netlink"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sys/unix"
 )
 
@@ -28,12 +33,12 @@ var (
 // redirect sends the sandbox's TCP connections to siblingRange to the forwarder, and refuses what else it sends there: it needs NET_ADMIN, so it runs once, before any program of the task.
 func redirect(args []string) error { return divert(args, false) }
 
-// redirectAll does that, and sends the forwarder every other connection the sandbox makes and each name it looks up, for a sandbox that may reach the whole internet through its proxy.
+// redirectAll, the command capture, does that, and sends the forwarder every other connection the sandbox makes and each name it looks up, for a sandbox that may reach the whole internet through its proxy: it fails unless the forwarder, which runs by then, gets them.
 func redirectAll(args []string) error { return divert(args, true) }
 
 func divert(args []string, all bool) error {
 	if len(args) > 0 { // one given for help, say, as root on a node, would make ownRange that machine's own
-		return fmt.Errorf("it takes no argument, and was given %q", args)
+		return fmt.Errorf("%s takes no argument, and was given %q", os.Args[1], args)
 	}
 	lo, err := net.InterfaceByName("lo")
 	if err != nil {
@@ -93,20 +98,17 @@ func divert(args []string, all bool) error {
 	over := func(is expr.CmpOp, protocol byte) []expr.Any {
 		return []expr.Any{&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: is, Register: 1, Data: []byte{protocol}}}
 	}
-	rule := func(in *nftables.Chain, then expr.Any, matches ...[]expr.Any) {
+	rule := func(in *nftables.Chain, then []expr.Any, matches ...[]expr.Any) {
 		exprs := []expr.Any{}
-		for _, match := range matches {
+		for _, match := range append(matches, then) {
 			exprs = append(exprs, match...)
-		}
-		if then == nil { // redirect to :3128
-			exprs = append(exprs, &expr.Immediate{Register: 1, Data: binary.BigEndian.AppendUint16(nil, forwarderPort)}, &expr.Redir{RegisterProtoMin: 1})
-		} else {
-			exprs = append(exprs, then)
 		}
 		c.AddRule(&nftables.Rule{Table: table, Chain: in, Exprs: exprs})
 	}
-	drop := &expr.Verdict{Kind: expr.VerdictDrop}
-	rule(chain, nil, to(expr.CmpOpEq, siblingRange), over(expr.CmpOpEq, unix.IPPROTO_TCP))
+	// redirect to :3128
+	forwarded := []expr.Any{&expr.Immediate{Register: 1, Data: binary.BigEndian.AppendUint16(nil, forwarderPort)}, &expr.Redir{RegisterProtoMin: 1}}
+	drop := []expr.Any{&expr.Verdict{Kind: expr.VerdictDrop}}
+	rule(chain, forwarded, to(expr.CmpOpEq, siblingRange), over(expr.CmpOpEq, unix.IPPROTO_TCP))
 	// The range is the sandbox's own, so its own server would take a datagram meant for a sibling, and its own kernel answer a ping.
 	rule(sent, drop, to(expr.CmpOpEq, siblingRange), over(expr.CmpOpNeq, unix.IPPROTO_TCP))
 	if all {
@@ -117,17 +119,62 @@ func divert(args []string, all bool) error {
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binary.BigEndian.AppendUint16(nil, resolver.Port())},
 		}
 		// A lookup: to the resolver either way, and one sent out of the sandbox as a datagram, which nothing would carry there.
-		rule(chain, nil, to(expr.CmpOpEq, netip.PrefixFrom(resolver.Addr(), 32)), over(expr.CmpOpEq, unix.IPPROTO_UDP), lookup)
-		rule(chain, nil, to(expr.CmpOpEq, netip.PrefixFrom(resolver.Addr(), 32)), over(expr.CmpOpEq, unix.IPPROTO_TCP), lookup)
-		rule(chain, nil, append(elsewhere, over(expr.CmpOpEq, unix.IPPROTO_UDP), lookup)...)
+		rule(chain, forwarded, to(expr.CmpOpEq, netip.PrefixFrom(resolver.Addr(), 32)), over(expr.CmpOpEq, unix.IPPROTO_UDP), lookup)
+		rule(chain, forwarded, to(expr.CmpOpEq, netip.PrefixFrom(resolver.Addr(), 32)), over(expr.CmpOpEq, unix.IPPROTO_TCP), lookup)
+		rule(chain, forwarded, append(elsewhere, over(expr.CmpOpEq, unix.IPPROTO_UDP), lookup)...)
 		// A connection to a name, at the address the forwarder gave it, or to an address that is not the sandbox's own.
-		rule(chain, nil, to(expr.CmpOpEq, nameRange), over(expr.CmpOpEq, unix.IPPROTO_TCP))
-		rule(chain, nil, append(elsewhere, over(expr.CmpOpEq, unix.IPPROTO_TCP))...)
+		rule(chain, forwarded, to(expr.CmpOpEq, nameRange), over(expr.CmpOpEq, unix.IPPROTO_TCP))
+		rule(chain, forwarded, append(elsewhere, over(expr.CmpOpEq, unix.IPPROTO_TCP))...)
 		// Nothing carries what is not TCP: it fails where it is sent, as to a sibling.
 		rule(sent, drop, to(expr.CmpOpEq, nameRange), over(expr.CmpOpNeq, unix.IPPROTO_TCP))
 		rule(sent, drop, append(elsewhere, over(expr.CmpOpNeq, unix.IPPROTO_TCP))...)
 	}
-	return c.Flush()
+	if err := c.Flush(); err != nil || !all {
+		return err
+	}
+	return proven()
+}
+
+// proven checks that the kernel sends the forwarder what the rules say: one that took them and redirected nothing would leave the sandbox running with every connection hanging.
+func proven() error {
+	question, err := (&dnsmessage.Message{
+		Header:    dnsmessage.Header{RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("capture.invalid."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}).Pack()
+	if err != nil {
+		return err
+	}
+	// A lookup sent out of the sandbox: the route, the redirect of a datagram and the forwarder's answer.
+	asks, err := net.DialTimeout("udp", "192.0.2.53:53", dialWait)
+	if err != nil {
+		return err
+	}
+	defer asks.Close()
+	asks.SetDeadline(time.Now().Add(dialWait))
+	answer := make([]byte, 512)
+	if _, err = asks.Write(question); err == nil {
+		var size int
+		if size, err = asks.Read(answer); err == nil {
+			var reply dnsmessage.Message
+			if err = reply.Unpack(answer[:size]); err == nil && len(reply.Answers) != 1 {
+				err = fmt.Errorf("%d records", len(reply.Answers))
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("a lookup sent out of the sandbox got no address from the forwarder: %w", err)
+	}
+	// A connection to the last address of nameRange, which stands for no name yet: the forwarder takes it and resets it, and with no redirect nothing listens there.
+	first := nameRange.Addr().As4()
+	unnamed := netip.AddrFrom4([4]byte(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(first[:])+1<<(32-nameRange.Bits())-2)))
+	taken, err := net.DialTimeout("tcp", netip.AddrPortFrom(unnamed, 9).String(), dialWait)
+	if errors.Is(err, syscall.ECONNRESET) { // its reset came before the connect had returned
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("a connection to a name's address did not reach the forwarder: %w", err)
+	}
+	return taken.Close()
 }
 
 // originalDst is where a connection was going before redirect sent it to the forwarder.

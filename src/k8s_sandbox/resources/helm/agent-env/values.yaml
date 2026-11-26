@@ -44,8 +44,7 @@ extraContainers: []
 # Sandbox with no network device also reach the services they share a network with.
 # @default -- Empty
 egressForwarderImage: ""
-# -- Send every TCP connection and DNS lookup of a pod that names an egress proxy to that
-# proxy, where the pod has no network device: see `vsock-egress/README.md`.
+# -- Tunnel every TCP connection of a pod with no network device through the egress proxy it names, and answer its DNS lookups in the pod: see `vsock-egress/README.md`.
 egressCapture: false
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []

@@ -75,7 +75,7 @@ spec:
       {{- $relayed := or $carried $taken $listened }}
       {{- $forwarder := or $egressProxy $relayed }}
       {{- range $service.ports }}
-      {{- if and $forwarder (eq (toString .port) "3128") }}{{ fail (printf "services.%s declares port 3128, which its pod's egress forwarder holds for TCP and for UDP: use another port" $name) }}{{ end }}
+      {{- if and $forwarder (eq (toString .port) "3128") (has (default "TCP" .protocol | upper) (list "TCP" "UDP")) }}{{ fail (printf "services.%s declares port 3128, which its pod's egress forwarder holds for TCP and for UDP: use another port" $name) }}{{ end }}
       {{- end }}
       {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
       {{- $noDnsVolume := $noCard }}
@@ -193,7 +193,7 @@ spec:
         {{- /* Ahead of every container that runs an image of the task's: the rule it installs needs NET_ADMIN once, and none of them gets it. */}}
         - name: egress-redirector-with-a-name-too-long-for-any-service-to-share
           image: {{ $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", {{ ternary "capture" "redirect" (not (empty $captured)) | quote }}]
+          command: ["/vsock-egress", {{ if $captured }}"capture"{{ else }}"redirect"{{ end }}]
           resources:
             requests:
               memory: "64Mi"

@@ -75,11 +75,11 @@
   for it, and the chart adds no network policy: add the one that says who reaches that
   port.
 - Add `egressCapture`: with it, a pod with no network device that names an egress proxy
-  sends that proxy every TCP connection it makes, as `CONNECT` to the name or address,
-  and its DNS lookups get addresses that stand for the names. UDP and ICMP fail where
-  they are sent. Its init container runs `vsock-egress capture`, and the forwarder holds
-  port 3128 for UDP too, so the chart refuses a service that declares that port of either
-  protocol.
+  sends that proxy every TCP connection it makes, and its DNS lookups get addresses that
+  stand for the names. UDP and ICMP fail where they are sent, and a connection the proxy
+  refuses or cannot place is accepted and then reset. Admit the init container's command
+  `vsock-egress capture` as you admit `redirect`. The chart now refuses a service that
+  declares UDP port 3128 on a pod with the forwarder too.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

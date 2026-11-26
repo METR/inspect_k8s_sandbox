@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,36 +14,64 @@ import (
 )
 
 // nameTTL is how long a client may keep an answer: short, so that one from a forwarder since restarted, which the new one does not know, is asked for again.
-const nameTTL = 5
+const nameTTL = 5 * time.Second
 
 // names gives each name the sandbox looks up an address of nameRange and tells a connection to that address which name it was for: the lookup that counts is made where the connection leaves.
 type names struct {
 	mu     sync.Mutex
-	byName map[string]netip.Addr
+	byName map[string]*alias
 	byAddr map[netip.Addr]string
-	next   uint32 // how many addresses have been given out
+	next   uint32 // addresses given out since the pod started, by this forwarder and any before it
+	kept   string // the file that holds next: a forwarder started again gives no address an earlier one gave another name
+	now    func() time.Time
 }
 
-func newNames() *names {
-	return &names{byName: map[string]netip.Addr{}, byAddr: map[netip.Addr]string{}}
+// alias is a name's address, and when the name was last looked up.
+type alias struct {
+	addr  netip.Addr
+	asked time.Time
 }
 
-// address is name's own, the same one each time it is asked; past the range's 32,766 the longest held goes to the next name.
-func (n *names) address(name string) netip.Addr {
+func newNames(kept string) *names {
+	n := &names{byName: map[string]*alias{}, byAddr: map[netip.Addr]string{}, kept: kept, now: time.Now}
+	if was, err := os.ReadFile(kept); err == nil && len(was) == 4 {
+		n.next = binary.BigEndian.Uint32(was)
+	}
+	return n
+}
+
+// address is name's own, the same one each time it is asked. With every address given, the name looked up longest ago gives its up, unless an answer with it may still be in use: then there is none.
+func (n *names) address(name string) (addr netip.Addr, room bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if addr, known := n.byName[name]; known {
-		return addr
+	now := n.now()
+	if held, known := n.byName[name]; known {
+		held.asked = now
+		return held.addr, true
 	}
 	hosts := uint32(1)<<(32-nameRange.Bits()) - 2 // but the range's first address and its last
-	first := nameRange.Addr().As4()
-	addr := netip.AddrFrom4([4]byte(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(first[:])+1+n.next%hosts)))
-	n.next++
-	if held, taken := n.byAddr[addr]; taken {
-		delete(n.byName, held)
+	if uint32(len(n.byAddr)) < hosts {
+		for taken := true; taken; _, taken = n.byAddr[addr] {
+			first := nameRange.Addr().As4()
+			addr = netip.AddrFrom4([4]byte(binary.BigEndian.AppendUint32(nil, binary.BigEndian.Uint32(first[:])+1+n.next%hosts)))
+			n.next++
+		}
+		os.WriteFile(n.kept, binary.BigEndian.AppendUint32(nil, n.next), 0o600)
+	} else {
+		var oldest string
+		for held, at := range n.byName {
+			if oldest == "" || at.asked.Before(n.byName[oldest].asked) {
+				oldest = held
+			}
+		}
+		if now.Sub(n.byName[oldest].asked) < 2*nameTTL {
+			return netip.Addr{}, false
+		}
+		addr = n.byName[oldest].addr
+		delete(n.byName, oldest)
 	}
-	n.byName[name], n.byAddr[addr] = addr, name
-	return addr
+	n.byName[name], n.byAddr[addr] = &alias{addr, now}, name
+	return addr, true
 }
 
 // named is the name addr was given for, or none.
@@ -52,7 +81,12 @@ func (n *names) named(addr netip.Addr) string {
 	return n.byAddr[addr]
 }
 
-// answer is the reply to a DNS question: an address of nameRange for a name's A record, and no record for any other question, an IPv6 address among them.
+// carried says whether a proxy would take name: it has a dot, and nothing that could end the line the forwarder asks the proxy for it in.
+func carried(name string) bool {
+	return strings.Contains(name, ".") && strings.Trim(name, "abcdefghijklmnopqrstuvwxyz0123456789-_.") == ""
+}
+
+// answer is the reply to a DNS question: an address of nameRange for the A record of a name a proxy would take, and no record for any other question, an IPv6 address among them.
 func (n *names) answer(question []byte) []byte {
 	var parser dnsmessage.Parser
 	header, err := parser.Start(question)
@@ -63,14 +97,21 @@ func (n *names) answer(question []byte) []byte {
 	if err != nil {
 		return nil
 	}
-	reply := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: header.ID, Response: true, RecursionDesired: header.RecursionDesired, RecursionAvailable: true})
+	said := dnsmessage.Header{ID: header.ID, Response: true, RecursionDesired: header.RecursionDesired, RecursionAvailable: true}
+	var addr netip.Addr
+	if name := strings.ToLower(strings.TrimSuffix(asked.Name.String(), ".")); asked.Class == dnsmessage.ClassINET && asked.Type == dnsmessage.TypeA && carried(name) {
+		var room bool
+		if addr, room = n.address(name); !room {
+			said.RCode = dnsmessage.RCodeServerFailure
+		}
+	}
+	reply := dnsmessage.NewBuilder(nil, said)
 	reply.EnableCompression()
 	reply.StartQuestions()
 	reply.Question(asked)
 	reply.StartAnswers()
-	if asked.Class == dnsmessage.ClassINET && asked.Type == dnsmessage.TypeA {
-		name := strings.ToLower(strings.TrimSuffix(asked.Name.String(), "."))
-		reply.AResource(dnsmessage.ResourceHeader{Name: asked.Name, Class: asked.Class, TTL: nameTTL}, dnsmessage.AResource{A: n.address(name).As4()})
+	if addr.IsValid() {
+		reply.AResource(dnsmessage.ResourceHeader{Name: asked.Name, Class: asked.Class, TTL: uint32(nameTTL / time.Second)}, dnsmessage.AResource{A: addr.As4()})
 	}
 	packed, err := reply.Finish()
 	if err != nil {

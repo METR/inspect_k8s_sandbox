@@ -1482,18 +1482,25 @@ def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
     assert f"{annotation}, which the chart writes itself" in exc_info.value.stderr
 
 
-@pytest.mark.parametrize("port", [0, 1], ids=["TCP", "UDP"])
+@pytest.mark.parametrize("protocol", ["TCP", "UDP", "SCTP"])
 def test_a_service_cannot_declare_the_port_its_pods_forwarder_holds(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, port: int
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, protocol: str
 ) -> None:
-    # Its server could not bind every address: the forwarder holds the port.
-    with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _sibling_pods(
+    def render() -> object:
+        return _sibling_pods(
             chart_dir,
             test_resources_dir,
             f"annotations.{_NO_CARD}",
-            f"services.game.ports[{port}].port=3128",
+            f"services.game.ports[1].port=3128,services.game.ports[1].protocol={protocol}",
         )
+
+    # The forwarder holds the port for TCP and for UDP, and no other protocol's.
+    if protocol == "SCTP":
+        render()
+        return
+    # Its server could not bind every address.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        render()
     assert "services.game declares port 3128" in exc_info.value.stderr
 
 
