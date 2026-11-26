@@ -2,13 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -26,7 +26,9 @@ func namespaced(t *testing.T) bool {
 		if os.Geteuid() != 0 {
 			t.Skip("only root can make a network namespace")
 		}
-		there := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.v")
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		there := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.v")
 		there.Env = append(os.Environ(), ownNamespace+"=1")
 		there.SysProcAttr = &syscall.SysProcAttr{Unshareflags: syscall.CLONE_NEWNET}
 		out, err := there.CombinedOutput()
@@ -59,26 +61,6 @@ func redirected(t *testing.T) bool {
 		t.Fatalf("redirect: %v", err)
 	}
 	return true
-}
-
-func TestRedirectAskedForHelpChangesNothing(t *testing.T) {
-	if !namespaced(t) {
-		return
-	}
-	// As an operator might ask on a node, as root: the address redirect adds would make 198.18.0.0/15 that machine's own.
-	out, err := exec.Command(os.Args[0], "redirect", "-h").CombinedOutput()
-	if err != nil || !strings.Contains(string(out), "Usage of redirect") {
-		t.Fatalf("redirect -h ended with %v: %s: want its usage alone", err, out)
-	}
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, addr := range addrs {
-		if addr.String() == ownRange.String() {
-			t.Fatalf("redirect -h gave this machine %v", addr)
-		}
-	}
 }
 
 func TestConnectionToASiblingsAddressOpensAStreamThatSaysWhereItWasGoing(t *testing.T) {

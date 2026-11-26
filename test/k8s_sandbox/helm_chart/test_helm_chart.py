@@ -1415,33 +1415,42 @@ def test_siblings_are_carried_only_for_a_pod_with_no_network_card_and_a_forwarde
     assert "3134" not in str(policies)
 
 
+@pytest.mark.parametrize(
+    ("protocol", "relayed"),
+    [
+        pytest.param(
+            "TCP", {"default": _SIBLINGS, "game": _SERVED, "hidden": _SIBLINGS}
+        ),
+        # No sibling of `game` has a DNS record, and it takes no TCP: nothing to carry.
+        pytest.param("UDP", {}),
+    ],
+)
 def test_a_pod_runs_the_forwarder_only_where_its_node_starts_it_a_worker(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+    chart_dir: pathlib.Path,
+    test_resources_dir: pathlib.Path,
+    protocol: str,
+    relayed: dict[str, str],
 ) -> None:
-    # `game` serves UDP alone and no sibling of its has a DNS record: nothing to carry.
     pods, _ = _sibling_pods(
         chart_dir,
         test_resources_dir,
         f"annotations.{_NO_CARD}",
-        "services.game.ports[0].protocol=UDP,services.game.ports[0].port=9000,"
-        "services.game.initContainers[0].name=setup,"
-        "services.game.initContainers[0].image=game:1,"
+        f"services.game.ports[0].protocol={protocol},services.game.ports[0].port=9000,"
         "services.default.dnsRecord=false,services.hidden.dnsRecord=false",
     )
 
     # A forwarder is ready once its worker listens: only these annotations start one.
     assert {
-        name: (
-            sorted({_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()),
-            [c["name"] for c in pod["spec"].get("initContainers", [])][:2],
-        )
+        name: annotation
         for name, pod in pods.items()
-    } == {
-        "default": ([_SIBLINGS], [_FORWARDER, _REDIRECT]),
-        "game": ([], ["setup"]),
-        "hidden": ([_SIBLINGS], [_FORWARDER, _REDIRECT]),
-        "offline": ([], []),
-    }
+        for annotation in {_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()
+    } == relayed
+    assert {
+        name
+        for name, pod in pods.items()
+        if {_FORWARDER, _REDIRECT}
+        & {c["name"] for c in pod["spec"].get("initContainers", [])}
+    } == relayed.keys()
 
 
 def test_a_service_that_keeps_its_network_card_is_no_sibling(
@@ -1472,6 +1481,20 @@ def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
             f"annotations.{_NO_CARD},services.default.podAnnotations.{annotation}=x",
         )
     assert f"{annotation}, which the chart writes itself" in exc_info.value.stderr
+
+
+def test_a_service_cannot_declare_the_port_its_pods_forwarder_holds(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    # Its server would fail to bind every address, and its siblings' connections reset.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _sibling_pods(
+            chart_dir,
+            test_resources_dir,
+            f"annotations.{_NO_CARD}",
+            "services.game.ports[0].port=3128",
+        )
+    assert "services.game declares TCP port 3128" in exc_info.value.stderr
 
 
 def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
@@ -1525,23 +1548,7 @@ def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy
     for network in ("front", "back"):
         ports = by_name[f"svc-game-{network}-ingress"]["ingress"][0]["toPorts"]
         assert relay in ports[0]["ports"]
-    # Once where the service declares that port itself, and not where it takes no TCP.
-    udp_alone = "9000,services.game.ports[0].protocol=UDP"
-    for declared, named in (("3134", 1), (udp_alone, 0)):
-        _, again = _sibling_pods(
-            chart_dir,
-            test_resources_dir,
-            f"annotations.{_NO_CARD}",
-            f"services.game.ports[0].port={declared}",
-        )
-        (ingress,) = (
-            policy["spec"]["ingress"][0]
-            for policy in again
-            if policy["metadata"]["name"].endswith("svc-game-front-ingress")
-        )
-        assert ingress["toPorts"][0]["ports"].count(relay) == named
-    # `default` names a proxy, so its policy names all it reaches: its one sibling's
-    # record, and that sibling's worker alone.
+    # `default` names a proxy, so its policy names all it reaches: one sibling's too.
     dns, proxy, siblings = by_name["svc-default-egress-proxy"]["egress"]
     assert dns["toPorts"][0]["rules"] == {
         "dns": [
@@ -1556,6 +1563,32 @@ def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy
     ]
     assert workers["matchLabels"]["app.kubernetes.io/instance"] == "my-release"
     assert siblings["toPorts"] == [{"ports": [relay]}]
+
+
+@pytest.mark.parametrize(
+    ("port", "named"),
+    [
+        pytest.param("3134", 1, id="the service declares that port itself"),
+        pytest.param("9000,services.game.ports[0].protocol=UDP", 0, id="no TCP port"),
+    ],
+)
+def test_a_services_policy_names_its_workers_port_once_and_only_beside_tcp(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, port: str, named: int
+) -> None:
+    _, policies = _sibling_pods(
+        chart_dir,
+        test_resources_dir,
+        f"annotations.{_NO_CARD}",
+        f"services.game.ports[0].port={port}",
+    )
+
+    (ingress,) = (
+        policy["spec"]["ingress"][0]
+        for policy in policies
+        if policy["metadata"]["name"].endswith("svc-game-front-ingress")
+    )
+    relay = {"port": "3134", "protocol": "TCP"}
+    assert ingress["toPorts"][0]["ports"].count(relay) == named
 
 
 def test_extra_containers_join_every_service_pod_as_written(chart_dir: Path) -> None:

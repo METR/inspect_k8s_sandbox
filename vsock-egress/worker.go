@@ -30,6 +30,7 @@ type worker struct {
 	pace     *pacer                 // all of the sandbox's streams, both ways
 	slots    chan struct{}          // one for each open stream
 	unkeyed  chan struct{}          // one for each connection that has not said what it wants yet: the key, or a sibling's port
+	arriving chan struct{}          // one for each connection its siblings have to it: they leave the pod's own streams half the places
 	keyWait  time.Duration          // how long a connection has to say it
 	stall    time.Duration          // how long the far end may leave a write to it, or the end of them, waiting
 
@@ -82,7 +83,7 @@ const stallWait = 5 * time.Minute
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, proxy string, rate int) *worker {
-	return &worker{vsock: vsock, proxy: &target{name: proxy}, siblings: map[netip.Addr]*target{}, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), keyWait: handshakeWait, stall: stallWait,
+	return &worker{vsock: vsock, proxy: &target{name: proxy}, siblings: map[netip.Addr]*target{}, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), arriving: make(chan struct{}, maxStreams), keyWait: handshakeWait, stall: stallWait,
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -261,6 +262,14 @@ func (w *worker) arrive(c net.Conn) {
 	tcp := c.(*net.TCPConn)
 	defer tcp.Close()
 	tcp.SetLinger(0) // until it is joined, a connection that ends here ends as one to a closed port does
+	select {
+	case w.arriving <- struct{}{}:
+		defer func() { <-w.arriving }()
+	default:
+		<-w.unkeyed
+		w.refuse()
+		return
+	}
 	port := make([]byte, 2)
 	tcp.SetReadDeadline(time.Now().Add(w.keyWait))
 	_, err := io.ReadFull(tcp, port)

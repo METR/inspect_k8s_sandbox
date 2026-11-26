@@ -21,10 +21,10 @@ datagram or a ping to one fails where it is sent (`EPERM`). A sibling's connecti
 `198.18.0.0`, whichever sibling made it, so a server takes it only if it listens on every address. A connection to a
 port with no server is accepted and then reset: a readiness check has to exchange data. A program that uses the pod's
 HTTP proxy needs its siblings' names in `no_proxy`. A pod's connections to its siblings count among its forwarder's
-64, and those its siblings make to it among its worker's 128. A pod's worker reaches a sibling's at port 3134 of its
-pod: the release's ingress policies decide which pods reach that port, so the chart refuses
-`networkPolicy.enabled: false` here. Admit `NET_ADMIN` for that init container alone, as the chart renders it and
-from the image you built, on a pod with no network device, and refuse exec into it.
+64, and those its siblings make to it, 64 at most, among its worker's 128. A pod's worker reaches a sibling's at port
+3134 of its pod: the release's ingress policies decide which pods reach that port. Admit `NET_ADMIN` for that init
+container alone, as the chart renders it and from the image you built, on a pod with no network device, and refuse
+exec into it.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 

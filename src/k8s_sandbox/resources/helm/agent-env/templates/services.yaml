@@ -71,6 +71,7 @@ spec:
       {{- /* With neither annotation the node starts the pod no worker, and its forwarder would never be ready. */}}
       {{- $relayed := or $carried $taken }}
       {{- $forwarder := or $egressProxy $relayed }}
+      {{- if and $forwarder (has "3128" $served) }}{{ fail (printf "services.%s declares TCP port 3128, which its pod's egress forwarder holds: use another port" $name) }}{{ end }}
       {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
       {{- $noDnsVolume := $noCard }}
       {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}

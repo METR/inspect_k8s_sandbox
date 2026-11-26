@@ -59,8 +59,8 @@
   `egress-forwarder-with-a-name-too-long-for-any-service-to-share`.
 - With `egressForwarderImage` set, the services of an AWS Nitro Sandbox with no network
   device reach each other over TCP: each pod resolves the names of the services it shares
-  a network with (`<service>` and `$AGENT_ENV-<service>`), and reaches any port of one, or
-  its `ports` where it declares them. Not carried: UDP and ICMP, which fail where they
+  a network with, where they have a DNS record (`<service>` and `$AGENT_ENV-<service>`),
+  and reaches any port of one, or its `ports` where it declares them. Not carried: UDP and ICMP, which fail where they
   are sent, and a service's `additionalDnsRecords`. A server is reached only if it listens
   on every address, and a connection to a port with no server behind it is accepted and
   then reset. Each such pod runs the forwarder, which holds `127.0.0.1:3128` there too,

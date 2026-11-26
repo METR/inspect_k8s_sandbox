@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"flag"
 	"net"
 	"net/netip"
 
@@ -22,8 +21,7 @@ var (
 )
 
 // redirect sends the sandbox's TCP connections to siblingRange to the forwarder, and refuses what else it sends there: it needs NET_ADMIN, so it runs once, before any program of the task.
-func redirect(args []string) error {
-	flag.NewFlagSet("redirect", flag.ExitOnError).Parse(args) // it has none: -h ends here, before the namespace is changed
+func redirect([]string) error {
 	lo, err := net.InterfaceByName("lo")
 	if err != nil {
 		return err

@@ -83,7 +83,7 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- if eq (get $annotations "sandbox.amazonaws.com/network-isolated") "true" }}true{{ end -}}
 {{- end -}}
 
-{{/* A service's siblings over vsock-egress, as a JSON list of {service, address, named}: those with no network device on a network of its; named, if a DNS record lets its pod find one. Takes a dict of root ($) and name. */}}
+{{/* A service's siblings over vsock-egress, as a JSON list of {service, address, named}: those with no network device on a network of its; named, if a DNS record lets its pod find one and it takes TCP. Takes a dict of root ($) and name. */}}
 {{- define "agentEnv.siblings" -}}
 {{- $own := get .root.Values.services .name -}}
 {{- $siblings := list -}}
@@ -94,7 +94,9 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- $shared := not $.root.Values.networks -}}
 {{- range $own.networks }}{{ if has . (default (list) $service.networks) }}{{ $shared = true }}{{ end }}{{ end -}}
 {{- if and (ne $name $.name) $shared (not $service.networkIsolated) (include "agentEnv.noCard" (dict "root" $.root "name" $name)) -}}
-{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256)) "named" (ne (include "shouldCreateDnsRecord" $service) "")) -}}
+{{- $tcp := not $service.ports -}}
+{{- range $service.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $tcp = true }}{{ end }}{{ end -}}
+{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256)) "named" (and $tcp (ne (include "shouldCreateDnsRecord" $service) ""))) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

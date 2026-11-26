@@ -277,7 +277,31 @@ func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T)
 	}
 }
 
-func TestSiblingIsLookedUpAgainOnceItsAddressIsFiveSecondsOld(t *testing.T) {
+func TestSiblingsHoldNoMoreThanHalfOfAPodsPlaces(t *testing.T) {
+	w := newWorker(firecracker(t, nil), "", 0)
+	w.keyWait = time.Hour // no silent connection gives its place up while the test runs
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	dial := relayed(t, w)
+	for held := 1; held <= maxStreams; held++ {
+		dial()
+		for deadline := time.Now().Add(budget); len(w.unkeyed) < held; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the worker took %d of its siblings' connections, want %d", len(w.unkeyed), held)
+			}
+		}
+	}
+	// With every place taken, the pod's own streams to its proxy and its siblings would be refused instead.
+	if _, err := io.Copy(io.Discard, dial()); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("one more connection from a sibling ended with %v: want it reset at once", err)
+	}
+	if open := len(w.unkeyed); open != maxStreams {
+		t.Fatalf("its siblings hold %d of the pod's %d places, want %d", open, workerStreams, maxStreams)
+	}
+}
+
+func TestSiblingIsLookedUpAgainOnceItsAddressIsStale(t *testing.T) {
 	key := newKey()
 	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
 	_, second := serverAt(t, fmt.Sprintf("127.0.0.2:%d", relayPort)) // where the Service points once the sibling's pod is replaced
@@ -295,14 +319,14 @@ func TestSiblingIsLookedUpAgainOnceItsAddressIsFiveSecondsOld(t *testing.T) {
 
 	stream()
 	within(t, first, "connection to the sibling's first address")
-	clock.Store(4)
+	clock.Store(int64(siblingFresh/time.Second) - 1)
 	stream()
-	within(t, first, "connection to the address the worker holds for four seconds")
-	clock.Store(5)
+	within(t, first, "connection to the address the worker still holds")
+	clock.Store(int64(siblingFresh / time.Second))
 	stream()
 	within(t, second, "connection to the sibling's new address")
 	if lookups.Load() != 2 {
-		t.Fatalf("%d lookups for three streams in five seconds: want 2", lookups.Load())
+		t.Fatalf("%d lookups for three streams: want 2", lookups.Load())
 	}
 }
 

@@ -363,6 +363,7 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 // forwarding starts the program's own forward, in a process of its own, and returns its TCP address once it listens: what a sandbox and its node meet is whatever that makes.
 func forwarding(t *testing.T) (addr string) {
 	t.Helper()
+	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -388,7 +389,7 @@ func forwarding(t *testing.T) (addr string) {
 		select {
 		case err := <-ended:
 			ended <- err
-			t.Skipf("forward did not come to listen: %v: %s", err, said)
+			t.Fatalf("forward did not come to listen: %v: %s", err, said)
 		default:
 		}
 		if time.Now().After(deadline) {
