@@ -273,7 +273,7 @@ func inNetns(path string, f func() error) error {
 	return err
 }
 
-// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy or siblings.
+// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy, siblings or a port to listen on.
 type launcher struct {
 	node
 	rate     int

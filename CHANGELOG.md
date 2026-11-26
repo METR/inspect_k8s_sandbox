@@ -71,9 +71,9 @@
   `networkPolicy.enabled: false` where a sibling is carried.
 - A pod with no network device takes connections on the port its annotation
   `inspect-k8s-sandbox/ingress-listen` names (1024 to 65535 other than 3134), handed to
-  the same port in the sandbox. It runs the forwarder and the redirect init container
-  for it, and the chart adds no network policy: add the one that says who reaches that
-  port.
+  the same port in the sandbox. Set `egressForwarderImage` for it, admit the redirect
+  init container in its namespace as for siblings, and add the network policy that says
+  who reaches that port: the chart adds none.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
