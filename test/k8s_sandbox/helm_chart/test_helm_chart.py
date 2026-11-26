@@ -1435,7 +1435,7 @@ def test_a_pod_runs_the_forwarder_only_where_its_node_starts_it_a_worker(
         chart_dir,
         test_resources_dir,
         f"annotations.{_NO_CARD}",
-        f"services.game.ports[0].protocol={protocol},services.game.ports[0].port=9000,"
+        f"services.game.ports[0].protocol={protocol},"
         "services.default.dnsRecord=false,services.hidden.dnsRecord=false",
     )
 
@@ -1446,11 +1446,10 @@ def test_a_pod_runs_the_forwarder_only_where_its_node_starts_it_a_worker(
         for annotation in {_SIBLINGS, _SERVED} & pod["metadata"]["annotations"].keys()
     } == relayed
     assert {
-        name
-        for name, pod in pods.items()
-        if {_FORWARDER, _REDIRECT}
+        name: {_FORWARDER, _REDIRECT}
         & {c["name"] for c in pod["spec"].get("initContainers", [])}
-    } == relayed.keys()
+        for name, pod in pods.items()
+    } == {name: {_FORWARDER, _REDIRECT} if name in relayed else set() for name in pods}
 
 
 def test_a_service_that_keeps_its_network_card_is_no_sibling(
@@ -1594,7 +1593,7 @@ def test_siblings_reach_the_worker_of_a_pod_that_declares_ports_or_names_a_proxy
     ("port", "named"),
     [
         pytest.param("3134", 1, id="the service declares that port itself"),
-        pytest.param("9000,services.game.ports[0].protocol=UDP", 0, id="no TCP port"),
+        pytest.param("8000,services.game.ports[0].protocol=UDP", 0, id="no TCP port"),
     ],
 )
 def test_a_services_policy_names_its_workers_port_once_and_only_beside_tcp(
@@ -1997,7 +1996,12 @@ def _run_helm_template(
 
     # stderr is captured so that tests asserting rejection can check why helm failed.
     result = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+        timeout=30,
     )
     return list(yaml.safe_load_all(result.stdout))
 

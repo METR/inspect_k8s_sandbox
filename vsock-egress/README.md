@@ -18,7 +18,7 @@ In a release whose `egressForwarderImage` is set, a pod with no network device a
 network with, over TCP, and they reach it. An init container runs `vsock-egress redirect` once, as root with
 `NET_ADMIN`: it makes `198.18.0.0/15` the VM's own, where each sibling has an address in `198.18.0.0/16`, and a
 datagram or a ping to one fails where it is sent (`EPERM`). A sibling's connection arrives at `198.19.0.1` from
-`198.18.0.0`, whichever sibling made it, so a server takes it only if it listens on every address. A connection to a
+`198.18.0.0`, whichever sibling made it, so a server that listens on `127.0.0.1` alone does not take it. A connection to a
 port with no server is accepted and then reset: a readiness check has to exchange data. A program that uses the pod's
 HTTP proxy needs its siblings' names in `no_proxy`. A pod's connections to its siblings count among its forwarder's
 64, and those its siblings make to it, 64 at most, among its worker's 128. A pod's worker reaches a sibling's at port
@@ -69,7 +69,7 @@ them, has one word to alarm on:
   sandbox of that uid gets a worker meanwhile. Again each minute while that lasts.
 - `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
 - `<pod>: proxy_unreached: <why>`, then `<pod>: proxy_unreached: <n> streams since the last report` each minute.
-- `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open`
+- `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open, of which its siblings may hold 64`
   and `<pod>: key_unfetched: <why>`, then their counts each minute: what a sandbox or its siblings can cause. Until a
   fetch of the key succeeds its streams are refused.
 - `<pod>: sibling_unreached: <why>` and `<pod>: guest_unreached: <why>`, then their counts each minute: the worker

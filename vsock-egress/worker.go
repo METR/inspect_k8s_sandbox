@@ -61,7 +61,7 @@ type target struct {
 // siblingFresh is the cluster DNS's own time to live for a Service: a sibling's names its pod, whose address another sibling's pod can take once it is replaced, and that one's worker would answer.
 const siblingFresh = 5 * time.Second
 
-// workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest.
+// workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest, and the pod's siblings may hold half of them.
 const workerStreams = 2 * maxStreams
 
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
@@ -133,7 +133,7 @@ func (w *worker) report() {
 // refuse counts a stream turned away; the first of each report is written at once.
 func (w *worker) refuse() {
 	if w.refused.Add(1) == 1 {
-		log.Printf("streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the %d open", workerStreams)
+		log.Printf("streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the %d open, of which its siblings may hold %d", workerStreams, maxStreams)
 	}
 }
 

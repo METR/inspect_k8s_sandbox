@@ -61,13 +61,14 @@
   device reach each other over TCP: each pod resolves the names of the services it shares
   a network with, where they have a DNS record (`<service>` and `$AGENT_ENV-<service>`),
   and reaches any port of one, or its `ports` where it declares them. Not carried: UDP and ICMP, which fail where they
-  are sent, and a service's `additionalDnsRecords`. A server is reached only if it listens
-  on every address, and a connection to a port with no server behind it is accepted and
+  are sent, and a service's `additionalDnsRecords`. A server that listens on `127.0.0.1`
+  alone is not reached, and a connection to a port with no server behind it is accepted and
   then reset. Each such pod runs the forwarder, which holds `127.0.0.1:3128` there too,
   and an init container named
   `egress-redirector-with-a-name-too-long-for-any-service-to-share`, as root with
-  `NET_ADMIN`, so its namespace's Pod Security level must be `privileged`, and the chart
-  refuses `networkPolicy.enabled: false` there.
+  `NET_ADMIN`, so its namespace's Pod Security level must be `privileged`. The chart
+  refuses a service that declares TCP port 3128 on a pod with the forwarder, and
+  `networkPolicy.enabled: false` where a sibling is carried.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

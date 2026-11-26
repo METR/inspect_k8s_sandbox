@@ -279,12 +279,12 @@ func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T)
 
 func TestSiblingsStreamOutlivesTheWaitForTheForwardersKey(t *testing.T) {
 	key := newKey()
-	wait := 250 * time.Millisecond
+	wait := time.Second
 	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
 		guest.Write(key)
 		io.ReadFull(guest, make([]byte, 2))
 		fromFrames(io.Discard, guest, nil)
-		time.Sleep(2 * wait) // past what the forwarder had to show its key in: left on the connection, that deadline would end the stream here
+		time.Sleep(wait + wait/4) // past what the forwarder had to show its key in: left on the connection, that deadline would end the stream here
 		toFrames(guest, strings.NewReader("reply"), nil)
 	}), "", 0)
 	w.keyWait = wait
