@@ -27,7 +27,7 @@ const (
 	siblingsAnnotation = "inspect-k8s-sandbox/egress-siblings"
 	// portsAnnotation names the ports of the pod its siblings may reach: *, or a list with commas between.
 	portsAnnotation = "inspect-k8s-sandbox/ingress-ports"
-	// listenAnnotation names ports of the pod its worker takes connections on, from whoever the pod's network policy lets in: a list with commas between.
+	// listenAnnotation names a port of the pod its worker takes connections on, from whoever the pod's network policy lets in.
 	listenAnnotation = "inspect-k8s-sandbox/ingress-listen"
 )
 
@@ -125,13 +125,9 @@ func (sb sandbox) carried() error {
 			}
 		}
 	}
-	if sb.listen != "" {
-		for _, port := range strings.Split(sb.listen, ",") {
-			// A worker is no root, so binds no port below 1024, and holds relayPort itself.
-			if n, _ := strconv.Atoi(port); !isPort(port) || n < 1024 || n == relayPort {
-				return fmt.Errorf("its annotation %s is %q, not ports from 1024 to 65535 other than %d, with commas between", listenAnnotation, sb.listen, relayPort)
-			}
-		}
+	// A worker is no root, so binds no port below 1024, and holds relayPort itself.
+	if n, _ := strconv.Atoi(sb.listen); sb.listen != "" && (!isPort(sb.listen) || n < 1024 || n == relayPort) {
+		return fmt.Errorf("its annotation %s is %q, not a port from 1024 to 65535 other than %d", listenAnnotation, sb.listen, relayPort)
 	}
 	return nil
 }
@@ -429,7 +425,7 @@ func (l *launcher) pass() error {
 			l.started[id] = true
 			delete(l.reported, id)
 		}
-		log.Printf("%s: worker %d as uid %d for proxy %q, siblings %q, ports %q", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target, sb.siblings, sb.ports)
+		log.Printf("%s: worker %d as uid %d for proxy %q, siblings %q, ports %q, listening on %q", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target, sb.siblings, sb.ports, sb.listen)
 		l.workers[id] = w
 		held[sb.uid] = true // wanted counts a uid's VMs, then reads each again: one whose directory came between is a second of this uid
 	}

@@ -415,7 +415,7 @@ func TestWorkerTakesAConnectionToAPortItsPodListensOnIntoTheGuestAtThatPort(t *t
 	defer worker.Process.Kill()
 	var c net.Conn
 	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
-		if c, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), budget); err == nil {
+		if c, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Until(deadline)); err == nil {
 			break
 		} else if time.Now().After(deadline) {
 			t.Fatalf("the worker did not come to listen on port %d: %v", port, err)

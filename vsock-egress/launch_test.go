@@ -77,30 +77,32 @@ func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testi
 		uid         int // of the VM's directory, where the test can choose it: as root
 		wanted      bool
 	}{
-		"a Service of its namespace":       {"eth0", proxied, vmUID, true},
-		"an address":                       {"eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID, false},
-		"a Service of another namespace":   {"eth0", map[string]string{proxyAnnotation: "proxy.other.svc.cluster.local:3128"}, vmUID, false},
-		"no proxy":                         {"eth0", map[string]string{"other": "annotation"}, vmUID, false},
-		"more than a name and a port":      {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128 -rate=1"}, vmUID, false},
-		"a port of 0":                      {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:0"}, vmUID, false},
-		"the last port":                    {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65535"}, vmUID, true},
-		"a port past the last":             {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65536"}, vmUID, false},
-		"the loopback interface's record":  {"lo", proxied, vmUID, false},
-		"a VM directory that is root's":    {"eth0", proxied, 0, false},
-		"a VM with the reaper's uid":       {"eth0", proxied, reaperUID, false},
-		"siblings and no proxy":            {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.ns.svc.cluster.local."), vmUID, true},
-		"a sibling of another namespace":   {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.other.svc.cluster.local."), vmUID, false},
-		"a sibling that is an address":     {"eth0", siblings("198.18.0.2=10.0.0.9"), vmUID, false},
-		"a sibling at another address":     {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
-		"a sibling at no address":          {"eth0", siblings("198.18.0.256=game.ns.svc.cluster.local."), vmUID, false},
-		"more than a sibling":              {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
-		"every port and no sibling":        {"eth0", map[string]string{portsAnnotation: "*"}, vmUID, true},
-		"ports and no sibling":             {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
-		"a served port past the last":      {"eth0", map[string]string{portsAnnotation: "8000,65536"}, vmUID, false},
-		"a listened port and nothing else": {"eth0", map[string]string{listenAnnotation: "2222,8022"}, vmUID, true},
-		"a listened port no worker binds":  {"eth0", map[string]string{listenAnnotation: "2222,1023"}, vmUID, false},
-		"a listened port past the last":    {"eth0", map[string]string{listenAnnotation: "2222,65536"}, vmUID, false},
-		"the worker's own port, listened":  {"eth0", map[string]string{listenAnnotation: "3134"}, vmUID, false},
+		"a Service of its namespace":      {"eth0", proxied, vmUID, true},
+		"an address":                      {"eth0", map[string]string{proxyAnnotation: "10.0.0.9:3128"}, vmUID, false},
+		"a Service of another namespace":  {"eth0", map[string]string{proxyAnnotation: "proxy.other.svc.cluster.local:3128"}, vmUID, false},
+		"no proxy":                        {"eth0", map[string]string{"other": "annotation"}, vmUID, false},
+		"more than a name and a port":     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:3128 -rate=1"}, vmUID, false},
+		"a port of 0":                     {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:0"}, vmUID, false},
+		"the last port":                   {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65535"}, vmUID, true},
+		"a port past the last":            {"eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:65536"}, vmUID, false},
+		"the loopback interface's record": {"lo", proxied, vmUID, false},
+		"a VM directory that is root's":   {"eth0", proxied, 0, false},
+		"a VM with the reaper's uid":      {"eth0", proxied, reaperUID, false},
+		"siblings and no proxy":           {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.ns.svc.cluster.local."), vmUID, true},
+		"a sibling of another namespace":  {"eth0", siblings("198.18.0.1=default.ns.svc.cluster.local.,198.18.0.2=game.other.svc.cluster.local."), vmUID, false},
+		"a sibling that is an address":    {"eth0", siblings("198.18.0.2=10.0.0.9"), vmUID, false},
+		"a sibling at another address":    {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
+		"a sibling at no address":         {"eth0", siblings("198.18.0.256=game.ns.svc.cluster.local."), vmUID, false},
+		"more than a sibling":             {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
+		"every port and no sibling":       {"eth0", map[string]string{portsAnnotation: "*"}, vmUID, true},
+		"ports and no sibling":            {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
+		"a served port past the last":     {"eth0", map[string]string{portsAnnotation: "8000,65536"}, vmUID, false},
+		"a listened port and no proxy":    {"eth0", map[string]string{listenAnnotation: "2222"}, vmUID, true},
+		"a listened port below 1024":      {"eth0", map[string]string{listenAnnotation: "1023"}, vmUID, false},
+		"a listened port past the last":   {"eth0", map[string]string{listenAnnotation: "65536"}, vmUID, false},
+		"the worker's own port, listened": {"eth0", map[string]string{listenAnnotation: "3134"}, vmUID, false},
+		// A worker that bound one port twice would end, and take the pod's proxy and siblings with it.
+		"a port listened on twice": {"eth0", map[string]string{listenAnnotation: "2222,2222"}, vmUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.uid != vmUID && os.Geteuid() != 0 {
@@ -539,7 +541,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	// A worker carries its pod only to what the launcher hands it from the pod's annotations.
 	named := "\x00-siblings\x00198.18.0.2=game.ns.svc.cluster.local.\x00-ports\x008000\x00-listen\x002222\x00"
 	if argv, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", other.cmd.Process.Pid)); !strings.Contains(string(argv), named) {
-		t.Fatalf("the worker was started as %q (%v): want its pod's siblings, ports and listened ports", argv, err)
+		t.Fatalf("the worker was started as %q (%v): want its pod's siblings, ports and listened port", argv, err)
 	}
 	pid := first.cmd.Process.Pid
 	uids, caps := fmt.Sprintf("%d %[1]d %[1]d %[1]d", vmUID), "0000000000000000"

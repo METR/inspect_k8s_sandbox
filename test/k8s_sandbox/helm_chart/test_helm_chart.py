@@ -1515,10 +1515,10 @@ _LISTENED = "inspect-k8s-sandbox/ingress-listen"
 
 
 def _listening(
-    chart_dir: pathlib.Path, ports: str, no_card: bool = True
+    chart_dir: pathlib.Path, port: str, no_card: bool = True
 ) -> dict[str, Any]:
-    """The pod of a release's one service, asked to take connections on `ports`."""
-    annotations = [f"services.default.podAnnotations.{_LISTENED}={ports}"]
+    """The pod of a release's one service, asked to take connections on `port`."""
+    annotations = [f"services.default.podAnnotations.{_LISTENED}={port}"]
     (stateful_set,) = _get_documents(
         _run_helm_template(
             chart_dir,
@@ -1533,28 +1533,28 @@ def _listening(
 def test_a_pod_asked_to_listen_runs_the_forwarder_and_the_redirect(
     chart_dir: pathlib.Path,
 ) -> None:
-    pod = _listening(chart_dir, r"2222\,8022")
+    pod = _listening(chart_dir, "2222")
 
     # The forwarder delivers at an address only the redirect makes the pod's own.
-    assert pod["metadata"]["annotations"][_LISTENED] == "2222,8022"
     assert [c["name"] for c in pod["spec"]["initContainers"]] == [_FORWARDER, _REDIRECT]
 
 
 @pytest.mark.parametrize(
-    ("ports", "no_card"),
+    ("port", "no_card"),
     [
         pytest.param("2222", False, id="a-pod-with-a-network-card"),
         pytest.param("1023", True, id="a-port-no-worker-binds"),
         pytest.param("65536", True, id="past-the-last-port"),
         pytest.param("3134", True, id="the-workers-own-port"),
+        # The launcher takes digits alone, and would start such a pod no worker.
         pytest.param("+2222", True, id="not-digits"),
     ],
 )
-def test_a_pod_is_asked_to_listen_only_on_ports_its_worker_can_take(
-    chart_dir: pathlib.Path, ports: str, no_card: bool
+def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
+    chart_dir: pathlib.Path, port: str, no_card: bool
 ) -> None:
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
-        _listening(chart_dir, ports, no_card)
+        _listening(chart_dir, port, no_card)
     assert _LISTENED in exc_info.value.stderr
 
 

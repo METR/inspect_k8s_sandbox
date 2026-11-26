@@ -21,16 +21,16 @@ datagram or a ping to one fails where it is sent (`EPERM`). A sibling's connecti
 `198.18.0.0`, whichever sibling made it, so a server that listens on `127.0.0.1` alone does not take it. A connection to a
 port with no server is accepted and then reset: a readiness check has to exchange data. A program that uses the pod's
 HTTP proxy needs its siblings' names in `no_proxy`. A pod's connections to its siblings count among its forwarder's
-64, and those its siblings make to it, 64 at most, among its worker's 128. A pod's worker reaches a sibling's at port
+64, and those made to it, 64 at most, among its worker's 128. A pod's worker reaches a sibling's at port
 3134 of its pod: the release's ingress policies decide which pods reach that port. Admit `NET_ADMIN` for that init
 container alone, as the chart renders it and from the image you built, on a pod with no network device, and refuse
 exec into it.
 
 A pod with no network device that carries the annotation `inspect-k8s-sandbox/ingress-listen` is reached from outside
-its release too: its worker takes a connection on each port the annotation lists (1024 to 65535 other than 3134, with
-commas between) and hands it to the same port in the sandbox, at `198.19.0.1`, so such a pod runs the forwarder and
-the redirect whatever its siblings. The chart adds no network policy for those ports: yours says who reaches them. A
-connection made before the sandbox's server listens is accepted and then reset.
+its release too: its worker takes a connection on the port the annotation names (1024 to 65535 other than 3134) and
+hands it to the same port in the sandbox, at `198.19.0.1`, so such a pod runs the forwarder and the redirect whatever
+its siblings. The chart adds no network policy for that port: yours says who reaches it. A connection made before the
+sandbox's server listens is accepted and then reset.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
@@ -76,11 +76,11 @@ them, has one word to alarm on:
 - `launch_failed: <why>` and `<pod>: work_failed: <why>`: the launcher or a worker ended with an error.
 - `<pod>: proxy_unreached: <why>`, then `<pod>: proxy_unreached: <n> streams since the last report` each minute.
 - `<pod>: streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the 128 open, of which those made to the pod may hold 64`
-  and `<pod>: key_unfetched: <why>`, then their counts each minute: what a sandbox or its siblings can cause. Until a
+  and `<pod>: key_unfetched: <why>`, then their counts each minute: what a sandbox, or what connects to it, can cause. Until a
   fetch of the key succeeds its streams are refused.
 - `<pod>: sibling_unreached: <why>` and `<pod>: guest_unreached: <why>`, then their counts each minute: the worker
-  could not reach a sibling's worker, or its own VM's forwarder for a sibling's connection. A sandbox or its siblings
-  can cause both: a sibling that is not up yet is one.
+  could not reach a sibling's worker, or its own VM's forwarder for a connection made to the pod. A sandbox, or what
+  connects to it, can cause both: a sibling that is not up yet is one.
 
 `gate.sh` proves the path to the proxy with real traffic on a node set aside for it. It runs `vsock-egress check` there,
 which names the assumption about AWS's runtime that broke. The `canary` that `check` meets in the sandbox ends by

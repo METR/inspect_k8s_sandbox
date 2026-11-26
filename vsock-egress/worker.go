@@ -46,7 +46,7 @@ type worker struct {
 	failed    atomic.Int64 // streams that did not reach the proxy since the last report
 	keyless   atomic.Int64 // fetches of the key that failed since the last report
 	unreached atomic.Int64 // streams that did not reach a sibling's worker since the last report
-	unentered atomic.Int64 // siblings' connections the guest did not take since the last report
+	unentered atomic.Int64 // connections made to the pod that the guest did not take since the last report
 }
 
 // target is a place the worker dials for its sandbox, as host:port.
@@ -144,7 +144,7 @@ func work(args []string) error {
 	target := fs.String("target", "", "host:port every proxy stream is joined to")
 	siblings := fs.String("siblings", "", "address=host for each sibling service of the pod, with commas between")
 	ports := fs.String("ports", "", "the ports of the pod its siblings may reach: *, or a list with commas between")
-	listened := fs.String("listen", "", "ports of the pod it takes connections on, from whoever the pod's network policy lets in, with commas between")
+	listened := fs.String("listen", "", "a port of the pod it takes connections on, from whoever the pod's network policy lets in")
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
@@ -170,12 +170,12 @@ func work(args []string) error {
 		}
 		go func() { ended <- w.serve(l, func(c net.Conn) { w.arrive(c, 0) }) }()
 	}
-	for _, port := range strings.FieldsFunc(*listened, func(r rune) bool { return r == ',' }) {
-		at, err := strconv.ParseUint(port, 10, 16)
+	if *listened != "" {
+		at, err := strconv.ParseUint(*listened, 10, 16)
 		if err != nil {
 			return err
 		}
-		l, err := listen(":"+port, proxyBuffer)
+		l, err := listen(":"+*listened, proxyBuffer)
 		if err != nil {
 			return err
 		}

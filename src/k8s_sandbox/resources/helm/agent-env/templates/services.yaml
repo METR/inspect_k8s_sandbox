@@ -68,13 +68,9 @@ spec:
       {{- range $service.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $served = append $served (toString .port) }}{{ end }}{{ end }}
       {{- $taken := and $siblings (include "shouldCreateDnsRecord" $service) (or $served (not $service.ports)) }}
       {{- if $taken }}{{ $_ := set $podAnnotations "inspect-k8s-sandbox/ingress-ports" (join "," $served | default "*") }}{{ end }}
-      {{- /* Ports the pod's worker takes connections on, from whoever the release's network policies let in: a worker is no root, and holds 3134 itself. */}}
+      {{- /* A port the pod's worker takes connections on, from whoever the release's network policies let in: a worker is no root, and holds 3134 itself. */}}
       {{- $listened := get $podAnnotations "inspect-k8s-sandbox/ingress-listen" }}
-      {{- if $listened }}
-      {{- range splitList "," $listened }}
-      {{- if or (not $noCard) (not (regexMatch "^[1-9][0-9]{3,4}$" .)) (lt (atoi .) 1024) (gt (atoi .) 65535) (eq . "3134") }}{{ fail (printf "services.%s has the annotation inspect-k8s-sandbox/ingress-listen %q: it takes ports from 1024 to 65535 other than 3134, with commas between, on a pod with no network device" $name $listened) }}{{ end }}
-      {{- end }}
-      {{- end }}
+      {{- if and $listened (or (not $noCard) (not (regexMatch "^[1-9][0-9]{3,4}$" $listened)) (lt (atoi $listened) 1024) (gt (atoi $listened) 65535) (eq $listened "3134")) }}{{ fail (printf "services.%s has the annotation inspect-k8s-sandbox/ingress-listen %q: it takes a port from 1024 to 65535 other than 3134, on a pod with no network device" $name $listened) }}{{ end }}
       {{- /* With none of the three annotations the node starts the pod no worker, and its forwarder would never be ready. */}}
       {{- $relayed := or $carried $taken $listened }}
       {{- $forwarder := or $egressProxy $relayed }}

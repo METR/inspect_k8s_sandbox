@@ -13,7 +13,7 @@ const (
 	keyPort       = 3130 // the sandbox serves its key on this vsock port, to the node alone
 	canaryPort    = 3131 // check and canary meet on this vsock port, both ways
 	siblingPort   = 3132 // the sandbox dials this vsock port on the node, once for each connection to a sibling service
-	inboundPort   = 3133 // the sandbox serves this vsock port to the node, once for each connection a sibling makes to it
+	inboundPort   = 3133 // the sandbox serves this vsock port to the node, once for each connection made to its pod
 	forwarderPort = 3128 // the forwarder's TCP port in the sandbox: its programs' HTTP proxy, and where redirect sends their connections to siblings
 	relayPort     = 3134 // a worker serves this TCP port in its pod's network namespace to the workers of the pod's siblings
 	hostCID       = 2

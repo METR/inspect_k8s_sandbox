@@ -134,7 +134,7 @@ func (f *forwarder) serveKey(l *vsockListener) {
 	})
 }
 
-// arrive carries a connection the node opened for one of the pod's siblings to the port it names, after showing the key: whoever else held this vsock port could not.
+// arrive carries a connection the node opened, for one made to the pod, to the port it names, after showing the key: whoever else held this vsock port could not.
 func (f *forwarder) arrive(c *os.File) {
 	port := make([]byte, 2)
 	c.SetDeadline(time.Now().Add(handshakeWait))
