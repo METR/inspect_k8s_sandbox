@@ -1482,18 +1482,19 @@ def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
     assert f"{annotation}, which the chart writes itself" in exc_info.value.stderr
 
 
+@pytest.mark.parametrize("port", [0, 1], ids=["TCP", "UDP"])
 def test_a_service_cannot_declare_the_port_its_pods_forwarder_holds(
-    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, port: int
 ) -> None:
-    # Its server would fail to bind every address, and its siblings' connections reset.
+    # Its server could not bind every address: the forwarder holds the port.
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _sibling_pods(
             chart_dir,
             test_resources_dir,
             f"annotations.{_NO_CARD}",
-            "services.game.ports[0].port=3128",
+            f"services.game.ports[{port}].port=3128",
         )
-    assert "services.game declares TCP port 3128" in exc_info.value.stderr
+    assert "services.game declares port 3128" in exc_info.value.stderr
 
 
 def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
@@ -1556,6 +1557,53 @@ def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _listening(chart_dir, port, no_card)
     assert _LISTENED in exc_info.value.stderr
+
+
+_CAPTURED = (
+    f"services.default.podAnnotations.{_EGRESS_PROXY}",
+    f"annotations.{_NO_CARD}",
+)
+
+
+@pytest.mark.parametrize(
+    ("capture", "annotations", "command"),
+    [
+        ("true", _CAPTURED, "capture"),
+        ("false", _CAPTURED, None),
+        # It has a forwarder, for the port it listens on, and no proxy to ask.
+        (
+            "true",
+            (_CAPTURED[1], f"services.default.podAnnotations.{_LISTENED}=2222"),
+            "redirect",
+        ),
+        # The routes of its network card would be lost to the forwarder's.
+        ("true", _CAPTURED[:1], None),
+    ],
+    ids=["captured", "not-asked", "no-proxy", "network-card"],
+)
+def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_release_asks(
+    chart_dir: pathlib.Path,
+    capture: str,
+    annotations: tuple[str, ...],
+    command: str | None,
+) -> None:
+    (stateful_set,) = _get_documents(
+        _run_helm_template(
+            chart_dir,
+            set_str=f"egressForwarderImage=vsock-egress:1,egressCapture={capture}",
+            set_string=",".join(annotations),
+        ),
+        "StatefulSet",
+    )
+
+    # With no sibling, the init container is there to capture or not at all.
+    commands = {
+        container["name"]: container["command"][-1]
+        for container in stateful_set["spec"]["template"]["spec"].get(
+            "initContainers", []
+        )
+    }
+    assert commands.get(_REDIRECT) == command
 
 
 def _peers_with_no_policy(

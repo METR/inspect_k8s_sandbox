@@ -32,6 +32,16 @@ hands it to the same port in the sandbox, at `198.19.0.1`, so such a pod runs th
 its siblings. The chart adds no network policy for that port: yours says who reaches it. A connection made before the
 sandbox's server listens is accepted and then reset.
 
+With the chart's `egressCapture` set, the init container of a pod that names an egress proxy runs
+`vsock-egress capture` in place of `redirect`: admit that command as you admit the other. Every TCP connection the
+sandbox then makes goes to the forwarder, which asks the pod's proxy for it with `CONNECT`, by name or by the address
+the program wrote, so the proxy alone says what the sandbox reaches, and no program needs the proxy's address. The
+forwarder answers the sandbox's DNS lookups itself, those sent to `127.0.0.1:53`, where the chart's `resolv.conf`
+points, and those sent over UDP to a resolver outside the sandbox: a name gets an address of `198.19.128.0/17` that
+stands for it until the forwarder restarts, a question for an IPv6 address gets none, and any other gets no record.
+What is neither TCP nor a lookup fails where it is sent (`EPERM`). The forwarder holds port 3128 for TCP and for UDP
+in every pod it runs in, and carries 64 connections at once, the pod's siblings' among them.
+
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
 - `profiles/<architecture>/vsock-egress.json`, in the kubelet's seccomp directory as `profiles/vsock-egress.json`:

@@ -75,6 +75,9 @@
     "egressForwarderImage": {
       "type": "string"
     },
+    "egressCapture": {
+      "type": "boolean"
+    },
     "corednsImage": {
       "type": "string"
     },

@@ -67,13 +67,19 @@
   and an init container named
   `egress-redirector-with-a-name-too-long-for-any-service-to-share`, as root with
   `NET_ADMIN`, so its namespace's Pod Security level must be `privileged`. The chart
-  refuses a service that declares TCP port 3128 on a pod with the forwarder, and
+  refuses a service that declares port 3128 on a pod with the forwarder, and
   `networkPolicy.enabled: false` where a sibling is carried.
 - A pod with no network device takes connections on the port its annotation
   `inspect-k8s-sandbox/ingress-listen` names (1024 to 65535 other than 3134), handed to
   the same port in the sandbox. It runs the forwarder and the redirect init container
   for it, and the chart adds no network policy: add the one that says who reaches that
   port.
+- Add `egressCapture`: with it, a pod with no network device that names an egress proxy
+  sends that proxy every TCP connection it makes, as `CONNECT` to the name or address,
+  and its DNS lookups get addresses that stand for the names. UDP and ICMP fail where
+  they are sent. Its init container runs `vsock-egress capture`, and the forwarder holds
+  port 3128 for UDP too, so the chart refuses a service that declares that port of either
+  protocol.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
