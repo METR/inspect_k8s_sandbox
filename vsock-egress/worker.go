@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -164,14 +165,14 @@ func work(args []string) error {
 	ended := make(chan error)
 	// Before the sockets its forwarder's readiness waits for: a pod that is ready takes the connections made to it.
 	if *ports != "" {
-		l, err := listen(fmt.Sprintf(":%d", relayPort), proxyBuffer)
+		l, err := taking(fmt.Sprintf(":%d", relayPort))
 		if err != nil {
 			return err
 		}
 		go func() { ended <- w.serve(l, w.arrive) }()
 	}
 	if *listened != "" {
-		l, err := listen(":"+*listened, proxyBuffer)
+		l, err := taking(":" + *listened)
 		if err != nil {
 			return err
 		}
@@ -193,6 +194,25 @@ func work(args []string) error {
 		}
 	}()
 	return <-ended
+}
+
+// taking listens at a port of the pod's for the connections made to it, and holds no more than maxStreams it has not accepted: the kernel keeps what each has sent, charged to no pod, and its own bound is 4096.
+func taking(addr string) (net.Listener, error) {
+	l, err := listen(addr, proxyBuffer)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := l.(*net.TCPListener).SyscallConn()
+	if err == nil {
+		if failed := raw.Control(func(fd uintptr) { err = syscall.Listen(int(fd), maxStreams) }); failed != nil {
+			err = failed
+		}
+	}
+	if err != nil {
+		l.Close()
+		return nil, err
+	}
+	return l, nil
 }
 
 // serve gives each connection to l to carry, which says what it wants within keyWait unless its port says it.
