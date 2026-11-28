@@ -1695,31 +1695,32 @@ _CAPTURED = (
 
 
 @pytest.mark.parametrize(
-    ("capture", "annotations", "command"),
+    ("asked", "annotations", "command"),
     [
-        ("true", _CAPTURED, "capture"),
-        ("false", _CAPTURED, None),
+        (",egressCapture=true", _CAPTURED, "capture"),
+        # The value left out, as a release that knows nothing of capture leaves it.
+        ("", _CAPTURED, None),
         # It has a forwarder, for the port it listens on, and no proxy to ask.
         (
-            "true",
+            ",egressCapture=true",
             (_CAPTURED[1], f"services.default.podAnnotations.{_LISTENED}=2222"),
             "redirect",
         ),
         # The routes of its network card would be lost to the forwarder's.
-        ("true", _CAPTURED[:1], None),
+        (",egressCapture=true", _CAPTURED[:1], None),
     ],
     ids=["captured", "not-asked", "no-proxy", "network-card"],
 )
 def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_release_asks(
     chart_dir: pathlib.Path,
-    capture: str,
+    asked: str,
     annotations: tuple[str, ...],
     command: str | None,
 ) -> None:
     (stateful_set,) = _get_documents(
         _run_helm_template(
             chart_dir,
-            set_str=f"egressForwarderImage=vsock-egress:1,egressCapture={capture}",
+            set_str=f"egressForwarderImage=vsock-egress:1{asked}",
             set_string=",".join(annotations),
         ),
         "StatefulSet",

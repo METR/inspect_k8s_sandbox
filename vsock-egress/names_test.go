@@ -84,7 +84,7 @@ func TestLookupConnectionAnswersEachQuestionSentOnIt(t *testing.T) {
 		}
 		var reply dnsmessage.Message
 		answer := make([]byte, binary.BigEndian.Uint16(size))
-		if _, err := io.ReadFull(client, answer); err != nil || reply.Unpack(answer) != nil || len(reply.Questions) != 1 || reply.Questions[0].Type != kind {
+		if _, err := io.ReadFull(client, answer); err != nil || reply.Unpack(answer) != nil || !reply.Response || len(reply.Questions) != 1 || reply.Questions[0].Type != kind {
 			t.Fatalf("the question of type %v was answered %+v, %v: want a reply to it", kind, reply, err)
 		}
 	}

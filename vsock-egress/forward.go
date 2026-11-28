@@ -274,7 +274,6 @@ func (f *forwarder) stream(c *net.TCPConn) {
 func tunnel(up *os.File, c *net.TCPConn, target string) error {
 	request := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
 	up.SetDeadline(time.Now().Add(handshakeWait))
-	defer up.SetDeadline(time.Time{})
 	if _, err := up.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(request))), request...)); err != nil {
 		return err
 	}

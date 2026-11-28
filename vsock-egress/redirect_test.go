@@ -168,8 +168,8 @@ func TestCapturedSandboxReachesANameAndAnAddressThroughItsProxy(t *testing.T) {
 		want  string
 		reply []string
 	}{
-		// The proxy's answer and a server that speaks first, in one frame.
-		found[0] + ":22": {"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n", []string{answer + banner}},
+		// The proxy's answer, then a server that speaks first: carried once the proxy has answered.
+		found[0] + ":22": {"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n", []string{answer, banner}},
 		// The answer in two, the second a full frame: the rest of it is the server's.
 		"203.0.113.9:443": {"CONNECT 203.0.113.9:443 HTTP/1.1\r\nHost: 203.0.113.9:443\r\n\r\n",
 			[]string{answer[:9], answer[9:] + banner + strings.Repeat("x", maxFrame-len(answer[9:]+banner))}},
