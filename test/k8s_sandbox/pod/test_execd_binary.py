@@ -399,6 +399,8 @@ async def test_execd_does_not_take_its_environments_word_for_its_user(
         assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
 
     assert await uid() == "65534\n"
+    own = client.exec(["sh", "-c", "echo $USER"], None, None, {}, None, None)
+    assert (await asyncio.wait_for(own, 30)).stdout == "nobody\n"  # as execd started
 
 
 @pytest.mark.parametrize(
