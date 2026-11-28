@@ -363,9 +363,9 @@ services:
             cpu: "50m"
 ```
 
-Between pods with no network device (see `egressForwarderImage`), a connection to another
-service is accepted before its server is asked: wait there with a check that exchanges
-data, such as `pg_isready`, and not with `nc -z`.
+Between pods with no network device (see `egressForwarderImage`), a connection to
+another service is accepted before its server is asked: wait there with a check that
+exchanges data, such as `pg_isready`, and not with `nc -z`.
 
 An init container can write to a volume that the service's container then reads:
 

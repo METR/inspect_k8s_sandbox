@@ -175,25 +175,7 @@ func TestForwardGivenNoAddressListensWhereNoSiblingIsDelivered(t *testing.T) {
 	if !redirected(t) {
 		return
 	}
-	loopback(t) // skips where this machine has no vsock to itself
-	file, said := t.TempDir()+"/key", new(bytes.Buffer)
-	forwarder := exec.Command(os.Args[0], "forward", "-key", file) // as the chart's pods run it
-	forwarder.Stderr = said
-	if err := forwarder.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		forwarder.Process.Kill()
-		forwarder.Wait()
-	})
-	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
-		if _, err := os.Stat(file + readySuffix); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("forward did not come to listen: %s", said)
-		}
-	}
+	forwardingWith(t) // as the chart's pods run it: with no address
 	// A sibling's connection is delivered at 198.19.0.1: the proxy's port there would open it the pod's own stream to its proxy.
 	if c, err := net.DialTimeout("tcp", "198.19.0.1:3128", budget); !errors.Is(err, syscall.ECONNREFUSED) {
 		t.Fatalf("a connection to the forwarder's port at the address siblings are delivered to gave %v, %v: want it refused", c, err)
