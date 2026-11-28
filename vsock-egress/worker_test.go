@@ -459,13 +459,15 @@ func TestSiblingKeepsItsAddressWhileItsNameDoesNotAnswer(t *testing.T) {
 	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
 		t.Fatal(err)
 	}
-	var clock atomic.Int64
+	var clock, given atomic.Int64
 	var answers atomic.Pointer[netip.Addr] // none while the cluster's DNS does not answer
 	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
-	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+	w.lookup = func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
 		if answer := answers.Load(); answer != nil {
 			return []netip.Addr{*answer}, nil
 		}
+		until, _ := ctx.Deadline()
+		given.Store(int64(time.Until(until)))
 		return nil, errors.New("server misbehaving")
 	}
 	dial := serveAt(t, w, siblingPort, w.sibling)
@@ -481,11 +483,85 @@ func TestSiblingKeepsItsAddressWhileItsNameDoesNotAnswer(t *testing.T) {
 		clock.Store(now)
 		stream()
 		within(t, first, "connection to the address the sibling had, its name not answering")
+		// A question the cluster's DNS drops holds its stream for all it is given: at the five seconds of a first lookup, half the connections of a 19 s outage waited them out.
+		if wait := time.Duration(given.Load()); wait > time.Second {
+			t.Fatalf("a stream with an address to use gave its sibling's name %v to answer: want a second at most", wait)
+		}
 	}
 	answers.Store(&moved)
 	clock.Store(20)
 	stream()
 	within(t, second, "connection to the address the sibling's name answers with again")
+}
+
+func TestSiblingThatRefusedADialIsReachedWhereItWasWhileItsNameDoesNotAnswer(t *testing.T) {
+	key := newKey()
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	var out atomic.Bool
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		if out.Load() {
+			return nil, errors.New("server misbehaving")
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() net.Conn {
+		c := dial()
+		c.Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...))
+		return c
+	}
+
+	// An agent that restarts on a node can take the cluster's DNS and a sibling's worker down together.
+	within(t, closed(stream()), "end of a stream to a sibling whose worker is down")
+	out.Store(true)
+	clock.Store(1)
+	within(t, closed(stream()), "end of a stream whose failed dial has the name asked again")
+	_, back := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	clock.Store(2)
+	stream()
+	within(t, back, "connection to the address the sibling had, its worker back and its name not answering")
+}
+
+func TestSiblingWhoseNameAnswersThatItHasNoAddressIsNotReachedWhereItWas(t *testing.T) {
+	key := newKey()
+	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	var unready atomic.Bool
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if unready.Load() { // as the cluster's DNS answers for a Service whose pod is not ready
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() net.Conn {
+		c := dial()
+		c.Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...))
+		return c
+	}
+
+	stream()
+	within(t, first, "connection to the sibling's address")
+	// The sibling's pod is being replaced: the address it had may be another pod's before the new one is ready.
+	unready.Store(true)
+	clock.Store(int64(siblingFresh / time.Second))
+	select {
+	case <-closed(stream()):
+	case <-first:
+		t.Fatal("a stream reached the address its sibling had, whose name now answers that it has none")
+	case <-time.After(budget):
+		t.Fatal("the stream was neither joined nor closed")
+	}
 }
 
 // working starts the real work for a pod whose guest shows key, and returns its vsock socket and what the guest takes of each connection handed into it.
@@ -969,7 +1045,8 @@ func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
 				t.Fatalf("5 streams within a second looked the proxy up %d times: want once", n)
 			}
 			clock.Add(1)
-			stream() // its failed dial gives the address up, or it asks again
+			stream() // its failed dial has the name asked before the next, or it asks again
+			stream()
 			stream()
 			if n := lookups.Load(); n != 2 {
 				t.Fatalf("streams a second later brought the lookups to %d: want 2", n)
