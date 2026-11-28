@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -365,8 +366,8 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	}
 }
 
-// forwarding starts the program's own forward, in a process of its own, and returns its TCP address once it listens: what a sandbox and its node meet is whatever that makes.
-func forwarding(t *testing.T) (addr string) {
+// forwarding starts the program's own forward, in a process of its own, and returns its TCP address and its key's file once it listens: what a sandbox and its node meet is whatever that makes.
+func forwarding(t *testing.T) (addr, file string) {
 	t.Helper()
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -374,15 +375,14 @@ func forwarding(t *testing.T) (addr string) {
 	}
 	addr = free.Addr().String()
 	free.Close()
-	forwardingWith(t, "-listen", addr)
-	return addr
+	return addr, forwardingWith(t, "-listen", addr)
 }
 
 // forwardingWith does that with flags beside the key's, and none of its own.
-func forwardingWith(t *testing.T, flags ...string) {
+func forwardingWith(t *testing.T, flags ...string) (file string) {
 	t.Helper()
 	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
-	file := filepath.Join(t.TempDir(), "key")
+	file = filepath.Join(t.TempDir(), "key")
 	forwarder := exec.Command(os.Args[0], append([]string{"forward", "-key", file}, flags...)...)
 	said := new(strings.Builder)
 	forwarder.Stderr = said
@@ -397,7 +397,7 @@ func forwardingWith(t *testing.T, flags ...string) {
 	})
 	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
 		if _, err := os.Stat(file + readySuffix); err == nil {
-			return
+			return file
 		}
 		select {
 		case err := <-ended:
@@ -425,11 +425,27 @@ func TestForwardTakesItsSiblingsConnectionsFromTheNodeAlone(t *testing.T) {
 	}
 }
 
+func TestForwardAnswersLookupsAtItsProxyPort(t *testing.T) {
+	addr, key := forwarding(t)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	asks := net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	}}
+	if got, err := asks.LookupHost(ctx, "example.com"); err != nil || len(got) != 1 || !nameRange.Contains(netip.MustParseAddr(got[0])) {
+		t.Fatalf("example.com, asked of forward at %v, resolved to %v, %v: want one address of %v", addr, got, err, nameRange)
+	}
+	// Beside the key, which outlives the forwarder: one started again finds there how many addresses were given.
+	if _, err := os.Stat(key + ".names"); err != nil {
+		t.Fatalf("forward kept no count of the addresses it gave: %v", err)
+	}
+}
+
 func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
 	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
 		t.Skip("this kernel has multipath TCP off")
 	}
-	addr := forwarding(t)
+	addr, _ := forwarding(t)
 	var guest net.Dialer
 	guest.SetMultipathTCP(true)
 	client, err := guest.Dial("tcp", addr)

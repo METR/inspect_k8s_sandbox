@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,6 +25,7 @@ type forwarder struct {
 	key     [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
 	host    uint32        // the node's CID
 	port    uint32        // the node's vsock port for proxy streams
+	names   *names        // the names a captured sandbox has looked up
 	slots   chan struct{} // one for each connection it carries
 	queue   chan struct{} // one for each connection it carries or holds back
 	wait    time.Duration // how long a connection is held back for a place
@@ -30,13 +33,13 @@ type forwarder struct {
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams),
+	return &forwarder{host: host, port: port, names: newNames(""), slots: make(chan struct{}, maxStreams),
 		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
 func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
-	addr := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", forwarderPort), "the address the sandbox's programs use as their HTTP proxy")
+	addr := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", forwarderPort), "the address the sandbox's programs use as their HTTP proxy, and over UDP the one their captured lookups are sent to")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
 	return newForwarder(hostCID, streamPort).run(*addr, *keyFile)
@@ -58,6 +61,13 @@ func (f *forwarder) run(addr, keyFile string) error {
 	if err != nil {
 		return err
 	}
+	// Where capture sends the sandbox's lookups: the same port, so that no pod loses another to it.
+	lookups, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return err
+	}
+	f.names = newNames(keyFile + ".names") // beside the key, which outlives a restart too
+	go f.names.serve(lookups)
 	arrivals, err := vsockListen(inboundPort)
 	if err != nil {
 		return err
@@ -206,9 +216,25 @@ const clientBuffer = 128 << 10
 
 // stream carries one of the sandbox's connections to the node on a vsock connection of its own: to the sibling redirect found it going to, named after the key, or else to the proxy.
 func (f *forwarder) stream(c *net.TCPConn) {
-	port, asked := f.port, []byte(nil)
-	if to, err := originalDst(c); err == nil && siblingRange.Contains(to.Addr()) {
-		port, asked = siblingPort, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
+	port, asked, captured := f.port, []byte(nil), ""
+	if to, err := originalDst(c); err == nil {
+		switch {
+		case siblingRange.Contains(to.Addr()):
+			port, asked = siblingPort, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
+		case to == resolver:
+			f.names.converse(c)
+			return
+		case nameRange.Contains(to.Addr()):
+			name := f.names.named(to.Addr())
+			if name == "" { // an address this forwarder gave no name: one before it did
+				c.SetLinger(0)
+				c.Close()
+				return
+			}
+			captured = net.JoinHostPort(name, strconv.Itoa(int(to.Port())))
+		case !to.Addr().IsLoopback(): // not a program that came to the proxy itself: an address written out
+			captured = to.String()
+		}
 	}
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
@@ -229,14 +255,50 @@ func (f *forwarder) stream(c *net.TCPConn) {
 		c.Close()
 		return
 	}
-	if _, err := up.Write(append(f.key[:], asked...)); err != nil {
+	_, err = up.Write(append(f.key[:], asked...))
+	if err != nil {
 		log.Print(err)
+	} else if captured != "" {
+		err = tunnel(up, c, captured) // the proxy's own record says what it refused: a line here for each would be the sandbox's to write at will
+	}
+	if err != nil {
 		c.SetLinger(0)
 		c.Close()
 		up.Close()
 		return
 	}
 	join(up, c, nil, stallWait)
+}
+
+// tunnel asks the proxy at the far end of up for target, and gives c what follows the proxy's answer.
+func tunnel(up *os.File, c *net.TCPConn, target string) error {
+	request := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
+	up.SetDeadline(time.Now().Add(handshakeWait))
+	if _, err := up.Write(append(binary.BigEndian.AppendUint32(nil, uint32(len(request))), request...)); err != nil {
+		return err
+	}
+	var answer []byte
+	for !bytes.Contains(answer, []byte("\r\n\r\n")) {
+		length := make([]byte, 4)
+		if _, err := io.ReadFull(up, length); err != nil {
+			return err
+		}
+		size := int(binary.BigEndian.Uint32(length))
+		// What follows the headers in their last frame is the origin's, and may fill it.
+		if size == 0 || size > maxFrame || len(answer) > maxFrame {
+			return errors.New("the proxy's answer ended, or ran past a frame, with no end of its headers")
+		}
+		answer = append(answer, make([]byte, size)...)
+		if _, err := io.ReadFull(up, answer[len(answer)-size:]); err != nil {
+			return err
+		}
+	}
+	head, rest, _ := bytes.Cut(answer, []byte("\r\n\r\n"))
+	if status := bytes.Fields(head); len(status) < 2 || string(status[1]) != "200" {
+		return errors.New("the proxy refused")
+	}
+	_, err := c.Write(rest)
+	return err
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.

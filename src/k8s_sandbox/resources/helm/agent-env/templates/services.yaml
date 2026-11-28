@@ -74,7 +74,14 @@ spec:
       {{- /* With none of these annotations and no proxy the node starts the pod no worker, and a forwarder there would never be ready. */}}
       {{- $relayed := or $carried $taken $listened }}
       {{- $forwarder := or $egressProxy $relayed }}
-      {{- if and $taken (has "3128" $served) }}{{ fail (printf "services.%s declares TCP port 3128, which its pod's egress forwarder holds: use another port" $name) }}{{ end }}
+      {{- /* With egressCapture the pod's every connection and lookup goes to its forwarder: a network device's own routes would not survive that. */}}
+      {{- $captured := and $egressProxy $.Values.egressCapture $noCard }}
+      {{- if $captured }}{{ range $other, $its := $.Values.services }}{{ if $its.additionalDnsRecords }}{{ fail (printf "services.%s.additionalDnsRecords: with egressCapture the pod of services.%s could reach these names on the internet, not at the service: remove them, or the value" $other $name) }}{{ end }}{{ end }}{{ end }}
+      {{- /* The forwarder holds the port over UDP in every pod it runs in, and over TCP in one its siblings come to. */}}
+      {{- range $service.ports }}
+      {{- $protocol := default "TCP" .protocol | upper }}
+      {{- if and (eq (toString .port) "3128") (or (and $taken (eq $protocol "TCP")) (and $forwarder (eq $protocol "UDP"))) }}{{ fail (printf "services.%s declares %s port 3128, which its pod's egress forwarder holds: use another port" $name $protocol) }}{{ end }}
+      {{- end }}
       {{- /* The DNS sidecar's volume, which such a pod lacks unless the service declares one of that name itself. */}}
       {{- $noDnsVolume := $noCard }}
       {{- /* Unquoted, a name such as 123 reaches the API server as a number, which refuses it mid-install. */}}
@@ -106,8 +113,8 @@ spec:
       {{- /* Do not leak info on services via env vars */}}
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ $service.terminationGracePeriodSeconds | default 0 | int64 }}
-      {{- if $.Values.corednsUpstream }}
-      {{- /* Replaces the resolv.conf subPath mount, which Kata Containers documents as unsupported. */}}
+      {{- /* In place of the resolv.conf subPath mount, which Kata Containers documents as unsupported, and so that no container of a captured pod has a search list. */}}
+      {{- if or $.Values.corednsUpstream $captured }}
       dnsPolicy: None
       dnsConfig:
         nameservers:
@@ -184,11 +191,11 @@ spec:
               type: Localhost
               localhostProfile: profiles/vsock-egress.json
       {{- end }}
-      {{- if $relayed }}
+      {{- if or $relayed $captured }}
         {{- /* Ahead of every container that runs an image of the task's: the rule it installs needs NET_ADMIN once, and none of them gets it. */}}
         - name: egress-redirector-with-a-name-too-long-for-any-service-to-share
           image: {{ $.Values.egressForwarderImage | quote }}
-          command: ["/vsock-egress", "redirect"]
+          command: ["/vsock-egress", {{ if $captured }}"capture"{{ else }}"redirect"{{ end }}]
           resources:
             requests:
               memory: "64Mi"

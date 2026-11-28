@@ -45,6 +45,10 @@ extraContainers: []
 # where they share a network and have a DNS record.
 # @default -- Empty
 egressForwarderImage: ""
+# -- Tunnel the IPv4 TCP connections of a pod with no network device, but those to itself
+# and to its siblings, through the egress proxy it names, and answer its DNS lookups in the
+# pod: see `vsock-egress/README.md`.
+egressCapture: false
 # -- References to pre-existing secrets that contain registry credentials.
 imagePullSecrets: []
 # - name: "gcr-json-key"

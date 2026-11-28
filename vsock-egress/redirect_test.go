@@ -3,16 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 )
 
@@ -66,6 +70,215 @@ func redirected(t *testing.T) bool {
 		}
 	}
 	return true
+}
+
+// capturing is namespaced once capture has run there: it returns a forwarder for the sandbox, and where the test takes its streams, as the node.
+func capturing(t *testing.T) (f *forwarder, node *vsockListener) {
+	t.Helper()
+	if !namespaced(t) {
+		return nil, nil
+	}
+	node, port := loopback(t)
+	f = keyedForwarder(unix.VMADDR_CID_LOCAL, port)
+	const at = "127.0.0.1:3128" // where the chart's pods have the forwarder
+	l, err := listen(at, clientBuffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookups, err := net.ListenPacket("udp", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close(); lookups.Close() })
+	go f.serve(l)
+	go f.names.serve(lookups)
+	// As the chart's init container runs it, once the forwarder listens.
+	if out, err := exec.Command(os.Args[0], "capture").CombinedOutput(); err != nil {
+		t.Fatalf("capture: %v: %s", err, out)
+	}
+	return f, node
+}
+
+func TestCaptureFailsWhereTheForwarderGetsNothingOfWhatItRedirects(t *testing.T) {
+	if !namespaced(t) {
+		return
+	}
+	// No forwarder: to capture it is a kernel that took the rules and sends nothing where they say.
+	if out, err := exec.Command(os.Args[0], "capture").CombinedOutput(); err == nil || !bytes.Contains(out, []byte("got no address from the forwarder")) {
+		t.Fatalf("capture ended with %v and said %q: want it to fail, and the sandbox with it", err, out)
+	}
+}
+
+// asked takes the next stream at node as the proxy, answers with reply, a frame for each part, and returns what the forwarder asked for.
+func asked(t *testing.T, f *forwarder, node *vsockListener, reply ...string) chan string {
+	requests := make(chan string, 1)
+	go func() {
+		up, _, err := node.accept()
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { up.Close() })
+		up.SetDeadline(time.Now().Add(budget))
+		opening := make([]byte, keySize+4)
+		if _, err := io.ReadFull(up, opening); err != nil || !bytes.Equal(opening[:keySize], f.key[:]) {
+			return
+		}
+		request := make([]byte, binary.BigEndian.Uint32(opening[keySize:]))
+		if _, err := io.ReadFull(up, request); err != nil {
+			return
+		}
+		for _, part := range reply {
+			up.Write(frame(part))
+		}
+		requests <- string(request)
+	}()
+	return requests
+}
+
+func TestCapturedSandboxReachesANameAndAnAddressThroughItsProxy(t *testing.T) {
+	f, node := capturing(t)
+	if f == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	var found []string
+	named, _ := f.names.address("example.com")
+	// The forwarder answers a lookup sent to the sandbox's resolver, either way, and one sent to a resolver the sandbox named, at that name's address.
+	for _, at := range [][2]string{{"udp", resolver.String()}, {"tcp", resolver.String()}, {"udp", named.String() + ":53"}} {
+		asks := net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, at[0], at[1])
+		}}
+		got, err := asks.LookupHost(ctx, "Example.com.") // with its dot: no search list of this machine's is tried first
+		if err != nil || len(got) != 1 || !nameRange.Contains(netip.MustParseAddr(got[0])) || (found != nil && got[0] != found[0]) {
+			t.Fatalf("example.com, asked of %v, resolved to %v, %v: want one address of %v each time, and none of IPv6", at, got, err, nameRange)
+		}
+		found = got
+	}
+	// A nat chain the guest adds later, at the priority of iptables' own, takes nothing capture redirects.
+	guest := &nftables.Conn{}
+	theirs := guest.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: "guest"})
+	guest.AddRule(&nftables.Rule{Table: theirs, Exprs: []expr.Any{&expr.Redir{}}, Chain: guest.AddChain(&nftables.Chain{
+		Name: "output", Table: theirs, Type: nftables.ChainTypeNAT, Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityNATDest})})
+	if err := guest.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	const answer, banner = "HTTP/1.1 200 OK\r\nserver: envoy\r\n\r\n", "SSH-2.0-origin\r\n"
+	for target, as := range map[string]struct {
+		want  string
+		reply []string
+	}{
+		// The proxy's answer, then a server that speaks first: carried once the proxy has answered.
+		found[0] + ":22": {"CONNECT example.com:22 HTTP/1.1\r\nHost: example.com:22\r\n\r\n", []string{answer, banner}},
+		// The answer in two, the second a full frame: the rest of it is the server's.
+		"203.0.113.9:443": {"CONNECT 203.0.113.9:443 HTTP/1.1\r\nHost: 203.0.113.9:443\r\n\r\n",
+			[]string{answer[:9], answer[9:] + banner + strings.Repeat("x", maxFrame-len(answer[9:]+banner))}},
+	} {
+		requests := asked(t, f, node, as.reply...)
+		c, err := net.DialTimeout("tcp", target, budget)
+		if err != nil {
+			t.Fatalf("a connection to %s: %v", target, err)
+		}
+		defer c.Close()
+		if got := within(t, requests, "stream to the proxy for "+target); got != as.want {
+			t.Fatalf("for a connection to %s the proxy was asked %q, want %q", target, got, as.want)
+		}
+		c.SetDeadline(time.Now().Add(budget))
+		first := make([]byte, len(banner))
+		if _, err := io.ReadFull(c, first); string(first) != banner {
+			t.Fatalf("the client of %s read %q, %v: want what followed the proxy's answer, and none of the answer", target, first, err)
+		}
+	}
+	// A program that knows of the proxy and comes to its port asks for itself: the forwarder adds no request of its own.
+	const own = "CONNECT example.org:443 HTTP/1.1\r\n\r\n"
+	requests := asked(t, f, node)
+	c, err := net.DialTimeout("tcp", "127.0.0.1:3128", budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte(own))
+	if got := within(t, requests, "stream to the proxy for a client of its own port"); got != own {
+		t.Fatalf("for a client of the proxy's own port the proxy was asked %q, want what the client wrote, %q", got, own)
+	}
+}
+
+func TestCapturedConnectionTheProxyRefusesIsReset(t *testing.T) {
+	f, node := capturing(t)
+	if f == nil {
+		return
+	}
+	requests := asked(t, f, node, "HTTP/1.1 403 Forbidden\r\n\r\nHawk's egress proxy refused this request")
+	read, err := reset(net.DialTimeout("tcp", "203.0.113.9:443", budget))
+	within(t, requests, "stream to the proxy")
+	if read != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("the refused connection gave %d bytes and ended with %v: want a reset, and none of the proxy's answer", read, err)
+	}
+}
+
+func TestCapturedSandboxSendsNothingButTCPAndLookups(t *testing.T) {
+	f, node := capturing(t)
+	if f == nil {
+		return
+	}
+	streams := make(chan struct{}, 1)
+	go func() {
+		if _, _, err := node.accept(); err == nil {
+			streams <- struct{}{}
+		}
+	}()
+	named, _ := f.names.address("example.com")
+	for _, to := range []string{"203.0.113.9:123", named.String() + ":123"} {
+		c, err := net.Dial("udp", to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte("datagram")); !errors.Is(err, unix.EPERM) {
+			t.Fatalf("a datagram to %s was sent with %v: want it refused where it is sent", to, err)
+		}
+	}
+	// A resolver of the sandbox's own, at another of its addresses, still hears what is sent to it.
+	own, err := net.ListenPacket("udp", "127.0.0.2:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.Close()
+	asks, err := net.Dial("udp", own.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer asks.Close()
+	asks.Write([]byte("question"))
+	own.SetDeadline(time.Now().Add(budget))
+	if size, _, err := own.ReadFrom(make([]byte, 16)); err != nil || size != len("question") {
+		t.Fatalf("the sandbox's own resolver at %v read %d bytes, %v: want the question sent to it", own.LocalAddr(), size, err)
+	}
+	// A connection to the sandbox's own addresses is its own still: to its loopback, and where the forwarder hands in what comes for it.
+	server, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.(*net.TCPListener).SetDeadline(time.Now().Add(budget))
+	for _, at := range []netip.Addr{netip.MustParseAddr("127.0.0.1"), deliverTo} {
+		to := netip.AddrPortFrom(at, uint16(server.Addr().(*net.TCPAddr).Port)).String()
+		if c, err := net.DialTimeout("tcp", to, budget); err == nil {
+			defer c.Close()
+		}
+		if _, err := server.Accept(); err != nil {
+			t.Fatalf("a connection to the sandbox's own %s did not reach its server there: %v", to, err)
+		}
+	}
+	// An address of the range that this forwarder gave no name.
+	if _, err := reset(net.DialTimeout("tcp", "198.19.200.200:443", budget)); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("a connection to an address no name was given ended with %v: want a reset", err)
+	}
+	select { // a stream would be there by now: the forwarder opens it before it resets a client the proxy did not answer for
+	case <-streams:
+		t.Fatal("the proxy was asked for an address that stands for no name")
+	default:
+	}
 }
 
 func TestRedirectGivenAnArgumentChangesNothing(t *testing.T) {
