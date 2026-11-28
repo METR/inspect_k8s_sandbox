@@ -1616,6 +1616,7 @@ def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _listening(chart_dir, port, no_card)
     assert _LISTENED in exc_info.value.stderr
+    assert "1024 to 65535" in exc_info.value.stderr
 
 
 def test_a_pod_asked_to_listen_may_declare_the_forwarders_port(
