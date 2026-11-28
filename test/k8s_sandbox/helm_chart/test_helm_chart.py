@@ -1580,14 +1580,17 @@ _LISTENED = "inspect-k8s-sandbox/ingress-listen"
 
 
 def _listening(
-    chart_dir: pathlib.Path, port: str, no_card: bool = True
+    chart_dir: pathlib.Path,
+    port: str,
+    no_card: bool = True,
+    on: str = "services.default.podAnnotations",
 ) -> dict[str, Any]:
     """The pod of a release's one service, asked to take connections on `port`."""
     (stateful_set,) = _get_documents(
         _run_helm_template(
             chart_dir,
             set_str="egressForwarderImage=vsock-egress:1",
-            set_string=f"services.default.podAnnotations.{_LISTENED}={port}"
+            set_string=f"{on}.{_LISTENED}={port}"
             + (f",annotations.{_NO_CARD}" if no_card else ""),
         ),
         "StatefulSet",
@@ -1595,11 +1598,18 @@ def _listening(
     return stateful_set["spec"]["template"]
 
 
-@pytest.mark.parametrize("port", ["1024", "65535"])
+@pytest.mark.parametrize(
+    ("port", "on"),
+    [
+        ("1024", "services.default.podAnnotations"),
+        # Asked of every pod of the release.
+        ("65535", "annotations"),
+    ],
+)
 def test_a_pod_asked_to_listen_runs_the_forwarder_and_the_redirect(
-    chart_dir: pathlib.Path, port: str
+    chart_dir: pathlib.Path, port: str, on: str
 ) -> None:
-    pod = _listening(chart_dir, port)
+    pod = _listening(chart_dir, port, on=on)
 
     # The forwarder delivers at an address only the redirect makes the pod's own.
     assert [c["name"] for c in pod["spec"]["initContainers"]] == [_FORWARDER, _REDIRECT]
@@ -1624,6 +1634,19 @@ def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
         _listening(chart_dir, port, no_card)
     assert _LISTENED in exc_info.value.stderr
     assert "1024 to 65535" in exc_info.value.stderr
+
+
+def test_a_pod_asked_to_listen_needs_the_forwarder_image(
+    chart_dir: pathlib.Path,
+) -> None:
+    # With no forwarder in the pod, its worker would take connections for no one.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_string=f"services.default.podAnnotations.{_LISTENED}=2222,"
+            f"annotations.{_NO_CARD}",
+        )
+    assert "egressForwarderImage" in exc_info.value.stderr
 
 
 def test_a_pod_asked_to_listen_may_declare_the_forwarders_port(
