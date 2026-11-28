@@ -33,6 +33,7 @@ type worker struct {
 	unkeyed  chan struct{}          // one for each connection that has not said what it wants yet: the key, or a sibling's port
 	arriving chan struct{}          // one for each connection made to the pod: they leave the pod's own streams half the places
 	keyWait  time.Duration          // how long a connection has to say what it wants
+	waits    time.Duration          // how long a connection made to the pod waits for a place: one is given back a moment after the stream that held it ended
 	stall    time.Duration          // how long the far end may leave a write to it, or the end of them, waiting
 
 	mu      sync.Mutex
@@ -84,7 +85,7 @@ const stallWait = 5 * time.Minute
 const proxyBuffer = 512 << 10
 
 func newWorker(vsock, proxy string, rate int) *worker {
-	return &worker{vsock: vsock, proxy: &target{name: proxy}, siblings: map[netip.Addr]*target{}, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), arriving: make(chan struct{}, maxStreams), keyWait: handshakeWait, stall: stallWait,
+	return &worker{vsock: vsock, proxy: &target{name: proxy}, siblings: map[netip.Addr]*target{}, pace: newPacer(rate), slots: make(chan struct{}, workerStreams), unkeyed: make(chan struct{}, workerStreams), arriving: make(chan struct{}, maxStreams), keyWait: handshakeWait, waits: endedWait, stall: stallWait,
 		now: time.Now, lookup: net.DefaultResolver.LookupNetIP, accepts: newPacer(newStreams)}
 }
 
@@ -297,7 +298,7 @@ func (w *worker) arriveAt(c net.Conn, at uint16) {
 	select {
 	case w.arriving <- struct{}{}:
 		defer func() { <-w.arriving }()
-	default:
+	case <-time.After(w.waits):
 		<-w.unkeyed
 		w.refuse()
 		return
