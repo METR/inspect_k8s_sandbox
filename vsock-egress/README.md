@@ -16,7 +16,8 @@ upload uncompleted, or its end unacknowledged, for five minutes, and the forward
 client and its reply.
 
 In a release whose `egressForwarderImage` is set, the pods with no network device also reach each other over TCP, where
-they share a network and have a DNS record. An init container runs `vsock-egress redirect` once, as root with
+they share a network and have a DNS record. Each reads its siblings' names from its `/etc/hosts`: a program that asks
+DNS alone, as `nslookup` does, finds none of them. An init container runs `vsock-egress redirect` once, as root with
 `NET_ADMIN`: it makes `198.18.0.0/15` the VM's own, where each sibling has an address in `198.18.0.0/16`, and a datagram
 or a ping to one fails where it is sent (`EPERM`). A sibling's connection arrives at `198.19.0.1`, the VM's own address,
 from `198.19.0.2`, whichever sibling made it: a server takes it if it listens on every address or on that one, and not
