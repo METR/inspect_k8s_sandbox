@@ -1522,7 +1522,7 @@ def test_a_service_that_keeps_its_network_card_is_no_sibling(
 
 
 @pytest.mark.parametrize("annotation", [_SIBLINGS, _SERVED])
-def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
+def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes_from_its_siblings(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, annotation: str
 ) -> None:
     # Left in, a sibling the chart never listed could be a Service of another release.
@@ -1574,6 +1574,105 @@ def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
             "services.default.volumeMounts[0].mountPath=/mnt",
         )
     assert "egress-forwarder-key" in exc_info.value.stderr
+
+
+_LISTENED = "inspect-k8s-sandbox/ingress-listen"
+
+
+def _listening(
+    chart_dir: pathlib.Path,
+    port: str,
+    no_card: bool = True,
+    on: str = "services.default.podAnnotations",
+) -> dict[str, Any]:
+    """The pod of a release's one service, asked to take connections on `port`."""
+    (stateful_set,) = _get_documents(
+        _run_helm_template(
+            chart_dir,
+            set_str="egressForwarderImage=vsock-egress:1",
+            set_string=f"{on}.{_LISTENED}={port}"
+            + (f",annotations.{_NO_CARD}" if no_card else ""),
+        ),
+        "StatefulSet",
+    )
+    return stateful_set["spec"]["template"]
+
+
+@pytest.mark.parametrize(
+    ("port", "on"),
+    [
+        ("1024", "services.default.podAnnotations"),
+        # Asked of every pod of the release.
+        ("65535", "annotations"),
+    ],
+)
+def test_a_pod_asked_to_listen_runs_the_forwarder_and_the_redirect(
+    chart_dir: pathlib.Path, port: str, on: str
+) -> None:
+    pod = _listening(chart_dir, port, on=on)
+
+    # The forwarder delivers at an address only the redirect makes the pod's own.
+    assert [c["name"] for c in pod["spec"]["initContainers"]] == [_FORWARDER, _REDIRECT]
+
+
+@pytest.mark.parametrize(
+    ("port", "no_card"),
+    [
+        pytest.param("2222", False, id="a-pod-with-a-network-card"),
+        pytest.param("1023", True, id="below-1024"),
+        pytest.param("65536", True, id="past-the-last-port"),
+        pytest.param("3134", True, id="the-workers-own-port"),
+        pytest.param("3128", True, id="the-forwarders-port-in-the-sandbox"),
+        # The launcher takes digits alone, and would start such a pod no worker.
+        pytest.param("+2222", True, id="not-digits"),
+    ],
+)
+def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
+    chart_dir: pathlib.Path, port: str, no_card: bool
+) -> None:
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _listening(chart_dir, port, no_card)
+    assert _LISTENED in exc_info.value.stderr
+    assert "1024 to 65535" in exc_info.value.stderr
+
+
+def test_a_pod_asked_to_listen_needs_the_forwarder_image(
+    chart_dir: pathlib.Path,
+) -> None:
+    # With no forwarder in the pod, its worker would take connections for no one.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_string=f"services.default.podAnnotations.{_LISTENED}=2222,"
+            f"annotations.{_NO_CARD}",
+        )
+    assert "egressForwarderImage" in exc_info.value.stderr
+
+
+def test_a_pod_asked_to_listen_may_declare_the_forwarders_port(
+    chart_dir: pathlib.Path,
+) -> None:
+    # No sibling comes to that port, and the port listened on is another.
+    _run_helm_template(
+        chart_dir,
+        set_str="egressForwarderImage=vsock-egress:1,services.default.ports[0].port=3128,"
+        "services.default.ports[0].protocol=TCP",
+        set_string=f"services.default.podAnnotations.{_LISTENED}=2222,annotations.{_NO_CARD}",
+    )
+
+
+@pytest.mark.parametrize("on", ["annotations", "services.default.podAnnotations"])
+def test_network_policy_disabled_refuses_a_port_listened_on(
+    chart_dir: pathlib.Path, on: str
+) -> None:
+    # Its worker takes whoever connects there: only a policy says who may.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str="networkPolicy.enabled=false,egressForwarderImage=vsock-egress:1",
+            set_string=f"{on}.{_LISTENED}=2222,annotations.{_NO_CARD}",
+        )
+    assert "who reaches the port services.default listens on" in exc_info.value.stderr
 
 
 def _peers_with_no_policy(

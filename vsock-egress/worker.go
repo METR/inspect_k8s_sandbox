@@ -31,7 +31,7 @@ type worker struct {
 	pace     *pacer                 // all of the sandbox's streams, both ways
 	slots    chan struct{}          // one for each open stream
 	unkeyed  chan struct{}          // one for each connection that has not said what it wants yet: the key, or a sibling's port
-	arriving chan struct{}          // one for each connection its siblings have to it: they leave the pod's own streams half the places
+	arriving chan struct{}          // one for each connection made to the pod: they leave the pod's own streams half the places
 	keyWait  time.Duration          // how long a connection has to say what it wants
 	waits    time.Duration          // how long a connection made to the pod waits for a place: one is given back a moment after the stream that held it ended
 	stall    time.Duration          // how long the far end may leave a write to it, or the end of them, waiting
@@ -48,7 +48,7 @@ type worker struct {
 	failed    atomic.Int64 // streams that did not reach the proxy since the last report
 	keyless   atomic.Int64 // fetches of the key that failed since the last report
 	unreached atomic.Int64 // streams that did not reach a sibling's worker since the last report
-	unentered atomic.Int64 // siblings' connections the guest did not take since the last report
+	unentered atomic.Int64 // connections made to the pod that the guest did not take since the last report
 }
 
 // target is a place the worker dials for its sandbox, as host:port.
@@ -64,7 +64,7 @@ type target struct {
 // siblingFresh is the cluster DNS's own time to live for a Service: a sibling's names its pod, whose address another sibling's pod can take once it is replaced, and that one's worker would answer.
 const siblingFresh = 5 * time.Second
 
-// workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest, and the pod's siblings may hold half of them.
+// workerStreams is twice the forwarder's bound: a stream ends on the node a moment after it ends in the guest, and connections made to the pod may hold half of them.
 const workerStreams = 2 * maxStreams
 
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
@@ -136,7 +136,7 @@ func (w *worker) report() {
 // refuse counts a stream turned away; the first of each report is written at once.
 func (w *worker) refuse() {
 	if w.refused.Add(1) == 1 {
-		log.Printf("streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the %d open, of which its siblings may hold %d", workerStreams, maxStreams)
+		log.Printf("streams_refused: a stream with no key, to no proxy or sibling of the pod's or no port it serves, or past the %d open, of which those made to the pod may hold %d", workerStreams, maxStreams)
 	}
 }
 
@@ -147,6 +147,7 @@ func work(args []string) error {
 	target := fs.String("target", "", "host:port every proxy stream is joined to")
 	siblings := fs.String("siblings", "", "address=host for each sibling service of the pod, with commas between")
 	ports := fs.String("ports", "", "the ports of the pod its siblings may reach: *, or a list with commas between")
+	listened := fs.String("listen", "", "a port of the pod it takes connections on, from whoever the pod's network policy lets in")
 	rate := fs.Int("rate", 0, "bytes a second, both ways together; 0 for no cap")
 	fs.Parse(args)
 	log.SetPrefix(*pod + ": ")
@@ -164,13 +165,21 @@ func work(args []string) error {
 		return err
 	}
 	ended := make(chan error)
-	// Before the sockets its forwarder's readiness waits for: a pod that is ready takes its siblings' connections.
+	// Before the sockets its forwarder's readiness waits for: a pod that is ready takes the connections made to it.
 	if *ports != "" {
 		l, err := taking(fmt.Sprintf(":%d", relayPort))
 		if err != nil {
 			return err
 		}
 		go func() { ended <- w.serve(l, w.arrive) }()
+	}
+	if *listened != "" {
+		l, err := taking(":" + *listened)
+		if err != nil {
+			return err
+		}
+		at := uint16(l.Addr().(*net.TCPAddr).Port)
+		go func() { ended <- w.serve(l, func(c net.Conn) { w.arriveAt(c, at) }) }()
 	}
 	for port, carry := range map[int]func(net.Conn){streamPort: w.proxied, siblingPort: w.sibling} {
 		path := fmt.Sprintf("%s_%d", *vsock, port) // where Firecracker takes the guest's connection to (host, port)
@@ -208,7 +217,7 @@ func taking(addr string) (net.Listener, error) {
 	return l, nil
 }
 
-// serve gives each connection to l to carry, which says what it wants within keyWait.
+// serve gives each connection to l to carry, which says what it wants within keyWait unless its port says it.
 func (w *worker) serve(l net.Listener, carry func(net.Conn)) error {
 	for {
 		w.accepts.wait(1)
@@ -280,7 +289,10 @@ func (w *worker) stream(c net.Conn, asked int) {
 }
 
 // arrive hands a connection from the worker of one of the pod's siblings to the forwarder, to the port it asks for, once what holds the guest's inbound port has shown the forwarder's key.
-func (w *worker) arrive(c net.Conn) {
+func (w *worker) arrive(c net.Conn) { w.arriveAt(c, 0) }
+
+// arriveAt does that for any connection made to the pod: to port at, or with none to the port its caller asks for.
+func (w *worker) arriveAt(c net.Conn, at uint16) {
 	tcp := c.(*net.TCPConn)
 	defer tcp.Close()
 	tcp.SetLinger(0) // until it is joined, a connection that ends here ends as one to a closed port does
@@ -292,11 +304,14 @@ func (w *worker) arrive(c net.Conn) {
 		w.refuse()
 		return
 	}
-	port := make([]byte, 2)
-	tcp.SetReadDeadline(time.Now().Add(w.keyWait))
-	_, err := io.ReadFull(tcp, port)
+	port, served := binary.BigEndian.AppendUint16(nil, at), true
+	if at == 0 {
+		tcp.SetReadDeadline(time.Now().Add(w.keyWait))
+		_, err := io.ReadFull(tcp, port)
+		served = err == nil && (w.ports == nil || w.ports[binary.BigEndian.Uint16(port)])
+	}
 	<-w.unkeyed
-	if err != nil || w.ports != nil && !w.ports[binary.BigEndian.Uint16(port)] {
+	if !served {
 		w.refuse()
 		return
 	}

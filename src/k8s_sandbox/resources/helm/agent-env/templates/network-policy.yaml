@@ -9,6 +9,8 @@
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
 {{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
 {{- range include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}{{ if .named }}{{ $unenforced = append $unenforced (printf "which pods reach services.%s over vsock-egress (egressForwarderImage)" .service) }}{{ end }}{{ end }}
+{{- $own := default (dict) $svc.podAnnotations }}
+{{- if get (ternary $own (default (dict) $.Values.annotations) (hasKey $own "inspect-k8s-sandbox/ingress-listen")) "inspect-k8s-sandbox/ingress-listen" }}{{ $unenforced = append $unenforced (printf "who reaches the port services.%s listens on (inspect-k8s-sandbox/ingress-listen)" $svcName) }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
 {{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " (uniq $unenforced))) }}

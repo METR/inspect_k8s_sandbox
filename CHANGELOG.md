@@ -82,6 +82,15 @@
   such a pod can listen on every address at port 3128, which the forwarder holds on
   `127.0.0.1`: the chart refuses a service that declares that TCP port there, and
   `networkPolicy.enabled: false` where a sibling is carried.
+- A pod with no network device takes connections on the port its annotation
+  `inspect-k8s-sandbox/ingress-listen` names (1024 to 65535 other than 3128 and 3134),
+  for the server on that port in the sandbox, which must listen on every address or on
+  `198.19.0.1`, and sees every caller at `198.19.0.2`: they count among the 64 the pod
+  takes at once, and are reset when the node's `vsock-egress launch` restarts. Set
+  `egressForwarderImage` for it (the pod runs the forwarder, as a sibling's does and at
+  the same 500m of CPU and 256Mi), admit the redirect init container in its namespace as
+  for siblings, and add the network policy that says who outside the release reaches
+  that port: the chart refuses `networkPolicy.enabled: false` for it.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.
