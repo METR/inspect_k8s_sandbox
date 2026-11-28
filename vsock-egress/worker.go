@@ -348,30 +348,30 @@ func (w *worker) arriveAt(c net.Conn, at uint16) {
 // dial connects to t. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a target that is down nor a name that does not resolve may cost a lookup a stream.
 func (w *worker) dial(t *target) (net.Conn, error) {
 	addr := t.addr.Load()
-	if addr != nil && t.fresh > 0 && w.now().Sub(*t.asked.Load()) >= t.fresh {
-		t.addr.CompareAndSwap(addr, nil)
-		addr = nil
-	}
-	if addr == nil { // under no lock: streams that ask during a lookup share it, each for dialWait at most
+	if addr == nil || t.fresh > 0 && w.now().Sub(*t.asked.Load()) >= t.fresh { // under no lock: streams that ask during a lookup share it, each for dialWait at most
 		host, port, err := net.SplitHostPort(t.name)
 		if err != nil {
 			return nil, err
 		}
-		if last := t.unresolved.Load(); last != nil && w.now().Sub(last.at) < time.Second {
-			return nil, last.err
+		failed := t.unresolved.Load()
+		if failed == nil || w.now().Sub(failed.at) >= time.Second {
+			ctx, cancel := context.WithTimeout(context.Background(), dialWait)
+			ips, err := w.lookup(ctx, "ip4", host)
+			cancel()
+			if err != nil {
+				failed = &failedLookup{err, w.now()}
+				t.unresolved.Store(failed)
+			} else {
+				found, asked := net.JoinHostPort(ips[0].String(), port), w.now()
+				t.asked.Store(&asked)
+				t.addr.CompareAndSwap(addr, &found) // an answer that came meanwhile is the newer one
+				addr = &found
+			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), dialWait)
-		ips, err := w.lookup(ctx, "ip4", host)
-		cancel()
-		if err != nil {
-			t.unresolved.Store(&failedLookup{err, w.now()})
-			return nil, err
+		// A name that does not answer leaves the address it had in use: the cluster's DNS can fail for seconds while every pod stays where it was.
+		if addr == nil {
+			return nil, failed.err
 		}
-		found := net.JoinHostPort(ips[0].String(), port)
-		addr = &found
-		asked := w.now()
-		t.asked.Store(&asked)
-		t.addr.CompareAndSwap(nil, addr) // an answer that came meanwhile is the newer one
 	}
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
