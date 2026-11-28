@@ -342,7 +342,11 @@ func TestSiblingsHoldNoMoreThanHalfOfAPodsPlaces(t *testing.T) {
 func TestSiblingsConnectionsGiveBackTheirPlaces(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)
-	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), target, 0)
+	entered := make(chan struct{}, 1)
+	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.Write(key)
+		entered <- struct{}{}
+	}), target, 0)
 	if err := w.annotated("", "22"); err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +360,9 @@ func TestSiblingsConnectionsGiveBackTheirPlaces(t *testing.T) {
 	c := serve(t, w)()
 	c.Write(key)
 	within(t, accepted, "the pod's stream to its proxy")
+	// And one of the 64 its siblings may hold, until it ended: kept, they would shut its siblings out.
+	sibling().Write([]byte("\x00\x16")) // port 22
+	within(t, entered, "connection from a sibling into the guest")
 }
 
 func TestSiblingIsLookedUpAgainOnceItsAddressIsStale(t *testing.T) {

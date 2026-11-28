@@ -20,14 +20,17 @@ they share a network and have a DNS record. An init container runs `vsock-egress
 `NET_ADMIN`: it makes `198.18.0.0/15` the VM's own, where each sibling has an address in `198.18.0.0/16`, and a datagram
 or a ping to one fails where it is sent (`EPERM`). A sibling's connection arrives at `198.19.0.1`, the VM's own address,
 from `198.19.0.2`, whichever sibling made it: a server takes it if it listens on every address or on that one, and not
-on `127.0.0.1` alone, where the service's own names lead. A connection to a port with no server, or to an address of the
-range that is no sibling's, is accepted and then reset: a readiness check has to exchange data. The five-minute bounds
-above hold for a sibling's connection too. A program that uses the pod's HTTP proxy needs its siblings' names in
-`no_proxy`. A pod's connections to its siblings count among its forwarder's 64, and those made to it, 64 at most, among
-its worker's 128: each holds its place until both of its ends have closed it. A pod's worker reaches a sibling's at port
-3134 of its pod: the release's ingress policies decide which pods reach that port, and a policy of yours that names
-another port of the pod sees none of what its siblings send it. Admit `NET_ADMIN` for that init container alone, as the
-chart renders it and from the image you built, on a pod with no network device, and refuse exec into it.
+on `127.0.0.1` alone, where the service's own names lead. Every such VM has those two addresses, so one a program reads
+from its own machine leads a sibling that is handed it back to itself: hand siblings names. No server there can listen
+on every address at port 3128, which the forwarder holds on `127.0.0.1`. A connection to a port with no server, or to an
+address of `198.18.0.0/16` that is no sibling's, is accepted and then reset: a readiness check has to exchange data. The
+five-minute bounds above hold for a sibling's connection too. A program that uses the pod's HTTP proxy needs its
+siblings' names in `no_proxy`. A pod's connections to its siblings count among its forwarder's 64, and those made to it,
+64 at most, among its worker's 128: each holds its place until both of its ends have closed it. A pod's worker reaches a
+sibling's at port 3134 of its pod: the release's ingress policies decide which pods reach that port, and a policy of
+yours that names another port of the pod sees none of what its siblings send it. Admit `NET_ADMIN` for that init
+container alone, as the chart renders it and from the image you built, on a pod with no network device, and refuse exec
+into it.
 
 A pod with no network device that carries the annotation `inspect-k8s-sandbox/ingress-listen` is reached from outside
 its release too: its worker takes a connection on the port the annotation names (1024 to 65535 other than 3128 and 3134)
