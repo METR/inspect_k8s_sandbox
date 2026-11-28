@@ -1,4 +1,4 @@
-// vsock-egress carries a sandbox's proxy connections out of an AWS Nitro Sandbox with no network card, over the VM's vsock to the one address its pod names. Linux only.
+// vsock-egress carries a sandbox's connections out of an AWS Nitro Sandbox with no network card, over the VM's vsock: to the proxy its pod names, and to its sibling services. Linux only.
 package main
 
 import (
@@ -9,13 +9,17 @@ import (
 )
 
 const (
-	streamPort = 3129 // the sandbox dials this vsock port on the node, once for each proxy connection
-	keyPort    = 3130 // the sandbox serves its key on this vsock port, to the node alone
-	canaryPort = 3131 // check and canary meet on this vsock port, both ways
-	hostCID    = 2
-	keySize    = 32
-	maxStreams = 64  // a sandbox's streams at once: the forwarder holds the next back until one ends
-	maxWaiting = 448 // connections the forwarder holds back at once: the next is reset
+	streamPort    = 3129 // the sandbox dials this vsock port on the node, once for each proxy connection
+	keyPort       = 3130 // the sandbox serves its key on this vsock port, to the node alone
+	canaryPort    = 3131 // check and canary meet on this vsock port, both ways
+	siblingPort   = 3132 // the sandbox dials this vsock port on the node, once for each connection to a sibling service
+	inboundPort   = 3133 // the sandbox serves this vsock port to the node, once for each connection a sibling makes to it
+	forwarderPort = 3128 // the forwarder's TCP port in the sandbox: its programs' HTTP proxy, and where redirect sends their connections to siblings
+	relayPort     = 3134 // a worker serves this TCP port in its pod's network namespace to the workers of the pod's siblings
+	hostCID       = 2
+	keySize       = 32
+	maxStreams    = 64  // a sandbox's streams at once: the forwarder holds the next back until one ends
+	maxWaiting    = 448 // connections the forwarder holds back at once: the next is reset
 
 	dialWait      = 5 * time.Second
 	handshakeWait = 10 * time.Second
@@ -24,12 +28,12 @@ const (
 func main() {
 	log.SetFlags(0)
 	commands := map[string]func([]string) error{
-		"forward": forward, "ready": ready, "canary": canary, // in the sandbox
+		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, // in the sandbox
 		"launch": launch, "check": check, "install": install, // on the node
 		"work": work, "probe": probe, "reap": reap, // started by launch and check
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
-		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|canary (in the sandbox), launch|check|install (on the node)")
+		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|canary (in the sandbox), launch|check|install (on the node)")
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {

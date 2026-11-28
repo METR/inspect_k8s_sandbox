@@ -317,7 +317,7 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 
 func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	_, placed := tcpPair(t)
-	l, err := listen("127.0.0.1:0")
+	l, err := listen("127.0.0.1:0", clientBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,20 +358,32 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked&unix.SOCK_RCVBUF_LOCK == 0 {
 		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, locked, as its listener gave it: unlocked, small segments grow it before the forwarder has seen it", got, locked, err, want)
 	}
+	// Its listener gave it that too: with nothing sent for 60 s after its client half-closes, the kernel forgets where redirect found it going.
+	alive, _ := unix.GetsockoptInt(int(kept.Fd()), unix.SOL_SOCKET, unix.SO_KEEPALIVE)
+	if idle, err := unix.GetsockoptInt(int(kept.Fd()), unix.IPPROTO_TCP, unix.TCP_KEEPIDLE); err != nil || alive == 0 || idle >= 60 {
+		t.Errorf("a connection is kept alive as %d, after %d s idle (%v): want it kept alive within the minute", alive, idle, err)
+	}
 }
 
-func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
-	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
-		t.Skip("this kernel has multipath TCP off")
-	}
+// forwarding starts the program's own forward, in a process of its own, and returns its TCP address once it listens: what a sandbox and its node meet is whatever that makes.
+func forwarding(t *testing.T) (addr string) {
+	t.Helper()
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, file := free.Addr().String(), filepath.Join(t.TempDir(), "key")
+	addr = free.Addr().String()
 	free.Close()
-	// The program's own forward, in a process of its own: the listener a sandbox dials is whatever that makes.
-	forwarder := exec.Command(os.Args[0], "forward", "-listen", addr, "-key", file)
+	forwardingWith(t, "-listen", addr)
+	return addr
+}
+
+// forwardingWith does that with flags beside the key's, and none of its own.
+func forwardingWith(t *testing.T, flags ...string) {
+	t.Helper()
+	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
+	file := filepath.Join(t.TempDir(), "key")
+	forwarder := exec.Command(os.Args[0], append([]string{"forward", "-key", file}, flags...)...)
 	said := new(strings.Builder)
 	forwarder.Stderr = said
 	if err := forwarder.Start(); err != nil {
@@ -385,18 +397,39 @@ func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
 	})
 	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
 		if _, err := os.Stat(file + readySuffix); err == nil {
-			break
+			return
 		}
 		select {
 		case err := <-ended:
 			ended <- err
-			t.Skipf("forward did not come to listen: %v: %s", err, said)
+			t.Fatalf("forward did not come to listen: %v: %s", err, said)
 		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("forward neither listened nor ended")
 		}
 	}
+}
+
+func TestForwardTakesItsSiblingsConnectionsFromTheNodeAlone(t *testing.T) {
+	forwarding(t)
+	// This test is a process of the forwarder's own VM, as a task's would be: only the node may hand it a sibling's connection.
+	c, err := vsockDial(unix.VMADDR_CID_LOCAL, inboundPort)
+	if err != nil {
+		t.Fatalf("forward does not listen for its siblings' connections: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(budget))
+	if n, err := c.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("a process of the VM read %d bytes, %v, at the port for siblings' connections: want it closed with no key", n, err)
+	}
+}
+
+func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
+	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
+		t.Skip("this kernel has multipath TCP off")
+	}
+	addr := forwarding(t)
 	var guest net.Dialer
 	guest.SetMultipathTCP(true)
 	client, err := guest.Dial("tcp", addr)

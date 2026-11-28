@@ -21,6 +21,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // firecracker stands in for a VM's vsock socket on the node: it answers CONNECT for a guest port with what a guest process listening there would say first.
@@ -34,6 +36,12 @@ func firecracker(t *testing.T, says map[uint32]string) (vsock string) {
 
 // firecrackerThat is firecracker for a guest whose ports do not always say the same.
 func firecrackerThat(t *testing.T, says func(port uint32) (say string, listening bool)) (vsock string) {
+	t.Helper()
+	return firecrackerWith(t, says, nil)
+}
+
+// firecrackerWith is firecrackerThat for a guest that also takes its siblings' connections: arrive gets each one the node makes to inboundPort.
+func firecrackerWith(t *testing.T, says func(port uint32) (say string, listening bool), arrive func(net.Conn)) (vsock string) {
 	t.Helper()
 	vsock = filepath.Join(t.TempDir(), "vm.vsock")
 	l, err := net.Listen("unix", vsock)
@@ -49,6 +57,12 @@ func firecrackerThat(t *testing.T, says func(port uint32) (say string, listening
 			}
 			var port uint32
 			fmt.Fscanf(bufio.NewReader(c), "CONNECT %d\n", &port)
+			if port == inboundPort && arrive != nil {
+				t.Cleanup(func() { c.Close() })
+				fmt.Fprint(c, "OK 1073741824\n")
+				go arrive(c)
+				continue
+			}
 			if say, ok := says(port); ok { // with no listener in the guest, Firecracker closes without a word
 				fmt.Fprintf(c, "OK 1073741824\n%s", say)
 			}
@@ -58,10 +72,21 @@ func firecrackerThat(t *testing.T, says func(port uint32) (say string, listening
 	return vsock
 }
 
+// holding is what a guest's ports say where its forwarder holds key and serves nothing else.
+func holding(key []byte) func(uint32) (string, bool) {
+	return func(port uint32) (string, bool) { return string(key), port == keyPort }
+}
+
 // proxy is a TCP server that hands over each connection it accepts.
 func proxy(t *testing.T) (address string, accepted chan net.Conn) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	return serverAt(t, "127.0.0.1:0")
+}
+
+// serverAt is proxy at an address of the test's choosing.
+func serverAt(t *testing.T, at string) (address string, accepted chan net.Conn) {
+	t.Helper()
+	l, err := net.Listen("tcp", at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,13 +116,19 @@ func served(t *testing.T, key []byte, target string, pace *pacer) (dial func() n
 // serve starts w at its VM's stream socket, and returns a dial for the guest's side.
 func serve(t *testing.T, w *worker) (dial func() net.Conn) {
 	t.Helper()
-	streams := fmt.Sprintf("%s_%d", w.vsock, streamPort)
+	return serveAt(t, w, streamPort, w.proxied)
+}
+
+// serveAt starts w at its VM's socket for one vsock port, and returns a dial for the guest's side.
+func serveAt(t *testing.T, w *worker, port int, carry func(net.Conn)) (dial func() net.Conn) {
+	t.Helper()
+	streams := fmt.Sprintf("%s_%d", w.vsock, port)
 	l, err := net.Listen("unix", streams)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go w.serve(l)
+	go w.serve(l, carry)
 	return func() net.Conn {
 		c, err := net.Dial("unix", streams)
 		if err != nil {
@@ -135,6 +166,483 @@ func newKey() []byte {
 	key := make([]byte, keySize)
 	rand.Read(key)
 	return key
+}
+
+// relayed starts w at a TCP port that stands for its pod's relay port, and returns a dial for a sibling's worker.
+func relayed(t *testing.T, w *worker) (dial func() *net.TCPConn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go w.serve(l, w.arrive)
+	return func() *net.TCPConn {
+		c, err := net.DialTimeout("tcp", l.Addr().String(), budget)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(budget))
+		t.Cleanup(func() { c.Close() })
+		return c.(*net.TCPConn)
+	}
+}
+
+// reset reads to its end a connection that is to be reset at once: the reset may land before the dial returns, which then fails with it.
+func reset(c net.Conn, err error) (int64, error) {
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(budget))
+	return io.Copy(io.Discard, c)
+}
+
+func TestSiblingStreamReachesTheWorkerOfTheSiblingItsAddressStandsFor(t *testing.T) {
+	out := capture(t)
+	key := newKey()
+	_, accepted := serverAt(t, "127.0.0.1:3134") // where every worker takes its siblings' connections, as the chart's policies have it
+	other, _ := proxy(t)
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), other, 0)
+	if err := w.annotated("198.18.0.2=localhost,198.18.0.4=127.0.0.3", ""); err != nil { // the second where no worker listens
+		t.Fatal(err)
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+
+	intruder := dial() // a workload process that opened the vsock itself
+	intruder.Write(append(append(newKey(), "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...))
+	select {
+	case <-accepted:
+		t.Fatal("a stream that did not open with the key reached the sibling's worker")
+	case <-closed(intruder):
+	case <-time.After(budget):
+		t.Fatal("the stream was neither refused nor joined")
+	}
+	c := dial()
+	c.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...)) // 198.18.0.2, port 8000
+	got := within(t, accepted, "connection to the sibling's worker")
+	got.SetDeadline(time.Now().Add(budget))
+	hello := make([]byte, 2+len("request"))
+	if _, err := io.ReadFull(got, hello); err != nil || string(hello) != "\x1f\x40request" {
+		t.Fatalf("the sibling's worker read %q, %v: want port 8000 as two bytes and then the request", hello, err)
+	}
+
+	c = dial()
+	c.Write(append(append(key, "\xc6\x12\x00\x03\x1f\x40"...), frame("request")...)) // 198.18.0.3
+	c.SetReadDeadline(time.Now().Add(budget))
+	if _, err := io.Copy(io.Discard, c); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("a stream for an address that is no sibling's was not closed")
+	}
+
+	c = dial()
+	c.Write(append(key, "\xc6\x12\x00\x04\x1f\x40"...)) // 198.18.0.4
+	c.SetReadDeadline(time.Now().Add(budget))
+	io.Copy(io.Discard, c)
+	w.report()
+	out.Lock()
+	defer out.Unlock()
+	if !strings.Contains(out.String(), "sibling_unreached: dial tcp 127.0.0.3:") || strings.Count(out.String(), "sibling_unreached: ") != 2 {
+		t.Fatalf("the log is %q: want the word an alarm reads for a sibling whose worker is gone, with why, and once more in the report", out.String())
+	}
+}
+
+func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		shown func(key []byte) []byte // what holds the guest's inbound port shows
+		ports string
+		said  string // the word an alarm reads, for a connection that does not enter
+	}{
+		"the forwarder, every port served":   {func(key []byte) []byte { return key }, "*", ""},
+		"the forwarder, that port served":    {func(key []byte) []byte { return key }, "22,8000", ""},
+		"the forwarder, another port served": {func(key []byte) []byte { return key }, "22", "streams_refused: "},
+		"another process on the vsock port":  {func([]byte) []byte { return newKey() }, "*", "guest_unreached: "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := capture(t)
+			key := newKey()
+			took := make(chan string, 1)
+			w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+				guest.SetDeadline(time.Now().Add(budget))
+				guest.Write(tc.shown(key))
+				port := make([]byte, 2)
+				var request bytes.Buffer
+				if _, err := io.ReadFull(guest, port); err != nil || fromFrames(&request, guest, nil) != nil {
+					took <- ""
+					return
+				}
+				toFrames(guest, strings.NewReader("reply"), nil)
+				took <- string(port) + request.String()
+			}), "", 0)
+			if err := w.annotated("", tc.ports); err != nil {
+				t.Fatal(err)
+			}
+			c := relayed(t, w)()
+			sent := "\x1f\x40request"
+			if tc.said != "" {
+				sent = sent[:2] // the port alone: a worker that closes on bytes it has not read resets the connection whatever it meant to
+			}
+			c.Write([]byte(sent))
+			c.CloseWrite()
+			reply, err := io.ReadAll(c)
+			if tc.said != "" {
+				w.report()
+				out.Lock()
+				defer out.Unlock()
+				if !errors.Is(err, syscall.ECONNRESET) || strings.Count(out.String(), tc.said) != 2 {
+					t.Fatalf("the sibling's worker read %q, %v, and the log is %q: want a reset, as a closed port gives, and %q at once and in the report", reply, err, out.String(), tc.said)
+				}
+				return
+			}
+			if got := within(t, took, "connection in the guest"); got != "\x1f\x40request" || string(reply) != "reply" || err != nil {
+				t.Fatalf("the guest took %q and the sibling's worker read %q, %v: want port 8000, the request, and the reply back", got, reply, err)
+			}
+		})
+	}
+}
+
+func TestSiblingsConnectionThatNamesNoPortIsReset(t *testing.T) {
+	w := newWorker(firecracker(t, nil), "", 0)
+	w.keyWait = 0
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go w.serve(l, w.arrive)
+	// Left to wait, 64 of them would be every place its siblings have.
+	if _, err := reset(net.DialTimeout("tcp", l.Addr().String(), budget)); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("a silent connection from a sibling ended with %v: want it reset", err)
+	}
+}
+
+func TestSiblingsHoldNoMoreThanHalfOfAPodsPlaces(t *testing.T) {
+	w := newWorker(firecracker(t, nil), "", 0)
+	w.keyWait = time.Hour // no silent connection gives its place up while the test runs
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	dial := relayed(t, w)
+	var at string
+	for held := 1; held <= maxStreams; held++ {
+		at = dial().RemoteAddr().String()
+		for deadline := time.Now().Add(budget); len(w.arriving) < held; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the worker took %d of its siblings' connections, want %d", len(w.arriving), held)
+			}
+		}
+	}
+	// With every place taken, the pod's own streams to its proxy and its siblings would be refused instead.
+	if _, err := reset(net.DialTimeout("tcp", at, budget)); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("one more connection from a sibling ended with %v: want it reset", err)
+	}
+	if open := len(w.unkeyed); open != maxStreams {
+		t.Fatalf("its siblings hold %d of the pod's %d places, want %d", open, workerStreams, maxStreams)
+	}
+}
+
+func TestSiblingsConnectionWaitsForAPlaceThatIsBeingGivenBack(t *testing.T) {
+	key := newKey()
+	entered := make(chan struct{}, 1)
+	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.Write(key)
+		entered <- struct{}{}
+	}), "", 0)
+	w.keyWait, w.waits = time.Hour, budget // neither runs out while the test runs
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	dial := relayed(t, w)
+	first := dial()
+	for held := 1; held <= maxStreams; held++ {
+		if held > 1 {
+			dial()
+		}
+		for deadline := time.Now().Add(budget); len(w.arriving) < held; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the worker took %d of its siblings' connections, want %d", len(w.arriving), held)
+			}
+		}
+	}
+	// A sibling's forwarder lets its next connection go a moment before the place its last one held is given back here: refused at once, it was reset with the pod at the 64 it may hold.
+	dial().Write([]byte("\x1f\x40"))
+	for deadline := time.Now().Add(budget); len(w.unkeyed) <= maxStreams; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("one more connection from a sibling does not wait for a place")
+		}
+	}
+	first.Close()
+	within(t, entered, "connection that came as a place was given back")
+}
+
+func TestSiblingsConnectionsGiveBackTheirPlaces(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	entered := make(chan struct{}, 1)
+	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.Write(key)
+		entered <- struct{}{}
+	}), target, 0)
+	if err := w.annotated("", "22"); err != nil {
+		t.Fatal(err)
+	}
+	sibling := relayed(t, w)
+	for range workerStreams {
+		c := sibling()
+		c.Write([]byte("\x1f\x40")) // port 8000, which the pod does not serve
+		io.Copy(io.Discard, c)
+	}
+	// Each was a place among the pod's 128 until its port was read: kept, they would shut the pod's own streams out.
+	c := serve(t, w)()
+	c.Write(key)
+	within(t, accepted, "the pod's stream to its proxy")
+	// And one of the 64 its siblings may hold, until it ended: kept, they would shut its siblings out.
+	sibling().Write([]byte("\x00\x16")) // port 22
+	within(t, entered, "connection from a sibling into the guest")
+}
+
+func TestWorkersListenerHoldsNoMoreThan512ConnectionsItHasNotAccepted(t *testing.T) {
+	l, err := taking("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	raw, err := l.(*net.TCPListener).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held *unix.TCPInfo
+	if failed := raw.Control(func(fd uintptr) { held, err = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO) }); failed != nil || err != nil {
+		t.Fatal(failed, err)
+	}
+	// Of a listening socket, the kernel says its bound here: each connection it holds may keep half a mebibyte that no pod is charged for.
+	if held.Sacked != 512 {
+		t.Fatalf("the worker's listener holds up to %d connections it has not accepted: want 512", held.Sacked)
+	}
+}
+
+func TestSiblingIsLookedUpAgainOnceItsAddressIsStale(t *testing.T) {
+	key := newKey()
+	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	_, second := serverAt(t, fmt.Sprintf("127.0.0.2:%d", relayPort)) // where the Service points once the sibling's pod is replaced
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock, lookups atomic.Int64
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr(fmt.Sprintf("127.0.0.%d", min(lookups.Add(1), 2)))}, nil
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() { dial().Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...)) }
+
+	stream()
+	within(t, first, "connection to the sibling's first address")
+	clock.Store(int64(siblingFresh/time.Second) - 1)
+	stream()
+	within(t, first, "connection to the address the worker still holds")
+	clock.Store(int64(siblingFresh / time.Second))
+	stream()
+	within(t, second, "connection to the sibling's new address")
+	stream()
+	within(t, second, "next connection to the address the worker now holds")
+}
+
+func TestSiblingKeepsItsAddressWhileItsNameDoesNotAnswer(t *testing.T) {
+	key := newKey()
+	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	_, second := serverAt(t, fmt.Sprintf("127.0.0.2:%d", relayPort))
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock, given atomic.Int64
+	var answers atomic.Pointer[netip.Addr] // none while the cluster's DNS does not answer
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+		if answer := answers.Load(); answer != nil {
+			return []netip.Addr{*answer}, nil
+		}
+		until, _ := ctx.Deadline()
+		given.Store(int64(time.Until(until)))
+		return nil, errors.New("server misbehaving")
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() { dial().Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...)) }
+
+	at, moved := netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("127.0.0.2")
+	answers.Store(&at)
+	stream()
+	within(t, first, "connection to the sibling's address")
+	// The cluster's DNS can fail for seconds, as its agent restarts on a node, while every pod stays where it was.
+	answers.Store(nil)
+	for _, now := range []int64{5, 6, 19} {
+		clock.Store(now)
+		stream()
+		within(t, first, "connection to the address the sibling had, its name not answering")
+		// A question the cluster's DNS drops holds its stream for all it is given: at the five seconds of a first lookup, half the connections of a 19 s outage waited them out.
+		if wait := time.Duration(given.Load()); wait > time.Second {
+			t.Fatalf("a stream with an address to use gave its sibling's name %v to answer: want a second at most", wait)
+		}
+	}
+	answers.Store(&moved)
+	clock.Store(20)
+	stream()
+	within(t, second, "connection to the address the sibling's name answers with again")
+}
+
+func TestSiblingThatRefusedADialIsReachedWhereItWasWhileItsNameDoesNotAnswer(t *testing.T) {
+	key := newKey()
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	var out atomic.Bool
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		if out.Load() {
+			return nil, errors.New("server misbehaving")
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() net.Conn {
+		c := dial()
+		c.Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...))
+		return c
+	}
+
+	// An agent that restarts on a node can take the cluster's DNS and a sibling's worker down together.
+	within(t, closed(stream()), "end of a stream to a sibling whose worker is down")
+	out.Store(true)
+	clock.Store(1)
+	within(t, closed(stream()), "end of a stream whose failed dial has the name asked again")
+	_, back := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	clock.Store(2)
+	stream()
+	within(t, back, "connection to the address the sibling had, its worker back and its name not answering")
+}
+
+func TestSiblingWhoseNameAnswersThatItHasNoAddressIsNotReachedWhereItWas(t *testing.T) {
+	key := newKey()
+	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	var unready atomic.Bool
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if unready.Load() { // as the cluster's DNS answers for a Service whose pod is not ready
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() net.Conn {
+		c := dial()
+		c.Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...))
+		return c
+	}
+
+	stream()
+	within(t, first, "connection to the sibling's address")
+	// The sibling's pod is being replaced: the address it had may be another pod's before the new one is ready.
+	unready.Store(true)
+	clock.Store(int64(siblingFresh / time.Second))
+	select {
+	case <-closed(stream()):
+	case <-first:
+		t.Fatal("a stream reached the address its sibling had, whose name now answers that it has none")
+	case <-time.After(budget):
+		t.Fatal("the stream was neither joined nor closed")
+	}
+}
+
+// working starts the real work for a pod whose guest shows key, and returns its vsock socket and what the guest takes of each connection handed into it.
+func working(t *testing.T, key []byte, flags ...string) (vsock string, took <-chan string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("a worker does not run as root")
+	}
+	taken := make(chan string, 1)
+	vsock = firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.SetDeadline(time.Now().Add(budget))
+		guest.Write(key)
+		hello := make([]byte, 2+4+len("request"))
+		io.ReadFull(guest, hello)
+		taken <- string(hello)
+	})
+	worker := exec.Command(os.Args[0], append([]string{"work", "-pod", "ns/pod", "-vsock", vsock}, flags...)...)
+	if err := worker.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		worker.Process.Kill()
+		worker.Wait()
+	})
+	for _, port := range []int{siblingPort, streamPort} { // it serves once its sockets are there, which come in no set order
+		for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
+			if c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, port)); err == nil {
+				c.Close()
+				break
+			} else if time.Now().After(deadline) {
+				t.Fatalf("the worker did not come to listen for its pod's connections at vsock port %d: %v", port, err)
+			}
+		}
+	}
+	return vsock, taken
+}
+
+func TestWorkerStartedForAPodWithSiblingsCarriesItToThemAndThemToIt(t *testing.T) {
+	key := newKey()
+	// The pod's one sibling is this machine, so the connection comes back to the same worker, as one from a sibling: at 127.0.0.2, which a relay port open on 127.0.0.1 alone would refuse.
+	vsock, took := working(t, key, "-siblings", "198.18.0.2=127.0.0.2", "-ports", "8000")
+	// A port the pod does not serve, first: the worker's own check, where no policy's ports stand for a pod with no device.
+	refused, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, siblingPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refused.Close()
+	refused.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x41"...), frame("request")...)) // to 198.18.0.2, port 8001
+	refused.SetReadDeadline(time.Now().Add(budget))
+	if _, err := io.Copy(io.Discard, refused); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("a stream for port 8001, which the pod does not serve, was neither carried nor closed")
+	}
+	c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, siblingPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...)) // to 198.18.0.2, port 8000
+	// The first the guest takes: one for port 8001 before it would be here in its place.
+	if got, want := within(t, took, "connection in the guest"), "\x1f\x40"+string(frame("request")); got != want {
+		t.Fatalf("the guest took %q: want port 8000 and the request, in frames", got)
+	}
+}
+
+func TestWorkerStartedForAPodWithSiblingsCarriesItToItsProxyToo(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	vsock, _ := working(t, key, "-target", target, "-siblings", "198.18.0.2=127.0.0.2", "-ports", "8000")
+	// The vsock port beside the siblings' is the proxy's: each has a handler of its own.
+	c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, streamPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(append(key, frame("request")...))
+	got := within(t, accepted, "the pod's stream to its proxy")
+	got.SetDeadline(time.Now().Add(budget))
+	request := make([]byte, len("request"))
+	if _, err := io.ReadFull(got, request); err != nil || string(request) != "request" {
+		t.Fatalf("the proxy read %q, %v: want the request", request, err)
+	}
 }
 
 func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
@@ -482,10 +990,27 @@ func TestStreamEndedBeforeItsProxyCouldBeDialledIsNoFailure(t *testing.T) {
 		guest.Close()
 	}()
 	w.unkeyed <- struct{}{}
-	w.stream(node)
+	w.proxied(node)
 	w.report()
 	if out.String() != "" {
 		t.Fatalf("the log is %q: want nothing for a stream its guest had ended", out.String())
+	}
+}
+
+func TestStreamToTheProxyOfAPodThatNamesNoneIsRefused(t *testing.T) {
+	out := capture(t)
+	key := newKey()
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0) // as for a pod that has siblings and no proxy
+	c := serve(t, w)()
+	c.Write(key)
+	select {
+	case <-closed(c):
+	case <-time.After(budget):
+		t.Fatal("the stream was not closed")
+	}
+	w.report()
+	if !strings.Contains(out.String(), "streams_refused") || strings.Contains(out.String(), "proxy_unreached") {
+		t.Fatalf("the log is %q: want the stream among those a sandbox can have refused, and no word the proxy's alarm reads", out.String())
 	}
 }
 
@@ -520,7 +1045,8 @@ func TestProxyThatIsDownIsLookedUpAtMostOnceASecond(t *testing.T) {
 				t.Fatalf("5 streams within a second looked the proxy up %d times: want once", n)
 			}
 			clock.Add(1)
-			stream() // its failed dial gives the address up, or it asks again
+			stream() // its failed dial has the name asked before the next, or it asks again
+			stream()
 			stream()
 			if n := lookups.Load(); n != 2 {
 				t.Fatalf("streams a second later brought the lookups to %d: want 2", n)
@@ -599,7 +1125,8 @@ func capped(t *testing.T, size int) (each [2]int) {
 
 func TestProxySocketIsCappedEachWay(t *testing.T) {
 	target, _ := proxy(t)
-	c, err := newWorker("", target, 0).dial()
+	w := newWorker("", target, 0)
+	c, err := w.dial(w.proxy)
 	if err != nil {
 		t.Fatal(err)
 	}

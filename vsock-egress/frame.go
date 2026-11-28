@@ -22,8 +22,17 @@ var (
 	readers = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 4+maxFrame) }}
 )
 
+// timed is the vsock end of a stream, with the deadline its opening may have left it.
+type timed interface {
+	io.ReadWriteCloser
+	SetDeadline(time.Time) error
+}
+
 // join carries one TCP connection over a vsock connection as frames: Firecracker passes no half-close on, so each direction ends with an empty frame.
-func join(vsock io.ReadWriteCloser, tcp *net.TCPConn, pace *pacer, stall time.Duration) {
+func join(vsock timed, tcp *net.TCPConn, pace *pacer, stall time.Duration) {
+	// The time each end had to say what it wants ends here: left on, it would end the stream.
+	vsock.SetDeadline(time.Time{})
+	tcp.SetDeadline(time.Time{})
 	var running sync.WaitGroup
 	var shut atomic.Bool // this side has closed its writes to tcp
 	sent, received, gone := make(chan error, 1), make(chan error, 1), make(chan struct{})

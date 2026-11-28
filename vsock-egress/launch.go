@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// proxyAnnotation names, as host:port, the one place a sandbox's streams are joined to: its sample's egress proxy.
-const proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
+const (
+	// proxyAnnotation names, as host:port, the one place a sandbox's proxy streams are joined to: its sample's egress proxy.
+	proxyAnnotation = "inspect-k8s-sandbox/egress-proxy"
+	// siblingsAnnotation names, as address=host with commas between, the Service behind each address that stands for a sibling in the sandbox.
+	siblingsAnnotation = "inspect-k8s-sandbox/egress-siblings"
+	// portsAnnotation names the ports of the pod its siblings may reach: *, or a list with commas between.
+	portsAnnotation = "inspect-k8s-sandbox/ingress-ports"
+)
 
-// A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
-var proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([0-9]{1,5})$`)
+var (
+	// A proxy is a Service of the pod's own namespace and a port: it keeps its address when its pod is replaced, and nothing else reaches a worker's command line.
+	proxyTarget = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?:([0-9]{1,5})$`)
+	// A sibling is an address of siblingRange and a Service of the pod's own namespace.
+	siblingTarget = regexp.MustCompile(`^([0-9.]+)=[a-z0-9]([-a-z0-9]*[a-z0-9])?\.([a-z0-9]([-a-z0-9]*[a-z0-9])?)\.svc\.cluster\.local\.?$`)
+)
 
 // node is where this node keeps what the launcher reads. It asks neither containerd nor the API server.
 type node struct {
@@ -81,16 +92,48 @@ type sandbox struct {
 	root     string // the VM's directory: Firecracker's jail root, which holds vm.vsock
 	uid, gid uint32 // the VM's own: Firecracker runs as them, and so does the VM's worker
 	netns    string
-	target   string
+	target   string // its annotations
+	siblings string
+	ports    string
+}
+
+// carried checks what a sandbox's annotations ask its worker to carry.
+func (sb sandbox) carried() error {
+	namespace := strings.Split(sb.pod, "/")[0]
+	if m := proxyTarget.FindStringSubmatch(sb.target); sb.target != "" && (m == nil || m[2] != namespace || !isPort(m[4])) {
+		return fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port from 1 to 65535>", proxyAnnotation, sb.target)
+	}
+	if sb.siblings != "" {
+		for _, sibling := range strings.Split(sb.siblings, ",") {
+			var at netip.Addr // none, where the annotation gives no address: no range holds it
+			m := siblingTarget.FindStringSubmatch(sibling)
+			if m != nil {
+				at, _ = netip.ParseAddr(m[1])
+			}
+			if m == nil || m[3] != namespace || !siblingRange.Contains(at) {
+				return fmt.Errorf("its annotation %s is %q, not <address in %s>=<service>.<its namespace>.svc.cluster.local, with commas between", siblingsAnnotation, sb.siblings, siblingRange)
+			}
+		}
+	}
+	if sb.ports != "" && sb.ports != "*" {
+		for _, port := range strings.Split(sb.ports, ",") {
+			if !isPort(port) {
+				return fmt.Errorf("its annotation %s is %q, not * or ports from 1 to 65535 with commas between", portsAnnotation, sb.ports)
+			}
+		}
+	}
+	return nil
 }
 
 // sandbox finds a record's VM. Its errors name what the launcher assumes of the runtime's layout.
 func (n *node) sandbox(r record) (sandbox, error) {
 	sb := sandbox{
-		pod:    r.pod(),
-		root:   filepath.Join(n.vms, r.ContainerID[:12], "root"),
-		netns:  filepath.Join(n.netns, filepath.Base(r.Netns)),
-		target: r.Capability.Annotations[proxyAnnotation],
+		pod:      r.pod(),
+		root:     filepath.Join(n.vms, r.ContainerID[:12], "root"),
+		netns:    filepath.Join(n.netns, filepath.Base(r.Netns)),
+		target:   r.Capability.Annotations[proxyAnnotation],
+		siblings: r.Capability.Annotations[siblingsAnnotation],
+		ports:    r.Capability.Annotations[portsAnnotation],
 	}
 	st, err := os.Stat(sb.root)
 	if err != nil {
@@ -222,7 +265,7 @@ func inNetns(path string, f func() error) error {
 	return err
 }
 
-// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy.
+// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy or siblings.
 type launcher struct {
 	node
 	rate     int
@@ -277,14 +320,14 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	for _, r := range records {
 		present[r.ContainerID] = true
-		if r.Capability.Annotations[proxyAnnotation] == "" {
+		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" {
 			continue
 		}
 		sb, err := l.sandbox(r)
 		gone := errors.Is(err, os.ErrNotExist)
 		l.had[r.ContainerID] = l.had[r.ContainerID] || !gone
-		if m := proxyTarget.FindStringSubmatch(sb.target); err == nil && (m == nil || m[2] != strings.Split(sb.pod, "/")[0] || !isPort(m[4])) {
-			err = fmt.Errorf("its annotation %s is %q, not <service>.<its namespace>.svc.cluster.local:<port from 1 to 65535>", proxyAnnotation, sb.target)
+		if err == nil {
+			err = sb.carried()
 		}
 		if err == nil && vms[sb.uid] > 1 { // a worker could open the other VM's socket, and ending it would end the other's
 			err = fmt.Errorf("%d live VMs on this node run as its uid %d", vms[sb.uid], sb.uid)
@@ -365,7 +408,7 @@ func (l *launcher) pass() error {
 		}
 		l.tried[id] = time.Now()
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
-			"-target", sb.target, "-rate", strconv.Itoa(l.rate))
+			"-target", sb.target, "-siblings", sb.siblings, "-ports", sb.ports, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
 			l.fault(id, sb.pod, err)
 			continue
@@ -374,7 +417,7 @@ func (l *launcher) pass() error {
 			l.started[id] = true
 			delete(l.reported, id)
 		}
-		log.Printf("%s: worker %d as uid %d for %s", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target)
+		log.Printf("%s: worker %d as uid %d for proxy %q, siblings %q, ports %q", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target, sb.siblings, sb.ports)
 		l.workers[id] = w
 		held[sb.uid] = true // wanted counts a uid's VMs, then reads each again: one whose directory came between is a second of this uid
 	}
