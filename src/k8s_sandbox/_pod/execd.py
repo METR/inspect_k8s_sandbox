@@ -1021,9 +1021,11 @@ class ExecdClient:
             stdout=str(out[STDOUT]),
             stderr=str(out[STDERR]),
         )
+        error = status.get("error", "")  # execd's, only if the command never started
+        if error.startswith("cannot look up user"):
+            raise PodError("execd could not look up the command's user.", error=error)
         if code == 126 and "permission denied" in result.stderr.casefold():
             raise PermissionError(f"Permission denied executing command. {result}")
-        error = status.get("error", "")  # execd's, only if the command never started
         if error.startswith("unknown user"):
             raise SandboxUserUnsupportedError(
                 f"The user parameter '{user}' provided to exec() does not appear to "

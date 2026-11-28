@@ -4682,12 +4682,42 @@ async def test_only_execd_itself_reports_an_unknown_user(tls_daemon: TlsDaemon) 
             w.write(frame(execd.EXIT, call_id, status))
 
     client = await tls_daemon(answers)
+    printed = client.exec(["sh"], None, None, {}, None, None)
 
-    assert (await client.exec(["sh"], None, None, {}, None, 30)).success
+    assert (await asyncio.wait_for(printed, 30)).success
     with pytest.raises(
         inspect_ai.util.SandboxUserUnsupportedError, match="does not appear to exist"
     ):
-        await client.exec(["true"], None, None, {}, "nobody2", 30)
+        refused = client.exec(["true"], None, None, {}, "nobody2", None)
+        await asyncio.wait_for(refused, 30)
+
+
+async def test_only_execd_itself_reports_a_lookup_it_could_not_make(
+    tls_daemon: TlsDaemon,
+) -> None:
+    printed = "cannot look up user nobody: open /etc/passwd: too many open files"
+    refused = "cannot look up user nobody: open /etc/passwd: permission denied"
+
+    async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        while True:
+            kind, call_id, payload = await read_frame(r)
+            if kind != execd.START:
+                continue
+            status: dict[str, object] = {"code": 126}
+            said = printed  # by a command
+            if json.loads(payload)["user"]:  # execd couldn't start it
+                status["error"] = said = refused
+            w.write(frame(execd.STDERR, call_id, f"execd: {said}\n".encode()))
+            w.write(frame(execd.EXIT, call_id, json.dumps(status).encode()))
+
+    client = await tls_daemon(answers)
+    ran = client.exec(["sh"], None, None, {}, None, None)
+
+    assert (await asyncio.wait_for(ran, 30)).returncode == 126
+    with pytest.raises(error.PodError, match="permission denied") as raised:
+        call = client.exec(["true"], None, None, {}, "nobody", None)
+        await asyncio.wait_for(call, 30)
+    assert type(raised.value) is error.PodError  # some subclasses are never sent again
 
 
 async def test_a_user_execd_cannot_become_warns_and_returns_the_failed_result(

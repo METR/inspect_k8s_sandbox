@@ -19,6 +19,7 @@ import anyio
 import anyio.abc
 import anyio.streams.stapled
 import anyio.streams.tls
+import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
 
@@ -377,6 +378,20 @@ async def test_an_id_no_uid_holds_is_not_narrowed_to_one(
         assert sandbox.sh(kept).returncode == 0
 
     assert (groups, own) == ("4242\n", "0\n")  # o without root's group; root still runs
+
+
+async def test_with_no_passwd_file_a_user_is_unsupported(
+    sandbox: Sandbox, client: execd.ExecdClient
+) -> None:
+    """Such an image has no user to find: the lookup is not one to send again."""
+    assert sandbox.sh("mv /etc/passwd /etc/passwd.kept").returncode == 0
+
+    try:
+        with pytest.raises(inspect_ai.util.SandboxUserUnsupportedError):
+            ran = client.exec(["id"], None, None, {}, "nobody", None)
+            await asyncio.wait_for(ran, 30)  # only bounds a hang
+    finally:  # the module's other tests share this container
+        assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
 
 
 @pytest.mark.parametrize(
