@@ -220,7 +220,7 @@
   with the `kubernetes` Python client 36 or later.
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
-  taking one each. Needs anyio 4.14 or later. With
+  taking one each. With
   `restarted_container_behavior="raise"`, `exec_stdio()` raises a detected restart
   before starting its command, as `exec()` does, and a stream already open raises
   `anyio.BrokenResourceError` at its next `receive()` or `send()` once a restart is
