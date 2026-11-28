@@ -95,7 +95,9 @@
   database client): with it, a pod with no network device that names an egress proxy
   sends that proxy every IPv4 TCP connection it makes but those to itself and to its
   siblings, and its DNS lookups get addresses that stand for the names, and no record
-  but an IPv4 address. UDP to any port but 53, and ICMP, fail where they are sent, and a
+  but an IPv4 address. The proxy alone refuses destinations, private and metadata
+  addresses among them: have it refuse what the sandbox must not reach. UDP to any port
+  but 53, and ICMP, fail where they are sent unless they go to the sandbox itself, and a
   connection the proxy refuses or cannot place is accepted and then reset. Such a pod
   runs the redirect's init container with the command `vsock-egress capture`: admit it
   as you admit `redirect`, with the pod's `dnsPolicy: None`. The chart refuses a
