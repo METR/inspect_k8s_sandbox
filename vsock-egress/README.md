@@ -91,9 +91,10 @@ A command run in the forwarder's container runs under the profile that admits th
 address from their caller. To bound what runs there, refuse exec into this container, admitting at most
 `/vsock-egress canary`, which `gate.sh` runs.
 
-A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start.
-A new pod's forwarder can be a newer build than the worker it meets: builds must interoperate on the wire, or the
-launchers be replaced before the forwarders.
+A pod's forwarder passes its startup probe once its worker listens, so where no launcher runs the pod does not start. A
+new pod's forwarder can be a newer build than the worker it meets, and a pod can carry an annotation that an older
+launcher does not read, which then starts it a worker that serves less, or none: builds must interoperate on the wire,
+or the launchers be replaced before the forwarders and before any pod carries such an annotation.
 
 A forwarder writes `vsock connect 2:3129: <why>` each time its connection to the node fails (`2:3132` on the way to
 a sibling), and `forward_failed: <why>` when it ends with an error. Each line the launcher's container writes about a
