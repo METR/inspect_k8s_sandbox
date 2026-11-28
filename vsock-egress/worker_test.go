@@ -451,6 +451,43 @@ func TestSiblingIsLookedUpAgainOnceItsAddressIsStale(t *testing.T) {
 	within(t, second, "next connection to the address the worker now holds")
 }
 
+func TestSiblingKeepsItsAddressWhileItsNameDoesNotAnswer(t *testing.T) {
+	key := newKey()
+	_, first := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort))
+	_, second := serverAt(t, fmt.Sprintf("127.0.0.2:%d", relayPort))
+	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), "", 0)
+	if err := w.annotated("198.18.0.2=game.test", ""); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	var answers atomic.Pointer[netip.Addr] // none while the cluster's DNS does not answer
+	w.now = func() time.Time { return time.Unix(clock.Load(), 0) }
+	w.lookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		if answer := answers.Load(); answer != nil {
+			return []netip.Addr{*answer}, nil
+		}
+		return nil, errors.New("server misbehaving")
+	}
+	dial := serveAt(t, w, siblingPort, w.sibling)
+	stream := func() { dial().Write(append(key, "\xc6\x12\x00\x02\x1f\x40"...)) }
+
+	at, moved := netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("127.0.0.2")
+	answers.Store(&at)
+	stream()
+	within(t, first, "connection to the sibling's address")
+	// The cluster's DNS can fail for seconds, as its agent restarts on a node, while every pod stays where it was.
+	answers.Store(nil)
+	for _, now := range []int64{5, 6, 19} {
+		clock.Store(now)
+		stream()
+		within(t, first, "connection to the address the sibling had, its name not answering")
+	}
+	answers.Store(&moved)
+	clock.Store(20)
+	stream()
+	within(t, second, "connection to the address the sibling's name answers with again")
+}
+
 // working starts the real work for a pod whose guest shows key, and returns its vsock socket and what the guest takes of each connection handed into it.
 func working(t *testing.T, key []byte, flags ...string) (vsock string, took <-chan string) {
 	t.Helper()
