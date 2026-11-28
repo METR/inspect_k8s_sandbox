@@ -66,10 +66,17 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 
 func id(c string) string { return strings.Repeat(c, 64) }
 
+// The annotations as the chart writes them: read from the program, a test would follow its mistake.
+const (
+	chartSiblings = "inspect-k8s-sandbox/egress-siblings"
+	chartPorts    = "inspect-k8s-sandbox/ingress-ports"
+	chartListen   = "inspect-k8s-sandbox/ingress-listen"
+)
+
 func TestOnlySandboxesWhoseAnnotationsAWorkerCanCarryAreWanted(t *testing.T) {
 	proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}
 	siblings := func(named string) map[string]string {
-		return map[string]string{siblingsAnnotation: named}
+		return map[string]string{chartSiblings: named}
 	}
 	for name, tc := range map[string]struct {
 		ifName      string
@@ -94,17 +101,17 @@ func TestOnlySandboxesWhoseAnnotationsAWorkerCanCarryAreWanted(t *testing.T) {
 		"a sibling at another address":    {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
 		"a sibling at no address":         {"eth0", siblings("198.18.0.256=game.ns.svc.cluster.local."), vmUID, false},
 		"more than a sibling":             {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
-		"every port and no sibling":       {"eth0", map[string]string{portsAnnotation: "*"}, vmUID, true},
-		"ports and no sibling":            {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
-		"a served port past the last":     {"eth0", map[string]string{portsAnnotation: "8000,65536"}, vmUID, false},
-		"a listened port and no proxy":    {"eth0", map[string]string{listenAnnotation: "1024"}, vmUID, true},
-		"the last port, listened":         {"eth0", map[string]string{listenAnnotation: "65535"}, vmUID, true},
-		"a listened port below 1024":      {"eth0", map[string]string{listenAnnotation: "1023"}, vmUID, false},
-		"a listened port past the last":   {"eth0", map[string]string{listenAnnotation: "65536"}, vmUID, false},
-		"the worker's own port, listened": {"eth0", map[string]string{listenAnnotation: "3134"}, vmUID, false},
-		"the forwarder's port, listened":  {"eth0", map[string]string{listenAnnotation: "3128"}, vmUID, false},
+		"every port and no sibling":       {"eth0", map[string]string{chartPorts: "*"}, vmUID, true},
+		"ports and no sibling":            {"eth0", map[string]string{chartPorts: "8000,8765"}, vmUID, true},
+		"a served port past the last":     {"eth0", map[string]string{chartPorts: "8000,65536"}, vmUID, false},
+		"a listened port and no proxy":    {"eth0", map[string]string{chartListen: "1024"}, vmUID, true},
+		"the last port, listened":         {"eth0", map[string]string{chartListen: "65535"}, vmUID, true},
+		"a listened port below 1024":      {"eth0", map[string]string{chartListen: "1023"}, vmUID, false},
+		"a listened port past the last":   {"eth0", map[string]string{chartListen: "65536"}, vmUID, false},
+		"the worker's own port, listened": {"eth0", map[string]string{chartListen: "3134"}, vmUID, false},
+		"the forwarder's port, listened":  {"eth0", map[string]string{chartListen: "3128"}, vmUID, false},
 		// The worker takes one port: given a list it would end, and the pod's proxy and siblings with it.
-		"a list of ports to listen on": {"eth0", map[string]string{listenAnnotation: "2222,2223"}, vmUID, false},
+		"a list of ports to listen on": {"eth0", map[string]string{chartListen: "2222,2223"}, vmUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.uid != vmUID && os.Geteuid() != 0 {
@@ -121,7 +128,7 @@ func TestOnlySandboxesWhoseAnnotationsAWorkerCanCarryAreWanted(t *testing.T) {
 				t.Fatalf("wanted %v, want the sandbox: %v", wanted, tc.wanted)
 			}
 			want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net",
-				target: tc.annotations[proxyAnnotation], siblings: tc.annotations[siblingsAnnotation], ports: tc.annotations[portsAnnotation], listen: tc.annotations[listenAnnotation], uid: sb.uid, gid: sb.gid}
+				target: tc.annotations[proxyAnnotation], siblings: tc.annotations[chartSiblings], ports: tc.annotations[chartPorts], listen: tc.annotations[chartListen], uid: sb.uid, gid: sb.gid}
 			if ok && (sb != want || os.Geteuid() == 0 && sb.uid != vmUID) {
 				t.Fatalf("got %+v, want %+v", sb, want)
 			}
@@ -525,7 +532,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	l.reap = budget
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
-	addSandbox(t, l, id("b"), "eth0", map[string]string{siblingsAnnotation: "198.18.0.2=game.ns.svc.cluster.local.", portsAnnotation: "8000", listenAnnotation: "2222"}, vmUID+1)
+	addSandbox(t, l, id("b"), "eth0", map[string]string{chartSiblings: "198.18.0.2=game.ns.svc.cluster.local.", chartPorts: "8000", chartListen: "2222"}, vmUID+1)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
 			w.end(budget)
