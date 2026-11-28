@@ -69,7 +69,7 @@ func forward(args []string) error {
 		return err
 	}
 	defer arrivals.f.Close()
-	go f.fromNode(arrivals, func(c *os.File) { go f.arrive(c) })
+	go f.serveArrivals(arrivals)
 	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
 		return err
 	}
@@ -141,6 +141,11 @@ func (f *forwarder) serveKey(l *vsockListener) {
 		c.Write(f.key[:])
 		c.Close()
 	})
+}
+
+// serveArrivals carries each connection the node opens for one made to the pod.
+func (f *forwarder) serveArrivals(l *vsockListener) {
+	f.fromNode(l, func(c *os.File) { go f.arrive(c) })
 }
 
 // arrive carries a connection the node opened, for one made to the pod, to the port it names, after showing the key: whoever else held this vsock port could not.

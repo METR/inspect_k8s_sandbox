@@ -57,14 +57,16 @@ func namespaced(t *testing.T) bool {
 	return true
 }
 
-// redirected is namespaced once redirect has run there.
+// redirected is namespaced once redirect has run there, twice: the kubelet may run an init container again.
 func redirected(t *testing.T) bool {
 	t.Helper()
 	if !namespaced(t) {
 		return false
 	}
-	if err := redirect(nil); err != nil {
-		t.Fatalf("redirect: %v", err)
+	for range 2 {
+		if err := redirect(nil); err != nil {
+			t.Fatalf("redirect: %v", err)
+		}
 	}
 	return true
 }
@@ -369,7 +371,7 @@ func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T)
 	}
 	arrivals, port := loopback(t)
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, 0)
-	go f.fromNode(arrivals, func(c *os.File) { go f.arrive(c) })
+	go f.serveArrivals(arrivals)
 	_, everywhere := serverAt(t, "0.0.0.0:8000")
 	serverAt(t, "127.0.0.1:8001")
 	_, second := serverAt(t, "0.0.0.0:8002")
