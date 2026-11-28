@@ -199,7 +199,7 @@ func reset(c net.Conn, err error) (int64, error) {
 func TestSiblingStreamReachesTheWorkerOfTheSiblingItsAddressStandsFor(t *testing.T) {
 	out := capture(t)
 	key := newKey()
-	_, accepted := serverAt(t, fmt.Sprintf("127.0.0.1:%d", relayPort)) // where every worker takes its siblings' connections
+	_, accepted := serverAt(t, "127.0.0.1:3134") // where every worker takes its siblings' connections, as the chart's policies have it
 	other, _ := proxy(t)
 	w := newWorker(firecracker(t, map[uint32]string{keyPort: string(key)}), other, 0)
 	if err := w.annotated("198.18.0.2=localhost,198.18.0.4=127.0.0.3", ""); err != nil { // the second where no worker listens
@@ -413,28 +413,62 @@ func working(t *testing.T, key []byte, flags ...string) (vsock string, took <-ch
 		worker.Process.Kill()
 		worker.Wait()
 	})
-	for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) { // it serves once its socket is there
-		if c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, siblingPort)); err == nil {
-			c.Close()
-			return vsock, taken
-		} else if time.Now().After(deadline) {
-			t.Fatalf("the worker did not come to listen for its pod's connections to siblings: %v", err)
+	for _, port := range []int{siblingPort, streamPort} { // it serves once its sockets are there, which come in no set order
+		for deadline := time.Now().Add(budget); ; time.Sleep(10 * time.Millisecond) {
+			if c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, port)); err == nil {
+				c.Close()
+				break
+			} else if time.Now().After(deadline) {
+				t.Fatalf("the worker did not come to listen for its pod's connections at vsock port %d: %v", port, err)
+			}
 		}
 	}
+	return vsock, taken
 }
 
 func TestWorkerStartedForAPodWithSiblingsCarriesItToThemAndThemToIt(t *testing.T) {
 	key := newKey()
-	// The pod's one sibling is this machine, so the connection comes back to the same worker, as one from a sibling.
-	vsock, took := working(t, key, "-siblings", "198.18.0.2=localhost", "-ports", "8000")
+	// The pod's one sibling is this machine, so the connection comes back to the same worker, as one from a sibling: at 127.0.0.2, which a relay port open on 127.0.0.1 alone would refuse.
+	vsock, took := working(t, key, "-siblings", "198.18.0.2=127.0.0.2", "-ports", "8000")
+	// A port the pod does not serve, first: the worker's own check, where no policy's ports stand for a pod with no device.
+	refused, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, siblingPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refused.Close()
+	refused.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x41"...), frame("request")...)) // to 198.18.0.2, port 8001
+	refused.SetReadDeadline(time.Now().Add(budget))
+	if _, err := io.Copy(io.Discard, refused); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("a stream for port 8001, which the pod does not serve, was neither carried nor closed")
+	}
 	c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, siblingPort))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 	c.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...)) // to 198.18.0.2, port 8000
+	// The first the guest takes: one for port 8001 before it would be here in its place.
 	if got, want := within(t, took, "connection in the guest"), "\x1f\x40"+string(frame("request")); got != want {
 		t.Fatalf("the guest took %q: want port 8000 and the request, in frames", got)
+	}
+}
+
+func TestWorkerStartedForAPodWithSiblingsCarriesItToItsProxyToo(t *testing.T) {
+	key := newKey()
+	target, accepted := proxy(t)
+	vsock, _ := working(t, key, "-target", target, "-siblings", "198.18.0.2=127.0.0.2", "-ports", "8000")
+	// The vsock port beside the siblings' is the proxy's: each has a handler of its own.
+	c, err := net.Dial("unix", fmt.Sprintf("%s_%d", vsock, streamPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(append(key, frame("request")...))
+	got := within(t, accepted, "the pod's stream to its proxy")
+	got.SetDeadline(time.Now().Add(budget))
+	request := make([]byte, len("request"))
+	if _, err := io.ReadFull(got, request); err != nil || string(request) != "request" {
+		t.Fatalf("the proxy read %q, %v: want the request", request, err)
 	}
 }
 

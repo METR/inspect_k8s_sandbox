@@ -26,11 +26,12 @@ on every address at port 3128, which the forwarder holds on `127.0.0.1`. A conne
 address of `198.18.0.0/16` that is no sibling's, is accepted and then reset: a readiness check has to exchange data. The
 five-minute bounds above hold for a sibling's connection too. A program that uses the pod's HTTP proxy needs its
 siblings' names in `no_proxy`. A pod's connections to its siblings count among its forwarder's 64, and those made to it,
-64 at most, among its worker's 128: each holds its place until both of its ends have closed it. A pod's worker reaches a
-sibling's at port 3134 of its pod: the release's ingress policies decide which pods reach that port, and a policy of
-yours that names another port of the pod sees none of what its siblings send it. Admit `NET_ADMIN` for that init
-container alone, as the chart renders it and from the image you built, on a pod with no network device, and refuse exec
-into it.
+64 at most, among its worker's 128: each holds its place until both of its ends have closed it. Its siblings together
+get about 28,000 short connections a minute to each of its ports, since each is delivered from the one address. A pod's
+worker reaches a sibling's at port 3134 of its pod: the release's ingress policies decide which pods reach that port,
+and a policy of yours that names another port of the pod sees none of what its siblings send it. Admit `NET_ADMIN` for
+that init container alone, as the chart renders it and from the image you built, on a pod with no network device, and
+refuse exec into it.
 
 A pod with no network device that carries the annotation `inspect-k8s-sandbox/ingress-listen` is reached from outside
 its release too: its worker takes a connection on the port the annotation names (1024 to 65535 other than 3128 and 3134)

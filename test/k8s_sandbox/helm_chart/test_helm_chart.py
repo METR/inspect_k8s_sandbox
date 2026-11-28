@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import pathlib
 import re
 import subprocess
@@ -1351,10 +1352,18 @@ def test_a_pod_with_no_network_card_reaches_the_siblings_on_its_networks(
     assert redirect["image"] == forwarder["image"]
     # It ends before them: one that restarted would hold NET_ADMIN beside the task.
     assert "restartPolicy" not in redirect
-    assert redirect["securityContext"]["capabilities"] == {
-        "drop": ["ALL"],
-        "add": ["NET_ADMIN"],
-    }
+    # Whole, as an admission rule pins it: root for the nft rules, and NET_ADMIN alone.
+    assert json.dumps(redirect["securityContext"], sort_keys=True) == json.dumps(
+        {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]},
+            "readOnlyRootFilesystem": True,
+            "runAsUser": 0,
+            "runAsGroup": 0,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        sort_keys=True,
+    )
     # The pod keeps the Guaranteed class its forwarder leaves it.
     assert redirect["resources"]["requests"] == redirect["resources"]["limits"]
     assert {"cpu", "memory"} <= redirect["resources"]["limits"].keys()
@@ -1620,6 +1629,7 @@ def test_a_pod_is_asked_to_listen_only_on_a_port_its_worker_can_take(
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         _listening(chart_dir, port, no_card)
     assert _LISTENED in exc_info.value.stderr
+    assert "1024 to 65535" in exc_info.value.stderr
 
 
 def test_a_pod_asked_to_listen_may_declare_the_forwarders_port(

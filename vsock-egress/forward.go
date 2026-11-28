@@ -42,27 +42,31 @@ func forward(args []string) error {
 	addr := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", forwarderPort), "the address the sandbox's programs use as their HTTP proxy, and over UDP the one their captured lookups are sent to")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
-	f := newForwarder(hostCID, streamPort)
+	return newForwarder(hostCID, streamPort).run(*addr, *keyFile)
+}
+
+// run is the forwarder at addr, its key kept at keyFile, until its listener ends.
+func (f *forwarder) run(addr, keyFile string) error {
 	keys, err := vsockListen(keyPort) // first: one forwarder alone can hold this port, and a second ends here having touched nothing of the first's
 	if err != nil {
 		return err
 	}
 	defer keys.f.Close()
-	os.Remove(*keyFile + readySuffix) // an earlier forwarder's
-	if err := f.loadKey(*keyFile); err != nil {
+	os.Remove(keyFile + readySuffix) // an earlier forwarder's
+	if err := f.loadKey(keyFile); err != nil {
 		return err
 	}
 	go f.serveKey(keys)
-	l, err := listen(*addr, clientBuffer)
+	l, err := listen(addr, clientBuffer)
 	if err != nil {
 		return err
 	}
 	// Where capture sends the sandbox's lookups: the same port, so that no pod loses another to it.
-	lookups, err := net.ListenPacket("udp", *addr)
+	lookups, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return err
 	}
-	f.names = newNames(*keyFile + ".names") // beside the key, which outlives a restart too
+	f.names = newNames(keyFile + ".names") // beside the key, which outlives a restart too
 	go f.names.serve(lookups)
 	arrivals, err := vsockListen(inboundPort)
 	if err != nil {
@@ -70,7 +74,7 @@ func forward(args []string) error {
 	}
 	defer arrivals.f.Close()
 	go f.serveArrivals(arrivals)
-	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
+	if err := os.WriteFile(keyFile+readySuffix, nil, 0o600); err != nil {
 		return err
 	}
 	return f.serve(l)
