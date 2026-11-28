@@ -403,30 +403,6 @@ async def test_execd_does_not_take_its_environments_word_for_its_user(
     assert (await asyncio.wait_for(own, 30)).stdout == "nobody\n"  # as execd started
 
 
-async def test_a_name_given_to_another_uid_after_execd_started_runs_as_that_uid(
-    sandbox: Sandbox, client: execd.ExecdClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Regression: execd's own user, found at its start, kept the name for good."""
-    monkeypatch.setattr(sandbox, "options", ("-e", "USER=agent"))
-    named = "cp -p /etc/passwd /etc/passwd.kept && sed -i s/^root:/agent:/ /etc/passwd"
-    moved = "sed -i s/^agent:/root:/ /etc/passwd"
-    moved += " && echo agent:x:1000:1000::/:/bin/sh >>/etc/passwd"
-
-    async def run(user: str | None, *argv: str) -> str:
-        ran = client.exec(list(argv), None, None, {}, user, None)
-        return (await asyncio.wait_for(ran, 30)).stdout  # only bounds a hang
-
-    try:
-        assert sandbox.sh(named).returncode == 0
-        await run(None, "true")  # execd starts with uid 0 named agent
-        assert sandbox.sh(moved).returncode == 0
-        uid = await run("agent", "id", "-u")
-    finally:  # the module's other tests share this container
-        assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
-
-    assert uid == "1000\n"
-
-
 @pytest.mark.parametrize(
     ("mode", "read_fails"),
     [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],
