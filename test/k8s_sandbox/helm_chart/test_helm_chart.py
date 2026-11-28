@@ -1495,6 +1495,13 @@ def test_a_pod_runs_the_forwarder_only_where_its_node_starts_it_a_worker(
         & {c["name"] for c in pod["spec"].get("initContainers", [])}
         for name, pod in pods.items()
     } == {name: {_FORWARDER, _REDIRECT} if name in relayed else set() for name in pods}
+    # A pod carried to `game` reads its names, with no DNS record of its own too.
+    assert {
+        name
+        for name, pod in pods.items()
+        if {"ip": "198.18.0.2", "hostnames": ["game", "agent-env-my-release-game"]}
+        in pod["spec"].get("hostAliases", [])
+    } == {name for name, annotation in relayed.items() if annotation == _SIBLINGS}
 
 
 def test_a_service_that_keeps_its_network_card_is_no_sibling(

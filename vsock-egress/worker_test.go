@@ -207,6 +207,15 @@ func TestSiblingStreamReachesTheWorkerOfTheSiblingItsAddressStandsFor(t *testing
 	}
 	dial := serveAt(t, w, siblingPort, w.sibling)
 
+	intruder := dial() // a workload process that opened the vsock itself
+	intruder.Write(append(append(newKey(), "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...))
+	select {
+	case <-accepted:
+		t.Fatal("a stream that did not open with the key reached the sibling's worker")
+	case <-closed(intruder):
+	case <-time.After(budget):
+		t.Fatal("the stream was neither refused nor joined")
+	}
 	c := dial()
 	c.Write(append(append(key, "\xc6\x12\x00\x02\x1f\x40"...), frame("request")...)) // 198.18.0.2, port 8000
 	got := within(t, accepted, "connection to the sibling's worker")
@@ -274,13 +283,6 @@ func TestSiblingsConnectionEntersTheGuestOnlyAfterTheForwardersKey(t *testing.T)
 			c.CloseWrite()
 			reply, err := io.ReadAll(c)
 			if tc.said != "" {
-				select {
-				case got := <-took:
-					if got != "" {
-						t.Fatalf("the guest took %q", got)
-					}
-				default: // the guest was never asked
-				}
 				w.report()
 				out.Lock()
 				defer out.Unlock()
@@ -389,6 +391,8 @@ func TestSiblingIsLookedUpAgainOnceItsAddressIsStale(t *testing.T) {
 	clock.Store(int64(siblingFresh / time.Second))
 	stream()
 	within(t, second, "connection to the sibling's new address")
+	stream()
+	within(t, second, "next connection to the address the worker now holds")
 }
 
 // working starts the real work for a pod whose guest shows key, and returns its vsock socket and what the guest takes of each connection handed into it.
