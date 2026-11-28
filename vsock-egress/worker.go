@@ -31,7 +31,7 @@ type worker struct {
 	slots    chan struct{}          // one for each open stream
 	unkeyed  chan struct{}          // one for each connection that has not said what it wants yet: the key, or a sibling's port
 	arriving chan struct{}          // one for each connection its siblings have to it: they leave the pod's own streams half the places
-	keyWait  time.Duration          // how long a connection has to say it
+	keyWait  time.Duration          // how long a connection has to say what it wants
 	stall    time.Duration          // how long the far end may leave a write to it, or the end of them, waiting
 
 	mu      sync.Mutex
