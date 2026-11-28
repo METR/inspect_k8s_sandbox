@@ -67,8 +67,10 @@ func TestAddressGoesToAnotherNameOnlyOnceItsOwnWasNotUsedForAWhile(t *testing.T)
 	first, _ := n.address("first.example")
 	second, _ := n.address("second.example")
 	third, _ := n.address("third.example")
-	for i := 3; i < 1<<(32-nameRange.Bits())-2; i++ { // every other address of the range
-		n.address(fmt.Sprintf("%d.example", i))
+	for i := 3; i < 32766; i++ { // every other address of the range, as the README counts them
+		if _, room := n.address(fmt.Sprintf("%d.example", i)); !room {
+			t.Fatalf("the table has no address for name %d: want 32,766 of them", i+1)
+		}
 	}
 	// A client may still hold the answer that named each address.
 	if code, records := answered(t, n, "late.example.", dnsmessage.TypeA); code != dnsmessage.RCodeServerFailure || len(records) != 0 {
@@ -115,7 +117,7 @@ func TestForwarderStartedAgainGivesNoAddressAnEarlierOneGaveAnotherName(t *testi
 		t.Fatalf("after a restart later.example is at %v and %v stands for %q: want %v to stand for no name", later, earlier, again.named(earlier), earlier)
 	}
 	// One started once every address was given has none that is not an earlier answer's, until those have expired.
-	if err := os.WriteFile(kept, binary.BigEndian.AppendUint32(nil, 1<<(32-nameRange.Bits())-2), 0o600); err != nil {
+	if err := os.WriteFile(kept, binary.BigEndian.AppendUint32(nil, 32766), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	last := newNames(kept)
