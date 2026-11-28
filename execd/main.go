@@ -19,7 +19,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"os/user"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -237,11 +236,9 @@ func run(network, address, keyHash string, replace bool) {
 	runtime.GOMAXPROCS(min(4, runtime.GOMAXPROCS(0))) // on more CPUs Go starts more threads than execd keeps spare
 	spare(16)
 	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
-	// os/user keeps its first answer for execd's own user, and takes $USER for the name where it reads no passwd entry.
-	if name := os.Getenv("USER"); name != "" {
-		os.Setenv("USER", "")
-		user.Current()
-		os.Setenv("USER", name)
+	if name, set := os.LookupEnv("USER"); set {
+		ownUSER = []string{"USER=" + name}
+		os.Unsetenv("USER")
 	}
 	s, err := newServer(keyHash)
 	if err != nil {

@@ -1466,10 +1466,13 @@ func (cl *call) flush() (frames int) {
 	return frames
 }
 
+// ownUSER is execd's USER, kept out of its environment: os/user takes $USER for execd's own name where it reads no passwd entry.
+var ownUSER []string
+
 // childEnv is execd's own environment, plus the call's.
 func childEnv(extra map[string]string) []string {
 	var env []string
-	for _, kv := range os.Environ() {
+	for _, kv := range append(os.Environ(), ownUSER...) {
 		k, _, _ := strings.Cut(kv, "=")
 		if _, over := extra[k]; !over {
 			env = append(env, kv)
