@@ -19,6 +19,7 @@ import anyio
 import anyio.abc
 import anyio.streams.stapled
 import anyio.streams.tls
+import inspect_ai.util
 import kubernetes.client.exceptions
 import pytest
 
@@ -377,6 +378,29 @@ async def test_an_id_no_uid_holds_is_not_narrowed_to_one(
         assert sandbox.sh(kept).returncode == 0
 
     assert (groups, own) == ("4242\n", "0\n")  # o without root's group; root still runs
+
+
+async def test_execd_does_not_take_its_environments_word_for_its_user(
+    sandbox: Sandbox, client: execd.ExecdClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: after a lookup that failed, it ran $USER's commands as root."""
+    # With no passwd entry to read, Go's os/user makes execd's own user of these two.
+    monkeypatch.setattr(sandbox, "options", ("-e", "USER=nobody", "-e", "HOME=/"))
+
+    async def uid() -> str:
+        ran = client.exec(["id", "-u"], None, None, {}, "nobody", None)
+        return (await asyncio.wait_for(ran, 30)).stdout  # only bounds a hang
+
+    assert sandbox.sh("mv /etc/passwd /etc/passwd.kept").returncode == 0
+    try:
+        with pytest.raises(inspect_ai.util.SandboxUserUnsupportedError):
+            await uid()
+    finally:  # the module's other tests share this container
+        assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
+
+    assert await uid() == "65534\n"
+    own = client.exec(["sh", "-c", "echo $USER"], None, None, {}, None, None)
+    assert (await asyncio.wait_for(own, 30)).stdout == "nobody\n"  # as execd started
 
 
 @pytest.mark.parametrize(
