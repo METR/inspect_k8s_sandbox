@@ -394,6 +394,27 @@ async def test_with_no_passwd_file_a_user_is_unsupported(
         assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
 
 
+async def test_execd_does_not_take_its_environments_word_for_its_user(
+    sandbox: Sandbox, client: execd.ExecdClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: after a lookup that failed, it ran $USER's commands as root."""
+    # With no passwd entry to read, Go's os/user makes execd's own user of these two.
+    monkeypatch.setattr(sandbox, "options", ("-e", "USER=nobody", "-e", "HOME=/"))
+
+    async def uid() -> str:
+        ran = client.exec(["id", "-u"], None, None, {}, "nobody", None)
+        return (await asyncio.wait_for(ran, 30)).stdout  # only bounds a hang
+
+    assert sandbox.sh("mv /etc/passwd /etc/passwd.kept").returncode == 0
+    try:
+        with pytest.raises(inspect_ai.util.SandboxUserUnsupportedError):
+            await uid()
+    finally:  # the module's other tests share this container
+        assert sandbox.sh("mv /etc/passwd.kept /etc/passwd").returncode == 0
+
+    assert await uid() == "65534\n"
+
+
 @pytest.mark.parametrize(
     ("mode", "read_fails"),
     [("raise", ()), ("raise", (True,)), ("raise", (False, True)), ("warn", ())],
