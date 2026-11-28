@@ -431,6 +431,26 @@ func TestWorkerStartedForAPodWithSiblingsCarriesItToThemAndThemToIt(t *testing.T
 	}
 }
 
+func TestWorkerTakesAConnectionToAPortItsPodListensOnIntoTheGuestAtThatPort(t *testing.T) {
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+	_, took := working(t, newKey(), "-listen", strconv.Itoa(port))
+	// At an address other than the one the port was found at: a caller comes to the pod's own, which a listener on 127.0.0.1 alone would refuse.
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.2:%d", port), budget)
+	if err != nil {
+		t.Fatalf("the worker does not listen on port %d of every address: %v", port, err)
+	}
+	defer c.Close()
+	c.Write([]byte("request")) // a client that knows nothing of the relay: it names no port
+	if got, want := within(t, took, "connection in the guest"), string([]byte{byte(port >> 8), byte(port)})+string(frame("request")); got != want {
+		t.Fatalf("the guest took %q: want port %d and the request, in frames", got, port)
+	}
+}
+
 func TestStreamWithoutTheKeyReachesNothing(t *testing.T) {
 	key := newKey()
 	target, accepted := proxy(t)

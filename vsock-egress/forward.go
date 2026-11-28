@@ -134,7 +134,7 @@ func (f *forwarder) serveKey(l *vsockListener) {
 	})
 }
 
-// arrive carries a connection the node opened for one of the pod's siblings to the port it names, after showing the key: whoever else held this vsock port could not.
+// arrive carries a connection the node opened, for one made to the pod, to the port it names, after showing the key: whoever else held this vsock port could not.
 func (f *forwarder) arrive(c *os.File) {
 	port := make([]byte, 2)
 	c.SetDeadline(time.Now().Add(handshakeWait))
@@ -147,7 +147,7 @@ func (f *forwarder) arrive(c *os.File) {
 		from := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(netip.AddrPortFrom(arriveFrom, 0)), Timeout: dialWait}
 		t, err = from.Dial("tcp", netip.AddrPortFrom(deliverTo, binary.BigEndian.Uint16(port)).String())
 	}
-	if err != nil { // no server on that port, say: the node resets the sibling's connection
+	if err != nil { // no server on that port, say: the node resets the connection
 		c.Close()
 		return
 	}

@@ -27,6 +27,8 @@ const (
 	siblingsAnnotation = "inspect-k8s-sandbox/egress-siblings"
 	// portsAnnotation names the ports of the pod its siblings may reach: *, or a list with commas between.
 	portsAnnotation = "inspect-k8s-sandbox/ingress-ports"
+	// listenAnnotation names a port of the pod its worker takes connections on, from whoever the pod's network policy lets in.
+	listenAnnotation = "inspect-k8s-sandbox/ingress-listen"
 )
 
 var (
@@ -95,6 +97,7 @@ type sandbox struct {
 	target   string // its annotations
 	siblings string
 	ports    string
+	listen   string
 }
 
 // carried checks what a sandbox's annotations ask its worker to carry.
@@ -122,6 +125,10 @@ func (sb sandbox) carried() error {
 			}
 		}
 	}
+	// Not below 1024, where a worker that is no root may be refused; not relayPort, which it holds itself, nor the forwarder's own in the sandbox.
+	if n, err := strconv.ParseUint(sb.listen, 10, 16); sb.listen != "" && (err != nil || n < 1024 || n == relayPort || n == forwarderPort) {
+		return fmt.Errorf("its annotation %s is %q, not a port from 1024 to 65535 other than %d and %d", listenAnnotation, sb.listen, forwarderPort, relayPort)
+	}
 	return nil
 }
 
@@ -134,6 +141,7 @@ func (n *node) sandbox(r record) (sandbox, error) {
 		target:   r.Capability.Annotations[proxyAnnotation],
 		siblings: r.Capability.Annotations[siblingsAnnotation],
 		ports:    r.Capability.Annotations[portsAnnotation],
+		listen:   r.Capability.Annotations[listenAnnotation],
 	}
 	st, err := os.Stat(sb.root)
 	if err != nil {
@@ -265,7 +273,7 @@ func inNetns(path string, f func() error) error {
 	return err
 }
 
-// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy or siblings.
+// launcher keeps one worker for each sandbox on this node whose pod names an egress proxy, siblings or a port to listen on.
 type launcher struct {
 	node
 	rate     int
@@ -320,7 +328,7 @@ func (l *launcher) wanted() (map[string]sandbox, error) {
 	}
 	for _, r := range records {
 		present[r.ContainerID] = true
-		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" {
+		if named := r.Capability.Annotations; named[proxyAnnotation] == "" && named[siblingsAnnotation] == "" && named[portsAnnotation] == "" && named[listenAnnotation] == "" {
 			continue
 		}
 		sb, err := l.sandbox(r)
@@ -408,7 +416,7 @@ func (l *launcher) pass() error {
 		}
 		l.tried[id] = time.Now()
 		w, err := start(sb.uid, sb.gid, sb.netns, "work", "-pod", sb.pod, "-vsock", filepath.Join(sb.root, "vm.vsock"),
-			"-target", sb.target, "-siblings", sb.siblings, "-ports", sb.ports, "-rate", strconv.Itoa(l.rate))
+			"-target", sb.target, "-siblings", sb.siblings, "-ports", sb.ports, "-listen", sb.listen, "-rate", strconv.Itoa(l.rate))
 		if err != nil {
 			l.fault(id, sb.pod, err)
 			continue
@@ -417,7 +425,7 @@ func (l *launcher) pass() error {
 			l.started[id] = true
 			delete(l.reported, id)
 		}
-		log.Printf("%s: worker %d as uid %d for proxy %q, siblings %q, ports %q", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target, sb.siblings, sb.ports)
+		log.Printf("%s: worker %d as uid %d for proxy %q, siblings %q, ports %q, listen %q", sb.pod, w.cmd.Process.Pid, sb.uid, sb.target, sb.siblings, sb.ports, sb.listen)
 		l.workers[id] = w
 		held[sb.uid] = true // wanted counts a uid's VMs, then reads each again: one whose directory came between is a second of this uid
 	}
