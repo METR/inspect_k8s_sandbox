@@ -66,10 +66,16 @@ func addSandbox(t *testing.T, l *launcher, id, ifName string, annotations map[st
 
 func id(c string) string { return strings.Repeat(c, 64) }
 
+// The annotations as the chart writes them: read from the program, a test would follow its mistake.
+const (
+	chartSiblings = "inspect-k8s-sandbox/egress-siblings"
+	chartPorts    = "inspect-k8s-sandbox/ingress-ports"
+)
+
 func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testing.T) {
 	proxied := map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local.:3128"}
 	siblings := func(named string) map[string]string {
-		return map[string]string{siblingsAnnotation: named}
+		return map[string]string{chartSiblings: named}
 	}
 	for name, tc := range map[string]struct {
 		ifName      string
@@ -94,9 +100,9 @@ func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testi
 		"a sibling at another address":    {"eth0", siblings("127.0.0.1=game.ns.svc.cluster.local."), vmUID, false},
 		"a sibling at no address":         {"eth0", siblings("198.18.0.256=game.ns.svc.cluster.local."), vmUID, false},
 		"more than a sibling":             {"eth0", siblings("198.18.0.2=game.ns.svc.cluster.local. -rate=1"), vmUID, false},
-		"every port and no sibling":       {"eth0", map[string]string{portsAnnotation: "*"}, vmUID, true},
-		"ports and no sibling":            {"eth0", map[string]string{portsAnnotation: "8000,8765"}, vmUID, true},
-		"a served port past the last":     {"eth0", map[string]string{portsAnnotation: "8000,65536"}, vmUID, false},
+		"every port and no sibling":       {"eth0", map[string]string{chartPorts: "*"}, vmUID, true},
+		"ports and no sibling":            {"eth0", map[string]string{chartPorts: "8000,8765"}, vmUID, true},
+		"a served port past the last":     {"eth0", map[string]string{chartPorts: "8000,65536"}, vmUID, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if tc.uid != vmUID && os.Geteuid() != 0 {
@@ -113,7 +119,7 @@ func TestOnlySandboxesThatNameAProxyOrSiblingsOfTheirNamespaceAreWanted(t *testi
 				t.Fatalf("wanted %v, want the sandbox: %v", wanted, tc.wanted)
 			}
 			want := sandbox{pod: "ns/pod-aaaa", root: filepath.Join(l.vms, id("a")[:12], "root"), netns: "/proc/self/ns/net",
-				target: tc.annotations[proxyAnnotation], siblings: tc.annotations[siblingsAnnotation], ports: tc.annotations[portsAnnotation], uid: sb.uid, gid: sb.gid}
+				target: tc.annotations[proxyAnnotation], siblings: tc.annotations[chartSiblings], ports: tc.annotations[chartPorts], uid: sb.uid, gid: sb.gid}
 			if ok && (sb != want || os.Geteuid() == 0 && sb.uid != vmUID) {
 				t.Fatalf("got %+v, want %+v", sb, want)
 			}
@@ -517,7 +523,7 @@ func TestWorkerRunsAsItsVMsUidAndEndsWithItsSandbox(t *testing.T) {
 	l.reap = budget
 	l.netns = podNetns(t)
 	record := addSandbox(t, l, id("a"), "eth0", map[string]string{proxyAnnotation: "proxy.ns.svc.cluster.local:9"}, vmUID)
-	addSandbox(t, l, id("b"), "eth0", map[string]string{siblingsAnnotation: "198.18.0.2=game.ns.svc.cluster.local.", portsAnnotation: "8000"}, vmUID+1)
+	addSandbox(t, l, id("b"), "eth0", map[string]string{chartSiblings: "198.18.0.2=game.ns.svc.cluster.local.", chartPorts: "8000"}, vmUID+1)
 	t.Cleanup(func() {
 		for _, w := range l.workers {
 			w.end(budget)

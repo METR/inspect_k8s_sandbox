@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -58,9 +58,11 @@ func redirected(t *testing.T) bool {
 	if !namespaced(t) {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
 	for range 2 {
-		if err := redirect(nil); err != nil {
-			t.Fatalf("redirect: %v", err)
+		if out, err := exec.CommandContext(ctx, os.Args[0], "redirect").CombinedOutput(); err != nil { // as the chart's init container runs it
+			t.Fatalf("redirect: %v: %s", err, out)
 		}
 	}
 	return true
@@ -95,7 +97,7 @@ func TestConnectionToASiblingsAddressOpensAStreamThatSaysWhereItWasGoing(t *test
 	}
 	t.Cleanup(func() { siblings.f.Close() })
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, proxied)
-	l, err := listen(fmt.Sprintf("127.0.0.1:%d", forwarderPort), clientBuffer)
+	l, err := listen("127.0.0.1:3128", clientBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,15 +151,93 @@ func TestDatagramToASiblingsAddressIsRefusedWhereItIsSent(t *testing.T) {
 	if _, err := c.Write([]byte("datagram")); !errors.Is(err, unix.EPERM) {
 		t.Fatalf("a datagram to a sibling's address was sent with %v: want it refused", err)
 	}
+	// A ping too, which the sandbox's own kernel would else answer as the sibling.
+	ping, err := net.Dial("ip4:icmp", "198.18.0.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ping.Close()
+	if _, err := ping.Write([]byte{8, 0, 0xf7, 0xff, 0, 0, 0, 0}); !errors.Is(err, unix.EPERM) { // an echo request
+		t.Fatalf("a ping to a sibling's address was sent with %v: want it refused", err)
+	}
+	// And nothing of what the sandbox sends itself.
+	own, err := net.Dial("udp", "127.0.0.1:8000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.Close()
+	if _, err := own.Write([]byte("datagram")); err != nil {
+		t.Fatalf("a datagram to the sandbox's own loopback: %v", err)
+	}
+}
+
+func TestForwardGivenNoAddressListensWhereNoSiblingIsDelivered(t *testing.T) {
+	if !redirected(t) {
+		return
+	}
+	loopback(t) // skips where this machine has no vsock to itself
+	file, said := t.TempDir()+"/key", new(bytes.Buffer)
+	forwarder := exec.Command(os.Args[0], "forward", "-key", file) // as the chart's pods run it
+	forwarder.Stderr = said
+	if err := forwarder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		forwarder.Process.Kill()
+		forwarder.Wait()
+	})
+	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(file + readySuffix); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("forward did not come to listen: %s", said)
+		}
+	}
+	// A sibling's connection is delivered at 198.19.0.1: the proxy's port there would open it the pod's own stream to its proxy.
+	if c, err := net.DialTimeout("tcp", "198.19.0.1:3128", budget); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("a connection to the forwarder's port at the address siblings are delivered to gave %v, %v: want it refused", c, err)
+	}
+	c, err := net.DialTimeout("tcp", "127.0.0.1:3128", budget)
+	if err != nil {
+		t.Fatalf("the sandbox's own programs do not reach the forwarder: %v", err)
+	}
+	c.Close()
 }
 
 func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T) {
 	if !redirected(t) {
 		return
 	}
-	arrivals, port := loopback(t)
-	f := keyedForwarder(unix.VMADDR_CID_LOCAL, 0)
-	go f.serveArrivals(arrivals)
+	loopback(t) // skips where this machine has no vsock to itself
+	// The forwarder as forward starts it, but for the node's CID: this test's own, so that it is the node.
+	f, file := newForwarder(unix.VMADDR_CID_LOCAL, 0), t.TempDir()+"/key"
+	ended := make(chan error, 1)
+	go func() { ended <- f.run("127.0.0.1:3128", file) }()
+	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(file + readySuffix); err == nil {
+			break
+		}
+		select {
+		case err := <-ended:
+			t.Fatalf("the forwarder ended: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the forwarder did not come to listen")
+		}
+	}
+	// Its key, as the node fetches it.
+	keys, err := vsockDial(unix.VMADDR_CID_LOCAL, keyPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keys.Close()
+	keys.SetDeadline(time.Now().Add(budget))
+	minted := make([]byte, keySize)
+	if _, err := io.ReadFull(keys, minted); err != nil || bytes.Equal(minted, make([]byte, keySize)) {
+		t.Fatalf("the node fetched the key %x, %v: want the one the forwarder minted", minted, err)
+	}
 	_, everywhere := serverAt(t, "0.0.0.0:8000")
 	serverAt(t, "127.0.0.1:8001")
 	_, second := serverAt(t, "0.0.0.0:8002")
@@ -167,14 +247,14 @@ func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T)
 	}
 	// The node's side of one sibling's connection: it reads the key, then names the port.
 	arrive := func(named string) *os.File {
-		c, err := vsockDial(unix.VMADDR_CID_LOCAL, port)
+		c, err := vsockDial(unix.VMADDR_CID_LOCAL, inboundPort)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { c.Close() })
 		c.SetDeadline(time.Now().Add(budget))
 		key := make([]byte, keySize)
-		if _, err := io.ReadFull(c, key); err != nil || !bytes.Equal(key, f.key[:]) {
+		if _, err := io.ReadFull(c, key); err != nil || !bytes.Equal(key, minted) {
 			t.Fatalf("the node read %q, %v: want the forwarder's key before it names a port", key, err)
 		}
 		c.Write(append([]byte(named), frame("request")...))
