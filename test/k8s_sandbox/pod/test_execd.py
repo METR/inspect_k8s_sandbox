@@ -4674,9 +4674,12 @@ async def test_only_execd_itself_reports_an_unknown_user(tls_daemon: TlsDaemon) 
             kind, call_id, payload = await read_frame(r)
             if kind != execd.START:
                 continue
-            w.write(frame(execd.STDERR, call_id, b"execd: unknown user nobody2\n"))
+            # With this name, stderr alone reads as the command's "permission denied".
+            w.write(
+                frame(execd.STDERR, call_id, b"execd: unknown user permission denied\n")
+            )
             if json.loads(payload)["user"]:  # execd couldn't start it
-                status = b'{"code": 126, "error": "unknown user nobody2"}'
+                status = b'{"code": 126, "error": "unknown user permission denied"}'
             else:  # a command printing the same
                 status = b'{"code": 0}'
             w.write(frame(execd.EXIT, call_id, status))
@@ -4688,7 +4691,7 @@ async def test_only_execd_itself_reports_an_unknown_user(tls_daemon: TlsDaemon) 
     with pytest.raises(
         inspect_ai.util.SandboxUserUnsupportedError, match="does not appear to exist"
     ):
-        refused = client.exec(["true"], None, None, {}, "nobody2", None)
+        refused = client.exec(["true"], None, None, {}, "permission denied", None)
         await asyncio.wait_for(refused, 30)
 
 
