@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Needs Inspect 0.3.275 or later, and anyio 4.16.0 or later.
 - Fix `write_file()` and `read_file()` over Kubernetes exec hanging when the exec
   stalls: they are retried after 60 seconds without progress, or once 1 MiB of an
   upload has taken that long to send.
@@ -257,7 +258,7 @@
   with the `kubernetes` Python client 36 or later.
 - Add `exec_stdio()`: with `INSPECT_EXEC_REMOTE_BRIDGE=1` (METR's Inspect fork),
   `exec_remote`'s server-wait requests share one exec per sandbox and user instead of
-  taking one each. Needs anyio 4.14 or later. With
+  taking one each. With
   `restarted_container_behavior="raise"`, `exec_stdio()` raises a detected restart
   before starting its command, as `exec()` does, and a stream already open raises
   `anyio.BrokenResourceError` at its next `receive()` or `send()` once a restart is

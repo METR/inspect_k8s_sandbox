@@ -16,8 +16,7 @@ pytestmark = pytest.mark.req_k8s
 # (keyed on the running check's function name). Strict means a check that starts
 # passing here is surfaced rather than silently ignored.
 _ROOT_XFAILS = {
-    # Running as a nonexistent user raises (by design) instead of returning a
-    # failed ExecResult, which is what the check expects.
+    # A nonexistent user raises a K8sError (by design), which the check does not accept.
     "test_exec_as_nonexistent_user": "k8s raises for a nonexistent user",
     # Root can read/write regardless of the permission bits.
     "test_read_file_not_allowed": "root can read after chmod -r",

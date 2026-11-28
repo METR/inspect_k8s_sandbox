@@ -236,6 +236,10 @@ func run(network, address, keyHash string, replace bool) {
 	runtime.GOMAXPROCS(min(4, runtime.GOMAXPROCS(0))) // on more CPUs Go starts more threads than execd keeps spare
 	spare(16)
 	debug.SetMemoryLimit(memoryLimit(cgroupLimit("/sys/fs/cgroup"))) // soft: execd's garbage counts against the sandbox's memory
+	if name, set := os.LookupEnv("USER"); set {
+		ownUSER = []string{"USER=" + name}
+		os.Unsetenv("USER")
+	}
 	s, err := newServer(keyHash)
 	if err != nil {
 		report(err.Error())
