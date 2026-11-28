@@ -336,11 +336,45 @@ func TestSiblingsHoldNoMoreThanHalfOfAPodsPlaces(t *testing.T) {
 	}
 	// With every place taken, the pod's own streams to its proxy and its siblings would be refused instead.
 	if _, err := reset(net.DialTimeout("tcp", at, budget)); !errors.Is(err, syscall.ECONNRESET) {
-		t.Fatalf("one more connection from a sibling ended with %v: want it reset at once", err)
+		t.Fatalf("one more connection from a sibling ended with %v: want it reset", err)
 	}
 	if open := len(w.unkeyed); open != maxStreams {
 		t.Fatalf("its siblings hold %d of the pod's %d places, want %d", open, workerStreams, maxStreams)
 	}
+}
+
+func TestSiblingsConnectionWaitsForAPlaceThatIsBeingGivenBack(t *testing.T) {
+	key := newKey()
+	entered := make(chan struct{}, 1)
+	w := newWorker(firecrackerWith(t, holding(key), func(guest net.Conn) {
+		guest.Write(key)
+		entered <- struct{}{}
+	}), "", 0)
+	w.keyWait, w.waits = time.Hour, budget // neither runs out while the test runs
+	if err := w.annotated("", "*"); err != nil {
+		t.Fatal(err)
+	}
+	dial := relayed(t, w)
+	first := dial()
+	for held := 1; held <= maxStreams; held++ {
+		if held > 1 {
+			dial()
+		}
+		for deadline := time.Now().Add(budget); len(w.arriving) < held; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the worker took %d of its siblings' connections, want %d", len(w.arriving), held)
+			}
+		}
+	}
+	// A sibling's forwarder lets its next connection go a moment before the place its last one held is given back here: refused at once, it was reset with the pod at the 64 it may hold.
+	dial().Write([]byte("\x1f\x40"))
+	for deadline := time.Now().Add(budget); len(w.unkeyed) <= maxStreams; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("one more connection from a sibling does not wait for a place")
+		}
+	}
+	first.Close()
+	within(t, entered, "connection that came as a place was given back")
 }
 
 func TestSiblingsConnectionsGiveBackTheirPlaces(t *testing.T) {
