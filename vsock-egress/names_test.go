@@ -38,6 +38,9 @@ func TestLookupGetsANamesOwnAddressAndNoneOfIPv6(t *testing.T) {
 	if len(first) != 1 || len(again) != 1 || len(other) != 1 {
 		t.Fatalf("answers of %d, %d and %d records: want one address each", len(first), len(again), len(other))
 	}
+	if kept := time.Duration(first[0].Header.TTL) * time.Second; kept > nameTTL {
+		t.Fatalf("the answer may be kept %v: want %v at most", kept, nameTTL)
+	}
 	a, b, c := first[0].Body.(*dnsmessage.AResource).A, again[0].Body.(*dnsmessage.AResource).A, other[0].Body.(*dnsmessage.AResource).A
 	if a != b || a == c || n.named(netip.AddrFrom4(a)) != "example.com" {
 		t.Fatalf("example.com at %v and %v, example.org at %v: want one address a name, that says which", a, b, c)
@@ -49,6 +52,8 @@ func TestLookupGetsANamesOwnAddressAndNoneOfIPv6(t *testing.T) {
 		"game.": dnsmessage.TypeA,
 		// It would end the line the forwarder asks the proxy for it in.
 		"a\r\nb.example.": dnsmessage.TypeA,
+		// Lowered as text, its Kelvin sign is a k: kernel.example, another name.
+		"\u212aernel.example.": dnsmessage.TypeA,
 	} {
 		if code, records := answered(t, n, name, kind); code != dnsmessage.RCodeSuccess || len(records) != 0 {
 			t.Fatalf("a question of type %v for %q got code %v and %v: want no record", kind, name, code, records)
@@ -68,6 +73,10 @@ func TestAddressGoesToAnotherNameOnlyOnceItsOwnWasNotUsedForAWhile(t *testing.T)
 	// A client may still hold the answer that named each address.
 	if code, records := answered(t, n, "late.example.", dnsmessage.TypeA); code != dnsmessage.RCodeServerFailure || len(records) != 0 {
 		t.Fatalf("with every address just given, one more name got code %v and %v: want a failure, and no address", code, records)
+	}
+	now = now.Add(nameTTL)
+	if late, room := n.address("late.example"); room {
+		t.Fatalf("one life of an answer after every address was given, late.example is at %v: want none before two", late)
 	}
 	now = now.Add(time.Minute)
 	n.address("first.example") // looked up again, and the second connected to: a program still uses each

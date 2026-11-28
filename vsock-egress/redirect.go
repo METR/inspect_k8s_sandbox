@@ -80,7 +80,7 @@ func divert(args []string, all bool) error {
 		return err
 	}
 	table := c.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: "vsock_egress"})
-	// One ahead of iptables' nat chain, which the guest has: at one priority, which of the two runs first is not defined.
+	// One ahead of iptables' nat chain, which the guest has: at one priority a chain added later would run first.
 	chain := c.AddChain(&nftables.Chain{Name: "output", Table: table, Type: nftables.ChainTypeNAT,
 		Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest - 1)})
 	sent := c.AddChain(&nftables.Chain{Name: "sent", Table: table, Type: nftables.ChainTypeFilter,

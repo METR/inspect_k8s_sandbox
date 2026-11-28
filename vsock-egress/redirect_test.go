@@ -186,6 +186,18 @@ func TestCapturedSandboxReachesANameAndAnAddressThroughItsProxy(t *testing.T) {
 			t.Fatalf("the client of %s read %q, %v: want what followed the proxy's answer, and none of the answer", target, first, err)
 		}
 	}
+	// A program that knows of the proxy and comes to its port asks for itself: the forwarder adds no request of its own.
+	const own = "CONNECT example.org:443 HTTP/1.1\r\n\r\n"
+	requests := asked(t, f, node)
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", forwarderPort), budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte(own))
+	if got := within(t, requests, "stream to the proxy for a client of its own port"); got != own {
+		t.Fatalf("for a client of the proxy's own port the proxy was asked %q, want what the client wrote, %q", got, own)
+	}
 }
 
 func TestCapturedConnectionTheProxyRefusesIsReset(t *testing.T) {

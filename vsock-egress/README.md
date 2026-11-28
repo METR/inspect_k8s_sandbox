@@ -48,17 +48,18 @@ and to its siblings, goes to the forwarder, which asks the pod's proxy for it wi
 the program wrote; an IPv6 address is not reached, and an address the guest holds on another device, as AWS's metadata
 address, goes to the proxy like any other. The proxy alone refuses a destination: the forwarder asks it for whatever the
 sandbox names, a private, loopback, link-local or metadata address among them. The forwarder answers the sandbox's DNS
-lookups itself, those sent to `127.0.0.1:53`, the pod's one resolver (`dnsPolicy: None`), and those sent over UDP to a
-resolver outside the sandbox (over TCP such a lookup is a connection like any other, and reaches that resolver): a name
-with a dot gets an address of `198.19.128.0/17` that stands for it, whether or not a host has that name (a program that
-refuses private addresses refuses every host), and a name with no dot, a question for an IPv6 address or any other
-record gets none. Past 32,766 names the one looked up or connected to longest ago loses its address to the next, no
-sooner than ten seconds after: a program that still holds the address then reaches the newer name's host. A forwarder
-that restarts forgets every name, and resets a connection to an address it gave before. A connection is accepted before
-the proxy answers for it, and reset if the proxy refuses it or cannot reach its host: a port scan sees every port open.
-What is neither TCP nor a lookup fails where it is sent (`EPERM`). The forwarder holds port 3128 for TCP and for UDP in
-every pod it runs in, and carries 64 connections at once: the next waits up to ten seconds for a place, and is then
-reset. The chart refuses a captured pod in a release where a service has `additionalDnsRecords`.
+lookups itself, those sent to `127.0.0.1:53`, the pod's one resolver (`dnsPolicy: None`), where a server of the
+sandbox's own hears nothing, and those sent over UDP to a resolver outside the sandbox (over TCP such a lookup is a
+connection like any other, and reaches that resolver): a name with a dot gets an address of `198.19.128.0/17` that
+stands for it, whether or not a host has that name (a program that refuses private addresses refuses every host), and a
+name with no dot, a question for an IPv6 address or any other record gets none. Past 32,766 names the one looked up or
+connected to longest ago loses its address to the next, no sooner than ten seconds after: a program that still holds the
+address then reaches the newer name's host. A forwarder that restarts forgets every name, and resets a connection to an
+address it gave before. A connection is accepted before the proxy answers for it, and reset if the proxy refuses it,
+cannot reach its host or says nothing for ten seconds: a port scan sees every port open. What the sandbox sends anywhere
+but to itself that is neither TCP nor a lookup fails where it is sent (`EPERM`). The forwarder holds port 3128 for TCP
+and for UDP in every pod it runs in, and carries 64 connections at once: the next waits up to ten seconds for a place,
+and is then reset. The chart refuses a captured pod in a release where a service has `additionalDnsRecords`.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 

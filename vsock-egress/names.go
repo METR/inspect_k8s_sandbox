@@ -95,7 +95,7 @@ func (n *names) named(addr netip.Addr) string {
 
 // carried says whether a proxy would take name: it has a dot, and nothing that could end the line that asks for it.
 func carried(name string) bool {
-	return strings.Contains(name, ".") && strings.Trim(name, "abcdefghijklmnopqrstuvwxyz0123456789-_.") == ""
+	return strings.Contains(name, ".") && strings.Trim(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") == ""
 }
 
 // answer is the reply to a DNS question: an address of nameRange for the A record of a name a proxy would take, and no record for any other.
@@ -111,9 +111,9 @@ func (n *names) answer(question []byte) []byte {
 	}
 	said := dnsmessage.Header{ID: header.ID, Response: true, RecursionDesired: header.RecursionDesired, RecursionAvailable: true}
 	var addr netip.Addr
-	if name := strings.ToLower(strings.TrimSuffix(asked.Name.String(), ".")); asked.Class == dnsmessage.ClassINET && asked.Type == dnsmessage.TypeA && carried(name) {
+	if name := strings.TrimSuffix(asked.Name.String(), "."); asked.Class == dnsmessage.ClassINET && asked.Type == dnsmessage.TypeA && carried(name) {
 		var room bool
-		if addr, room = n.address(name); !room {
+		if addr, room = n.address(strings.ToLower(name)); !room { // lowered once it is all ASCII: as text, a Kelvin sign is a k
 			said.RCode = dnsmessage.RCodeServerFailure
 		}
 	}
