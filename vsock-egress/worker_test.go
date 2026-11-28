@@ -403,7 +403,7 @@ func TestSiblingsConnectionsGiveBackTheirPlaces(t *testing.T) {
 	within(t, entered, "connection from a sibling into the guest")
 }
 
-func TestWorkersListenerHoldsNoMoreUntakenConnectionsThanItCarries(t *testing.T) {
+func TestWorkersListenerHoldsNoMoreThan512ConnectionsItHasNotAccepted(t *testing.T) {
 	l, err := taking("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -417,9 +417,9 @@ func TestWorkersListenerHoldsNoMoreUntakenConnectionsThanItCarries(t *testing.T)
 	if failed := raw.Control(func(fd uintptr) { held, err = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO) }); failed != nil || err != nil {
 		t.Fatal(failed, err)
 	}
-	// Of a listening socket, the kernel says its bound here: each connection past the worker's 64 would hold half a mebibyte that no pod is charged for.
-	if held.Sacked != maxStreams {
-		t.Fatalf("the worker's listener holds up to %d connections it has not accepted: want %d", held.Sacked, maxStreams)
+	// Of a listening socket, the kernel says its bound here: each connection it holds may keep half a mebibyte that no pod is charged for.
+	if held.Sacked != 512 {
+		t.Fatalf("the worker's listener holds up to %d connections it has not accepted: want 512", held.Sacked)
 	}
 }
 
