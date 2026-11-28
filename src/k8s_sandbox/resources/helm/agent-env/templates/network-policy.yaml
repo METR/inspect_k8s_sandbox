@@ -8,9 +8,10 @@
 {{- if $svc.networkIsolated }}{{ $unenforced = append $unenforced (printf "services.%s.networkIsolated" $svcName) }}{{ end }}
 {{- if $svc.networks }}{{ $unenforced = append $unenforced (printf "services.%s.networks" $svcName) }}{{ end }}
 {{- if include "agentEnv.egressProxy" (dict "root" $ "service" $svc) }}{{ $unenforced = append $unenforced (printf "the egress proxy services.%s names" $svcName) }}{{ end }}
+{{- range include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}{{ if .named }}{{ $unenforced = append $unenforced (printf "which pods reach services.%s over vsock-egress (egressForwarderImage)" .service) }}{{ end }}{{ end }}
 {{- end }}
 {{- if $unenforced }}
-{{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " $unenforced)) }}
+{{- fail (printf "networkPolicy.enabled is false (set in the task's values or the INSPECT_SANDBOX_VALUES file), so nothing would enforce %s. Unset these, or enable network policies." (join ", " (uniq $unenforced))) }}
 {{- end }}
 {{- else -}}
 {{- /* A pod that names an egress proxy takes the last policy of this file in place of sandbox-egress. */}}
@@ -199,6 +200,7 @@ spec:
       toPorts:
         - ports:
 {{ include "agentEnv.servicePortsListFor" (dict "svc" $svc) | nindent 12 }}
+        {{- with include "agentEnv.workerPortRule" (dict "root" $ "name" $svcName "svc" $svc) }}{{ . | nindent 8 }}{{ end }}
       {{- end }}
     - fromEndpoints:
       - matchLabels:
@@ -248,6 +250,7 @@ spec:
       toPorts:
         - ports:
 {{ include "agentEnv.servicePortsListFor" (dict "svc" $svc) | nindent 12 }}
+        {{- with include "agentEnv.workerPortRule" (dict "root" $ "name" $svcName "svc" $svc) }}{{ . | nindent 8 }}{{ end }}
       {{- end }}
     - fromEndpoints:
       - matchLabels:
@@ -305,7 +308,8 @@ metadata:
 spec:
   description: |
     Service "{{ $svcName }}" names an egress proxy: its pod reaches only that name's
-    DNS record and the proxy's port on the pods of this sandbox.
+    DNS record and the proxy's port on the pods of this sandbox, and where vsock-egress
+    carries it to its siblings, their records and their workers' port.
   endpointSelector:
     matchLabels:
       io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
@@ -326,6 +330,13 @@ spec:
           rules:
             dns:
               - matchName: {{ regexReplaceAll "[.]?:[0-9]+$" $proxy "" | quote }}
+              {{- $carried := list }}
+              {{- range include "agentEnv.siblings" (dict "root" $ "name" $svcName) | fromJsonArray }}
+              {{- if .named }}
+              {{- $carried = append $carried .service }}
+              - matchName: {{ printf "%s-%s.%s.svc.cluster.local" (include "agentEnv.fullname" $) .service $.Release.Namespace | quote }}
+              {{- end }}
+              {{- end }}
     - toEndpoints:
       - matchLabels:
           io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
@@ -334,5 +345,19 @@ spec:
         - ports:
             - port: {{ regexFind "[0-9]+$" $proxy | quote }}
               protocol: TCP
+    {{- with $carried }}
+    - toEndpoints:
+      - matchLabels:
+          io.kubernetes.pod.namespace: {{ $.Release.Namespace | quote }}
+          {{- include "agentEnv.selectorLabels" $ | nindent 10 }}
+        matchExpressions:
+          - key: inspect/service
+            operator: In
+            values: {{ toJson . }}
+      toPorts:
+        - ports:
+            - port: "3134"
+              protocol: TCP
+    {{- end }}
 {{- end }}
 {{- end }}

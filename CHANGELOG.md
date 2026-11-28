@@ -62,6 +62,22 @@
   seccomp profiles, which `vsock-egress install` writes (see `vsock-egress/README.md`):
   on a node with no launcher such a pod does not start. The forwarder's container is named
   `egress-forwarder-with-a-name-too-long-for-any-service-to-share`.
+- With `egressForwarderImage` set, services whose pods are AWS Nitro Sandboxes with no
+  network device reach each other over TCP: each pod resolves the names of the services
+  it shares a network with, where they have a DNS record, and reaches any port of one,
+  or its `ports` where it declares them. Not carried: UDP and ICMP, which fail where
+  they are sent, so a service whose `ports` are all UDP gets no name. A server takes its
+  siblings' connections at `198.19.0.1`, so it must listen on every address or on that
+  one, and sees each come from `198.19.0.2`. A connection to a port with no server
+  behind it is accepted and then reset: a readiness check has to exchange data. A pod
+  holds 64 connections to its siblings and its proxy at once, and takes 64 from its
+  siblings. A program that uses the pod's HTTP proxy needs its siblings' names in
+  `no_proxy`. Each such pod runs the forwarder, which adds 500m of CPU and 256Mi of
+  memory to its requests and limits, and an init container named
+  `egress-redirector-with-a-name-too-long-for-any-service-to-share`, as root with
+  `NET_ADMIN`, so its namespace's Pod Security level must be `privileged`. The chart
+  refuses a service that declares TCP port 3128 on such a pod, and
+  `networkPolicy.enabled: false` where a sibling is carried.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

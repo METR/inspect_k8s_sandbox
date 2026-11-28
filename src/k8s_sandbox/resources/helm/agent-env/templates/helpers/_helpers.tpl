@@ -76,6 +76,33 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 {{- end -}}
 
+{{/* Whether a service's pod has no network device, by the annotations its template gives it. Takes a dict of root ($) and name. */}}
+{{- define "agentEnv.noCard" -}}
+{{- $annotations := deepCopy (default (dict) .root.Values.annotations) -}}
+{{- range $key, $value := (get .root.Values.services .name).podAnnotations }}{{ $_ := set $annotations $key $value }}{{ end -}}
+{{- if eq (get $annotations "sandbox.amazonaws.com/network-isolated") "true" }}true{{ end -}}
+{{- end -}}
+
+{{/* A service's siblings over vsock-egress, as a JSON list of {service, address, named}: those with no network device on a network of its; named, if a DNS record lets its pod find one and it takes TCP. Takes a dict of root ($) and name. */}}
+{{- define "agentEnv.siblings" -}}
+{{- $own := get .root.Values.services .name -}}
+{{- $siblings := list -}}
+{{- if and (include "agentEnv.noCard" .) .root.Values.egressForwarderImage (not $own.networkIsolated) -}}
+{{- $index := 0 -}}
+{{- range $name, $service := .root.Values.services -}}
+{{- $index = add1 $index -}}
+{{- $shared := not $.root.Values.networks -}}
+{{- range $own.networks }}{{ if has . (default (list) $service.networks) }}{{ $shared = true }}{{ end }}{{ end -}}
+{{- if and (ne $name $.name) $shared (not $service.networkIsolated) (include "agentEnv.noCard" (dict "root" $.root "name" $name)) -}}
+{{- $tcp := not $service.ports -}}
+{{- range $service.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $tcp = true }}{{ end }}{{ end -}}
+{{- $siblings = append $siblings (dict "service" $name "address" (printf "198.18.%d.%d" (div $index 256) (mod $index 256)) "named" (and $tcp (ne (include "shouldCreateDnsRecord" $service) ""))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $siblings -}}
+{{- end -}}
+
 {{/*
 Whether to create a ClusterIP type Service (which implies a DNS record) for a service
 */}}
@@ -112,4 +139,14 @@ true
   {{- end }}
 {{- end }}
 {{ include "agentEnv.toYaml" $out -}}
+{{- end -}}
+
+{{/* Where vsock-egress carries a service's siblings to a TCP port of its, the port its pod's worker takes them at: a rule of its own, for Cilium takes 40 ports in one. */}}
+{{- define "agentEnv.workerPortRule" -}}
+{{- $tcp := false }}{{ range .svc.ports }}{{ if eq (default "TCP" .protocol | upper) "TCP" }}{{ $tcp = true }}{{ end }}{{ end }}
+{{- if and $tcp (include "agentEnv.siblings" (dict "root" .root "name" .name) | fromJsonArray) }}
+- ports:
+    - port: "3134"
+      protocol: TCP
+{{- end }}
 {{- end -}}

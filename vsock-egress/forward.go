@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"syscall"
 	"time"
@@ -14,25 +18,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// forwarder is the sandbox's side. It reads nothing of what it carries and names no destination.
+// forwarder is the sandbox's side. It reads nothing of what it carries and names no Service.
 type forwarder struct {
-	key     [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
-	host    uint32        // the node's CID
-	port    uint32        // the node's vsock port for streams
-	slots   chan struct{} // one for each connection it carries
-	queue   chan struct{} // one for each connection it carries or holds back
-	wait    time.Duration // how long a connection is held back for a place
-	connect func(cid, port uint32) (*os.File, error)
+	key      [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
+	host     uint32        // the node's CID
+	port     uint32        // the node's vsock port for proxy streams
+	siblings uint32        // and for a sibling's
+	slots    chan struct{} // one for each connection it carries
+	queue    chan struct{} // one for each connection it carries or holds back
+	wait     time.Duration // how long a connection is held back for a place
+	connect  func(cid, port uint32) (*os.File, error)
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, slots: make(chan struct{}, maxStreams),
+	return &forwarder{host: host, port: port, siblings: siblingPort, slots: make(chan struct{}, maxStreams),
 		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
 func forward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ExitOnError)
-	addr := fs.String("listen", "127.0.0.1:3128", "the address the sandbox's programs use as their HTTP proxy")
+	addr := fs.String("listen", fmt.Sprintf("127.0.0.1:%d", forwarderPort), "the address the sandbox's programs use as their HTTP proxy")
 	keyFile := fs.String("key", "", "where the key is kept, in a directory only the forwarder can read")
 	fs.Parse(args)
 	f := newForwarder(hostCID, streamPort)
@@ -46,17 +51,23 @@ func forward(args []string) error {
 		return err
 	}
 	go f.serveKey(keys)
-	l, err := listen(*addr)
+	l, err := listen(*addr, clientBuffer)
 	if err != nil {
 		return err
 	}
+	arrivals, err := vsockListen(inboundPort)
+	if err != nil {
+		return err
+	}
+	defer arrivals.f.Close()
+	go f.fromNode(arrivals, func(c *os.File) { go f.arrive(c) })
 	if err := os.WriteFile(*keyFile+readySuffix, nil, 0o600); err != nil {
 		return err
 	}
 	return f.serve(l)
 }
 
-// readySuffix names the file beside the key that is there while the forwarder listens on both of its ports.
+// readySuffix names the file beside the key that is there while the forwarder listens on all of its ports.
 const readySuffix = ".ready"
 
 // ready is the forwarder's startup probe: the kubelet can reach no port of a pod with no network device.
@@ -95,31 +106,64 @@ func (f *forwarder) loadKey(file string) error {
 	return os.WriteFile(file, f.key[:], 0o600)
 }
 
-// serveKey gives the key to each peer the kernel says is the node: a process in this VM cannot claim that CID.
-func (f *forwarder) serveKey(l *vsockListener) {
+// fromNode calls each with every connection to l that the kernel says is the node's: a process in this VM cannot claim that CID.
+func (f *forwarder) fromNode(l *vsockListener, each func(*os.File)) {
 	for {
 		c, peer, err := l.accept()
 		if errors.Is(err, os.ErrClosed) {
 			return
 		}
-		if err != nil { // a connection that ended before it was accepted, say: not the end of the key port
-			log.Printf("key port: %v", err)
+		if err != nil { // a connection that ended before it was accepted, say: not the end of the port
+			log.Printf("vsock port: %v", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if peer == f.host {
-			c.Write(f.key[:])
+		if peer != f.host {
+			c.Close()
+			continue
 		}
-		c.Close()
+		each(c)
 	}
 }
 
-// listen takes the proxy port, where every connection is born with its receive buffer held at half the cap, the size the kernel starts it with: left alone until stream runs, a client's small segments grow it to the kernel's maximum, and the forwarder is charged for it all as it accepts.
-func listen(addr string) (net.Listener, error) {
+// serveKey gives the key to the node.
+func (f *forwarder) serveKey(l *vsockListener) {
+	f.fromNode(l, func(c *os.File) {
+		c.Write(f.key[:])
+		c.Close()
+	})
+}
+
+// arrive carries a connection the node opened for one of the pod's siblings to the port it names, after showing the key: whoever else held this vsock port could not.
+func (f *forwarder) arrive(c *os.File) {
+	port := make([]byte, 2)
+	c.SetDeadline(time.Now().Add(handshakeWait))
+	_, err := c.Write(f.key[:])
+	if err == nil {
+		_, err = io.ReadFull(c, port)
+	}
+	var t net.Conn
+	if err == nil {
+		from := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(netip.AddrPortFrom(arriveFrom, 0)), Timeout: dialWait}
+		t, err = from.Dial("tcp", netip.AddrPortFrom(deliverTo, binary.BigEndian.Uint16(port)).String())
+	}
+	if err != nil { // no server on that port, say: the node resets the sibling's connection
+		c.Close()
+		return
+	}
+	c.SetDeadline(time.Time{})
+	t.(*net.TCPConn).SetReadBuffer(clientBuffer)
+	t.(*net.TCPConn).SetWriteBuffer(clientBuffer)
+	join(c, t.(*net.TCPConn), nil, stallWait)
+}
+
+// listen takes a TCP port where every connection is born with its receive buffer held at half of buffer, the size the kernel starts it with: left alone until its stream runs, a client's small segments grow it to the kernel's maximum, and the listener is charged for it all as it accepts.
+func listen(addr string, buffer int) (net.Listener, error) {
+	// Go's keep-alive stays on: without it the kernel forgets where redirect found a connection going once its client has half-closed it and 60 s pass.
 	held := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
-		return c.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, clientBuffer/2) })
+		return c.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, buffer/2) })
 	}}
-	held.SetMultipathTCP(false) // Go listens for it unasked, and a multipath connection's subflows have buffers of their own, which nothing set on the connection bounds
+	held.SetMultipathTCP(false) // Go listens for it unasked: a multipath connection's subflows have buffers of their own, which nothing set on the connection bounds, and it does not say where redirect found it going
 	return held.Listen(context.Background(), "tcp", addr)
 }
 
@@ -150,8 +194,12 @@ func (f *forwarder) serve(l net.Listener) error {
 // clientBuffer caps a stream's socket to its client each way, and the kernel accounts twice it: it bounds what the streams a guest stalls hold, under the forwarder's memory limit in the chart, and is smaller than the worker's proxyBuffer because loopback needs no more.
 const clientBuffer = 128 << 10
 
-// stream carries one of the sandbox's connections to the node, on a vsock connection of its own.
+// stream carries one of the sandbox's connections to the node on a vsock connection of its own: to the sibling redirect found it going to, named after the key, or else to the proxy.
 func (f *forwarder) stream(c *net.TCPConn) {
+	port, asked := f.port, []byte(nil)
+	if to, err := originalDst(c); err == nil && siblingRange.Contains(to.Addr()) {
+		port, asked = f.siblings, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
+	}
 	// A client that closes a connection and opens the next is ahead of the node, where the old stream is still ending: refusing the new one broke clients that keep 64 busy.
 	select {
 	case f.slots <- struct{}{}:
@@ -164,14 +212,14 @@ func (f *forwarder) stream(c *net.TCPConn) {
 	// Only now the whole of it: the 448 that wait hold the half their listener gave them.
 	c.SetReadBuffer(clientBuffer)
 	c.SetWriteBuffer(clientBuffer)
-	up, err := f.dial()
+	up, err := f.dial(port)
 	if err != nil {
 		log.Print(err)
 		c.SetLinger(0)
 		c.Close()
 		return
 	}
-	if _, err := up.Write(f.key[:]); err != nil {
+	if _, err := up.Write(append(f.key[:], asked...)); err != nil {
 		log.Print(err)
 		c.SetLinger(0)
 		c.Close()
@@ -182,9 +230,9 @@ func (f *forwarder) stream(c *net.TCPConn) {
 }
 
 // dial connects to the node's worker, waiting out one that is starting or being replaced: with none listening the connection is reset.
-func (f *forwarder) dial() (*os.File, error) {
+func (f *forwarder) dial(port uint32) (*os.File, error) {
 	for deadline := time.Now().Add(handshakeWait); ; time.Sleep(100 * time.Millisecond) {
-		c, err := f.connect(f.host, f.port)
+		c, err := f.connect(f.host, port)
 		if err == nil || !errors.Is(err, unix.ECONNRESET) || time.Now().After(deadline) {
 			return c, err
 		}

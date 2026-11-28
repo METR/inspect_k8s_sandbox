@@ -40,7 +40,9 @@ networkPolicy:
 # `securityContext`: none of the service's hardening applies to it.
 extraContainers: []
 # -- The vsock-egress image (built from `vsock-egress/`), required once a pod carries
-# the annotation `inspect-k8s-sandbox/egress-proxy`.
+# the annotation `inspect-k8s-sandbox/egress-proxy`; with it, pods that are AWS Nitro
+# Sandboxes with no network device also reach each other, where they share a network and
+# have a DNS record.
 # @default -- Empty
 egressForwarderImage: ""
 # -- References to pre-existing secrets that contain registry credentials.

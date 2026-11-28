@@ -317,7 +317,7 @@ func TestConnectionThatGetsNoPlaceIsResetWithNoStream(t *testing.T) {
 
 func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	_, placed := tcpPair(t)
-	l, err := listen("127.0.0.1:0")
+	l, err := listen("127.0.0.1:0", clientBuffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,17 +360,16 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	}
 }
 
-func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
-	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
-		t.Skip("this kernel has multipath TCP off")
-	}
+// forwarding starts the program's own forward, in a process of its own, and returns its TCP address once it listens: what a sandbox and its node meet is whatever that makes.
+func forwarding(t *testing.T) (addr string) {
+	t.Helper()
+	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr, file := free.Addr().String(), filepath.Join(t.TempDir(), "key")
 	free.Close()
-	// The program's own forward, in a process of its own: the listener a sandbox dials is whatever that makes.
 	forwarder := exec.Command(os.Args[0], "forward", "-listen", addr, "-key", file)
 	said := new(strings.Builder)
 	forwarder.Stderr = said
@@ -385,18 +384,39 @@ func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
 	})
 	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
 		if _, err := os.Stat(file + readySuffix); err == nil {
-			break
+			return addr
 		}
 		select {
 		case err := <-ended:
 			ended <- err
-			t.Skipf("forward did not come to listen: %v: %s", err, said)
+			t.Fatalf("forward did not come to listen: %v: %s", err, said)
 		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("forward neither listened nor ended")
 		}
 	}
+}
+
+func TestForwardTakesItsSiblingsConnectionsFromTheNodeAlone(t *testing.T) {
+	forwarding(t)
+	// This test is a process of the forwarder's own VM, as a task's would be: only the node may hand it a sibling's connection.
+	c, err := vsockDial(unix.VMADDR_CID_LOCAL, inboundPort)
+	if err != nil {
+		t.Fatalf("forward does not listen for its siblings' connections: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(budget))
+	if n, err := c.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("a process of the VM read %d bytes, %v, at the port for siblings' connections: want it closed with no key", n, err)
+	}
+}
+
+func TestClientThatAsksForMultipathTCPGetsPlainTCP(t *testing.T) {
+	if on, _ := os.ReadFile("/proc/sys/net/mptcp/enabled"); strings.TrimSpace(string(on)) != "1" {
+		t.Skip("this kernel has multipath TCP off")
+	}
+	addr := forwarding(t)
 	var guest net.Dialer
 	guest.SetMultipathTCP(true)
 	client, err := guest.Dial("tcp", addr)
