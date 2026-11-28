@@ -158,6 +158,11 @@ func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T)
 	go f.fromNode(arrivals, func(c *os.File) { go f.arrive(c) })
 	_, everywhere := serverAt(t, "0.0.0.0:8000")
 	serverAt(t, "127.0.0.1:8001")
+	_, second := serverAt(t, "0.0.0.0:8002")
+	// One port to connect from: taken as the forwarder binds, it would be closed to the second connection below, and to the sandbox's own.
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_local_port_range", []byte("40000 40000"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	// The node's side of one sibling's connection: it reads the key, then names the port.
 	arrive := func(named string) *os.File {
 		c, err := vsockDial(unix.VMADDR_CID_LOCAL, port)
@@ -184,6 +189,8 @@ func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T)
 	if at, from := got.LocalAddr().(*net.TCPAddr).IP.String(), got.RemoteAddr().(*net.TCPAddr).IP.String(); at != "198.19.0.1" || from != "198.19.0.2" {
 		t.Fatalf("the server took its sibling's connection at %v from %v: want at 198.19.0.1 from 198.19.0.2, as the README says", at, from)
 	}
+	arrive("\x1f\x42") // port 8002, while the first is open
+	within(t, second, "connection from a second sibling")
 	// The address the sandbox calls its own is no sibling's: a connection it makes there reaches its own server.
 	addrs, _ := net.InterfaceAddrs()
 	for _, addr := range addrs {

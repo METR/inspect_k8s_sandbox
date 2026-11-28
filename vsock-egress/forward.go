@@ -143,7 +143,10 @@ func (f *forwarder) arrive(c *os.File) {
 	}
 	var t net.Conn
 	if err == nil {
-		from := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(netip.AddrPortFrom(arriveFrom, 0)), Timeout: dialWait}
+		// Its port is taken as it connects: taken as it binds, each of these would close a port to every connection the VM makes, for a minute after it ends.
+		from := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(netip.AddrPortFrom(arriveFrom, 0)), Timeout: dialWait, Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) { unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BIND_ADDRESS_NO_PORT, 1) })
+		}}
 		t, err = from.Dial("tcp", netip.AddrPortFrom(deliverTo, binary.BigEndian.Uint16(port)).String())
 	}
 	if err != nil { // no server on that port, say: the node resets the sibling's connection
