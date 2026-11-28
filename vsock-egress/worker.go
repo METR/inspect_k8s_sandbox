@@ -197,7 +197,7 @@ func work(args []string) error {
 	return <-ended
 }
 
-// taking listens at a port of the pod's for the connections made to it, and holds no more than maxStreams it has not accepted: the kernel keeps what each has sent, charged to no pod, and its own bound is 4096.
+// taking listens at a port of the pod's for the connections made to it, and holds no more than 512 it has not accepted: the kernel keeps what each has sent, charged to no pod, and its own bound is 4096. At 64, two siblings' load waited seconds to connect.
 func taking(addr string) (net.Listener, error) {
 	l, err := listen(addr, proxyBuffer)
 	if err != nil {
@@ -205,7 +205,7 @@ func taking(addr string) (net.Listener, error) {
 	}
 	raw, err := l.(*net.TCPListener).SyscallConn()
 	if err == nil {
-		if failed := raw.Control(func(fd uintptr) { err = syscall.Listen(int(fd), maxStreams) }); failed != nil {
+		if failed := raw.Control(func(fd uintptr) { err = syscall.Listen(int(fd), maxStreams+maxWaiting) }); failed != nil {
 			err = failed
 		}
 	}
