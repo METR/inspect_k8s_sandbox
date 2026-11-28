@@ -1545,6 +1545,19 @@ def test_a_pod_no_sibling_reaches_may_declare_the_forwarders_port(
     )
 
 
+def test_a_service_cannot_declare_the_udp_port_its_pods_forwarder_holds(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    # It answers lookups there wherever it runs: beside a proxy and no sibling too.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            test_resources_dir / "egress-proxy-values.yaml",
+            "services.default.ports[0].port=3128,services.default.ports[0].protocol=UDP",
+        )
+    assert "services.default declares UDP port 3128" in exc_info.value.stderr
+
+
 def test_no_other_container_mounts_the_key_of_a_forwarder_that_serves_siblings(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
 ) -> None:
@@ -1633,6 +1646,99 @@ def test_network_policy_disabled_refuses_a_port_listened_on(
             set_string=f"{on}.{_LISTENED}=2222,annotations.{_NO_CARD}",
         )
     assert "who reaches the port services.default listens on" in exc_info.value.stderr
+
+
+_CAPTURED = (
+    f"services.default.podAnnotations.{_EGRESS_PROXY}",
+    f"annotations.{_NO_CARD}",
+)
+
+
+@pytest.mark.parametrize(
+    ("capture", "annotations", "command"),
+    [
+        ("true", _CAPTURED, "capture"),
+        ("false", _CAPTURED, None),
+        # It has a forwarder, for the port it listens on, and no proxy to ask.
+        (
+            "true",
+            (_CAPTURED[1], f"services.default.podAnnotations.{_LISTENED}=2222"),
+            "redirect",
+        ),
+        # The routes of its network card would be lost to the forwarder's.
+        ("true", _CAPTURED[:1], None),
+    ],
+    ids=["captured", "not-asked", "no-proxy", "network-card"],
+)
+def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_release_asks(
+    chart_dir: pathlib.Path,
+    capture: str,
+    annotations: tuple[str, ...],
+    command: str | None,
+) -> None:
+    (stateful_set,) = _get_documents(
+        _run_helm_template(
+            chart_dir,
+            set_str=f"egressForwarderImage=vsock-egress:1,egressCapture={capture}",
+            set_string=",".join(annotations),
+        ),
+        "StatefulSet",
+    )
+
+    pod = stateful_set["spec"]["template"]["spec"]
+    # With no sibling it is there to capture, for a listened port, or not at all.
+    commands = {
+        container["name"]: container["command"][-1]
+        for container in pod.get("initContainers", [])
+    }
+    assert commands.get(_REDIRECT) == command
+    # No search list: the forwarder would give each name it made an address.
+    assert pod.get("dnsConfig") == (
+        {"nameservers": ["127.0.0.1"]} if command == "capture" else None
+    )
+    assert pod.get("dnsPolicy") == ("None" if command == "capture" else None)
+
+
+def test_a_captured_pod_with_siblings_runs_capture_and_they_run_redirect(
+    chart_dir: pathlib.Path, test_resources_dir: pathlib.Path
+) -> None:
+    pods, _ = _sibling_pods(
+        chart_dir,
+        test_resources_dir,
+        f"annotations.{_NO_CARD},{_CAPTURED[0]}",
+        "egressCapture=true",
+    )
+
+    assert {
+        name: [
+            container["command"][-1]
+            for container in pod["spec"].get("initContainers", [])
+            if container["name"] == _REDIRECT
+        ]
+        for name, pod in pods.items()
+    } == {
+        "default": ["capture"],
+        "game": ["redirect"],
+        "hidden": ["redirect"],
+        "offline": [],
+    }
+
+
+def test_a_captured_pod_is_refused_beside_a_service_with_additional_dns_records(
+    chart_dir: pathlib.Path,
+) -> None:
+    # Whichever service's: the captured pod would look the name up on the internet.
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _run_helm_template(
+            chart_dir,
+            set_str=(
+                "egressForwarderImage=vsock-egress:1,egressCapture=true,"
+                "services.other.image=other:1,services.other.networkIsolated=true,"
+                "services.other.additionalDnsRecords={site.test}"
+            ),
+            set_string=",".join(_CAPTURED),
+        )
+    assert "services.other.additionalDnsRecords" in exc_info.value.stderr
 
 
 def _peers_with_no_policy(

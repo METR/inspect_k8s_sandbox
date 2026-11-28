@@ -14,7 +14,7 @@ const (
 	canaryPort    = 3131 // check and canary meet on this vsock port, both ways
 	siblingPort   = 3132 // the sandbox dials this vsock port on the node, once for each connection to a sibling service
 	inboundPort   = 3133 // the sandbox serves this vsock port to the node, once for each connection made to its pod
-	forwarderPort = 3128 // the forwarder's TCP port in the sandbox: its programs' HTTP proxy, and where redirect sends their connections to siblings
+	forwarderPort = 3128 // the forwarder's port in the sandbox: its programs' HTTP proxy, where redirect and capture send their connections and, over UDP, their lookups
 	relayPort     = 3134 // a worker serves this TCP port in its pod's network namespace to the workers of the pod's siblings
 	hostCID       = 2
 	keySize       = 32
@@ -28,12 +28,12 @@ const (
 func main() {
 	log.SetFlags(0)
 	commands := map[string]func([]string) error{
-		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, // in the sandbox
+		"forward": forward, "ready": ready, "canary": canary, "redirect": redirect, "capture": redirectAll, // in the sandbox
 		"launch": launch, "check": check, "install": install, // on the node
 		"work": work, "probe": probe, "reap": reap, // started by launch and check
 	}
 	if len(os.Args) < 2 || commands[os.Args[1]] == nil {
-		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|canary (in the sandbox), launch|check|install (on the node)")
+		fmt.Fprintln(os.Stderr, "usage: vsock-egress forward|redirect|capture|canary (in the sandbox), launch|check|install (on the node)")
 		os.Exit(2)
 	}
 	if err := commands[os.Args[1]](os.Args[2:]); err != nil {
