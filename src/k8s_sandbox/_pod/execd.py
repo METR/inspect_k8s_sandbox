@@ -19,7 +19,11 @@ from typing import IO, Any, cast
 
 import anyio
 from anyio.abc import ByteStream
-from inspect_ai.util import ExecResult, OutputLimitExceededError
+from inspect_ai.util import (
+    ExecResult,
+    OutputLimitExceededError,
+    SandboxUserUnsupportedError,
+)
 from inspect_ai.util import SandboxEnvironmentLimits as limits
 from kubernetes.client.exceptions import ApiException
 
@@ -1021,7 +1025,7 @@ class ExecdClient:
             raise PermissionError(f"Permission denied executing command. {result}")
         error = status.get("error", "")  # execd's, only if the command never started
         if error.startswith("unknown user"):
-            raise RuntimeError(
+            raise SandboxUserUnsupportedError(
                 f"The user parameter '{user}' provided to exec() does not appear to "
                 f"exist in the container. Docs: {EXEC_USER_URL}\n"
                 f"{result.stderr[-_STDERR_TAIL_BYTES:]}"
@@ -1142,7 +1146,9 @@ class ExecdClient:
 def _named(user: str | None) -> str:
     """The user to ask execd for: "" is none to execd, and no user to a caller."""
     if user == "":  # runuser refuses it over Kubernetes exec
-        raise RuntimeError(f"exec() was given an empty user. Docs: {EXEC_USER_URL}")
+        raise SandboxUserUnsupportedError(
+            f"exec() was given an empty user. Docs: {EXEC_USER_URL}"
+        )
     return user or ""
 
 

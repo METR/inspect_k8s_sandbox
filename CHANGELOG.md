@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Needs Inspect 0.3.275 or later.
 - Fix `write_file()` and `read_file()` over Kubernetes exec hanging when the exec
   stalls: they are retried after 60 seconds without progress, or once 1 MiB of an
   upload has taken that long to send.

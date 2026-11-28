@@ -1521,14 +1521,12 @@ async def test_a_calls_last_frames_wait_behind_one_start_or_upload_at_most(
         running.cancel()
 
 
-async def test_an_empty_user_is_refused_not_run_as_the_containers(
-    daemons: Daemons,
-) -> None:
-    client = daemons.client()  # it serves nothing: a refusal needs no connection
+async def test_an_empty_user_is_refused_not_run_as_the_containers() -> None:
+    client = Daemons().client()  # it serves nothing: a refusal needs no connection
 
-    with pytest.raises(RuntimeError, match="empty user"):
+    with pytest.raises(inspect_ai.util.SandboxUserUnsupportedError, match="empty user"):
         await client.exec(["id"], None, None, {}, "", None)
-    with pytest.raises(RuntimeError, match="empty user"):
+    with pytest.raises(inspect_ai.util.SandboxUserUnsupportedError, match="empty user"):
         await client.open_stream(["id"], "")
 
 
@@ -4670,7 +4668,7 @@ async def test_stray_frames_are_counted_per_ping_interval(
     assert await asyncio.wait_for(stream.receive(), 30) == b"still here"
 
 
-async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> None:
+async def test_only_execd_itself_reports_an_unknown_user(tls_daemon: TlsDaemon) -> None:
     async def answers(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         while True:
             kind, call_id, payload = await read_frame(r)
@@ -4683,11 +4681,12 @@ async def test_only_execd_itself_reports_an_unknown_user(daemons: Daemons) -> No
                 status = b'{"code": 0}'
             w.write(frame(execd.EXIT, call_id, status))
 
-    await daemons.serve(answers)
-    client = daemons.client()
+    client = await tls_daemon(answers)
 
     assert (await client.exec(["sh"], None, None, {}, None, 30)).success
-    with pytest.raises(RuntimeError, match="does not appear to exist"):
+    with pytest.raises(
+        inspect_ai.util.SandboxUserUnsupportedError, match="does not appear to exist"
+    ):
         await client.exec(["true"], None, None, {}, "nobody2", 30)
 
 
