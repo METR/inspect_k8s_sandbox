@@ -31,7 +31,7 @@ type worker struct {
 	slots    chan struct{}          // one for each open stream
 	unkeyed  chan struct{}          // one for each connection that has not said what it wants yet: the key, or a sibling's port
 	arriving chan struct{}          // one for each connection made to the pod: they leave the pod's own streams half the places
-	keyWait  time.Duration          // how long a connection has to say it
+	keyWait  time.Duration          // how long a connection has to say what it wants
 	stall    time.Duration          // how long the far end may leave a write to it, or the end of them, waiting
 
 	mu      sync.Mutex
@@ -195,7 +195,7 @@ func work(args []string) error {
 	return <-ended
 }
 
-// serve gives each connection to l to carry, which says what it wants within keyWait.
+// serve gives each connection to l to carry, which says what it wants within keyWait unless its port says it.
 func (w *worker) serve(l net.Listener, carry func(net.Conn)) error {
 	for {
 		w.accepts.wait(1)

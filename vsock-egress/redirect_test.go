@@ -289,9 +289,12 @@ func TestConnectionToASiblingsAddressOpensAStreamThatSaysWhereItWasGoing(t *test
 		return
 	}
 	proxy, proxied := loopback(t)
-	siblings, port := loopback(t)
+	siblings, err := vsockListen(siblingPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { siblings.f.Close() })
 	f := keyedForwarder(unix.VMADDR_CID_LOCAL, proxied)
-	f.siblings = port
 	l, err := listen(fmt.Sprintf("127.0.0.1:%d", forwarderPort), clientBuffer)
 	if err != nil {
 		t.Fatal(err)
@@ -380,8 +383,8 @@ func TestSiblingsConnectionReachesAServerOnEveryAddressAfterTheKey(t *testing.T)
 	if _, err := io.ReadFull(got, request); err != nil || string(request) != "request" {
 		t.Fatalf("the server read %q, %v: want the request", request, err)
 	}
-	if from := got.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap(); from != arriveFrom {
-		t.Fatalf("the server sees its sibling at %v: want %v, which is not the address it listens at", from, arriveFrom)
+	if at, from := got.LocalAddr().(*net.TCPAddr).IP.String(), got.RemoteAddr().(*net.TCPAddr).IP.String(); at != "198.19.0.1" || from != "198.19.0.2" {
+		t.Fatalf("the server took its sibling's connection at %v from %v: want at 198.19.0.1 from 198.19.0.2, as the README says", at, from)
 	}
 	// The address the sandbox calls its own is no sibling's: a connection it makes there reaches its own server.
 	addrs, _ := net.InterfaceAddrs()

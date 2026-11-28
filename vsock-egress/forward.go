@@ -22,19 +22,18 @@ import (
 
 // forwarder is the sandbox's side. It reads nothing of what it carries and names no Service.
 type forwarder struct {
-	key      [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
-	host     uint32        // the node's CID
-	port     uint32        // the node's vsock port for proxy streams
-	siblings uint32        // and for a sibling's
-	names    *names        // the names a captured sandbox has looked up
-	slots    chan struct{} // one for each connection it carries
-	queue    chan struct{} // one for each connection it carries or holds back
-	wait     time.Duration // how long a connection is held back for a place
-	connect  func(cid, port uint32) (*os.File, error)
+	key     [keySize]byte // minted once for the pod: the node fetches it, and refuses a stream without it
+	host    uint32        // the node's CID
+	port    uint32        // the node's vsock port for proxy streams
+	names   *names        // the names a captured sandbox has looked up
+	slots   chan struct{} // one for each connection it carries
+	queue   chan struct{} // one for each connection it carries or holds back
+	wait    time.Duration // how long a connection is held back for a place
+	connect func(cid, port uint32) (*os.File, error)
 }
 
 func newForwarder(host, port uint32) *forwarder {
-	return &forwarder{host: host, port: port, siblings: siblingPort, names: newNames(""), slots: make(chan struct{}, maxStreams),
+	return &forwarder{host: host, port: port, names: newNames(""), slots: make(chan struct{}, maxStreams),
 		queue: make(chan struct{}, maxStreams+maxWaiting), wait: handshakeWait, connect: vsockDial}
 }
 
@@ -210,7 +209,7 @@ func (f *forwarder) stream(c *net.TCPConn) {
 	if to, err := originalDst(c); err == nil {
 		switch {
 		case siblingRange.Contains(to.Addr()):
-			port, asked = f.siblings, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
+			port, asked = siblingPort, binary.BigEndian.AppendUint16(to.Addr().AsSlice(), to.Port())
 		case to == resolver:
 			f.names.converse(c)
 			return
