@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -52,11 +54,38 @@ func TestLookupGetsANamesOwnAddressAndNoneOfIPv6(t *testing.T) {
 		"game.": dnsmessage.TypeA,
 		// It would end the line the forwarder asks the proxy for it in.
 		"a\r\nb.example.": dnsmessage.TypeA,
+		// It would be two words of that line.
+		"a b.example.": dnsmessage.TypeA,
 		// Lowered as text, its Kelvin sign is a k: kernel.example, another name.
 		"\u212aernel.example.": dnsmessage.TypeA,
 	} {
 		if code, records := answered(t, n, name, kind); code != dnsmessage.RCodeSuccess || len(records) != 0 {
 			t.Fatalf("a question of type %v for %q got code %v and %v: want no record", kind, name, code, records)
+		}
+	}
+}
+
+func TestLookupConnectionAnswersEachQuestionSentOnIt(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	go newNames("").converse(server)
+	client.SetDeadline(time.Now().Add(budget))
+	// glibc sends its questions for a name's IPv4 and IPv6 addresses on one connection.
+	for _, kind := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
+		question := dnsmessage.Message{Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("example.com."), Type: kind, Class: dnsmessage.ClassINET}}}
+		packed, err := question.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(packed))), packed...))
+		size := make([]byte, 2)
+		if _, err := io.ReadFull(client, size); err != nil {
+			t.Fatalf("the question of type %v got no answer on the connection: %v", kind, err)
+		}
+		var reply dnsmessage.Message
+		answer := make([]byte, binary.BigEndian.Uint16(size))
+		if _, err := io.ReadFull(client, answer); err != nil || reply.Unpack(answer) != nil || len(reply.Questions) != 1 || reply.Questions[0].Type != kind {
+			t.Fatalf("the question of type %v was answered %+v, %v: want a reply to it", kind, reply, err)
 		}
 	}
 }
