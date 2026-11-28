@@ -55,8 +55,9 @@ type worker struct {
 type target struct {
 	name       string
 	fresh      time.Duration             // how long its address is used before its name is asked again: 0 for until a dial fails
-	addr       atomic.Pointer[string]    // its address, once looked up
+	addr       atomic.Pointer[string]    // the address its name last answered with
 	asked      atomic.Pointer[time.Time] // when that was: a Time, whose monotonic reading no step of the node's clock moves
+	again      atomic.Bool               // a dial to its address failed: its name is asked before the next
 	unresolved atomic.Pointer[failedLookup]
 }
 
@@ -69,7 +70,7 @@ const workerStreams = 2 * maxStreams
 // newStreams bounds the streams a worker takes in a second: past it Firecracker waits in its connect, so a guest that floods its worker holds up its own VM.
 const newStreams = 2000
 
-// failedLookup is the target's last lookup that failed, and when: for a second after, streams fail as it did.
+// failedLookup is the target's last lookup that failed, and when: for a second after, no stream asks again, and one with no address to use fails as it did.
 type failedLookup struct {
 	err error
 	at  time.Time
@@ -345,25 +346,36 @@ func (w *worker) arriveAt(c net.Conn, at uint16) {
 	join(g, tcp, w.pace, w.stall)
 }
 
-// dial connects to t. A failed dial has its address looked up again, once a second at most: a replaced pod has another, and neither a target that is down nor a name that does not resolve may cost a lookup a stream.
+// dial connects to t. A failed dial has its name asked again, once a second at most: a replaced pod has another address, and neither a target that is down nor a name that does not resolve may cost a lookup a stream.
 func (w *worker) dial(t *target) (net.Conn, error) {
 	addr := t.addr.Load()
-	if addr == nil || t.fresh > 0 && w.now().Sub(*t.asked.Load()) >= t.fresh { // under no lock: streams that ask during a lookup share it, each for dialWait at most
+	if addr == nil || t.again.Load() || t.fresh > 0 && w.now().Sub(*t.asked.Load()) >= t.fresh { // under no lock: streams that ask during a lookup share it, each for its own wait at most
 		host, port, err := net.SplitHostPort(t.name)
 		if err != nil {
 			return nil, err
 		}
 		failed := t.unresolved.Load()
 		if failed == nil || w.now().Sub(failed.at) >= time.Second {
-			ctx, cancel := context.WithTimeout(context.Background(), dialWait)
+			wait := dialWait
+			// A stream with an address to use is held a second at most by a name that does not answer. shortcut: a name that needs longer is never refreshed, upgrade to a lookup that goes on behind the stream if a cluster's DNS is that slow.
+			if addr != nil {
+				wait = time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), wait)
 			ips, err := w.lookup(ctx, "ip4", host)
 			cancel()
 			if err != nil {
 				failed = &failedLookup{err, w.now()}
 				t.unresolved.Store(failed)
+				// An answer too: the name has no address while its pod is not ready, and the one it had may be another pod's by now.
+				if none, ok := errors.AsType[*net.DNSError](err); ok && none.IsNotFound {
+					t.addr.CompareAndSwap(addr, nil)
+					addr = nil
+				}
 			} else {
 				found, asked := net.JoinHostPort(ips[0].String(), port), w.now()
 				t.asked.Store(&asked)
+				t.again.Store(false)
 				t.addr.CompareAndSwap(addr, &found) // an answer that came meanwhile is the newer one
 				addr = &found
 			}
@@ -376,7 +388,7 @@ func (w *worker) dial(t *target) (net.Conn, error) {
 	c, err := net.DialTimeout("tcp", *addr, dialWait)
 	if err != nil {
 		if w.now().Sub(*t.asked.Load()) >= time.Second {
-			t.addr.CompareAndSwap(addr, nil)
+			t.again.Store(true)
 		}
 		return nil, err
 	}
