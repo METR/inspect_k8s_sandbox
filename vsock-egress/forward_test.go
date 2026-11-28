@@ -359,19 +359,31 @@ func TestStreamCapsItsClientSocketOnlyOnceItHasAPlace(t *testing.T) {
 	if got, want := buffers(t, kept)[0], capped(t, 64<<10)[0]; err != nil || got != want || locked&unix.SOCK_RCVBUF_LOCK == 0 {
 		t.Errorf("a connection that got no place takes %d bytes from its client, with buffers locked as %d (%v): want %d, half the cap, locked, as its listener gave it: unlocked, small segments grow it before the forwarder has seen it", got, locked, err, want)
 	}
+	// Its listener gave it that too: with nothing sent for 60 s after its client half-closes, the kernel forgets where redirect found it going.
+	alive, _ := unix.GetsockoptInt(int(kept.Fd()), unix.SOL_SOCKET, unix.SO_KEEPALIVE)
+	if idle, err := unix.GetsockoptInt(int(kept.Fd()), unix.IPPROTO_TCP, unix.TCP_KEEPIDLE); err != nil || alive == 0 || idle >= 60 {
+		t.Errorf("a connection is kept alive as %d, after %d s idle (%v): want it kept alive within the minute", alive, idle, err)
+	}
 }
 
 // forwarding starts the program's own forward, in a process of its own, and returns its TCP address and its key's file once it listens: what a sandbox and its node meet is whatever that makes.
 func forwarding(t *testing.T) (addr, file string) {
 	t.Helper()
-	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
 	free, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, file = free.Addr().String(), filepath.Join(t.TempDir(), "key")
+	addr = free.Addr().String()
 	free.Close()
-	forwarder := exec.Command(os.Args[0], "forward", "-listen", addr, "-key", file)
+	return addr, forwardingWith(t, "-listen", addr)
+}
+
+// forwardingWith does that with flags beside the key's, and none of its own.
+func forwardingWith(t *testing.T, flags ...string) (file string) {
+	t.Helper()
+	loopback(t) // skips where this machine has no vsock to itself: after that, a forward that ends is a failure
+	file = filepath.Join(t.TempDir(), "key")
+	forwarder := exec.Command(os.Args[0], append([]string{"forward", "-key", file}, flags...)...)
 	said := new(strings.Builder)
 	forwarder.Stderr = said
 	if err := forwarder.Start(); err != nil {
@@ -385,7 +397,7 @@ func forwarding(t *testing.T) (addr, file string) {
 	})
 	for deadline := time.Now().Add(budget); ; time.Sleep(time.Millisecond) {
 		if _, err := os.Stat(file + readySuffix); err == nil {
-			return addr, file
+			return file
 		}
 		select {
 		case err := <-ended:
