@@ -94,12 +94,12 @@
   database client): with it, a pod with no network device that names an egress proxy
   sends that proxy every IPv4 TCP connection it makes but those to itself and to its
   siblings, and its DNS lookups get addresses that stand for the names, and no record
-  but an IPv4 address. Other UDP, and ICMP, fail where they are sent, and a connection
-  the proxy refuses or cannot place is accepted and then reset. Such a pod runs the
-  redirect's init container with the command `vsock-egress capture`: admit it as you
-  admit `redirect`, with the pod's `dnsPolicy: None`. The chart refuses a captured pod
-  in a release where a service has `additionalDnsRecords`. The chart refuses a service
-  that declares UDP port 3128 on a pod that runs the forwarder.
+  but an IPv4 address. UDP to any port but 53, and ICMP, fail where they are sent, and a
+  connection the proxy refuses or cannot place is accepted and then reset. Such a pod
+  runs the redirect's init container with the command `vsock-egress capture`: admit it
+  as you admit `redirect`, with the pod's `dnsPolicy: None`. The chart refuses a
+  captured pod in a release where a service has `additionalDnsRecords`. The chart
+  refuses a service that declares UDP port 3128 on a pod that runs the forwarder.
 - Add `additionalResourceDnsRecords`: a Service that `additionalResources` adds as
   `{{ template "agentEnv.fullname" $ }}-<name>` resolves from within the agent
   environment as `$AGENT_ENV-<name>` once the value lists `<name>`.

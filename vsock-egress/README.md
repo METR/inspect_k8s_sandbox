@@ -61,11 +61,12 @@ refuses every host), and any other name, a question for an IPv6 address or any o
 the one looked up or connected to longest ago loses its address to the next, no sooner than ten seconds after: a program
 that still holds the address then reaches the newer name's host. A forwarder that restarts forgets every name, and
 resets a connection to an address it gave before. A connection is accepted before the proxy answers for it, and reset if
-the proxy refuses it, cannot reach its host or says nothing for ten seconds: a port scan sees every port open. What is
-neither TCP nor a lookup fails where it is sent (`EPERM`), unless it goes to the sandbox itself. The forwarder holds
-port 3128 for TCP and for UDP in every pod it runs in, and carries 64 connections at once: the next waits up to ten
-seconds for a place, and is then reset. The chart refuses a captured pod in a release where a service has
-`additionalDnsRecords`.
+the proxy refuses it, cannot reach its host or says nothing for ten seconds: a port scan sees every port open. A
+datagram to port 53 of `127.0.0.1` or of a host outside the sandbox is taken for a lookup whatever it carries: one that
+is no DNS question gets no answer. What else is not TCP fails where it is sent (`EPERM`), unless it goes to the sandbox
+itself. The forwarder holds port 3128 for TCP and for UDP in every pod it runs in, and carries 64 connections at once:
+the next waits up to ten seconds for a place, and is then reset. The chart refuses a captured pod in a release where a
+service has `additionalDnsRecords`.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 
