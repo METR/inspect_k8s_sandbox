@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/google/nftables v0.3.0
 	github.com/mdlayher/netlink v1.11.2
-	golang.org/x/net v0.53.0
+	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.50.0
 )
 
