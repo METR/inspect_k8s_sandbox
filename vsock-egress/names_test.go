@@ -76,9 +76,9 @@ func TestAddressGoesToAnotherNameOnlyOnceItsOwnWasNotUsedForAWhile(t *testing.T)
 	if code, records := answered(t, n, "late.example.", dnsmessage.TypeA); code != dnsmessage.RCodeServerFailure || len(records) != 0 {
 		t.Fatalf("with every address just given, one more name got code %v and %v: want a failure, and no address", code, records)
 	}
-	now = now.Add(nameTTL)
+	now = now.Add(2*nameTTL - time.Second)
 	if late, room := n.address("late.example"); room {
-		t.Fatalf("one life of an answer after every address was given, late.example is at %v: want none before two", late)
+		t.Fatalf("a second short of two lives of an answer after every address was given, late.example is at %v: want none before two", late)
 	}
 	now = now.Add(time.Minute)
 	n.address("first.example") // looked up again, and the second connected to: a program still uses each

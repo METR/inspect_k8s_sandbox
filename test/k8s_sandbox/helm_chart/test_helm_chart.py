@@ -1698,10 +1698,10 @@ def test_a_pod_is_captured_only_with_a_proxy_and_no_network_card_where_the_relea
     pod = stateful_set["spec"]["template"]["spec"]
     # With no sibling it is there to capture, for a listened port, or not at all.
     commands = {
-        container["name"]: container["command"][-1]
+        container["name"]: container["command"]
         for container in pod.get("initContainers", [])
     }
-    assert commands.get(_REDIRECT) == command
+    assert commands.get(_REDIRECT) == (command and ["/vsock-egress", command])
     # No search list: the forwarder would give each name it made an address.
     assert pod.get("dnsConfig") == (
         {"nameservers": ["127.0.0.1"]} if command == "capture" else None
@@ -1721,15 +1721,15 @@ def test_a_captured_pod_with_siblings_runs_capture_and_they_run_redirect(
 
     assert {
         name: [
-            container["command"][-1]
+            container["command"]
             for container in pod["spec"].get("initContainers", [])
             if container["name"] == _REDIRECT
         ]
         for name, pod in pods.items()
     } == {
-        "default": ["capture"],
-        "game": ["redirect"],
-        "hidden": ["redirect"],
+        "default": [["/vsock-egress", "capture"]],
+        "game": [["/vsock-egress", "redirect"]],
+        "hidden": [["/vsock-egress", "redirect"]],
         "offline": [],
     }
 
