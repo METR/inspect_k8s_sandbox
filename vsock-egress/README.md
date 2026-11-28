@@ -34,12 +34,12 @@ into it.
 
 A pod with no network device that carries the annotation `inspect-k8s-sandbox/ingress-listen` is reached from outside
 its release too: its worker takes a connection on the port the annotation names (1024 to 65535 other than 3128 and 3134)
-and hands it to the same port in the sandbox, at `198.19.0.1` as a sibling's: its server must listen on every address or
-on that one. Such a pod runs the forwarder, which holds `127.0.0.1:3128` there too, and the redirect, with or without
-siblings. The chart adds no network policy for that port: the release's ingress policies apply to it as to the pod's
-other ports, and yours says who else reaches it. A connection made before the sandbox's server listens is accepted and
-then reset, and one that is open ends with the pod's worker: a restart of the launcher's container, as on a rollout,
-resets it.
+and hands it to the same port in the sandbox, at `198.19.0.1` as a sibling's, under the same five-minute bounds: its
+server must listen on every address or on that one. Such a pod runs the forwarder, which holds `127.0.0.1:3128` there
+too, and the redirect, with or without siblings. The chart adds no network policy for that port: the release's ingress
+policies apply to it as to the pod's other ports, and yours says who else reaches it. A connection made before the
+sandbox's server listens is accepted and then reset, and one that is open ends with the pod's worker: a restart of the
+launcher's container, as on a rollout, resets it.
 
 Each node needs these three. `vsock-egress install <the kubelet's seccomp directory>` writes the first two:
 

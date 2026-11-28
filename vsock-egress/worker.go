@@ -195,7 +195,7 @@ func work(args []string) error {
 	return <-ended
 }
 
-// serve gives each connection to l to carry, which says what it wants within keyWait.
+// serve gives each connection to l to carry, which says what it wants within keyWait unless its port says it.
 func (w *worker) serve(l net.Listener, carry func(net.Conn)) error {
 	for {
 		w.accepts.wait(1)

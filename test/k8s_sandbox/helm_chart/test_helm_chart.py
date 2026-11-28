@@ -1506,7 +1506,7 @@ def test_a_service_that_keeps_its_network_card_is_no_sibling(
 
 
 @pytest.mark.parametrize("annotation", [_SIBLINGS, _SERVED])
-def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes(
+def test_a_value_cannot_say_what_a_pods_worker_dials_or_takes_from_its_siblings(
     chart_dir: pathlib.Path, test_resources_dir: pathlib.Path, annotation: str
 ) -> None:
     # Left in, a sibling the chart never listed could be a Service of another release.
