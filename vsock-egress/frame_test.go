@@ -78,6 +78,28 @@ func frame(payload string) []byte {
 	return append(binary.BigEndian.AppendUint32(nil, uint32(len(payload))), payload...)
 }
 
+func TestJoinEndsTheDeadlinesAStreamsOpeningLeft(t *testing.T) {
+	client, inSandbox := tcpPair(t)
+	guest, node := vsockPair(t)
+	// As an opening leaves both ends, its time to say what it wants long past.
+	guest.SetDeadline(time.Now().Add(-time.Hour))
+	inSandbox.SetDeadline(time.Now().Add(-time.Hour))
+	go join(guest, inSandbox, nil, 0)
+
+	client.SetDeadline(time.Now().Add(budget))
+	node.SetDeadline(time.Now().Add(budget))
+	client.Write([]byte("request"))
+	sent := make([]byte, 4+len("request"))
+	if _, err := io.ReadFull(node, sent); err != nil || string(sent) != string(frame("request")) {
+		t.Fatalf("the node read %q, %v: want the request in a frame", sent, err)
+	}
+	node.Write(frame("reply"))
+	got := make([]byte, len("reply"))
+	if _, err := io.ReadFull(client, got); err != nil || string(got) != "reply" {
+		t.Fatalf("the client read %q, %v: want the reply", got, err)
+	}
+}
+
 func TestHalfClosedClientGetsItsReply(t *testing.T) {
 	client, inSandbox := tcpPair(t)
 	onNode, proxy := tcpPair(t)

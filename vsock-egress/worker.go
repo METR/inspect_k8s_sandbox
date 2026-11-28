@@ -242,7 +242,6 @@ func (w *worker) stream(c net.Conn, asked int) {
 		w.refuse()
 		return
 	}
-	c.SetReadDeadline(time.Time{})
 	t, err := w.dial(to)
 	if err == nil && asked > 0 {
 		if _, err = t.Write(port); err != nil {
@@ -301,7 +300,6 @@ func (w *worker) arriveAt(c net.Conn, at uint16) {
 		w.refuse()
 		return
 	}
-	tcp.SetReadDeadline(time.Time{})
 	tcp.SetReadBuffer(proxyBuffer)
 	tcp.SetWriteBuffer(proxyBuffer)
 	g, err := guestDial(w.vsock, inboundPort)
@@ -323,7 +321,6 @@ func (w *worker) arriveAt(c net.Conn, at uint16) {
 		}
 		return
 	}
-	g.SetDeadline(time.Time{})
 	join(g, tcp, w.pace, w.stall)
 }
 

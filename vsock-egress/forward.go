@@ -172,7 +172,6 @@ func (f *forwarder) arrive(c *os.File) {
 		c.Close()
 		return
 	}
-	c.SetDeadline(time.Time{})
 	t.(*net.TCPConn).SetReadBuffer(clientBuffer)
 	t.(*net.TCPConn).SetWriteBuffer(clientBuffer)
 	join(c, t.(*net.TCPConn), nil, stallWait)
