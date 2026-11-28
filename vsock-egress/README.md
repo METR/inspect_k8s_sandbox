@@ -46,16 +46,17 @@ Each node needs these three. `vsock-egress install <the kubelet's seccomp direct
   `SETGID` and no other, under the launcher's profile, with the node's `/var/lib/nitro-sandbox/firecracker` and
   `/run/netns` mounted with `HostToContainer` propagation and `/var/lib/cni/results` read-only. Keep its pod off the
   host network, or a sandbox deleted before the launcher started can raise `no_worker`. Every sandbox's worker runs in
-  that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64
-  downloads 86 MiB, and one whose guest does its worst 308 MiB. Give the container a CPU request, a memory limit for
-  as many sandboxes as the node can hold, and a memory request that its idle workers and one sandbox's worst fit in.
-  Past the limit the kernel kills every process in the container unless the kubelet's `singleProcessOOMKill` is on.
-  With it on the kernel ends one process; were that the launcher, every worker would end with it. Each worker sets
-  its `oom_score_adj` to 1000 so that it is a worker instead: the one with the most resident memory, whichever
-  sandbox filled the socket buffers, so one sandbox can cost another its worker. That holds only while a thousandth
-  of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more than the launcher's
-  resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the memory request and
-  the node's memory.
+  that container's cgroup. Measured there: an idle worker holds 4 MiB, a sandbox that stops reading 64 downloads 86 MiB,
+  and one whose guest does its worst 308 MiB. A worker that takes connections for its pod also holds up to 512 it has
+  not accepted, each with up to half a mebibyte it was sent: about 256 MiB at worst, which no pod is charged for. Give
+  the container a CPU request, a memory limit for as many sandboxes as the node can hold, and a memory request that its
+  idle workers and one sandbox's worst fit in. Past the limit the kernel kills every process in the container unless the
+  kubelet's `singleProcessOOMKill` is on. With it on the kernel ends one process; were that the launcher, every worker
+  would end with it. Each worker sets its `oom_score_adj` to 1000 so that it is a worker instead: the one with the most
+  resident memory, whichever sandbox filled the socket buffers, so one sandbox can cost another its worker. That holds
+  only while a thousandth of the limit for each point of the launcher's own `oom_score_adj` below 1000 comes to more
+  than the launcher's resident memory over that worker's; the kubelet sets the launcher's `oom_score_adj` from the
+  memory request and the node's memory.
 
 A command run in the forwarder's container runs under the profile that admits the vsock, and need not be
 `/vsock-egress`: on runc, `/proc/self/exe` there is runc itself. `forward`, `ready` and `canary` take no vsock port or
